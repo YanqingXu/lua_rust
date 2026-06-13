@@ -1,35 +1,65 @@
-# lua_rust — Lua 5.1 Interpreter in Rust
+# lua_rust - Lua 5.1 Rust Migration
 
 [![Rust](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-一个用纯 Rust 编写的 **Lua 5.1 解释器**，完整实现寄存器虚拟机、编译器前端、标记-清除 GC 和标准库。
+`lua_rust` 是 `lua_cpp` 的 Lua 5.1 解释器 Rust 迁移工程。当前不是可用的完整解释器，而是已完成 Phase 0 工程基础设施、并已启动 Phase 1 Runtime Core 的迁移工作区。
+
+最近审计日期：2026-06-13。
 
 ---
 
-## 目录
+## 当前进度
 
-- [特性](#特性)
-- [快速开始](#快速开始)
-- [项目结构](#项目结构)
-- [Crate 说明](#crate-说明)
-- [架构概览](#架构概览)
-- [开发](#开发)
-- [文档](#文档)
-- [许可证](#许可证)
+| 范围 | 状态 | 说明 |
+|---|---|---|
+| Phase 0: Project Infrastructure | 已完成 | Rust workspace、6 个 crate 脚手架、CI workflow、质量脚本、迁移文档目录和 fixture 目录已建立。 |
+| Phase 1: Runtime Core | 已启动 | `lua_core` 已落地 P1.1/P1.2 的类型系统、`Value`、`GcRef`、GC 对象头/trait、GC collector 骨架、`GcString` 和 `StringPool`。 |
+| Phase 2: Compiler | 未开始 | `lua_compiler` 仅保留 crate 和模块规划注释，lexer/parser/AST/codegen 未实现。 |
+| Phase 3: VM | 未开始 | `lua_vm` 仅保留 crate 和模块规划注释，LuaState、栈、调用帧、opcode dispatch 未实现。 |
+| Phase 4: Standard Library | 未开始 | `lua_stdlib` 仅保留 crate 和模块规划注释。 |
+| Phase 5: CLI / tools | 未开始 | `lua_app` 与 `lua_bytecode` 是 placeholder binary，不执行 Lua 脚本，也不输出真实字节码。 |
 
 ---
 
-## 特性
+## 已实现与未实现
 
-- **完整的 Lua 5.1 语义**: nil/boolean/number/string/table/function/userdata/thread 全部值类型
-- **寄存器虚拟机**: 32 位指令格式，38 条 opcode，RK 操作数编码
-- **标记-清除 GC**: 三色标记算法，弱表支持，终结器与复活机制，写屏障
-- **字符串驻留**: 相同内容的字符串在内存中仅存一份，比较简化为指针比较
-- **编译器前端**: 完整的 Lexer → Parser → AST → CodeGenerator 管线
-- **标准库**: base、math、string、table、io、os、coroutine、debug、package
-- **交互式 REPL**: 支持行编辑、历史记录
-- **字节码工具**: 编译 Lua 源码并输出字节码（text / JSON 格式）
+### 已实现的工程基础
+
+- Rust workspace：`lua_core`、`lua_compiler`、`lua_vm`、`lua_stdlib`、`lua_app`、`lua_bytecode` 6 个成员 crate。
+- 工具链配置：`rust-toolchain.toml` 使用 stable，workspace `rust-version = "1.96"`，默认目标为 `x86_64-pc-windows-msvc`。
+- CI 配置：`.github/workflows/ci.yml` 包含 Windows quality-gate job，步骤为环境检查、fmt、clippy、build、nextest、doc、cargo-audit 和质量脚本。
+- Runtime core 基础：Lua 基础类型、`ValueType`/`GcObjectType`/`GcColor`、`Value` enum、Lua truthiness、指针身份相等、Display/toString 风格输出。
+- GC 基础设施：`GcRef<T>`、`GcObjectHeader`、`GcObject` unsafe trait、`GarbageCollector` 对象注册/根集/标记骨架、`GcStrategy`、`MarkSweepGc`/`IncrementalGc` 策略接口。
+- 字符串驻留：`GcString`、Lua 5.1 风格字符串哈希、`StringPool::intern/find/remove`。
+- 测试基础：`lua_core` 单元测试与 integration test 已覆盖 Value、GC 基础、字符串对象和字符串驻留。
+
+### 尚未实现的 Lua 5.1 语义
+
+- 完整标记-清除 GC：`collect()` 当前仍返回 `0`，类型感知 sweep、终结器、弱表、写屏障和对象释放尚未实现。
+- 核心对象模型：`Table`、`Function`、`Proto`、`Upval`、`Thread`、`Userdata`、metatable 仍是 Phase 1.4 目标或占位。
+- 编译器：opcode、instruction 编解码、lexer、parser、AST、bytecode codegen 均未实现。
+- VM：LuaState、GlobalState、值栈、CallInfo、38 opcode dispatch、调用/返回、trace/debug 均未实现。
+- 标准库：base、math、string、table、io、os、coroutine、debug、package 等模块未实现。
+- CLI 与工具：REPL、脚本执行、字节码 dump/JSON 输出未实现。
+- 与 C++ 基准的行为对齐：当前仅有结构和部分 runtime core 类型级对齐；bytecode diff 和 VM trace diff 需要 Phase 2/3 之后才能生效。
+
+---
+
+## Crate 说明
+
+| Crate | 类型 | 当前职责与状态 |
+|---|---|---|
+| `lua_core` | lib | Phase 1 目标 crate。已实现基础类型、`Value`、`GcRef`、GC 对象头/trait、collector 骨架、GC 策略接口、`GcString` 和 `StringPool`；Table/Function/Thread/Userdata 等仍为占位或待实现。 |
+| `lua_compiler` | lib | Phase 2 目标 crate。目前只有脚手架和 C++ -> Rust 模块映射注释；未导出 opcode、lexer、parser、AST 或 codegen 模块。 |
+| `lua_vm` | lib | Phase 3 目标 crate。目前只有脚手架和模块规划；未实现 LuaState、执行循环、opcode handlers、调用帧或 trace。 |
+| `lua_stdlib` | lib | Phase 4 目标 crate。目前只有脚手架和标准库模块规划；未实现任何 Lua 标准库。 |
+| `lua_app` | bin | Phase 5 目标 binary。目前只打印 placeholder 信息；不支持 REPL 或脚本执行。 |
+| `lua_bytecode` | bin | Phase 5 目标 binary。目前只打印 placeholder 信息；不编译 Lua 源码，也不输出真实字节码。 |
+
+### 依赖关系现状
+
+内部 crate 依赖目前大多尚未启用，`Cargo.toml` 中以 phase-gated 注释保留。`lua_core` 是当前唯一承载实际迁移实现的 crate。
 
 ---
 
@@ -37,249 +67,124 @@
 
 ### 环境要求
 
-- Rust **1.96+** (stable toolchain)
-- Windows x64-msvc（主要开发平台）
+- Rust stable，workspace 要求 `rust-version = "1.96"`。
+- Windows x64 MSVC 是当前主开发/CI 平台。
+- 完整 CI 门禁还需要 `cargo-nextest` 和 `cargo-audit`。
 
-### 安装与构建
+### 本地基础验证
+
+这些命令不依赖 C++ 基准构建产物，也不依赖 `cargo-audit`：
 
 ```powershell
-# 克隆仓库
-git clone <repo-url>
 cd lua_rust
 
-# 构建全部 workspace
+cargo fmt --check
+cargo clippy --workspace -- -D warnings
 cargo build --workspace
-
-# 运行全部测试
 cargo test --workspace
-
-# 构建文档
-cargo doc --no-deps --open
+cargo doc --no-deps
 ```
 
-### 运行 Lua 脚本
+当前审计结果：上述命令均通过；`cargo test --workspace` 共运行 82 个 Rust 测试，测试集中在 `lua_core`。
+
+### CI 对齐门禁
+
+CI workflow 和 `tools/rust_quality_gate.ps1` 的目标门禁包含：
 
 ```powershell
-# 执行 Lua 脚本文件
-cargo run -p lua_app -- path/to/script.lua
-
-# 启动交互式 REPL
-cargo run -p lua_app
-
-# 查看字节码
-cargo run -p lua_bytecode -- path/to/script.lua --format=json
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_env_check.ps1
+cargo fmt --check
+cargo clippy --workspace -- -D warnings
+cargo build --workspace
+cargo nextest run --workspace
+cargo doc --no-deps
+cargo audit
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_quality_gate.ps1
 ```
+
+本地可按阶段跳过暂不适用的步骤：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_quality_gate.ps1 -SkipAudit -SkipCrossValidate
+```
+
+注意：当前脚本实际调用 `cargo nextest run --workspace`。如果本机未安装 `cargo-nextest`，或遇到 `.cargo/config.toml` 中 `nextest` alias 导致的递归错误，可先使用 `cargo test --workspace` 作为本地回退验证。
+
+### Placeholder binaries
+
+当前 binary 只用于确认脚手架可构建：
+
+```powershell
+cargo run -p lua_app
+cargo run -p lua_bytecode
+```
+
+它们不会执行 Lua 脚本，也不会生成字节码。
+
+---
+
+## CI 与 C++ 基准对齐
+
+`.github/workflows/ci.yml` 当前包含两个 job：
+
+| Job | 状态 | 说明 |
+|---|---|---|
+| `quality-gate` | 已配置 | Windows 上运行 Rust 工具链安装、环境检查、fmt、clippy、build、nextest、doc、audit 和质量脚本。 |
+| `cross-validate` | 已配置但禁用 | `if: false`，计划在 Phase 2+ 且 CI 中可用 C++ 基准产物后启用。 |
+
+`tools/compare_bytecode.ps1` 和 `tools/compare_vm_trace.ps1` 已存在，但当前对齐状态为 N/A：
+
+- `lua_cpp` 源码目录存在于 `..\lua_cpp`。
+- `..\lua_cpp\bin` 当前不存在，因此 C++ `lua_bytecode.exe` / `lua_app.exe` 不可用。
+- Rust 侧 compiler、VM、CLI 仍未实现，因此 bytecode diff 和 VM trace diff 还不能代表 Lua 语义兼容性。
+- `docs/rust_migration/deviation_log.md` 当前没有登记任何已批准行为偏差。
 
 ---
 
 ## 项目结构
 
-```
+```text
 lua_rust/
-├── Cargo.toml                  # Workspace 根配置
-├── rust-toolchain.toml         # Rust 工具链固定版本
-├── README.md
-├── .cargo/
-│   └── config.toml             # 构建配置
-├── .github/
-│   └── workflows/
-│       └── ci.yml              # CI 流水线
+├── Cargo.toml
+├── rust-toolchain.toml
+├── .cargo/config.toml
+├── .github/workflows/ci.yml
 ├── crates/
-│   ├── lua_core/               # 运行时核心库
-│   │   ├── src/
-│   │   │   ├── lib.rs
-│   │   │   ├── types.rs        # 基础类型、ValueType、GcObjectType
-│   │   │   ├── value.rs        # Value 枚举 — Lua 值的统一表示
-│   │   │   ├── gc/             # 垃圾回收模块
-│   │   │   │   ├── mod.rs
-│   │   │   │   ├── header.rs   # GcObjectHeader（侵入式链表节点）
-│   │   │   │   ├── gc_ref.rs   # GcRef<T>（GC 引用安全句柄）
-│   │   │   │   ├── gc_object.rs # GcObject trait
-│   │   │   │   ├── collector.rs # GarbageCollector
-│   │   │   │   └── strategy.rs  # GCStrategy trait + 内置策略
-│   │   │   ├── gc_string.rs    # GcString（驻留字符串）
-│   │   │   ├── string_pool.rs  # StringPool（字符串驻留池）
-│   │   │   ├── table.rs        # Table（数组 + 哈希）
-│   │   │   ├── function.rs     # Function + Proto（函数与字节码容器）
-│   │   │   ├── upvalue.rs      # Upvalue（闭包捕获变量）
-│   │   │   ├── thread.rs       # Thread（协程）
-│   │   │   └── userdata.rs     # Userdata（用户自定义数据）
-│   │   └── tests/
-│   ├── lua_compiler/           # 编译器前端
-│   │   └── src/
-│   │       ├── opcode.rs       # OpCode 枚举 + Instruction 编解码
-│   │       ├── lexer/          # 词法分析器
-│   │       ├── parser/         # 语法分析器
-│   │       ├── ast/            # 抽象语法树
-│   │       └── codegen/        # 字节码生成器
-│   ├── lua_vm/                 # 虚拟机核心
-│   │   └── src/
-│   │       ├── state/          # LuaState、GlobalState、Stack、CallInfo
-│   │       ├── execute.rs      # 主 dispatch 循环（38 条指令）
-│   │       ├── ops.rs          # 算术/比较辅助
-│   │       ├── call.rs         # 调用/返回辅助
-│   │       └── trace.rs        # 执行 trace / 调试
-│   ├── lua_stdlib/             # 标准库
-│   │   └── src/
-│   │       ├── catalog.rs      # 库注册表
-│   │       ├── base.rs         # base 库
-│   │       ├── math.rs         # math 库
-│   │       ├── string.rs       # string 库
-│   │       ├── table.rs        # table 库
-│   │       ├── io.rs           # io 库
-│   │       ├── os.rs           # os 库
-│   │       ├── coroutine.rs    # coroutine 库
-│   │       ├── debug.rs        # debug 库
-│   │       └── package.rs      # package 库
-│   ├── lua_app/                # CLI 应用入口
-│   │   └── src/main.rs         # REPL + 脚本执行器
-│   └── lua_bytecode/           # 字节码工具
-│       └── src/main.rs         # Lua 源码 → 字节码输出
-├── tests/
-│   └── fixtures/               # Lua 测试脚本
-├── tools/                      # 辅助脚本
-│   ├── rust_env_check.ps1      # 开发环境检查
-│   └── rust_quality_gate.ps1   # 质量门禁
-└── docs/                       # 项目文档
-    ├── glossary.md             # 术语表
-    └── rust_migration/         # 类型映射与偏差记录
+│   ├── lua_core/
+│   │   ├── src/types.rs
+│   │   ├── src/value.rs
+│   │   ├── src/gc/
+│   │   ├── src/gc_string.rs
+│   │   └── src/string_pool.rs
+│   ├── lua_compiler/
+│   ├── lua_vm/
+│   ├── lua_stdlib/
+│   ├── lua_app/
+│   └── lua_bytecode/
+├── tests/fixtures/
+│   ├── phase_1/
+│   ├── phase_2/
+│   ├── phase_3/
+│   ├── phase_4/
+│   └── phase_5/
+├── tools/
+│   ├── rust_env_check.ps1
+│   ├── rust_quality_gate.ps1
+│   ├── compare_bytecode.ps1
+│   └── compare_vm_trace.ps1
+└── docs/
+    ├── glossary.md
+    └── rust_migration/
 ```
 
 ---
 
-## Crate 说明
+## 开发约定
 
-| Crate | 类型 | 描述 |
-|---|---|---|
-| `lua_core` | lib | 运行时核心：类型系统、Value、GC 基础设施、字符串驻留、Table、Function、Upvalue、Thread、Userdata |
-| `lua_compiler` | lib | 编译器前端：OpCode 指令集、词法分析、语法分析、AST 构建、字节码生成 |
-| `lua_vm` | lib | 虚拟机：LuaState、值栈、CallInfo 调用帧、38 条指令 dispatch、调用返回、trace/debug |
-| `lua_stdlib` | lib | 标准库：base、math、string、table、io、os、coroutine、debug、package 全部模块 |
-| `lua_app` | bin | CLI 应用：交互式 REPL 和 Lua 脚本文件执行器 |
-| `lua_bytecode` | bin | 字节码工具：编译 `.lua` 文件并以 text 或 JSON 格式输出字节码 |
-
-### 依赖关系
-
-```
-lua_core          ← 基础层（无内部依赖）
-  ↑
-lua_compiler      ← 依赖 lua_core（使用类型系统和字符串池）
-  ↑
-lua_vm            ← 依赖 lua_core + lua_compiler
-  ↑
-lua_stdlib        ← 依赖 lua_core + lua_vm
-  ↑
-lua_app           ← 依赖全部 4 个库 crate
-lua_bytecode      ← 依赖 lua_core + lua_compiler
-```
-
----
-
-## 架构概览
-
-### 值系统
-
-`Value` 是一个 Rust enum，统一表示所有 Lua 运行时值：
-
-```rust
-pub enum Value {
-    Nil,                              // nil
-    Boolean(bool),                    // true / false
-    LightUserdata(GcRef<c_void>),     // 轻量用户数据
-    Number(f64),                      // 浮点数
-    String(GcRef<GcString>),          // 驻留字符串
-    Table(GcRef<Table>),              // 表
-    Function(GcRef<Function>),        // 函数
-    Userdata(GcRef<Userdata>),        // 用户数据
-    Thread(GcRef<Thread>),            // 协程
-}
-```
-
-### 垃圾回收
-
-采用三色标记-清除算法：
-
-- **白色**: 未访问，可能被回收
-- **灰色**: 已访问但未扫描子引用
-- **黑色**: 已访问且已扫描所有子引用
-
-GC 通过 `GarbageCollector` 管理侵入式对象链表，`GcRef<T>` 提供对 GC 对象的安全引用句柄。支持弱表（弱键/弱值）、终结器（`__gc` 元方法）和写屏障。
-
-### 字符串驻留
-
-`StringPool` 确保相同内容的字符串在内存中仅存一份。字符串创建时预计算 Lua 5.1 兼容的哈希值，后续比较直接通过指针相等完成。
-
-### 编译器管线
-
-```
-Lua 源码
-  → Lexer (词法分析) → Token 流
-  → Parser (语法分析) → AST
-  → CodeGenerator (代码生成) → Proto（字节码）
-```
-
-### 虚拟机
-
-寄存器架构的字节码解释器，32 位定长指令，38 条 opcode：
-
-```
-MOVE  LOADK  LOADBOOL  LOADNIL
-GETUPVAL  GETGLOBAL  GETTABLE
-SETGLOBAL  SETUPVAL  SETTABLE
-NEWTABLE  SELF
-ADD  SUB  MUL  DIV  MOD  POW
-UNM  NOT  LEN
-CONCAT
-JMP  EQ  LT  LE  TEST  TESTSET
-CALL  TAILCALL  RETURN
-FORLOOP  FORPREP  TFORLOOP
-SETLIST  CLOSE  CLOSURE  VARARG
-```
-
----
-
-## 开发
-
-### 命名规范
-
-| 元素 | 规范 | 示例 |
-|---|---|---|
-| 类型 | `CamelCase` | `Value`, `StringPool`, `GcRef` |
-| 方法与函数 | `snake_case` | `is_nil()`, `as_number()` |
-| 常量 | `UPPER_CASE` | `NUM_OPCODES`, `WHITE0BIT` |
-| 模块路径 | `snake_case` | `lua_core::gc::header` |
-
-### Unsafe 使用原则
-
-`unsafe` 严格限制在以下边界：
-
-- GC 内部（侵入式链表操作）
-- `GcRef<T>` 的裸指针解引用
-- FFI / C API 边界
-
-每个 `unsafe` 块必须附带 `// SAFETY:` 注释，说明依赖的不变量及其成立理由。
-
-### 常用命令
-
-```powershell
-# 构建
-cargo build --workspace
-cargo build -p lua_core
-
-# 测试
-cargo test --workspace
-cargo test -p lua_core
-
-# 代码质量
-cargo fmt --check
-cargo clippy --workspace -- -D warnings
-
-# 文档
-cargo doc --no-deps --open
-
-# 质量门禁
-powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_quality_gate.ps1
-```
+- 类型使用 `CamelCase`，函数/方法/模块使用 `snake_case`，常量使用 `UPPER_CASE`。
+- `unsafe` 仅用于 GC、裸指针/FFI 等边界；workspace lint 开启 `unsafe_op_in_unsafe_fn = "deny"` 和 `clippy::undocumented_unsafe_blocks = "deny"`。
+- 迁移应优先保持与 `lua_cpp` 行为一致；所有批准的行为差异必须登记到偏差日志。
+- Phase 推进时先更新对应 crate 的真实实现，再更新 README 和迁移文档，避免文档先行宣称未落地功能。
 
 ---
 
@@ -287,11 +192,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_quality_gate.ps1
 
 | 文档 | 说明 |
 |---|---|
-| [术语表](docs/glossary.md) | Lua 概念在本项目各模块中的位置 |
-| [类型映射](docs/rust_migration/type_mapping_table.md) | 类型别名、枚举与 trait 速查 |
+| [Phase 0 报告](docs/rust_migration/phase_0_report.md) | 工程基础设施初始化记录。 |
+| [类型映射表](docs/rust_migration/type_mapping_table.md) | C++ -> Rust 类型、模块和 phase 映射速查。 |
+| [偏差日志](docs/rust_migration/deviation_log.md) | Rust 与 C++ 基准之间已批准行为偏差的登记表；当前为空。 |
+| [P1.1 Types + Value 任务](docs/rust_migration/tasks/P1.1-types-value.md) | Phase 1 首个 runtime core 任务说明。 |
+| [术语表](docs/glossary.md) | Lua 概念与项目术语说明。 |
 
 ---
 
 ## 许可证
 
-MIT License — 详见 [LICENSE](LICENSE) 文件。
+MIT License - 详见 [LICENSE](LICENSE)。
