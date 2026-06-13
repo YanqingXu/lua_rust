@@ -1,0 +1,21 @@
+# Rust build output
+target/
+debug/
+release/
+
+# IDE
+.vs/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cross-validation artifacts
+target/bytecode_diff/
+target/vm_trace_diff/
+
+# Generated documentation
+target/doc/

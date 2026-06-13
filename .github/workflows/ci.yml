@@ -1,0 +1,91 @@
+name: Rust CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  quality-gate:
+    name: Quality Gate (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Environment check
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_env_check.ps1
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Test workspace
+        run: cargo nextest run --workspace
+
+      - name: Documentation
+        run: cargo doc --no-deps
+
+      - name: Security audit
+        run: cargo audit
+
+      - name: Quality gate
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_quality_gate.ps1
+
+  # C++ baseline validation — runs only when C++ tools are built
+  cross-validate:
+    name: Cross-Language Validation
+    runs-on: windows-latest
+    needs: quality-gate
+    if: false  # Enable when Phase 2+ and C++ baseline is available in CI
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Bytecode comparison
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/compare_bytecode.ps1 -InputDir tests/fixtures/
+
+      - name: VM trace comparison
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/compare_vm_trace.ps1 -InputDir tests/fixtures/

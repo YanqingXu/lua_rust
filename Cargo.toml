@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lua_core",
+    "crates/lua_compiler",
+    "crates/lua_vm",
+    "crates/lua_stdlib",
+    "crates/lua_app",
+    "crates/lua_bytecode",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/user/lua_in_rust"
+rust-version = "1.96"
+
+[workspace.dependencies]
+# Internal crate dependencies will be added as crates mature
+# lua_core   = { path = "crates/lua_core" }
+# lua_compiler = { path = "crates/lua_compiler" }
+# lua_vm     = { path = "crates/lua_vm" }
+# lua_stdlib = { path = "crates/lua_stdlib" }
+
+# External dependencies (phase-gated)
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+# Profile overrides for migration workflow
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.test]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = true

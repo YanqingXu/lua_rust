@@ -1,0 +1,19 @@
+# Cargo configuration for Lua interpreter C++→Rust migration project.
+# Mirrors the intent of lua_cpp/CMakeLists.txt build settings.
+
+[build]
+# Default target matches the C++ x64 target
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+# Mirror MSVC stack size reservation from lua_cpp's lua_configure_runtime_stack()
+# 16 MiB stack for debug VM dispatch frames
+rustflags = ["-C", "link-args=/STACK:16777216"]
+
+[alias]
+# Convenience aliases for the migration workflow
+nextest = "nextest run"
+gate = "run --package lua_app --"
+
+[term]
+color = "always"
