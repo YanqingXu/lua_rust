@@ -69,11 +69,8 @@ pub struct Proto {
     _private: (),
 }
 
-/// Lua 上值对象（占位 — Phase 1.4 实现）
-#[derive(Debug, Clone)]
-pub struct Upval {
-    _private: (),
-}
+/// Lua 上值对象（P1.4 — 已实现）
+pub use crate::upvalue::Upvalue;
 
 // =====================================================================
 // Lua 类型标签枚举

@@ -14,7 +14,7 @@
 | 范围 | 状态 | 说明 |
 |---|---|---|
 | Phase 0: Project Infrastructure | 已完成 | Rust workspace、6 个 crate 脚手架、CI workflow、质量脚本、迁移文档目录和 fixture 目录已建立。 |
-| Phase 1: Runtime Core | 进行中 | `lua_core` 已落地 P1.1/P1.2 的类型系统、`Value`、`GcRef`、GC 对象头/trait、GC collector 骨架、`GcString`、`StringPool`；P1.4 `Table`（数组/哈希/元表/迭代器）和 `Metatable`（TMS 枚举、flags 缓存查找）已实现。Function/Thread/Userdata/Proto/Upval 仍待实现。 |
+| Phase 1: Runtime Core | 进行中 | `lua_core` 已落地 P1.1/P1.2 类型系统/GC 基础；P1.3 完整标记-清除 GC；P1.4 `Table`、`Metatable`、`Upvalue`。Function/Thread/Userdata/Proto 仍待实现。 |
 | Phase 2: Compiler | 未开始 | `lua_compiler` 仅保留 crate 和模块规划注释，lexer/parser/AST/codegen 未实现。 |
 | Phase 3: VM | 未开始 | `lua_vm` 仅保留 crate 和模块规划注释，LuaState、栈、调用帧、opcode dispatch 未实现。 |
 | Phase 4: Standard Library | 未开始 | `lua_stdlib` 仅保留 crate 和模块规划注释。 |
@@ -30,13 +30,13 @@
 - 工具链配置：`rust-toolchain.toml` 使用 stable，workspace `rust-version = "1.96"`，默认目标为 `x86_64-pc-windows-msvc`。
 - CI 配置：`.github/workflows/ci.yml` 包含 Windows quality-gate job，步骤为环境检查、fmt、clippy、build、nextest、doc、cargo-audit 和质量脚本。
 - Runtime core 基础：Lua 基础类型、`ValueType`/`GcObjectType`/`GcColor`、`Value` enum、Lua truthiness、指针身份相等、Display/toString 风格输出。
-- GC 基础设施：`GcRef<T>`、`GcObjectHeader`、`GcObject` unsafe trait、`GarbageCollector` 对象注册/根集/标记骨架、`GcStrategy`、`MarkSweepGc`/`IncrementalGc` 策略接口。
+- GC 基础设施：`GcRef<T>`、`GcObjectHeader`、`GcObject` unsafe trait、`GarbageCollector`（完整标记-清除循环：mark/propagate/sweep、弱表清理、写屏障、终结器框架）、`GcStrategy`、`MarkSweepGc`/`IncrementalGc` 策略接口。
 - 字符串驻留：`GcString`、Lua 5.1 风格字符串哈希、`StringPool::intern/find/remove`。
 - 测试基础：`lua_core` 单元测试与 integration test 已覆盖 Value、GC 基础、字符串对象和字符串驻留。
 
 ### 尚未实现的 Lua 5.1 语义
 
-- 完整标记-清除 GC：`collect()` 当前仍返回 `0`，类型感知 sweep、终结器、弱表、写屏障和对象释放尚未实现。
+- 完整标记-清除 GC：✅ P1.3 已实现 `collect()` 返回回收数量、类型感知 sweep（String/Table）、弱表清理、写屏障和对象释放。终结器框架已就位，待 Userdata 实现后启用。
 - 核心对象模型：`Table`（数组/哈希混合存储、元表引用、`#` 长度运算符、`next()` 迭代器、GC 标记）和 `Metatable`（17 种 TMS 枚举、flags 缓存查找）已实现。`Function`、`Proto`、`Upval`、`Thread`、`Userdata` 仍为占位。
 - 编译器：opcode、instruction 编解码、lexer、parser、AST、bytecode codegen 均未实现。
 - VM：LuaState、GlobalState、值栈、CallInfo、38 opcode dispatch、调用/返回、trace/debug 均未实现。
@@ -85,7 +85,7 @@ cargo test --workspace
 cargo doc --no-deps
 ```
 
-当前审计结果：上述命令均通过；`cargo test --workspace` 共运行 152 个 Rust 测试，测试集中在 `lua_core`。
+当前审计结果：上述命令均通过；`cargo test --workspace` 共运行 190 个 Rust 测试，测试集中在 `lua_core`。
 
 ### CI 对齐门禁
 

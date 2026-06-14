@@ -1,35 +1,53 @@
 //! 垃圾回收器核心
 //!
 //! `GarbageCollector` 管理所有 GC 对象的生命周期，实现三色标记-清除算法。
-//! 此模块提供对象创建/注册、根集管理，和 GC 循环入口点。
-//! 完整的标记/清除/终结/弱表逻辑在 Phase 1.3 各自模块中实现。
+//! Phase 1.3 补全了完整的标记传播、清扫回收、弱表清理和终结器框架。
 //!
 //! C++ 参考: `lua_cpp/src/gc/garbage_collector.hpp`, `.cpp`
+
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::gc::gc_object::GcObject;
 use crate::gc::gc_ref::GcRef;
 use crate::gc::header::GcObjectHeader;
 use crate::gc::strategy::{GcStrategy, MarkSweepGc};
+use crate::string_pool::StringPool;
 use crate::types::GcColor;
 
 /// 垃圾回收器
 ///
 /// 管理侵入式 GC 对象链表和根集合。
-/// 当前实现为 Phase 1.2 简化版 —— 完整 GC 循环在 Phase 1.3。
+/// Phase 1.3 补全了完整的三色标记-清除循环。
 pub struct GarbageCollector {
     /// 所有 GC 对象的侵入式链表头
-    all_objects: *mut GcObjectHeader,
+    pub(crate) all_objects: *mut GcObjectHeader,
 
     /// 根对象集合（受保护，不被回收）
-    roots: Vec<*mut GcObjectHeader>,
+    pub(crate) roots: Vec<*mut GcObjectHeader>,
+
+    /// 灰色对象列表（待处理的标记工作队列）
+    pub(crate) gray_list: Vec<*mut GcObjectHeader>,
+
+    /// 本轮标记中发现的弱表
+    pub(crate) weak_tables: Vec<*mut GcObjectHeader>,
+
+    /// 等待执行 `__gc` 终结器的 userdata（Phase 1.4+ 启用）
+    pub(crate) pending_finalizers: Vec<*mut GcObjectHeader>,
+
+    /// 本轮标记中已遍历的外部 collector 对象
+    pub(crate) external_marked: Vec<*mut GcObjectHeader>,
+
+    /// 防止终结器递归执行（Phase 1.4+ 启用）
+    #[allow(dead_code)]
+    pub(crate) finalizers_running: bool,
 
     /// 对象计数
-    object_count: usize,
+    pub(crate) object_count: usize,
 
     /// 估算总内存使用量（字节）
-    total_memory: usize,
+    pub(crate) total_memory: usize,
 
-    /// 当前 GC 策略（Phase 1.3 启用完整收集循环）
+    /// 当前 GC 策略
     #[allow(dead_code)]
     strategy: Box<dyn GcStrategy>,
 }
@@ -40,6 +58,11 @@ impl GarbageCollector {
         Self {
             all_objects: std::ptr::null_mut(),
             roots: Vec::new(),
+            gray_list: Vec::new(),
+            weak_tables: Vec::new(),
+            pending_finalizers: Vec::new(),
+            external_marked: Vec::new(),
+            finalizers_running: false,
             object_count: 0,
             total_memory: 0,
             strategy: Box::new(MarkSweepGc),
@@ -62,16 +85,15 @@ impl GarbageCollector {
         let header_ptr: *mut GcObjectHeader = raw as *mut GcObjectHeader;
 
         // 加入侵入式链表
-        // SAFETY: header_ptr 指向刚分配的 T 实例，在 Box::into_raw 后仍然有效，
-        // 且 GcObjectHeader 的 Cell 字段支持通过共享引用修改
+        // SAFETY: header_ptr 指向刚分配的 T 实例，在 Box::into_raw 后仍然有效
         unsafe {
             (*header_ptr).set_next(self.all_objects);
+            (*header_ptr).set_color(GcColor::White);
         }
         self.all_objects = header_ptr;
 
-        // 注册到 root（临时做法 — Phase 1.3 移除，改用更精确的根集管理）
         self.object_count += 1;
-        // SAFETY: raw 指向刚分配的 T 实例，仍然有效且未释放
+        // SAFETY: raw 指向刚分配的 T 实例
         self.total_memory += unsafe { (*raw).get_size() };
 
         // SAFETY: raw 指向刚分配、已注册的有效对象
@@ -84,29 +106,6 @@ impl GarbageCollector {
         let header_ptr = gc_ref.as_ptr() as *mut GcObjectHeader;
         self.add_root_ptr(header_ptr);
         gc_ref
-    }
-
-    // ── 对象注册 ──────────────────────────────────────────────
-
-    /// 将外部创建的对象注册到 GC 链表
-    ///
-    /// # Safety
-    /// `obj` 必须指向一个有效的、尚未注册的 GC 对象。
-    pub unsafe fn register_object<T: GcObject>(&mut self, obj: *const T) {
-        // SAFETY: caller guarantees obj is a valid, unregistered GC object pointer
-        unsafe {
-            let header_ptr = obj as *mut GcObjectHeader;
-
-            // 设置颜色为白色
-            (*header_ptr).set_color(GcColor::White);
-
-            // 加入链表
-            (*header_ptr).set_next(self.all_objects);
-            self.all_objects = header_ptr;
-
-            self.object_count += 1;
-            self.total_memory += (*obj).get_size();
-        }
     }
 
     // ── 根集管理 ──────────────────────────────────────────────
@@ -140,23 +139,71 @@ impl GarbageCollector {
 
     /// 执行完整的标记-清除 GC 循环
     ///
-    /// 返回回收的对象数量。完整实现在 Phase 1.3 完成。
-    /// 当前提供骨架实现。
-    pub fn collect(&mut self) -> usize {
-        // Phase 1.3: 完整标记-清除实现
-        // 1. 重置所有对象为白色
-        // 2. 标记根集
-        // 3. 传播标记
-        // 4. 清除白色对象
-        0 // 暂无回收（骨架）
+    /// Phase 1.3: 实现了完整的 mark → sweep 流程。
+    /// 弱表条目在 sweep 前清理；终结器框架保留（Userdata 未实现时为空操作）。
+    ///
+    /// 返回回收的对象数量。
+    pub fn collect(&mut self, string_pool: &mut StringPool) -> usize {
+        // 1. 标记阶段：重置标记，标记根集，传播标记
+        self.mark();
+
+        // 2. 清理弱表条目（在 sweep 删除白色对象之前执行）
+        self.clear_weak_table_entries();
+
+        // 3. 清扫阶段：回收白色对象
+        let collected = self.sweep(string_pool);
+
+        // 4. 清空本轮临时列表
+        self.weak_tables.clear();
+
+        collected
+    }
+
+    /// 清空所有对象（用于测试和关闭）
+    ///
+    /// 强制删除所有 GC 对象、清空根集和所有内部列表。
+    pub fn clear_all(&mut self, string_pool: &mut StringPool) {
+        // 清空所有列表
+        self.roots.clear();
+        self.gray_list.clear();
+        self.weak_tables.clear();
+        self.pending_finalizers.clear();
+        self.external_marked.clear();
+
+        // 遍历链表，删除所有非固定对象
+        let mut prev: *mut GcObjectHeader = std::ptr::null_mut();
+        let mut current = self.all_objects;
+
+        while !current.is_null() {
+            // SAFETY: current is a valid node in the intrusive linked list
+            let (next, is_fixed) = unsafe { ((*current).next(), (*current).is_fixed()) };
+
+            if !is_fixed {
+                // 从链表中移除
+                if prev.is_null() {
+                    self.all_objects = next;
+                } else {
+                    // SAFETY: prev is a valid node
+                    unsafe {
+                        (*prev).set_next(next);
+                    }
+                }
+
+                // SAFETY: current is being removed from the list
+                self.destroy_object(current, string_pool);
+            } else {
+                prev = current;
+            }
+
+            current = next;
+        }
     }
 
     /// 重置所有对象为白色（标记前准备）
     pub fn reset_marks(&mut self) {
         let mut current = self.all_objects;
         while !current.is_null() {
-            // SAFETY: current is a node in the intrusive linked list created
-            // by create(); all nodes remain valid during GC operations
+            // SAFETY: current is a node in the intrusive linked list
             unsafe {
                 (*current).set_color(GcColor::White);
                 current = (*current).next();
@@ -168,8 +215,7 @@ impl GarbageCollector {
     pub fn mark_roots(&mut self) {
         for &root in &self.roots {
             if !root.is_null() {
-                // SAFETY: root is a GC-managed object in the roots vector;
-                // roots remain valid while registered
+                // SAFETY: root is a GC-managed object in the roots vector
                 unsafe {
                     (*root).set_color(GcColor::Gray);
                 }
@@ -187,9 +233,13 @@ impl GarbageCollector {
             if obj.is_null() {
                 return;
             }
-            if (*obj).is_white() {
-                (*obj).set_color(GcColor::Gray);
+            // 如果已经是灰色或黑色，不需要重复标记
+            if !(*obj).is_white() {
+                return;
             }
+            // 标记为灰色并加入灰度列表
+            (*obj).set_color(GcColor::Gray);
+            self.gray_list.push(obj);
         }
     }
 
@@ -215,11 +265,68 @@ impl GarbageCollector {
         let mut current = self.all_objects;
         while !current.is_null() {
             f(current);
-            // SAFETY: current is a node in the intrusive linked list;
-            // all nodes remain valid during iteration
+            // SAFETY: current is a node in the intrusive linked list
             unsafe {
                 current = (*current).next();
             }
+        }
+    }
+
+    /// 检查对象是否会在当前 sweep 中被回收
+    ///
+    /// C++ 对应: `GarbageCollector::isObjectDead(GCObject* obj)`
+    pub fn is_object_dead(&self, obj: *mut GcObjectHeader) -> bool {
+        if obj.is_null() {
+            return false;
+        }
+        // SAFETY: obj is a valid GC object pointer
+        unsafe {
+            if (*obj).is_fixed() {
+                return false;
+            }
+            (*obj).is_white()
+        }
+    }
+
+    /// 检查包含 GC 引用的 Value 中的对象是否已死
+    ///
+    /// 字符串永远被视为存活（字符串驻留保证了即使无其他引用也可达）。
+    ///
+    /// C++ 对应: `GarbageCollector::isValueDead(const Value& value)`
+    pub fn is_value_dead(&self, value: &crate::value::Value) -> bool {
+        match value {
+            crate::value::Value::String(_) => false,
+            crate::value::Value::Table(t) => self.is_object_dead(t.as_ptr() as *mut GcObjectHeader),
+            crate::value::Value::Function(f) => {
+                self.is_object_dead(f.as_ptr() as *mut GcObjectHeader)
+            }
+            crate::value::Value::Userdata(u) => {
+                self.is_object_dead(u.as_ptr() as *mut GcObjectHeader)
+            }
+            crate::value::Value::Thread(t) => {
+                self.is_object_dead(t.as_ptr() as *mut GcObjectHeader)
+            }
+            // Nil, Boolean, Number, LightUserdata 不是 GC 对象
+            _ => false,
+        }
+    }
+
+    /// 检查弱值槽位是否应被清理
+    ///
+    /// 字符串永远不会被清理；userdata 在 pending_finalizers 中时视为已死。
+    ///
+    /// C++ 对应: `GarbageCollector::isWeakValueDead(const Value& value)`
+    pub fn is_weak_value_dead(&self, value: &crate::value::Value) -> bool {
+        match value {
+            crate::value::Value::String(_) => false,
+            crate::value::Value::Userdata(u) => {
+                let ptr = u.as_ptr() as *mut GcObjectHeader;
+                if self.pending_finalizers.contains(&ptr) {
+                    return true;
+                }
+                self.is_value_dead(value)
+            }
+            _ => self.is_value_dead(value),
         }
     }
 }
@@ -230,19 +337,35 @@ impl Default for GarbageCollector {
     }
 }
 
+// ── GC 阶段方法（实现于子模块）──────────────────────────────
+
+impl GarbageCollector {
+    // 以下方法在 gc/mark.rs、gc/sweep.rs、gc/weak.rs 中实现，
+    // 但因 Rust 的 impl 块可跨文件（同 crate），只需在同模块声明。
+
+    // mark phase — see gc/mark.rs
+    // sweep phase — see gc/sweep.rs
+    // weak table — see gc/weak.rs
+    // finalizer  — see gc/finalize.rs
+}
+
 impl Drop for GarbageCollector {
     fn drop(&mut self) {
         // 清理所有 GC 对象
+        // Note: 完整的类型感知清理需要 StringPool。
+        // 在没有 StringPool 的 drop 场景，对象将泄漏（测试中应调用 clear_all）。
         let mut current = self.all_objects;
         while !current.is_null() {
-            // SAFETY: current comes from the intrusive list; all nodes were
-            // allocated via Box::into_raw in create(). Phase 1.3 will add
-            // type-aware sweep to properly convert back to Box and drop.
+            // SAFETY: current comes from the intrusive list
             let next = unsafe { (*current).next() };
+            if !current.is_null() {
+                // SAFETY: 从链表中摘除 next 指针，避免后续重复释放
+                unsafe {
+                    (*current).set_next(std::ptr::null_mut());
+                }
+            }
             current = next;
         }
-        // FIXME Phase 1.3: 实现类型感知的清理，而非简单 leak
-        // 当前泄漏所有 GC 对象以避免 drop 时类型信息丢失
     }
 }
 

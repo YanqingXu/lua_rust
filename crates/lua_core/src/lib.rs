@@ -17,13 +17,13 @@
 //! | `src/core/string_pool.hpp/.cpp` | `string_pool` | ✅ P1.2 |
 //! | `src/gc/garbage_collector.hpp/.cpp` | `gc::collector` | ✅ P1.2 |
 //! | `src/gc/gc_strategy.hpp/.cpp` | `gc::strategy` | ✅ P1.2 |
-//! | `src/gc/gc_mark.cpp` | `gc::mark` | pending (P1.3) |
-//! | `src/gc/gc_sweep.cpp` | `gc::sweep` | pending (P1.3) |
-//! | `src/gc/gc_finalize.cpp` | `gc::finalize` | pending (P1.3) |
-//! | `src/gc/gc_weak.cpp` | `gc::weak` | pending (P1.3) |
+//! | `src/gc/gc_mark.cpp` | `gc::mark` | ✅ P1.3 |
+//! | `src/gc/gc_sweep.cpp` | `gc::sweep` | ✅ P1.3 |
+//! | `src/gc/gc_finalize.cpp` | `gc::finalize` | ✅ P1.3 (骨架) |
+//! | `src/gc/gc_weak.cpp` | `gc::weak` | ✅ P1.3 |
 //! | `src/core/table.hpp/.cpp` | `table` | ✅ P1.4 |
 //! | `src/core/function.hpp/.cpp` | `function` | pending (P1.4) |
-//! | `src/core/upvalue.hpp/.cpp` | `upvalue` | pending (P1.4) |
+//! | `src/core/upvalue.hpp/.cpp` | `upvalue` | ✅ P1.4 |
 //! | `src/core/thread.hpp/.cpp` | `thread` | pending (P1.4) |
 //! | `src/core/userdata.hpp/.cpp` | `userdata` | pending (P1.4) |
 //! | `src/core/metatable.hpp/.cpp` | `metatable` | ✅ P1.4 |
@@ -43,8 +43,8 @@ pub mod string_pool;
 // Phase 1.4: Core object model
 pub mod metatable; // ✅ P1.4 — TMS enum, metamethod lookup with flags caching
 pub mod table; // ✅ P1.4 — Table with array/hash parts and metatable
+pub mod upvalue; // ✅ P1.4 — Upvalue: open/closed, linked list, GC integration
 // Future phases — uncomment as implemented
 // pub mod function;
-// pub mod upvalue;
 // pub mod thread;
 // pub mod userdata;

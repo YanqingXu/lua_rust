@@ -5,6 +5,7 @@
 //! C++ 参考: `lua_cpp/src/gc/gc_strategy.hpp`
 
 use crate::gc::collector::GarbageCollector;
+use crate::string_pool::StringPool;
 
 /// GC 上下文 — 收集循环所需的参数
 ///
@@ -12,6 +13,8 @@ use crate::gc::collector::GarbageCollector;
 pub struct GcContext<'a> {
     /// 垃圾回收器
     pub collector: &'a mut GarbageCollector,
+    /// 字符串驻留池
+    pub string_pool: &'a mut StringPool,
 }
 
 /// GC 策略 trait
@@ -40,7 +43,7 @@ pub struct MarkSweepGc;
 impl GcStrategy for MarkSweepGc {
     fn collect(&self, context: &mut GcContext<'_>) -> usize {
         // Phase 1.3: 完整实现标记 → 传播 → 弱表清理 → 终结 → 清除
-        context.collector.collect()
+        context.collector.collect(context.string_pool)
     }
 
     fn name(&self) -> &'static str {
@@ -66,7 +69,7 @@ pub struct IncrementalGc;
 impl GcStrategy for IncrementalGc {
     fn collect(&self, context: &mut GcContext<'_>) -> usize {
         // Phase 1.3+: 增量步进实现
-        context.collector.collect()
+        context.collector.collect(context.string_pool)
     }
 
     fn name(&self) -> &'static str {
