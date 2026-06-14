@@ -21,7 +21,7 @@
 //! | `src/gc/gc_sweep.cpp` | `gc::sweep` | pending (P1.3) |
 //! | `src/gc/gc_finalize.cpp` | `gc::finalize` | pending (P1.3) |
 //! | `src/gc/gc_weak.cpp` | `gc::weak` | pending (P1.3) |
-//! | `src/core/table.hpp/.cpp` | `table` | pending (P1.4) |
+//! | `src/core/table.hpp/.cpp` | `table` | ✅ P1.4 |
 //! | `src/core/function.hpp/.cpp` | `function` | pending (P1.4) |
 //! | `src/core/upvalue.hpp/.cpp` | `upvalue` | pending (P1.4) |
 //! | `src/core/thread.hpp/.cpp` | `thread` | pending (P1.4) |
@@ -40,8 +40,9 @@ pub mod gc;
 pub mod gc_string;
 pub mod string_pool;
 
+// Phase 1.4: Core object model
+pub mod table; // ✅ P1.4 — Table with array/hash parts and metatable
 // Future phases — uncomment as implemented
-// pub mod table;
 // pub mod function;
 // pub mod upvalue;
 // pub mod thread;

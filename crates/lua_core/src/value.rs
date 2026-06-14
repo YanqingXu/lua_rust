@@ -6,6 +6,7 @@
 //! C++ 参考: `lua_cpp/src/core/value.hpp`, `lua_cpp/src/core/value.cpp`
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use crate::gc::gc_ref::GcRef;
 use crate::gc_string::GcString;
@@ -296,6 +297,38 @@ impl PartialEq for Value {
 }
 
 impl Eq for Value {}
+
+// =====================================================================
+// Hash（对齐 C++ ValueHash）
+// =====================================================================
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Value::Nil => 0_usize.hash(state),
+            Value::Boolean(b) => {
+                if *b {
+                    1_usize.hash(state);
+                } else {
+                    0_usize.hash(state);
+                }
+            }
+            Value::Number(n) => n.to_bits().hash(state),
+            Value::LightUserdata(p) => p.hash(state),
+            Value::String(s) => {
+                // SAFETY: GC single-threaded model ensures the GcString
+                // is alive while we hold a GcRef to it. Reading the
+                // precomputed hash is a pure read with no side effects.
+                let h = unsafe { s.as_ref() }.map(|gs| gs.hash()).unwrap_or(0);
+                h.hash(state);
+            }
+            Value::Table(t) => t.hash(state),
+            Value::Function(f) => f.hash(state),
+            Value::Userdata(u) => u.hash(state),
+            Value::Thread(t) => t.hash(state),
+        }
+    }
+}
 
 // =====================================================================
 // Display（格式对齐 C++ Value::toString()）

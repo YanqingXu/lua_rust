@@ -42,11 +42,8 @@ pub use crate::gc::gc_ref::GcRef;
 // GcString 在 Phase 1.2 已实现，通过 crate::gc_string 导出
 pub use crate::gc_string::GcString;
 
-/// Lua 表对象（占位 — Phase 1.4 实现）
-#[derive(Debug, Clone)]
-pub struct Table {
-    _private: (),
-}
+/// Lua 表对象（P1.4 — 已实现完整功能）
+pub use crate::table::Table;
 
 /// Lua 函数对象（占位 — Phase 1.4 实现）
 #[derive(Debug, Clone)]
