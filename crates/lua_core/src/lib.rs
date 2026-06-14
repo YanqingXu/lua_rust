@@ -26,7 +26,7 @@
 //! | `src/core/upvalue.hpp/.cpp` | `upvalue` | pending (P1.4) |
 //! | `src/core/thread.hpp/.cpp` | `thread` | pending (P1.4) |
 //! | `src/core/userdata.hpp/.cpp` | `userdata` | pending (P1.4) |
-//! | `src/core/metatable.hpp/.cpp` | `metatable` | pending (P1.4) |
+//! | `src/core/metatable.hpp/.cpp` | `metatable` | ✅ P1.4 |
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -41,10 +41,10 @@ pub mod gc_string;
 pub mod string_pool;
 
 // Phase 1.4: Core object model
+pub mod metatable; // ✅ P1.4 — TMS enum, metamethod lookup with flags caching
 pub mod table; // ✅ P1.4 — Table with array/hash parts and metatable
 // Future phases — uncomment as implemented
 // pub mod function;
 // pub mod upvalue;
 // pub mod thread;
 // pub mod userdata;
-// pub mod metatable;
