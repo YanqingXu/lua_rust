@@ -105,14 +105,24 @@ impl GarbageCollector {
                     let table_ptr = header_ptr as *const Table;
                     (*table_ptr).mark_children(self);
                 }
-                // 所有其他 GC 类型：通过 GcObject trait 调用 mark_children
-                // Phase 1.3: 对于尚未实现的类型（Function, Userdata, Thread, Proto, Upval），
-                // 此路径为安全回退；mark_children 在这些占位类型上为空操作。
-                _ => {
-                    // 泛型分发到已知可工作的类型
-                    // 使用 Table 作为 fallback 入口（仅对已实现 GcObject 的类型有效）
-                    // 实际产生效果仅当对象确实是已知类型时
+                GcObjectType::Function => {
+                    let func_ptr = header_ptr as *const crate::function::Function;
+                    (*func_ptr).mark_children(self);
                 }
+                GcObjectType::Proto => {
+                    let proto_ptr = header_ptr as *const crate::proto::Proto;
+                    (*proto_ptr).mark_children(self);
+                }
+                GcObjectType::Upval => {
+                    let upval_ptr = header_ptr as *const crate::upvalue::Upvalue;
+                    (*upval_ptr).mark_children(self);
+                }
+                GcObjectType::Userdata => {
+                    let ud_ptr = header_ptr as *const crate::userdata::Userdata;
+                    (*ud_ptr).mark_children(self);
+                }
+                // 尚未实现的类型（Thread）fallthrough — 无操作
+                _ => {}
             }
         }
     }
@@ -386,6 +396,8 @@ mod tests {
     use crate::types::{GcColor, GcObjectType};
 
     /// 测试用 GC 对象（包含对其他对象的引用）
+    /// `#[repr(C)]` 确保 header 在偏移 0，可以安全转换为 `*mut GcObjectHeader`。
+    #[repr(C)]
     struct TestObjectWithRef {
         header: GcObjectHeader,
         refs: Vec<*mut GcObjectHeader>,
@@ -394,8 +406,9 @@ mod tests {
     impl TestObjectWithRef {
         fn new(refs: Vec<*mut GcObjectHeader>) -> Self {
             Self {
-                // Use Proto type to avoid routing into table-specific mark logic
-                header: GcObjectHeader::new(GcObjectType::Proto),
+                // Use Thread type to avoid routing into type-specific mark/sweep logic
+                // (Thread is the only remaining unimplemented GC type in Phase 1.4)
+                header: GcObjectHeader::new(GcObjectType::Thread),
                 refs,
             }
         }
@@ -431,12 +444,11 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        // 创建两个对象：一个作为根，一个不是
-        let root_obj = gc.create_root(TestObjectWithRef::new(Vec::new()));
-        let plain_obj = gc.create(TestObjectWithRef::new(Vec::new()));
+        // 创建两个 Table 对象：一个作为根，一个不是
+        let root_obj = gc.create_root(Table::new());
+        let _plain_obj = gc.create(Table::new());
 
         let root_header = root_obj.as_ptr() as *mut GcObjectHeader;
-        let _plain_header = plain_obj.as_ptr() as *mut GcObjectHeader;
 
         assert_eq!(gc.object_count(), 2);
 

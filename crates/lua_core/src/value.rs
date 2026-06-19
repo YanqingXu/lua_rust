@@ -343,7 +343,20 @@ impl fmt::Display for Value {
             Value::LightUserdata(p) => write!(f, "lightuserdata: {:p}", p.as_ptr()),
             Value::String(p) => write!(f, "string: {:p}", p.as_ptr()),
             Value::Table(p) => write!(f, "table: {:p}", p.as_ptr()),
-            Value::Function(p) => write!(f, "function: {:p}", p.as_ptr()),
+            Value::Function(p) => {
+                // SAFETY: Display takes &self, preventing concurrent GC mutation.
+                // The GcRef is valid as long as no GC sweep has freed the object.
+                // The single-threaded GC model guarantees this during Display.
+                if let Some(func) = unsafe { p.as_ref() } {
+                    if func.is_c_function() {
+                        write!(f, "C function: {:p}", p.as_ptr())
+                    } else {
+                        write!(f, "Lua function: {:p}", p.as_ptr())
+                    }
+                } else {
+                    write!(f, "function: {:p}", p.as_ptr())
+                }
+            }
             Value::Userdata(p) => write!(f, "userdata: {:p}", p.as_ptr()),
             Value::Thread(p) => write!(f, "thread: {:p}", p.as_ptr()),
         }

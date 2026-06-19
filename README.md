@@ -14,7 +14,7 @@
 | 范围 | 状态 | 说明 |
 |---|---|---|
 | Phase 0: Project Infrastructure | 已完成 | Rust workspace、6 个 crate 脚手架、CI workflow、质量脚本、迁移文档目录和 fixture 目录已建立。 |
-| Phase 1: Runtime Core | 进行中 | `lua_core` 已落地 P1.1/P1.2 类型系统/GC 基础；P1.3 完整标记-清除 GC；P1.4 `Table`、`Metatable`、`Upvalue`。Function/Thread/Userdata/Proto 仍待实现。 |
+| Phase 1: Runtime Core | 进行中 | `lua_core` 已落地 P1.1/P1.2 类型系统/GC 基础；P1.3 完整标记-清除 GC；P1.4 `Table`、`Metatable`、`Upvalue`、`Proto`、`Function`、`Userdata`。仅 Thread 仍待实现。 |
 | Phase 2: Compiler | 未开始 | `lua_compiler` 仅保留 crate 和模块规划注释，lexer/parser/AST/codegen 未实现。 |
 | Phase 3: VM | 未开始 | `lua_vm` 仅保留 crate 和模块规划注释，LuaState、栈、调用帧、opcode dispatch 未实现。 |
 | Phase 4: Standard Library | 未开始 | `lua_stdlib` 仅保留 crate 和模块规划注释。 |
@@ -50,7 +50,7 @@
 
 | Crate | 类型 | 当前职责与状态 |
 |---|---|---|
-| `lua_core` | lib | Phase 1 目标 crate。已实现基础类型、`Value`、`GcRef`、GC 对象头/trait、collector 骨架、GC 策略接口、`GcString`、`StringPool`、Table、Metatable；Function/Thread/Userdata/Proto/Upval 仍为占位。 |
+| `lua_core` | lib | Phase 1 目标 crate。已实现基础类型、`Value`、`GcRef`、GC 对象头/trait、collector 骨架、GC 策略接口、`GcString`、`StringPool`、Table、Metatable、Proto、Upvalue、Function、Userdata；仅 Thread 仍为占位。 |
 | `lua_compiler` | lib | Phase 2 目标 crate。目前只有脚手架和 C++ -> Rust 模块映射注释；未导出 opcode、lexer、parser、AST 或 codegen 模块。 |
 | `lua_vm` | lib | Phase 3 目标 crate。目前只有脚手架和模块规划；未实现 LuaState、执行循环、opcode handlers、调用帧或 trace。 |
 | `lua_stdlib` | lib | Phase 4 目标 crate。目前只有脚手架和标准库模块规划；未实现任何 Lua 标准库。 |

@@ -45,17 +45,17 @@ pub use crate::gc_string::GcString;
 /// Lua 表对象（P1.4 — 已实现完整功能）
 pub use crate::table::Table;
 
-/// Lua 函数对象（占位 — Phase 1.4 实现）
-#[derive(Debug, Clone)]
-pub struct Function {
-    _private: (),
-}
+/// Lua 函数对象（P1.4 — 已实现）
+///
+/// 闭包对象，可以是 C 函数闭包或 Lua 函数闭包。
+/// 持有上值（Upvalue）数组和环境表，GC 管理。
+pub use crate::function::Function;
 
-/// Lua 用户数据对象（占位 — Phase 1.4 实现）
-#[derive(Debug, Clone)]
-pub struct Userdata {
-    _private: (),
-}
+/// Lua 用户数据对象（P1.4 — 已实现）
+///
+/// GC 管理的字节缓冲区，允许将任意数据包装成 Lua 对象。
+/// 支持元表绑定和可选的数据析构回调。
+pub use crate::userdata::Userdata;
 
 /// Lua 线程/协程对象（占位 — Phase 1.4 实现）
 #[derive(Debug, Clone)]
@@ -63,11 +63,11 @@ pub struct Thread {
     _private: (),
 }
 
-/// Lua 函数原型对象（占位 — Phase 1.4 实现）
-#[derive(Debug, Clone)]
-pub struct Proto {
-    _private: (),
-}
+/// Lua 函数原型对象（P1.4 — 已实现）
+///
+/// 包含编译后函数的完整元数据：字节码、常量表、嵌套函数原型、
+/// 调试信息（行号、局部变量、上值名称）等。
+pub use crate::proto::Proto;
 
 /// Lua 上值对象（P1.4 — 已实现）
 pub use crate::upvalue::Upvalue;

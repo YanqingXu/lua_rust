@@ -143,6 +143,26 @@ impl GarbageCollector {
                     let ptr = obj as *const Table;
                     (*ptr).get_size()
                 }
+                GcObjectType::Function => {
+                    use crate::function::Function;
+                    let ptr = obj as *const Function;
+                    (*ptr).get_size()
+                }
+                GcObjectType::Proto => {
+                    use crate::proto::Proto;
+                    let ptr = obj as *const Proto;
+                    (*ptr).get_size()
+                }
+                GcObjectType::Upval => {
+                    use crate::upvalue::Upvalue;
+                    let ptr = obj as *const Upvalue;
+                    (*ptr).get_size()
+                }
+                GcObjectType::Userdata => {
+                    use crate::userdata::Userdata;
+                    let ptr = obj as *const Userdata;
+                    (*ptr).get_size()
+                }
                 // 对于尚未实现的类型，返回默认大小
                 _ => std::mem::size_of::<GcObjectHeader>() + 32,
             }
@@ -166,6 +186,22 @@ impl GarbageCollector {
                 GcObjectType::Table => {
                     use crate::table::Table;
                     let _ = Box::from_raw(obj as *mut Table);
+                }
+                GcObjectType::Function => {
+                    use crate::function::Function;
+                    let _ = Box::from_raw(obj as *mut Function);
+                }
+                GcObjectType::Proto => {
+                    use crate::proto::Proto;
+                    let _ = Box::from_raw(obj as *mut Proto);
+                }
+                GcObjectType::Upval => {
+                    use crate::upvalue::Upvalue;
+                    let _ = Box::from_raw(obj as *mut Upvalue);
+                }
+                GcObjectType::Userdata => {
+                    use crate::userdata::Userdata;
+                    let _ = Box::from_raw(obj as *mut Userdata);
                 }
                 // 对于尚未实现的类型，直接释放内存（避免泄漏）
                 // 这仅在测试/清理路径中发生

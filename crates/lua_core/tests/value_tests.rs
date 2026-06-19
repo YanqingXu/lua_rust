@@ -254,8 +254,19 @@ fn test_display_gc_types() {
     let p = unsafe { GcRef::<Table>::from_ptr(0x2000 as *const _) };
     assert!(format!("{}", Value::Table(p)).starts_with("table: 0x"));
 
-    let p = unsafe { GcRef::<Function>::from_ptr(0x3000 as *const _) };
-    assert!(format!("{}", Value::Function(p)).starts_with("function: 0x"));
+    // Function Display requires a valid GcRef to distinguish C/Lua functions,
+    // so use a real object for testing.
+    {
+        use lua_core::function::Function;
+        use lua_core::gc::collector::GarbageCollector;
+        use lua_core::proto::Proto;
+
+        let mut gc = GarbageCollector::new();
+        let proto = gc.create(Proto::new());
+        let func = gc.create(Function::new_lua(proto));
+        let output = format!("{}", Value::Function(func));
+        assert!(output.starts_with("Lua function: 0x"), "Got '{}'", output);
+    }
 
     let p = unsafe { GcRef::<Userdata>::from_ptr(0x4000 as *const _) };
     assert!(format!("{}", Value::Userdata(p)).starts_with("userdata: 0x"));
