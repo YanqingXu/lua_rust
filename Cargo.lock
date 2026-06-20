@@ -6,6 +6,10 @@ version = 4
 name = "lua_app"
 version = "0.1.0"
 dependencies = [
+ "lua_compiler",
+ "lua_core",
+ "lua_stdlib",
+ "lua_vm",
  "thiserror",
 ]
 
@@ -13,6 +17,8 @@ dependencies = [
 name = "lua_bytecode"
 version = "0.1.0"
 dependencies = [
+ "lua_compiler",
+ "lua_core",
  "thiserror",
 ]
 

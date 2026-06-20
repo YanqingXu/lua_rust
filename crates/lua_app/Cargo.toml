@@ -14,10 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 thiserror.workspace = true
-# lua_core     = { path = "../lua_core" }     # uncomment in Phase 5
-# lua_compiler = { path = "../lua_compiler" } # uncomment in Phase 5
-# lua_vm       = { path = "../lua_vm" }       # uncomment in Phase 5
-# lua_stdlib   = { path = "../lua_stdlib" }   # uncomment in Phase 5
+lua_core     = { path = "../lua_core" }
+lua_compiler = { path = "../lua_compiler" }
+lua_vm       = { path = "../lua_vm" }
+lua_stdlib   = { path = "../lua_stdlib" }
 
 [lints]
 workspace = true
