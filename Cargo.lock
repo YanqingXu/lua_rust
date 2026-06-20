@@ -20,6 +20,7 @@ dependencies = [
 name = "lua_compiler"
 version = "0.1.0"
 dependencies = [
+ "lua_core",
  "thiserror",
 ]
 

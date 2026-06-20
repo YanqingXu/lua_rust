@@ -163,8 +163,11 @@ impl GarbageCollector {
                     let ptr = obj as *const Userdata;
                     (*ptr).get_size()
                 }
-                // 对于尚未实现的类型，返回默认大小
-                _ => std::mem::size_of::<GcObjectHeader>() + 32,
+                GcObjectType::Thread => {
+                    use crate::thread::Thread;
+                    let ptr = obj as *const Thread;
+                    (*ptr).get_size()
+                }
             }
         }
     }
@@ -203,13 +206,9 @@ impl GarbageCollector {
                     use crate::userdata::Userdata;
                     let _ = Box::from_raw(obj as *mut Userdata);
                 }
-                // 对于尚未实现的类型，直接释放内存（避免泄漏）
-                // 这仅在测试/清理路径中发生
-                _ => {
-                    // 释放原始内存而不调用析构函数
-                    // 注意：这仅在对象不持有额外资源时才是安全的
-                    let layout = std::alloc::Layout::new::<GcObjectHeader>();
-                    std::alloc::dealloc(obj as *mut u8, layout);
+                GcObjectType::Thread => {
+                    use crate::thread::Thread;
+                    let _ = Box::from_raw(obj as *mut Thread);
                 }
             }
         }

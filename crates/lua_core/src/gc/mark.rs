@@ -121,8 +121,10 @@ impl GarbageCollector {
                     let ud_ptr = header_ptr as *const crate::userdata::Userdata;
                     (*ud_ptr).mark_children(self);
                 }
-                // 尚未实现的类型（Thread）fallthrough — 无操作
-                _ => {}
+                GcObjectType::Thread => {
+                    let thread_ptr = header_ptr as *const crate::thread::Thread;
+                    (*thread_ptr).mark_children(self);
+                }
             }
         }
     }

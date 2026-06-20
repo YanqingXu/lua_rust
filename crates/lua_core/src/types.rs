@@ -57,11 +57,11 @@ pub use crate::function::Function;
 /// 支持元表绑定和可选的数据析构回调。
 pub use crate::userdata::Userdata;
 
-/// Lua 线程/协程对象（占位 — Phase 1.4 实现）
-#[derive(Debug, Clone)]
-pub struct Thread {
-    _private: (),
-}
+/// Lua 线程/协程对象（P1.4 — 已实现）
+///
+/// GC 管理的协程对象，持有独立的执行状态。
+/// 支持 resume 链管理和协程状态跟踪。
+pub use crate::thread::Thread;
 
 /// Lua 函数原型对象（P1.4 — 已实现）
 ///

@@ -24,7 +24,7 @@
 //! | `src/core/table.hpp/.cpp` | `table` | ✅ P1.4 |
 //! | `src/core/function.hpp/.cpp` | `function` (Proto) | ✅ P1.4 |
 //! | `src/core/upvalue.hpp/.cpp` | `upvalue` | ✅ P1.4 |
-//! | `src/core/thread.hpp/.cpp` | `thread` | pending (P1.4) |
+//! | `src/core/thread.hpp/.cpp` | `thread` | ✅ P1.4 |
 //! | `src/core/userdata.hpp/.cpp` | `userdata` | ✅ P1.4 |
 //! | `src/core/metatable.hpp/.cpp` | `metatable` | ✅ P1.4 |
 
@@ -45,7 +45,6 @@ pub mod function; // ✅ P1.4 — Function: C/Lua closures, upvalue capture, env
 pub mod metatable; // ✅ P1.4 — TMS enum, metamethod lookup with flags caching
 pub mod proto; // ✅ P1.4 — Proto: function prototype, bytecode, constants, debug info
 pub mod table; // ✅ P1.4 — Table with array/hash parts and metatable
+pub mod thread; // ✅ P1.4 — Thread: coroutine object, status mgmt, caller chain
 pub mod upvalue; // ✅ P1.4 — Upvalue: open/closed, linked list, GC integration
 pub mod userdata; // ✅ P1.4 — Userdata: GC-managed byte buffer, metatable, optional destructor
-// Future phases — uncomment as implemented
-// pub mod thread;

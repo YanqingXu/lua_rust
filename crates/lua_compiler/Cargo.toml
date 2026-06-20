@@ -8,7 +8,7 @@ description = "Lua 5.1 compiler frontend: OpCode, lexer, parser, AST, codegen"
 
 [dependencies]
 thiserror.workspace = true
-# lua_core = { path = "../lua_core" }  # uncomment in Phase 2
+lua_core = { path = "../lua_core" }
 
 [lints]
 workspace = true
