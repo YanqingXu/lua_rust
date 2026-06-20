@@ -23,7 +23,6 @@ pub fn open_math(l: &mut LuaState, gc: &mut GarbageCollector) {
     let math_table = find_lib_table(l, "math");
     // math_table found — register all functions
     if math_table.is_null() {
-        eprintln!("open_math: math table not found in global table!");
         return;
     }
     let tbl_ptr = math_table.as_ptr() as *mut Table;

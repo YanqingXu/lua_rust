@@ -24,17 +24,14 @@ use crate::opcode::{self, OpCode};
 pub struct BytecodeBuilder {
     /// 当前绑定的 Proto
     proto: Proto,
-    /// 字符串驻留池（用于调试信息的字符串驻留）
-    string_pool: Option<*const StringPool>,
+    /// 字符串驻留池（用于字符串驻留；mut 因为 intern() 需要 &mut）
+    string_pool: Option<*mut StringPool>,
 }
 
-// SAFETY: string_pool raw pointer is never dereferenced except in &self methods
-// where the original StringPool is guaranteed to outlive the builder (the pool is
-// owned by the caller and passed via bind_pool which borrows it).
-// The *const StringPool is essentially an opaque token — all actual pool access
-// happens through the public API of Proto (add_constant etc.) which owns its data.
+// SAFETY: string_pool raw pointer is only accessed during compilation,
+// which is single-threaded. The original StringPool outlives the builder.
 unsafe impl Send for BytecodeBuilder {}
-// SAFETY: See Send impl — string_pool pointer is read-only and pool outlives builder.
+// SAFETY: See Send impl.
 unsafe impl Sync for BytecodeBuilder {}
 
 impl BytecodeBuilder {
@@ -46,9 +43,9 @@ impl BytecodeBuilder {
         }
     }
 
-    /// 绑定 StringPool（用于调试信息中的字符串驻留）
-    pub fn bind_pool(&mut self, pool: &StringPool) {
-        self.string_pool = Some(pool as *const StringPool);
+    /// 绑定 StringPool（用于字符串驻留）
+    pub fn bind_pool(&mut self, pool: &mut StringPool) {
+        self.string_pool = Some(pool as *mut StringPool);
     }
 
     /// 获取 Proto 的可变引用
@@ -159,15 +156,25 @@ impl BytecodeBuilder {
 
     /// 添加字符串常量，返回常量索引
     ///
-    /// 注意：此方法需要 GC 引用来分配 GC 字符串。
-    /// 当前实现直接创建 GcString 而不通过 StringPool 驻留（TODO：实现驻留）。
+    /// 如果 StringPool 已绑定，则优先从驻留池获取已有字符串（保证相同内容的
+    /// 字符串获得相同的 GcRef，从而使指针比较在表查找中直接生效）。
+    /// 如果池中不存在，则创建新 GcString 并注册到驻留池。
     pub fn add_string_constant(
         &mut self,
         gc: &mut lua_core::gc::collector::GarbageCollector,
         value: &str,
     ) -> Option<i32> {
-        // Create a GC string and add it to the constants table
-        let gc_str = gc.create(GcString::new(value));
+        // Try StringPool interning first (for pointer-identical GcRef across
+        // compiler and stdlib).
+        let gc_str = if let Some(pool_ptr) = self.string_pool {
+            // SAFETY: pool_ptr was set from a valid &mut StringPool that outlives
+            // the builder. Compilation is single-threaded.
+            let pool: &mut StringPool = unsafe { &mut *pool_ptr };
+            pool.intern(gc, value)
+        } else {
+            // No pool available — fall back to direct GC allocation
+            gc.create(GcString::new(value))
+        };
         let idx = self.proto.add_constant(Value::String(gc_str)) as i32;
         Some(idx)
     }

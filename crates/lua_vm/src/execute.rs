@@ -411,8 +411,20 @@ pub fn execute_proto(
                                 "Lua function has no proto",
                             ));
                         } else if let Some(cfunc) = func_obj.c_function() {
-                            // Call C function — shift args to bottom of stack so
-                            // the C function sees them at positions 0..nargs-1.
+                            // Call C function — save registers R(0)..R(A+nargs),
+                            // shift args to position 0, call, then restore.
+                            let save_count = a + nargs as usize + 1;
+                            let mut saved: Vec<Value> = Vec::with_capacity(save_count);
+                            for i in 0..save_count {
+                                saved.push(
+                                    l.stack
+                                        .at(base_idx + i)
+                                        .cloned()
+                                        .unwrap_or(Value::Nil),
+                                );
+                            }
+
+                            // Shift args to positions 0..nargs-1
                             let src_start = base_idx + a + 1;
                             for i in 0..nargs as usize {
                                 let src = l
@@ -420,25 +432,23 @@ pub fn execute_proto(
                                     .at(src_start + i)
                                     .cloned()
                                     .unwrap_or(Value::Nil);
-                                if let Some(dst) = l.stack.at_mut(i) {
+                                if let Some(dst) = l.stack.at_mut(base_idx + i) {
                                     *dst = src;
                                 }
                             }
-                            // C functions expect l.get_top() == nargs
-                            l.top = nargs as usize;
+                            l.top = base_idx + nargs as usize;
 
                             // C function signature: fn(*mut c_void) -> i32
                             let l_ptr = l as *mut LuaState as *mut std::ffi::c_void;
-                            // SAFETY: l_ptr points to the currently executing LuaState,
-                            // which is valid for the duration of the C function call.
+                            // SAFETY: l_ptr points to the currently executing LuaState
                             let nret = unsafe { cfunc(l_ptr) };
 
+                            // Move nret results from positions 0..nret-1 to R(A)..R(A+nret-1)
                             if nret >= 0 {
-                                // Move nret results from stack bottom to R(A)..R(A+nret-1)
                                 for i in 0..nret as usize {
                                     let src = l
                                         .stack
-                                        .at(i)
+                                        .at(base_idx + i)
                                         .cloned()
                                         .unwrap_or(Value::Nil);
                                     if let Some(dst) =
@@ -447,8 +457,20 @@ pub fn execute_proto(
                                         *dst = src;
                                     }
                                 }
+                                // Restore saved registers R(0)..R(A-1)
+                                for (i, val) in saved.iter().enumerate().take(a) {
+                                    if let Some(dst) = l.stack.at_mut(base_idx + i) {
+                                        *dst = val.clone();
+                                    }
+                                }
                                 l.top = base_idx + a + nret as usize;
                             } else {
+                                // Restore all saved registers on failure
+                                for (i, val) in saved.iter().enumerate() {
+                                    if let Some(dst) = l.stack.at_mut(base_idx + i) {
+                                        *dst = val.clone();
+                                    }
+                                }
                                 return Err(RuntimeError::new(
                                     "C function call failed",
                                 ));

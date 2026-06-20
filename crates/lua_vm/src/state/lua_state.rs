@@ -5,8 +5,9 @@
 //!
 //! C++ 参考: `lua_cpp/src/vm/state/lua_state.hpp`
 
-use lua_core::table::Table;
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::string_pool::StringPool;
+use lua_core::table::Table;
 use lua_core::value::Value;
 
 use super::call_info::CallInfo;
@@ -49,6 +50,8 @@ pub struct LuaState {
     pub allow_yield: u16,
     /// 全局表 (_G)
     pub global_table: Option<GcRef<Table>>,
+    /// 字符串驻留池（用于跨编译器和标准库的字符串共享）
+    pub string_pool: Option<*mut StringPool>,
 }
 
 impl LuaState {
@@ -64,6 +67,7 @@ impl LuaState {
             nccalls: 1,
             allow_yield: 0,
             global_table: None,
+            string_pool: None,
         }
     }
 

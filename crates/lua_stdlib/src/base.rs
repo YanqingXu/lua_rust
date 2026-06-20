@@ -10,6 +10,7 @@
 use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc_string::GcString;
+use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_vm::state::LuaState;
@@ -26,15 +27,29 @@ pub fn open_base(l: &mut LuaState, gc: &mut GarbageCollector) {
     }
 }
 
-/// Register a C function in the global table
+/// Register a C function in the global table.
+/// Uses StringPool for string interning when available.
 fn register(
-    _l: &mut LuaState,
+    l: &mut LuaState,
     gc: &mut GarbageCollector,
     table_ptr: *mut Table,
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::new(name));
+    // Use StringPool interning if available so that the same string
+    // from the compiler shares the same GcRef.
+    let name_str = if let Some(pool_ptr) = l.string_pool {
+        // SAFETY: pool_ptr was set from a valid &mut StringPool
+        let pool: &mut StringPool = unsafe { &mut *pool_ptr };
+        // Check if already interned
+        if let Some(existing) = pool.find(name) {
+            existing
+        } else {
+            pool.intern(gc, name)
+        }
+    } else {
+        gc.create(GcString::new(name))
+    };
     let func_obj = gc.create(Function::new_c(func));
     // SAFETY: table_ptr points to a valid GC-rooted table
     unsafe {
