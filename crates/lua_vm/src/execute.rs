@@ -282,8 +282,9 @@ pub fn execute_proto(
             // ── 控制流 (6) ───────────────────────────────────
             OpCode::JMP => {
                 let sbx = opcode::get_arg_sbx(inst);
-                pc = ((pc as i32) + sbx) as usize;
-                continue; // skip pc += 1
+                // +1 compensates for Lua C's pre-increment fetch (pc++ before switch)
+                pc = ((pc as i32) + sbx + 1) as usize;
+                continue; // skip pc += 1 at end of loop
             }
 
             OpCode::EQ => {
@@ -293,6 +294,7 @@ pub fn execute_proto(
                 let lhs = get_rk(l, base_idx, b, constants);
                 let rhs = get_rk(l, base_idx, c, constants);
                 let equal = values_equal(&lhs, &rhs);
+                // Lua 5.1: skip when (equal as i32) != A
                 if (equal && a == 0) || (!equal && a != 0) {
                     pc += 1; // skip next
                 }
@@ -327,6 +329,7 @@ pub fn execute_proto(
                 let c = opcode::get_arg_c(inst);
                 let val = l.stack.at(base_idx + a).cloned().unwrap_or(Value::Nil);
                 let truthy = !val.is_false();
+                // Lua 5.1: skip when (truthy as i32) != C
                 if (truthy && c == 0) || (!truthy && c != 0) {
                     pc += 1;
                 }
@@ -408,9 +411,21 @@ pub fn execute_proto(
                                 "Lua function has no proto",
                             ));
                         } else if let Some(cfunc) = func_obj.c_function() {
-                            // Call C function
-                            let old_top = l.top;
-                            l.top = base_idx + a + 1 + nargs as usize;
+                            // Call C function — shift args to bottom of stack so
+                            // the C function sees them at positions 0..nargs-1.
+                            let src_start = base_idx + a + 1;
+                            for i in 0..nargs as usize {
+                                let src = l
+                                    .stack
+                                    .at(src_start + i)
+                                    .cloned()
+                                    .unwrap_or(Value::Nil);
+                                if let Some(dst) = l.stack.at_mut(i) {
+                                    *dst = src;
+                                }
+                            }
+                            // C functions expect l.get_top() == nargs
+                            l.top = nargs as usize;
 
                             // C function signature: fn(*mut c_void) -> i32
                             let l_ptr = l as *mut LuaState as *mut std::ffi::c_void;
@@ -419,12 +434,11 @@ pub fn execute_proto(
                             let nret = unsafe { cfunc(l_ptr) };
 
                             if nret >= 0 {
-                                // Move nret results down to R(A)..R(A+nret-1)
-                                let result_start = base_idx + a + 1 + nargs as usize;
+                                // Move nret results from stack bottom to R(A)..R(A+nret-1)
                                 for i in 0..nret as usize {
                                     let src = l
                                         .stack
-                                        .at(result_start + i)
+                                        .at(i)
                                         .cloned()
                                         .unwrap_or(Value::Nil);
                                     if let Some(dst) =
@@ -435,7 +449,6 @@ pub fn execute_proto(
                                 }
                                 l.top = base_idx + a + nret as usize;
                             } else {
-                                l.top = old_top;
                                 return Err(RuntimeError::new(
                                     "C function call failed",
                                 ));
@@ -584,7 +597,8 @@ pub fn execute_proto(
                 if (step_num > 0.0 && idx_num <= limit_num)
                     || (step_num < 0.0 && idx_num >= limit_num)
                 {
-                    pc = ((pc as i32) + sbx) as usize;
+                    // +1 compensates for Lua C's pre-increment fetch
+                    pc = ((pc as i32) + sbx + 1) as usize;
                     continue;
                 }
             }
@@ -608,7 +622,8 @@ pub fn execute_proto(
                 if let Some(dst) = l.stack.at_mut(base_idx + a) {
                     *dst = Value::Number(init_num);
                 }
-                pc = ((pc as i32) + sbx) as usize;
+                // +1 compensates for Lua C's pre-increment fetch
+                pc = ((pc as i32) + sbx + 1) as usize;
                 continue;
             }
 
