@@ -8,8 +8,8 @@ description = "Lua 5.1 virtual machine: LuaState, stack, 38-opcode dispatch, cal
 
 [dependencies]
 thiserror.workspace = true
-# lua_core     = { path = "../lua_core" }     # uncomment in Phase 3
-# lua_compiler = { path = "../lua_compiler" } # uncomment in Phase 3
+lua_core     = { path = "../lua_core" }     # Phase 3
+lua_compiler = { path = "../lua_compiler" } # Phase 3
 
 [lints]
 workspace = true

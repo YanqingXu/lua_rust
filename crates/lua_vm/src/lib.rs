@@ -10,24 +10,19 @@
 //! ## Module Map (C++ → Rust)
 //! | C++ | Rust module | Status |
 //! |---|---|---|
-//! | `src/vm/state/*` | `state` | pending |
-//! | `src/vm/vm.cpp` + handlers | `execute` | pending |
-//! | `src/vm/vm_ops.cpp` | `ops` | pending |
-//! | `src/vm/vm_call.cpp` | `call` | pending |
-//! | `src/vm/vm_table.cpp` | `table_helpers` | pending |
-//! | `src/vm/vm_frame.cpp` | `frame` | pending |
-//! | `src/vm/vm_loop.cpp` | `loop_helpers` | pending |
+//! | `src/vm/state/*` | `state` | ✅ P3.1 |
+//! | `src/vm/vm.cpp` + handlers | `execute` | ✅ P3.2 |
+//! | `src/vm/vm_ops.cpp` | `execute` (helpers) | ✅ P3.2 |
+//! | `src/vm/vm_call.cpp` | `execute` | 🏗️ |
+//! | `src/vm/vm_table.cpp` | `execute` (TODO) | 🏗️ |
+//! | `src/vm/vm_loop.cpp` | `execute` | ✅ basic |
 //! | `src/vm/vm_trace.cpp` | `trace` | pending |
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-// Public modules — populated during Phase 3
-// pub mod state;
-// pub mod execute;
-// pub mod ops;
-// pub mod call;
-// pub mod table_helpers;
-// pub mod frame;
-// pub mod loop_helpers;
-// pub mod trace;
+pub mod execute;
+pub mod state;
+
+pub use execute::{ExecResult, RuntimeError, execute_proto};
+pub use state::{CallInfo, LUA_MULTRET, LuaState, Stack, ThreadStatus};
