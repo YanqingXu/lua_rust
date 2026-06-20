@@ -1,0 +1,10 @@
+print("abs(-5):", math.abs(-5))
+print("floor(3.7):", math.floor(3.7))
+print("ceil(3.2):", math.ceil(3.2))
+print("sqrt(16):", math.sqrt(16))
+print("max:", math.max(1, 5, 3, 9, 2))
+print("min:", math.min(1, 5, 3, 9, 2))
+print("sin(0):", math.sin(0))
+print("cos(0):", math.cos(0))
+print("pow(2, 8):", math.pow(2, 8))
+return 42

@@ -581,8 +581,13 @@ impl CodeGenerator {
     fn emit_value_member(&mut self, e: &MemberExpr) -> ValueResult {
         let table = self.emit_value(&e.table);
         let table_reg = self.value_to_any_reg(table);
-        let k = self.builder.add_number_constant(0.0); // placeholder
-        let _ = e.member.as_str();
+        // SAFETY: self.gc is set during CodeGenerator::new() from a valid &mut GC
+        let gc: &mut lua_core::gc::collector::GarbageCollector =
+            unsafe { &mut *self.gc };
+        let k = self
+            .builder
+            .add_string_constant(gc, &e.member)
+            .unwrap_or_else(|| self.builder.add_number_constant(0.0));
         let rk_key = if k <= MAXINDEXRK { rk_ask(k) } else { k };
         ValueResult::make_pending_load(AccessKind::Indexed, table_reg, -1, rk_key)
     }
@@ -714,8 +719,13 @@ impl CodeGenerator {
             Expr::Member(m) => {
                 let table_val = self.emit_value(&m.table);
                 let table_reg = self.value_to_any_reg(table_val);
-                let k = self.builder.add_number_constant(0.0); // placeholder
-                let _ = m.member.as_str();
+                // SAFETY: self.gc is set from a valid &mut GC during CodeGenerator::new()
+                let gc: &mut lua_core::gc::collector::GarbageCollector =
+                    unsafe { &mut *self.gc };
+                let k = self
+                    .builder
+                    .add_string_constant(gc, &m.member)
+                    .unwrap_or_else(|| self.builder.add_number_constant(0.0));
                 let rk_key = if k <= MAXINDEXRK { rk_ask(k) } else { k };
                 let mut result = LValueRef::new();
                 result.kind = LValueKind::Indexed;

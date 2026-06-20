@@ -37,4 +37,4 @@ pub mod table;
 // pub mod package;
 // pub mod test;
 
-pub use catalog::{LibEntry, LibOpenFn, find_library, get_catalog, open_all};
+pub use catalog::{LibEntry, LibOpenFn, get_catalog, open_all};

@@ -4,7 +4,9 @@
 //!
 //! C++ 参考: `lua_cpp/src/lib/lib_catalog.hpp/.cpp`
 
+use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;
+use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_vm::state::LuaState;
@@ -51,54 +53,69 @@ pub fn get_catalog() -> &'static [LibEntry] {
     ]
 }
 
-/// 按 ID 查找库
-pub fn find_library(id: &str) -> Option<&'static LibEntry> {
-    get_catalog().iter().find(|e| e.id == id)
-}
-
 /// 打开所有标准库
 pub fn open_all(l: &mut LuaState, gc: &mut GarbageCollector) {
     for entry in get_catalog() {
-        (entry.open)(l, gc);
-    }
-}
-
-/// 将栈顶的 C 函数注册为全局变量
-pub fn register_global(l: &mut LuaState, _name: &str, _func_ptr: *const ()) {
-    // Push the function name string — but we need GC access to create strings.
-    // For now, register as a placeholder table entry.
-    // The actual function pointer will be wired when C function calling works.
-    l.push_nil(); // placeholder: function value
-}
-
-/// 注册 C 函数到当前栈顶表
-pub fn register_function(_l: &mut LuaState, _name: &str, _func: LibOpenFn) {
-    // TODO: actual lua_setfield equivalent
-}
-
-/// 注册库表（推入以 name 命名的空表）
-pub fn register_lib_table(_l: &mut LuaState, _name: &str) {
-    // TODO: push new table
-}
-
-/// 在 LuaState 的全局表中注册一个 C 函数
-///
-/// 使用 `std::mem::transmute` 将 C 函数指针转换为 Lua value。
-/// 这是 Lua C API 的标准做法。
-pub fn register_c_function(
-    l: &mut LuaState,
-    _name: &str,
-    _func: LibOpenFn,
-) {
-    // Get or create the global table entry for `name`
-    // For now, push a nil placeholder since C function calling is not fully wired
-    l.push_nil();
-    if let Some(ref global_tbl) = l.global_table {
-        let tbl_ptr = global_tbl.as_ptr() as *mut Table;
-        // SAFETY: global_table is a GC root; we have exclusive access via &mut LuaState
-        unsafe {
-            (*tbl_ptr).set(&Value::Nil, &Value::Nil); // placeholder
+        if entry.id == "_G" {
+            // Base library registers directly into the global table
+            (entry.open)(l, gc);
+        } else {
+            // Other libraries: create a table, register functions, set as global
+            open_library(l, gc, entry);
         }
     }
-    let _ = l.pop();
+}
+
+/// 打开一个命名空间库（创建库表 + 注册函数 + 设置全局变量）
+fn open_library(l: &mut LuaState, gc: &mut GarbageCollector, entry: &LibEntry) {
+    // Create the library table
+    let lib_table = gc.create(Table::new());
+
+    // Store it temporarily in a well-known location
+    // We use a helper pattern: push the table ref, open the library (which
+    // registers functions into it), then set as global
+    let lib_ref = lib_table;
+    let name_str = gc.create(GcString::new(entry.name));
+
+    // Set empty table as global first, so open function can find it
+    if let Some(gt) = l.global_table {
+        let gt_ptr = gt.as_ptr() as *mut Table;
+        // SAFETY: gt is a GC root
+        unsafe {
+            (*gt_ptr).set(&Value::String(name_str), &Value::Table(lib_ref));
+        }
+    }
+
+    // Now open the library (it will register into the lib table via the global)
+    (entry.open)(l, gc);
+}
+
+/// 在指定表中注册一个 C 函数（直接操作，需要 GC）
+pub fn register_in_table(
+    gc: &mut GarbageCollector,
+    table: &mut Table,
+    name: &str,
+    func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+) {
+    let name_str = gc.create(GcString::new(name));
+    let func_obj = gc.create(Function::new_c(func));
+    table.set(&Value::String(name_str), &Value::Function(func_obj));
+}
+
+/// 在全局表中注册函数（用于 base 库）
+///
+/// # Safety
+/// `global_table` must point to a valid GC-rooted Table.
+pub unsafe fn register_global(
+    gc: &mut GarbageCollector,
+    global_table: *mut Table,
+    name: &str,
+    func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+) {
+    let name_str = gc.create(GcString::new(name));
+    let func_obj = gc.create(Function::new_c(func));
+    // SAFETY: caller guarantees global_table is a valid GC-rooted table
+    unsafe {
+        (*global_table).set(&Value::String(name_str), &Value::Function(func_obj));
+    }
 }

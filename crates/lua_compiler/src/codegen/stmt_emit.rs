@@ -287,8 +287,14 @@ impl CodeGenerator {
             // 简单全局函数
             let reg = self.reg_alloc.alloc();
             self.emit_closure_to_reg(f, reg)?;
-            // SETGLOBAL
-            let k = self.builder.add_number_constant(0.0); // placeholder
+            // SETGLOBAL: add function name as string constant
+            // SAFETY: self.gc is set from a valid &mut GC during CodeGenerator::new()
+            let gc: &mut lua_core::gc::collector::GarbageCollector =
+                unsafe { &mut *self.gc };
+            let k = self
+                .builder
+                .add_string_constant(gc, &f.name)
+                .unwrap_or_else(|| self.builder.add_number_constant(0.0));
             self.code_abx(OpCode::SETGLOBAL, reg, k, self.current_line);
         } else {
             // 表成员函数: t.a.b.f() or t:m()

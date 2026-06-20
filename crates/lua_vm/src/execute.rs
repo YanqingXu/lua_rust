@@ -844,6 +844,25 @@ fn get_table(_l: &LuaState, table: &Value, key: &Value) -> Value {
                 if !result.is_nil() {
                     return result;
                 }
+                // String interning may not be active; try content-based lookup
+                if let Value::String(key_ref) = key {
+                    // SAFETY: GC does not run during VM execution; the key GcRef
+                    // is valid as long as it's on the LuaState stack or in constants.
+                    if let Some(key_str) = unsafe { key_ref.as_ref() } {
+                        let key_data = key_str.data();
+                        for (k, val) in table_obj.hash_entries() {
+                            if let Value::String(k_ref) = k {
+                                // SAFETY: table keys are valid GC refs as long as
+                                // the table is reachable and GC is not running.
+                                if let Some(k_str) = unsafe { k_ref.as_ref() } {
+                                    if k_str.data() == key_data {
+                                        return val.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Check for __index metamethod
                 if let Some(mt) = table_obj.metatable() {
                     // SAFETY: mt is a GC ref to the metatable; GC does not run during VM
