@@ -8,8 +8,8 @@ description = "Lua 5.1 standard libraries: base, math, string, table, io, os, co
 
 [dependencies]
 thiserror.workspace = true
-# lua_core = { path = "../lua_core" } # uncomment in Phase 4
-# lua_vm   = { path = "../lua_vm" }   # uncomment in Phase 4
+lua_core = { path = "../lua_core" }
+lua_vm   = { path = "../lua_vm" }
 
 [lints]
 workspace = true

@@ -35,6 +35,8 @@ dependencies = [
 name = "lua_stdlib"
 version = "0.1.0"
 dependencies = [
+ "lua_core",
+ "lua_vm",
  "thiserror",
 ]
 
