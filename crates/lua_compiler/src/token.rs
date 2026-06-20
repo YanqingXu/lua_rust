@@ -54,6 +54,10 @@ pub enum TokenType {
     Comma = 44,
     /// `.`
     Dot = 46,
+    /// `#`
+    Len = 35,
+    /// `:`
+    Colon = 58,
 
     // ── 关键词 (257+) ─────────────────────────────────────────────
     And = 257,
@@ -134,6 +138,8 @@ impl TokenType {
             TokenType::Semicolon => ";",
             TokenType::Comma => ",",
             TokenType::Dot => ".",
+            TokenType::Len => "#",
+            TokenType::Colon => ":",
             // 关键词
             TokenType::And => "and",
             TokenType::Break => "break",

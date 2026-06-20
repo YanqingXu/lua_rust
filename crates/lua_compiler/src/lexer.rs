@@ -213,17 +213,20 @@ impl<'source> Lexer<'source> {
             '}' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
             ';' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
             ',' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
+            ']' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
 
             // [ 可能是长字符串
             '[' => self.try_long_string_or_token(line, col),
 
             // 单字符运算符
-            '+' | '*' | '/' | '^' | '%' | '-' => self.make_token(
+            '+' | '*' | '/' | '^' | '%' | '-' | '#' => self.make_token(
                 TokenType::from_char(c).unwrap_or(TokenType::Error),
                 c,
                 line,
                 col,
             ),
+
+            ':' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
 
             '<' => {
                 let tt = if self.match_char('=') {
@@ -728,6 +731,8 @@ impl TokenType {
             ';' => Some(TokenType::Semicolon),
             ',' => Some(TokenType::Comma),
             '.' => Some(TokenType::Dot),
+            '#' => Some(TokenType::Len),
+            ':' => Some(TokenType::Colon),
             _ => None,
         }
     }
