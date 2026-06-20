@@ -6,12 +6,13 @@
 //!
 //! C++ 参考: `lua_cpp/src/lib/stringlib.hpp/.cpp`
 
+use lua_core::gc::collector::GarbageCollector;
 use lua_core::value::Value;
 use lua_vm::state::LuaState;
 
 use crate::catalog::register_function;
 
-pub fn open_string(l: &mut LuaState) {
+pub fn open_string(l: &mut LuaState, _gc: &mut GarbageCollector) {
     register_function(l, "len", lua_str_len);
     register_function(l, "sub", lua_str_sub);
     register_function(l, "upper", lua_str_upper);

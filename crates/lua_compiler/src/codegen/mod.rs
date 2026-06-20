@@ -33,6 +33,7 @@ pub use types::{
     ValueResult,
 };
 
+use lua_core::gc::collector::GarbageCollector;
 use lua_core::proto::Proto;
 
 use crate::ast::stmt::Chunk;
@@ -101,10 +102,17 @@ pub struct CodeGenerator {
 
     // ── 代码块栈 ──────────────────────────────────────────────
     pub blocks: Vec<BlockInfo>,
+
+    /// GC 引用（用于创建字符串常量等 GC 对象）
+    pub gc: *mut GarbageCollector,
 }
 
+// SAFETY: CodeGenerator is used on the stack during compilation;
+// the GC pointer is valid for the duration of the compilation.
+unsafe impl Send for CodeGenerator {}
+
 impl CodeGenerator {
-    pub fn new() -> Self {
+    pub fn new(gc: &mut GarbageCollector) -> Self {
         let proto = Proto::new();
         Self {
             builder: BytecodeBuilder::new(proto),
@@ -115,12 +123,12 @@ impl CodeGenerator {
             active_var_count: 0,
             upvalues: Vec::new(),
             blocks: Vec::new(),
+            gc: gc as *mut GarbageCollector,
         }
     }
 
     /// 生成字节码（完整入口）
     pub fn generate(mut self, chunk: &Chunk, _source_name: &str) -> Result<Proto, CodegenError> {
-        self.builder.set_max_stack_size(2);
         self.builder.set_vararg(true);
 
         self.emit_block(&chunk.statements)
@@ -128,6 +136,10 @@ impl CodeGenerator {
 
         let final_line = chunk.statements.last().map(|s| s.end_line()).unwrap_or(1);
         self.code_abc(OpCode::RETURN, 0, 1, 0, final_line);
+
+        // Compute max stack size from register allocator usage
+        let max_stack = self.reg_alloc.current() + 2; // +2 for safety margin
+        self.builder.set_max_stack_size(max_stack as u8);
 
         Ok(self.builder.into_proto())
     }
@@ -147,8 +159,4 @@ impl CodeGenerator {
     }
 }
 
-impl Default for CodeGenerator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// Default removed: CodeGenerator now requires &mut GarbageCollector for string constants

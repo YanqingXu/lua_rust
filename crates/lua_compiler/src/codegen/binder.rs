@@ -30,10 +30,15 @@ impl CodeGenerator {
         }
 
         // 3. Fallback: 全局变量
-        let const_idx = self.builder.add_number_constant(0.0); // placeholder
-        let _ = const_idx;
-        // TODO: add_string_constant properly
-        SymbolRef::new(SymbolKind::Global, -1, name)
+        // SAFETY: self.gc is set during CodeGenerator::new() from a valid &mut
+        // GarbageCollector reference that outlives the compilation process.
+        let gc: &mut lua_core::gc::collector::GarbageCollector =
+            unsafe { &mut *self.gc };
+        let const_idx = self
+            .builder
+            .add_string_constant(gc, name)
+            .unwrap_or(-1);
+        SymbolRef::new(SymbolKind::Global, const_idx, name)
     }
 
     /// 将 SymbolRef 转为 ValueResult（读路径）

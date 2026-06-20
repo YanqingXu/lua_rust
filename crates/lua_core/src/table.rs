@@ -474,6 +474,13 @@ impl Table {
         self.hash.len()
     }
 
+    /// 返回哈希部分的所有条目迭代器
+    ///
+    /// 用于需要按内容查找字符串键的场景（字符串驻留未激活时的回退路径）
+    pub fn hash_entries(&self) -> impl Iterator<Item = (&Value, &Value)> {
+        self.hash.iter()
+    }
+
     /// 获取表的总元素数量
     ///
     /// C++ 对应: `Table::getTotalSize()`

@@ -32,8 +32,16 @@ impl CodeGenerator {
             Expr::Boolean(b) => ValueResult::make_boolean(b.value),
             Expr::Number(n) => ValueResult::make_number(n.value),
             Expr::String(s) => {
-                let k = self.builder.add_number_constant(0.0); // placeholder: should be string constant
-                let _ = s;
+                // SAFETY: self.gc is a valid pointer set during CodeGenerator::new()
+                let gc: &mut lua_core::gc::collector::GarbageCollector =
+                    unsafe { &mut *self.gc };
+                let k = self
+                    .builder
+                    .add_string_constant(gc, &s.value)
+                    .unwrap_or_else(|| {
+                        // Fallback: add as number constant if string constant fails
+                        self.builder.add_number_constant(0.0)
+                    });
                 ValueResult::make_constant(k)
             }
             Expr::Vararg(_) => {

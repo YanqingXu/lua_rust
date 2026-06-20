@@ -6,12 +6,13 @@
 //!
 //! C++ 参考: `lua_cpp/src/lib/mathlib.hpp/.cpp`
 
+use lua_core::gc::collector::GarbageCollector;
 use lua_core::value::Value;
 use lua_vm::state::LuaState;
 
 use crate::catalog::register_function;
 
-pub fn open_math(l: &mut LuaState) {
+pub fn open_math(l: &mut LuaState, _gc: &mut GarbageCollector) {
     register_function(l, "abs", lua_math_abs);
     register_function(l, "acos", lua_math_acos);
     register_function(l, "asin", lua_math_asin);

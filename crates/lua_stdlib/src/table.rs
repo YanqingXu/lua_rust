@@ -4,12 +4,13 @@
 //!
 //! C++ 参考: `lua_cpp/src/lib/tablelib.hpp/.cpp`
 
+use lua_core::gc::collector::GarbageCollector;
 use lua_core::value::Value;
 use lua_vm::state::LuaState;
 
 use crate::catalog::register_function;
 
-pub fn open_table(l: &mut LuaState) {
+pub fn open_table(l: &mut LuaState, _gc: &mut GarbageCollector) {
     register_function(l, "insert", lua_tbl_insert);
     register_function(l, "remove", lua_tbl_remove);
     register_function(l, "sort", lua_tbl_sort);

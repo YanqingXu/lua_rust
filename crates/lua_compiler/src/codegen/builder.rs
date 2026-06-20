@@ -159,22 +159,17 @@ impl BytecodeBuilder {
 
     /// 添加字符串常量，返回常量索引
     ///
-    /// 注意：此方法需要 StringPool 已通过 bind_pool() 设置
+    /// 注意：此方法需要 GC 引用来分配 GC 字符串。
+    /// 当前实现直接创建 GcString 而不通过 StringPool 驻留（TODO：实现驻留）。
     pub fn add_string_constant(
         &mut self,
         gc: &mut lua_core::gc::collector::GarbageCollector,
         value: &str,
     ) -> Option<i32> {
-        // SAFETY: self.string_pool is set at bind_pool() from a &StringPool reference
-        // whose lifetime outlives the builder (caller guarantees this).
-        // The raw pointer is only read, never written through.
-        let pool_ref = unsafe { self.string_pool?.as_ref()? };
-        // TODO: Full implementation — pool.inter() requires &mut pool, which conflicts
-        // with the *const pointer design. Need to refactor to store pool differently.
-        let _ = pool_ref;
-        let _ = gc;
-        let _ = value;
-        None
+        // Create a GC string and add it to the constants table
+        let gc_str = gc.create(GcString::new(value));
+        let idx = self.proto.add_constant(Value::String(gc_str)) as i32;
+        Some(idx)
     }
 
     /// 添加子原型，返回原型索引

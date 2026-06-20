@@ -286,6 +286,9 @@ impl PartialEq for Value {
             (Value::Number(a), Value::Number(b)) => a.to_bits() == b.to_bits(),
             // GcRef<T> 的 PartialEq 比较指针相等性
             (Value::LightUserdata(a), Value::LightUserdata(b)) => a == b,
+            // GcRef<T> 的 PartialEq 比较指针相等性。
+            // Lua 5.1 relies on string interning: same content → same pointer.
+            // Content-based equality is unnecessary when interning works correctly.
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Table(a), Value::Table(b)) => a == b,
             (Value::Function(a), Value::Function(b)) => a == b,

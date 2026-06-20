@@ -6,6 +6,7 @@
 use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::opcode::{self, OpCode};
 use lua_compiler::parser::Parser;
+use lua_core::gc::collector::GarbageCollector;
 use lua_core::value::Value;
 
 use std::env;
@@ -41,8 +42,9 @@ fn dump_file(filename: &str, format: &str) -> Result<(), Box<dyn std::error::Err
     let mut parser = Parser::new(&source);
     let chunk = parser.parse()?;
 
-    // Compile
-    let cg = CodeGenerator::new();
+    // Compile (create temporary GC for string constant allocation)
+    let mut temp_gc = GarbageCollector::new();
+    let cg = CodeGenerator::new(&mut temp_gc);
     let proto = cg.generate(&chunk, filename)?;
 
     match format {

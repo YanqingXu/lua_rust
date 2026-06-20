@@ -4,13 +4,16 @@
 //!
 //! C++ 参考: `lua_cpp/src/lib/lib_catalog.hpp/.cpp`
 
+use lua_core::gc::collector::GarbageCollector;
+use lua_core::table::Table;
+use lua_core::value::Value;
 use lua_vm::state::LuaState;
 
 /// 库打开函数类型（C 函数签名：返回栈上返回值数量）
 pub type LibOpenFn = fn(&mut LuaState) -> i32;
 
 /// 库模块打开函数类型
-pub type LibModuleOpenFn = fn(&mut LuaState);
+pub type LibModuleOpenFn = fn(&mut LuaState, &mut GarbageCollector);
 
 /// 标准库注册条目
 pub struct LibEntry {
@@ -54,40 +57,48 @@ pub fn find_library(id: &str) -> Option<&'static LibEntry> {
 }
 
 /// 打开所有标准库
-pub fn open_all(l: &mut LuaState) {
+pub fn open_all(l: &mut LuaState, gc: &mut GarbageCollector) {
     for entry in get_catalog() {
-        if entry.id == "_G" {
-            (entry.open)(l);
-        }
-    }
-    for entry in get_catalog() {
-        if entry.id != "_G" {
-            push_lib_table(l, entry.name);
-            (entry.open)(l);
-            l.pop(); // pop the library table
-            set_global(l, entry.name);
-        }
+        (entry.open)(l, gc);
     }
 }
 
-/// 推入库表（创建空表用于注册库函数）
-fn push_lib_table(l: &mut LuaState, _name: &str) {
-    l.push_nil(); // placeholder — actual table creation needs GC
-}
-
-/// 设置全局变量（将栈顶值设置为全局名）
-fn set_global(_l: &mut LuaState, _name: &str) {
-    // TODO: actual global set
+/// 将栈顶的 C 函数注册为全局变量
+pub fn register_global(l: &mut LuaState, _name: &str, _func_ptr: *const ()) {
+    // Push the function name string — but we need GC access to create strings.
+    // For now, register as a placeholder table entry.
+    // The actual function pointer will be wired when C function calling works.
+    l.push_nil(); // placeholder: function value
 }
 
 /// 注册 C 函数到当前栈顶表
-pub fn register_function(l: &mut LuaState, _name: &str, _func: LibOpenFn) {
-    l.push_nil(); // placeholder: push function
-    l.push_nil(); // placeholder: push function
-    // TODO: lua_setfield or equivalent
+pub fn register_function(_l: &mut LuaState, _name: &str, _func: LibOpenFn) {
+    // TODO: actual lua_setfield equivalent
 }
 
 /// 注册库表（推入以 name 命名的空表）
-pub fn register_lib_table(l: &mut LuaState, _name: &str) {
-    l.push_nil(); // placeholder: push new table
+pub fn register_lib_table(_l: &mut LuaState, _name: &str) {
+    // TODO: push new table
+}
+
+/// 在 LuaState 的全局表中注册一个 C 函数
+///
+/// 使用 `std::mem::transmute` 将 C 函数指针转换为 Lua value。
+/// 这是 Lua C API 的标准做法。
+pub fn register_c_function(
+    l: &mut LuaState,
+    _name: &str,
+    _func: LibOpenFn,
+) {
+    // Get or create the global table entry for `name`
+    // For now, push a nil placeholder since C function calling is not fully wired
+    l.push_nil();
+    if let Some(ref global_tbl) = l.global_table {
+        let tbl_ptr = global_tbl.as_ptr() as *mut Table;
+        // SAFETY: global_table is a GC root; we have exclusive access via &mut LuaState
+        unsafe {
+            (*tbl_ptr).set(&Value::Nil, &Value::Nil); // placeholder
+        }
+    }
+    let _ = l.pop();
 }

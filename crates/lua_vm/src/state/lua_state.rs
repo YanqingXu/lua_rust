@@ -5,6 +5,8 @@
 //!
 //! C++ 参考: `lua_cpp/src/vm/state/lua_state.hpp`
 
+use lua_core::table::Table;
+use lua_core::gc::gc_ref::GcRef;
 use lua_core::value::Value;
 
 use super::call_info::CallInfo;
@@ -45,6 +47,8 @@ pub struct LuaState {
     pub nccalls: i32,
     /// allow yield counter
     pub allow_yield: u16,
+    /// 全局表 (_G)
+    pub global_table: Option<GcRef<Table>>,
 }
 
 impl LuaState {
@@ -59,7 +63,15 @@ impl LuaState {
             status: ThreadStatus::Ok,
             nccalls: 1,
             allow_yield: 0,
+            global_table: None,
         }
+    }
+
+    /// 创建带全局表的 Lua 线程
+    pub fn with_global_table(global: GcRef<Table>) -> Self {
+        let mut state = Self::new();
+        state.global_table = Some(global);
+        state
     }
 
     // ── 栈操作 ──────────────────────────────────────────────────

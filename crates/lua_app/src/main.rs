@@ -5,6 +5,8 @@
 
 use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::parser::Parser;
+use lua_core::gc::collector::GarbageCollector;
+use lua_core::table::Table;
 use lua_stdlib::catalog::open_all;
 use lua_vm::execute::execute_proto;
 use lua_vm::state::LuaState;
@@ -16,11 +18,15 @@ use std::io::{self, Write};
 fn main() {
     let args: Vec<String> = env::args().collect();
 
+    let mut gc = GarbageCollector::new();
+    let global_table = gc.create_root(Table::new());
+    let mut state = LuaState::with_global_table(global_table);
+
     if args.len() < 2 {
-        repl();
+        repl(&mut state, &mut gc);
     } else {
         let filename = &args[1];
-        match run_file(filename) {
+        match run_file(&mut state, &mut gc, filename) {
             Ok(_) => {}
             Err(e) => eprintln!("Error: {}", e),
         }
@@ -28,13 +34,22 @@ fn main() {
 }
 
 /// Run a Lua source file
-fn run_file(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run_file(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    filename: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let source = fs::read_to_string(filename)?;
-    run_source(&source, filename)
+    run_source(state, gc, &source, filename)
 }
 
 /// Run Lua source code
-pub fn run_source(source: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_source(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    source: &str,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Lua 5.1 Rust Interpreter ===");
     println!("Source: {} ({} bytes)", name, source.len());
 
@@ -50,7 +65,7 @@ pub fn run_source(source: &str, name: &str) -> Result<(), Box<dyn std::error::Er
     println!("Parsed: {} top-level statements", chunk.statements.len());
 
     // Phase 2: CodeGen
-    let cg = CodeGenerator::new();
+    let cg = CodeGenerator::new(gc);
     let proto = match cg.generate(&chunk, name) {
         Ok(p) => p,
         Err(e) => {
@@ -64,14 +79,13 @@ pub fn run_source(source: &str, name: &str) -> Result<(), Box<dyn std::error::Er
         proto.constant_count()
     );
 
-    // Phase 3: VM Execution
-    let mut state = LuaState::new();
+    // Phase 3: VM Execution (reuse existing state and gc from caller)
 
     // Phase 4: Load standard library
-    open_all(&mut state);
+    open_all(state, gc);
 
     println!("--- Execution ---");
-    match execute_proto(&mut state, &proto) {
+    match execute_proto(state, &proto, gc) {
         Ok(result) => println!("VM result: {:?} (status: {:?})", result, state.get_status()),
         Err(e) => eprintln!("Runtime error: {}", e),
     }
@@ -80,13 +94,12 @@ pub fn run_source(source: &str, name: &str) -> Result<(), Box<dyn std::error::Er
 }
 
 /// Interactive REPL
-fn repl() {
+fn repl(state: &mut LuaState, gc: &mut GarbageCollector) {
     println!("Lua 5.1 Rust Interpreter REPL");
     println!("Type 'exit' to quit, 'help' for commands.");
     println!();
 
-    let mut state = LuaState::new();
-    open_all(&mut state);
+    open_all(state, gc);
 
     let mut buffer = String::new();
     loop {
@@ -127,7 +140,7 @@ fn repl() {
             line.to_string()
         };
 
-        match run_repl_line(&mut state, &source) {
+        match run_repl_line(state, &source, gc) {
             Ok(_) => {}
             Err(e) => eprintln!("Error: {}", e),
         }
@@ -135,13 +148,17 @@ fn repl() {
     println!("Goodbye.");
 }
 
-fn run_repl_line(state: &mut LuaState, source: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run_repl_line(
+    state: &mut LuaState,
+    source: &str,
+    gc: &mut GarbageCollector,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut parser = Parser::new(source);
     let chunk = parser.parse()?;
-    let cg = CodeGenerator::new();
+    let cg = CodeGenerator::new(gc);
     let proto = cg.generate(&chunk, "<repl>")?;
 
-    match execute_proto(state, &proto) {
+    match execute_proto(state, &proto, gc) {
         Ok(_result) => {
             // Print stack top as result
             if let Some(val) = state.pop() {
