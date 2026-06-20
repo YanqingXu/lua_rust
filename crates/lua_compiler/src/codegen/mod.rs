@@ -6,28 +6,25 @@
 //! - `types` — 核心数据流类型 (PatchList, ValueResult, CondResult, LValueRef, SymbolRef)
 //! - `reg_alloc` — 临时寄存器分配/回收
 //! - `builder` — 指令发射/常量写入/调试信息
-//!
-//! ## 待实现模块
-//! - `expr_emit` — 表达式 lowering (对标 expression_emitter.hpp)
-//! - `stmt_emit` — 语句/block/控制流 lowering (对标 statement_emitter.hpp)
-//! - `binder` — 名字解析 (对标 name_binder.hpp)
-//! - `jump` — 跳转链表管理 (对标 jump_patcher.hpp)
-//! - `scope` — 局部变量/upvalue 作用域 (对标 scope_manager.hpp)
-//! - `func_comp` — 子函数编译 + 闭包 (对标 function_compiler.hpp)
+//! - `jump` — 跳转链表管理与回填 (jump_patcher.hpp)
+//! - `scope` — 局部变量/upvalue/block 作用域 (scope_manager.hpp)
+//! - `binder` — 名字解析 SymbolRef (name_binder.hpp)
+//! - `expr_emit` — 表达式 lowering (expression_emitter.hpp)
+//! - `stmt_emit` — 语句/block/控制流 lowering (statement_emitter.hpp)
+//! - `func_comp` — 子函数编译与闭包 (function_compiler.hpp)
 //!
 //! C++ 参考: `lua_cpp/src/compiler/codegen/` (18 个文件)
 
+pub mod binder;
 pub mod builder;
+pub mod expr_emit;
+pub mod func_comp;
+pub mod jump;
 pub mod reg_alloc;
+pub mod scope;
+pub mod stmt_emit;
 pub mod types;
-// pub mod binder;
-// pub mod expr_emit;
-// pub mod func_comp;
-// pub mod jump;
-// pub mod scope;
-// pub mod stmt_emit;
 
-// 常用类型重导出
 pub use builder::BytecodeBuilder;
 pub use reg_alloc::RegisterAllocator;
 pub use types::{
@@ -38,7 +35,7 @@ pub use types::{
 
 use lua_core::proto::Proto;
 
-use crate::ast::stmt::{Chunk, Stmt};
+use crate::ast::stmt::Chunk;
 use crate::opcode::OpCode;
 use crate::parser::ParseError;
 
@@ -46,9 +43,6 @@ use crate::parser::ParseError;
 // CodegenError
 // =====================================================================
 
-/// 代码生成错误
-///
-/// C++ 对应: `Lua::CodegenError`
 #[derive(Debug, Clone)]
 pub struct CodegenError {
     pub message: String,
@@ -81,116 +75,75 @@ impl From<ParseError> for CodegenError {
 }
 
 // =====================================================================
-// CodeGenerator — 框架入口
+// CodeGenerator
 // =====================================================================
 
 /// Lua 5.1 字节码生成器
 ///
 /// 将 AST 编译为可执行的 Proto 对象。
-///
-/// ## 当前状态
-/// 框架已建立（类型系统、寄存器分配器、字节码构建器）。
-/// 完整的表达式/语句 lowering 和函数编译待实现。
+/// 实现完整的表达式/语句 lowering 和函数编译管线。
 ///
 /// C++ 对应: `Lua::CodeGenerator`
 pub struct CodeGenerator {
-    /// 字节码构建器（拥有 Proto）
     pub builder: BytecodeBuilder,
-    /// 寄存器分配器
     pub reg_alloc: RegisterAllocator,
-    /// 当前行号
     pub current_line: i32,
+
+    // ── 跳转管理 ──────────────────────────────────────────────
+    pub jpc: i32,
+
+    // ── 局部变量 ──────────────────────────────────────────────
+    pub local_vars: Vec<LocalVar>,
+    pub active_var_count: i32,
+
+    // ── Upvalue ───────────────────────────────────────────────
+    pub upvalues: Vec<UpvalueCapture>,
+
+    // ── 代码块栈 ──────────────────────────────────────────────
+    pub blocks: Vec<BlockInfo>,
 }
 
 impl CodeGenerator {
-    /// 创建新的代码生成器
     pub fn new() -> Self {
         let proto = Proto::new();
         Self {
             builder: BytecodeBuilder::new(proto),
             reg_alloc: RegisterAllocator::new(0),
             current_line: 0,
+            jpc: NO_JUMP,
+            local_vars: Vec::new(),
+            active_var_count: 0,
+            upvalues: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
-    /// 生成字节码
-    ///
-    /// 当前为框架骨架：为 Chunk 中的每条语句预留位置。
-    /// 完整实现需要 ExpressionEmitter + StatementEmitter + FunctionCompiler。
-    ///
-    /// C++ 对应: `Lua::CodeGenerator::generate()`
+    /// 生成字节码（完整入口）
     pub fn generate(mut self, chunk: &Chunk, _source_name: &str) -> Result<Proto, CodegenError> {
-        // 遍历顶层语句
-        for stmt in &chunk.statements {
-            self.current_line = stmt.line();
-            self.emit_statement(stmt)?;
-        }
+        self.builder.set_max_stack_size(2);
+        self.builder.set_vararg(true);
 
-        // 末尾兜底 RETURN
+        self.emit_block(&chunk.statements)
+            .map_err(|msg| CodegenError::new(msg, 0, 0))?;
+
         let final_line = chunk.statements.last().map(|s| s.end_line()).unwrap_or(1);
         self.code_abc(OpCode::RETURN, 0, 1, 0, final_line);
 
-        // 返回编译后的 Proto
         Ok(self.builder.into_proto())
     }
 
     // ── 指令生成便捷方法 ──────────────────────────────────────────
 
-    fn code_abc(&mut self, op: OpCode, a: i32, b: i32, c: i32, line: i32) -> i32 {
+    pub fn code_abc(&mut self, op: OpCode, a: i32, b: i32, c: i32, line: i32) -> i32 {
         self.builder.emit_abc(line, op, a, b, c)
     }
 
-    #[allow(dead_code)] // TODO: used by expression/statement emitters (pending)
-    fn code_abx(&mut self, op: OpCode, a: i32, bx: i32, line: i32) -> i32 {
+    pub fn code_abx(&mut self, op: OpCode, a: i32, bx: i32, line: i32) -> i32 {
         self.builder.emit_abx(line, op, a, bx)
     }
 
-    #[allow(dead_code)] // TODO: used by expression/statement emitters (pending)
-    fn code_as_bx(&mut self, op: OpCode, a: i32, sbx: i32, line: i32) -> i32 {
+    pub fn code_as_bx(&mut self, op: OpCode, a: i32, sbx: i32, line: i32) -> i32 {
         self.builder.emit_as_bx(line, op, a, sbx)
-    }
-
-    // ── 语句 lowering（骨架） ─────────────────────────────────────
-
-    fn emit_statement(&mut self, stmt: &Stmt) -> Result<(), CodegenError> {
-        match stmt {
-            Stmt::Empty(_) => {}
-            Stmt::Assign(a) => {
-                let _ = a;
-            }
-            Stmt::Local(l) => {
-                let _ = l;
-            }
-            Stmt::Call(c) => {
-                let _ = c;
-            }
-            Stmt::If(i) => {
-                let _ = i;
-            }
-            Stmt::While(w) => {
-                let _ = w;
-            }
-            Stmt::Repeat(r) => {
-                let _ = r;
-            }
-            Stmt::ForNum(f) => {
-                let _ = f;
-            }
-            Stmt::ForIn(f) => {
-                let _ = f;
-            }
-            Stmt::Function(f) => {
-                let _ = f;
-            }
-            Stmt::Return(r) => {
-                let _ = r;
-            }
-            Stmt::Break(_) => {}
-            Stmt::Do(d) => {
-                let _ = d;
-            }
-        }
-        Ok(())
     }
 }
 
