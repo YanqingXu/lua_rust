@@ -24,5 +24,7 @@
 pub mod execute;
 pub mod state;
 
-pub use execute::{ExecResult, RuntimeError, execute_proto};
+pub use execute::{
+    ExecResult, RuntimeError, execute_proto, resume_lua_thread, start_lua_call_at_stack,
+};
 pub use state::{CallInfo, LUA_MULTRET, LuaState, Stack, ThreadStatus};

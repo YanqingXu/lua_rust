@@ -126,9 +126,7 @@ impl<'source> Lexer<'source> {
 
     /// 前进一个字符并返回
     fn advance(&mut self) -> Option<char> {
-        let c = self.rest.chars().next()?;
-        let len = c.len_utf8();
-        self.rest = &self.rest[len..];
+        let c = self.advance_raw()?;
         if c == '\n' {
             self.line += 1;
             self.column = 1;
@@ -136,6 +134,31 @@ impl<'source> Lexer<'source> {
             self.column += 1;
         }
         Some(c)
+    }
+
+    fn advance_raw(&mut self) -> Option<char> {
+        let c = self.rest.chars().next()?;
+        let len = c.len_utf8();
+        self.rest = &self.rest[len..];
+        Some(c)
+    }
+
+    fn is_newline(c: char) -> bool {
+        c == '\n' || c == '\r'
+    }
+
+    fn consume_newline(&mut self) -> String {
+        let first = self.advance_raw().expect("expected newline");
+        debug_assert!(Self::is_newline(first));
+
+        let mut consumed = String::from(first);
+        if self.peek().is_some_and(Self::is_newline) && self.peek() != Some(first) {
+            consumed.push(self.advance_raw().unwrap());
+        }
+
+        self.line += 1;
+        self.column = 1;
+        consumed
     }
 
     /// 查看当前字符（不前进）
@@ -180,8 +203,12 @@ impl<'source> Lexer<'source> {
 
             match c {
                 // 空白字符
-                ' ' | '\t' | '\r' | '\n' => {
+                ' ' | '\t' => {
                     self.advance();
+                    continue;
+                }
+                '\r' | '\n' => {
+                    self.consume_newline();
                     continue;
                 }
                 // 注释
@@ -191,6 +218,11 @@ impl<'source> Lexer<'source> {
                     if let Some(err) = self.skip_comment() {
                         return err;
                     }
+                    continue;
+                }
+                '#' if self.line == 1 && self.column == 1 => {
+                    self.advance(); // consume first-line shebang/special comment marker
+                    self.skip_line_comment();
                     continue;
                 }
                 _ => break,
@@ -303,7 +335,12 @@ impl<'source> Lexer<'source> {
             'a'..='z' | 'A'..='Z' | '_' => self.scan_identifier(c, line, col),
 
             // 非法字符
-            _ => Token::new_error(format!("unexpected character '{}'", c), line, col),
+            _ => Token::new_error_with_lexeme(
+                format!("unexpected character '{}'", c),
+                c.to_string(),
+                line,
+                col,
+            ),
         }
     }
 
@@ -329,7 +366,7 @@ impl<'source> Lexer<'source> {
         }
 
         // 小数部分
-        if self.peek() == Some('.') && self.peek_next().is_some_and(|c| c.is_ascii_digit()) {
+        if self.peek() == Some('.') && self.peek_next() != Some('.') {
             lexeme.push(self.advance().unwrap()); // '.'
             while self.peek().is_some_and(|c| c.is_ascii_digit()) {
                 lexeme.push(self.advance().unwrap());
@@ -425,11 +462,17 @@ impl<'source> Lexer<'source> {
                 }
                 Some('\\') => {
                     lexeme.push('\\');
-                    match self.advance() {
+                    match self.peek() {
                         None => {
                             return Token::new_error("unterminated string".to_string(), line, col);
                         }
+                        Some(ec) if Self::is_newline(ec) => {
+                            let newline = self.consume_newline();
+                            lexeme.push_str(&newline);
+                            value.push('\n');
+                        }
                         Some(ec) => {
+                            self.advance();
                             lexeme.push(ec);
                             match ec {
                                 'a' => value.push('\x07'),
@@ -442,12 +485,6 @@ impl<'source> Lexer<'source> {
                                 '\\' => value.push('\\'),
                                 '"' => value.push('"'),
                                 '\'' => value.push('\''),
-                                '\n' | '\r' => {
-                                    // 跨行转义：跳过换行
-                                    if ec == '\r' && self.peek() == Some('\n') {
-                                        lexeme.push(self.advance().unwrap());
-                                    }
-                                }
                                 '0'..='9' => {
                                     // 十进制转义 \ddd
                                     let mut digits = String::from(ec);
@@ -534,21 +571,17 @@ impl<'source> Lexer<'source> {
         let mut value = String::new();
 
         // Lua 5.1: skip first newline after opening bracket
-        if self.peek() == Some('\n') {
-            lexeme.push(self.advance().unwrap());
-        } else if self.peek() == Some('\r') {
-            lexeme.push(self.advance().unwrap());
-            if self.peek() == Some('\n') {
-                lexeme.push(self.advance().unwrap());
-            }
+        if self.peek().is_some_and(Self::is_newline) {
+            lexeme.push_str(&self.consume_newline());
         }
 
         loop {
-            match self.advance() {
+            match self.peek() {
                 None => {
                     return Token::new_error("unfinished long string".to_string(), line, col);
                 }
                 Some(']') => {
+                    self.advance();
                     lexeme.push(']');
                     // 检查是否是结束分隔符 ]=*]
                     let mut close_level = 0i32;
@@ -566,15 +599,12 @@ impl<'source> Lexer<'source> {
                         value.push('=');
                     }
                 }
-                Some('\r') => {
-                    lexeme.push('\r');
-                    // Lua 5.1: normalize \r\n → \n
-                    if self.peek() == Some('\n') {
-                        lexeme.push(self.advance().unwrap());
-                    }
+                Some(c) if Self::is_newline(c) => {
+                    lexeme.push_str(&self.consume_newline());
                     value.push('\n');
                 }
                 Some(c) => {
+                    self.advance();
                     lexeme.push(c);
                     value.push(c);
                 }
@@ -649,17 +679,12 @@ impl<'source> Lexer<'source> {
 
     fn skip_long_comment(&mut self, level: i32, start_line: i32, start_col: i32) -> Option<Token> {
         // Lua 5.1: skip first newline after opening bracket
-        if self.peek() == Some('\n') {
-            self.advance();
-        } else if self.peek() == Some('\r') {
-            self.advance();
-            if self.peek() == Some('\n') {
-                self.advance();
-            }
+        if self.peek().is_some_and(Self::is_newline) {
+            self.consume_newline();
         }
 
         loop {
-            match self.advance() {
+            match self.peek() {
                 None => {
                     return Some(Token::new_error(
                         "unfinished long comment".to_string(),
@@ -668,6 +693,7 @@ impl<'source> Lexer<'source> {
                     ));
                 }
                 Some(']') => {
+                    self.advance();
                     let mut close_level = 0i32;
                     while close_level < level && self.peek() == Some('=') {
                         self.advance();
@@ -678,7 +704,12 @@ impl<'source> Lexer<'source> {
                         return None; // 成功闭合
                     }
                 }
-                _ => {}
+                Some(c) if Self::is_newline(c) => {
+                    self.consume_newline();
+                }
+                Some(_) => {
+                    self.advance();
+                }
             }
         }
     }
@@ -844,6 +875,19 @@ mod tests {
         assert!(matches!(tokens[0].value, TokenValue::Number(0.5)));
     }
 
+    #[test]
+    fn test_trailing_dot_number_and_concat_boundary() {
+        let tokens = scan_non_eos("1.+.1 4. 1..2");
+        assert_eq!(tokens.len(), 7);
+        assert!(matches!(tokens[0].value, TokenValue::Number(1.0)));
+        assert_eq!(tokens[1].token_type, TokenType::Plus);
+        assert!(matches!(tokens[2].value, TokenValue::Number(0.1)));
+        assert!(matches!(tokens[3].value, TokenValue::Number(4.0)));
+        assert!(matches!(tokens[4].value, TokenValue::Number(1.0)));
+        assert_eq!(tokens[5].token_type, TokenType::Concat);
+        assert!(matches!(tokens[6].value, TokenValue::Number(2.0)));
+    }
+
     // ── 字符串测试 ────────────────────────────────────────────────
 
     #[test]
@@ -863,6 +907,25 @@ mod tests {
         let tokens = scan_non_eos(source);
         assert_eq!(tokens.len(), 1);
         assert!(matches!(&tokens[0].value, TokenValue::String(s) if s == "a\nb\tc\\d\"e"));
+    }
+
+    #[test]
+    fn test_string_escaped_newlines_are_normalized() {
+        for source in ["\"\\\n\"", "\"\\\r\"", "\"\\\r\n\"", "\"\\\n\r\""] {
+            let tokens = scan_non_eos(source);
+            assert_eq!(tokens.len(), 1);
+            assert!(matches!(&tokens[0].value, TokenValue::String(s) if s == "\n"));
+        }
+    }
+
+    #[test]
+    fn test_newline_sequences_count_as_single_source_line() {
+        let tokens = scan_non_eos("a\rb\n\rc\r\nd");
+        assert_eq!(tokens.len(), 4);
+        assert_eq!(tokens[0].line, 1);
+        assert_eq!(tokens[1].line, 2);
+        assert_eq!(tokens[2].line, 3);
+        assert_eq!(tokens[3].line, 4);
     }
 
     #[test]
@@ -929,6 +992,23 @@ mod tests {
         assert_eq!(tokens.len(), 2);
         assert!(matches!(tokens[0].value, TokenValue::Number(42.0)));
         assert!(matches!(tokens[1].value, TokenValue::Number(43.0)));
+    }
+
+    #[test]
+    fn test_first_line_hash_comment() {
+        let tokens = scan_non_eos("#!/usr/bin/env lua\nprint(#x)");
+        let types: Vec<TokenType> = tokens.iter().map(|t| t.token_type).collect();
+        assert_eq!(
+            types,
+            vec![
+                TokenType::Name,
+                TokenType::LParen,
+                TokenType::Len,
+                TokenType::Name,
+                TokenType::RParen,
+            ]
+        );
+        assert_eq!(tokens[0].line, 2);
     }
 
     #[test]

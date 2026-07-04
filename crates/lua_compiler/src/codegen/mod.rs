@@ -29,11 +29,12 @@ pub use builder::BytecodeBuilder;
 pub use reg_alloc::RegisterAllocator;
 pub use types::{
     AccessKind, BlockInfo, CallResultInfo, CallResultKind, CompiledFunction, CondResult,
-    LValueKind, LValueRef, LocalVar, NO_JUMP, PatchList, SymbolKind, SymbolRef, UpvalueCapture,
-    ValueResult,
+    LValueKind, LValueRef, LocalVar, NO_JUMP, ParentFunctionContext, PatchList, SymbolKind,
+    SymbolRef, UpvalueCapture, ValueResult,
 };
 
 use lua_core::gc::collector::GarbageCollector;
+use lua_core::gc_string::GcString;
 use lua_core::proto::Proto;
 
 use crate::ast::stmt::Chunk;
@@ -99,6 +100,7 @@ pub struct CodeGenerator {
 
     // ── Upvalue ───────────────────────────────────────────────
     pub upvalues: Vec<UpvalueCapture>,
+    pub parent_functions: Vec<ParentFunctionContext>,
 
     // ── 代码块栈 ──────────────────────────────────────────────
     pub blocks: Vec<BlockInfo>,
@@ -122,13 +124,18 @@ impl CodeGenerator {
             local_vars: Vec::new(),
             active_var_count: 0,
             upvalues: Vec::new(),
+            parent_functions: Vec::new(),
             blocks: Vec::new(),
             gc: gc as *mut GarbageCollector,
         }
     }
 
     /// 生成字节码（完整入口）
-    pub fn generate(mut self, chunk: &Chunk, _source_name: &str) -> Result<Proto, CodegenError> {
+    pub fn generate(mut self, chunk: &Chunk, source_name: &str) -> Result<Proto, CodegenError> {
+        // SAFETY: self.gc is set during CodeGenerator::new() from a valid &mut GC.
+        let gc: &mut GarbageCollector = unsafe { &mut *self.gc };
+        self.builder
+            .set_source(Some(gc.create(GcString::new(source_name))));
         self.builder.set_vararg(true);
 
         self.emit_block(&chunk.statements)
@@ -138,8 +145,9 @@ impl CodeGenerator {
         self.code_abc(OpCode::RETURN, 0, 1, 0, final_line);
 
         // Compute max stack size from register allocator usage
-        let max_stack = self.reg_alloc.current() + 2; // +2 for safety margin
+        let max_stack = self.reg_alloc.max_used() + 2; // +2 for safety margin
         self.builder.set_max_stack_size(max_stack as u8);
+        self.attach_local_debug();
 
         Ok(self.builder.into_proto())
     }

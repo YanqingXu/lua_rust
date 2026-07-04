@@ -286,10 +286,20 @@ impl PartialEq for Value {
             (Value::Number(a), Value::Number(b)) => a.to_bits() == b.to_bits(),
             // GcRef<T> 的 PartialEq 比较指针相等性
             (Value::LightUserdata(a), Value::LightUserdata(b)) => a == b,
-            // GcRef<T> 的 PartialEq 比较指针相等性。
-            // Lua 5.1 relies on string interning: same content → same pointer.
-            // Content-based equality is unnecessary when interning works correctly.
-            (Value::String(a), Value::String(b)) => a == b,
+            // Lua strings compare by byte content. Interning keeps this fast in
+            // the common path, but equality must still be correct if a caller
+            // creates two GC strings outside the shared pool.
+            (Value::String(a), Value::String(b)) => {
+                if a == b {
+                    true
+                } else {
+                    // SAFETY: string Value operands are live while equality is evaluated.
+                    let a_data = unsafe { a.as_ref() }.map(|s| s.data());
+                    // SAFETY: string Value operands are live while equality is evaluated.
+                    let b_data = unsafe { b.as_ref() }.map(|s| s.data());
+                    a_data == b_data
+                }
+            }
             (Value::Table(a), Value::Table(b)) => a == b,
             (Value::Function(a), Value::Function(b)) => a == b,
             (Value::Userdata(a), Value::Userdata(b)) => a == b,
@@ -373,6 +383,8 @@ impl fmt::Display for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::collector::GarbageCollector;
+    use crate::gc_string::GcString;
     use std::mem;
 
     #[test]
@@ -387,5 +399,15 @@ mod tests {
     fn test_value_size_constraint() {
         let size = mem::size_of::<Value>();
         assert!(size <= 16, "Value size {} exceeds 16 bytes", size);
+    }
+
+    #[test]
+    fn test_string_values_compare_by_content_without_interning() {
+        let mut gc = GarbageCollector::new();
+        let left = gc.create(GcString::new("same"));
+        let right = gc.create(GcString::new("same"));
+
+        assert_ne!(left, right);
+        assert_eq!(Value::String(left), Value::String(right));
     }
 }

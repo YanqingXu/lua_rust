@@ -8,6 +8,7 @@
 use crate::codegen::CodeGenerator;
 use crate::codegen::types::{BlockInfo, LocalVar, PatchList, UpvalueCapture};
 use crate::opcode::OpCode;
+use lua_core::gc_string::GcString;
 
 impl CodeGenerator {
     // ── 局部变量 ──────────────────────────────────────────────────
@@ -64,8 +65,8 @@ impl CodeGenerator {
     /// 移除局部变量到指定层级
     ///
     /// C++ 对应: `ScopeManager::removeLocalVars()`
-    pub fn remove_local_vars(&mut self, to_level: i32) {
-        self.close_scope_upvalues(to_level);
+    pub fn remove_local_vars(&mut self, to_level: i32) -> Option<i32> {
+        let close_pc = self.close_scope_upvalues(to_level);
         let pc = self.builder.instruction_count() as i32;
 
         // 关闭离开作用域的局部变量
@@ -83,14 +84,15 @@ impl CodeGenerator {
         let current_max = self.builder.max_stack_size() as i32;
         let new_max = self.reg_alloc.check_stack(0, current_max);
         self.builder.set_max_stack_size(new_max as u8);
+        close_pc
     }
 
     /// 关闭被捕获的局部变量（发射 CLOSE 指令）
     ///
     /// C++ 对应: `ScopeManager::closeScopeUpvalues()`
-    fn close_scope_upvalues(&mut self, level: i32) {
+    pub(crate) fn close_scope_upvalues(&mut self, level: i32) -> Option<i32> {
         if self.active_var_count <= level {
-            return;
+            return None;
         }
 
         // 检查是否有被捕获的局部变量
@@ -99,22 +101,22 @@ impl CodeGenerator {
             .iter()
             .any(|v| v.endpc == -1 && v.reg >= level && v.captured);
         if !has_captured {
-            return;
+            return None;
         }
 
         // 如果最后一条指令是 RETURN，跳过（返回时会自动关闭）
         if self.builder.has_instructions() && self.builder.last_opcode() == Some(OpCode::RETURN) {
-            return;
+            return None;
         }
 
-        self.emit_close(level);
+        Some(self.emit_close(level))
     }
 
     /// 发射 CLOSE 指令
-    fn emit_close(&mut self, level: i32) {
+    fn emit_close(&mut self, level: i32) -> i32 {
         self.flush_pending_jumps();
         self.builder
-            .emit_abc(self.current_line, OpCode::CLOSE, level, 0, 0);
+            .emit_abc(self.current_line, OpCode::CLOSE, level, 0, 0)
     }
 
     /// 活动局部变量数量
@@ -153,9 +155,23 @@ impl CodeGenerator {
     /// 解析 upvalue（跨函数查找）
     ///
     /// C++ 对应: `ScopeManager::resolveUpvalue()`
-    pub fn resolve_upvalue(&mut self, _name: &str) -> i32 {
-        // 当前没有父函数上下文时返回 -1
-        // TODO: parent codegen context (needed for nested functions)
+    pub fn resolve_upvalue(&mut self, name: &str) -> i32 {
+        if self.parent_functions.is_empty() {
+            return -1;
+        }
+
+        let parent_idx = self.parent_functions.len() - 1;
+        if let Some(local) = find_context_local(&self.parent_functions[parent_idx], name) {
+            mark_context_local_captured(&mut self.parent_functions[parent_idx], local);
+            return self.add_upvalue(name, true, local);
+        }
+
+        if let Some(parent_upvalue) =
+            resolve_context_upvalue(&mut self.parent_functions, parent_idx, name)
+        {
+            return self.add_upvalue(name, false, parent_upvalue);
+        }
+
         -1
     }
 
@@ -183,9 +199,9 @@ impl CodeGenerator {
     /// C++ 对应: `ScopeManager::leaveBlock()`
     pub fn leave_block(&mut self) {
         let block = self.blocks.pop().expect("No block to leave");
-        self.remove_local_vars(block.active_var_count);
+        let close_pc = self.remove_local_vars(block.active_var_count);
         let label = self.get_label();
-        self.patch_list_vec(&block.breaklist, label);
+        self.patch_list_vec(&block.breaklist, close_pc.unwrap_or(label));
     }
 
     /// 当前代码块
@@ -200,7 +216,7 @@ impl CodeGenerator {
 
     /// 向代码块的 breaklist 追加跳转
     pub fn append_break_jump(&mut self, jump_pc: i32) {
-        if let Some(block) = self.blocks.last_mut() {
+        if let Some(block) = self.blocks.iter_mut().rev().find(|b| b.is_breakable) {
             let mut combined = PatchList::new();
             combined.append_list(&block.breaklist);
             combined.append(jump_pc);
@@ -218,8 +234,76 @@ impl CodeGenerator {
             } else {
                 self.builder.instruction_count() as i32
             };
+            // SAFETY: self.gc is set by CodeGenerator::new and lives for this codegen pass.
+            let gc = unsafe { &mut *self.gc };
+            let name = gc.create(GcString::new(&var.name));
             self.builder
-                .add_local_debug(None, var.startpc, endpc, var.reg);
+                .add_local_debug(Some(name), var.startpc, endpc, var.reg);
         }
     }
+}
+
+fn find_context_local(
+    ctx: &crate::codegen::types::ParentFunctionContext,
+    name: &str,
+) -> Option<i32> {
+    ctx.local_vars
+        .iter()
+        .rev()
+        .find(|var| var.name == name && var.endpc == -1)
+        .map(|var| var.reg)
+}
+
+fn mark_context_local_captured(ctx: &mut crate::codegen::types::ParentFunctionContext, reg: i32) {
+    if let Some(var) = ctx
+        .local_vars
+        .iter_mut()
+        .rev()
+        .find(|var| var.reg == reg && var.endpc == -1)
+    {
+        var.captured = true;
+    }
+}
+
+fn context_add_upvalue(
+    ctx: &mut crate::codegen::types::ParentFunctionContext,
+    name: &str,
+    in_stack: bool,
+    index: i32,
+) -> i32 {
+    if let Some(pos) = ctx.upvalues.iter().position(|uv| uv.name == name) {
+        return pos as i32;
+    }
+    ctx.upvalues
+        .push(UpvalueCapture::new(name, in_stack, index));
+    (ctx.upvalues.len() - 1) as i32
+}
+
+fn resolve_context_upvalue(
+    contexts: &mut [crate::codegen::types::ParentFunctionContext],
+    current_idx: usize,
+    name: &str,
+) -> Option<i32> {
+    if current_idx == 0 {
+        return None;
+    }
+
+    let parent_idx = current_idx - 1;
+    if let Some(local) = find_context_local(&contexts[parent_idx], name) {
+        mark_context_local_captured(&mut contexts[parent_idx], local);
+        return Some(context_add_upvalue(
+            &mut contexts[current_idx],
+            name,
+            true,
+            local,
+        ));
+    }
+
+    let parent_upvalue = resolve_context_upvalue(contexts, parent_idx, name)?;
+    Some(context_add_upvalue(
+        &mut contexts[current_idx],
+        name,
+        false,
+        parent_upvalue,
+    ))
 }

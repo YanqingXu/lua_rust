@@ -27,14 +27,15 @@
 
 pub mod base;
 pub mod catalog;
+pub mod coroutine;
+pub mod debug;
+pub mod dump;
+pub mod io;
 pub mod math;
+pub mod os;
+pub mod package;
 pub mod string;
 pub mod table;
-// pub mod io;
-// pub mod os;
-// pub mod coroutine;
-// pub mod debug;
-// pub mod package;
 // pub mod test;
 
 pub use catalog::{LibEntry, LibOpenFn, get_catalog, open_all};

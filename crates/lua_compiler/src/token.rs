@@ -264,11 +264,16 @@ impl Token {
 
     /// 创建错误 Token
     pub fn new_error(message: String, line: i32, column: i32) -> Self {
+        Self::new_error_with_lexeme(message, String::new(), line, column)
+    }
+
+    /// 创建带源词素的错误 Token
+    pub fn new_error_with_lexeme(message: String, lexeme: String, line: i32, column: i32) -> Self {
         let msg = message.clone();
         Self {
             token_type: TokenType::Error,
             value: TokenValue::None,
-            lexeme: String::new(),
+            lexeme,
             error_message: msg,
             line,
             column,

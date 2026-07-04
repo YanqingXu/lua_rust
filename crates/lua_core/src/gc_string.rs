@@ -54,7 +54,7 @@ impl GcString {
         Self {
             header: GcObjectHeader::new(GcObjectType::String),
             hash,
-            length: s.len(),
+            length: lua_byte_len(s),
             data: s.to_string(),
         }
     }
@@ -137,6 +137,18 @@ impl GcString {
 
         h
     }
+}
+
+fn lua_byte_len(s: &str) -> usize {
+    s.chars()
+        .map(|ch| {
+            if (ch as u32) <= 0xff {
+                1
+            } else {
+                ch.len_utf8()
+            }
+        })
+        .sum()
 }
 
 // =====================================================================

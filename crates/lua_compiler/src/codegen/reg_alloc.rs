@@ -13,11 +13,16 @@
 pub struct RegisterAllocator {
     // 下一个空闲寄存器
     freereg: i32,
+    // 本函数编译期间触达过的最高寄存器边界
+    max_used: i32,
 }
 
 impl RegisterAllocator {
     pub fn new(start: i32) -> Self {
-        Self { freereg: start }
+        Self {
+            freereg: start,
+            max_used: start,
+        }
     }
 
     /// 当前下一个空闲寄存器
@@ -25,10 +30,16 @@ impl RegisterAllocator {
         self.freereg
     }
 
+    /// 编译过程中达到过的最大寄存器边界。
+    pub fn max_used(&self) -> i32 {
+        self.max_used
+    }
+
     /// 分配一个新寄存器
     pub fn alloc(&mut self) -> i32 {
         let reg = self.freereg;
         self.freereg += 1;
+        self.update_max();
         reg
     }
 
@@ -36,6 +47,7 @@ impl RegisterAllocator {
     pub fn alloc_n(&mut self, n: i32) -> i32 {
         let reg = self.freereg;
         self.freereg += n;
+        self.update_max();
         reg
     }
 
@@ -66,6 +78,7 @@ impl RegisterAllocator {
     /// 将下一个空闲寄存器设置到指定位置
     pub fn set_freereg(&mut self, reg: i32) {
         self.freereg = reg;
+        self.update_max();
     }
 
     /// 将下一个空闲寄存器重置到当前活动局部变量之后
@@ -81,18 +94,27 @@ impl RegisterAllocator {
     /// 保留连续寄存器，不立即更新 maxStackSize
     pub fn reserve(&mut self, count: i32) {
         self.freereg += count;
+        self.update_max();
     }
 
     /// 确保下一个空闲寄存器至少位于指定位置
     pub fn ensure_at_least(&mut self, reg: i32) {
         if self.freereg < reg {
             self.freereg = reg;
+            self.update_max();
         }
     }
 
     /// 重置到初始状态（用于子函数编译）
     pub fn reset(&mut self, start: i32) {
         self.freereg = start;
+        self.max_used = start;
+    }
+
+    fn update_max(&mut self) {
+        if self.freereg > self.max_used {
+            self.max_used = self.freereg;
+        }
     }
 }
 

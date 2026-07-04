@@ -136,6 +136,12 @@ impl Upvalue {
         self.stack_index
     }
 
+    /// 获取 Open upvalue 所属栈的不透明指针。
+    #[inline]
+    pub fn owner_stack(&self) -> *mut std::ffi::c_void {
+        self.owner_stack
+    }
+
     // ── 状态转换 ────────────────────────────────────────────────
 
     /// 关闭 Upvalue（从 Open 转换为 Closed）

@@ -440,6 +440,21 @@ impl UpvalueCapture {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ParentFunctionContext {
+    pub local_vars: Vec<LocalVar>,
+    pub upvalues: Vec<UpvalueCapture>,
+}
+
+impl ParentFunctionContext {
+    pub fn new(local_vars: Vec<LocalVar>, upvalues: Vec<UpvalueCapture>) -> Self {
+        Self {
+            local_vars,
+            upvalues,
+        }
+    }
+}
+
 // =====================================================================
 // LocalVar — 局部变量信息
 // =====================================================================

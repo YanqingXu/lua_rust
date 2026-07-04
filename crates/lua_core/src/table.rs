@@ -52,6 +52,11 @@ pub struct Table {
 
     /// 哈希部分：存储其他类型的键或非连续的整数键
     hash: HashMap<Value, Value>,
+    /// 哈希键的稳定迭代顺序。删除会留下 nil 墓碑，避免 `next`
+    /// 在遍历期间删除当前键时退化或失去位置。
+    hash_order: Vec<Value>,
+    /// 哈希键到 `hash_order` 位置的索引。
+    hash_positions: HashMap<Value, usize>,
 
     /// 元表指针（None 表示无元表）
     metatable: Option<GcRef<Table>>,
@@ -70,6 +75,8 @@ impl Table {
             header: GcObjectHeader::new(GcObjectType::Table),
             array: Vec::new(),
             hash: HashMap::new(),
+            hash_order: Vec::new(),
+            hash_positions: HashMap::new(),
             metatable: None,
             flags: 0,
         }
@@ -84,6 +91,8 @@ impl Table {
             header: GcObjectHeader::new(GcObjectType::Table),
             array: Vec::with_capacity(array_capacity),
             hash: HashMap::with_capacity(hash_capacity),
+            hash_order: Vec::with_capacity(hash_capacity),
+            hash_positions: HashMap::with_capacity(hash_capacity),
             metatable: None,
             flags: 0,
         }
@@ -107,7 +116,6 @@ impl Table {
             return self.get_array(index);
         }
 
-        // 从哈希部分查找
         self.hash.get(key).cloned().unwrap_or(Value::Nil)
     }
 
@@ -151,8 +159,15 @@ impl Table {
         // TODO Phase 1.3: 写屏障 — gc->writeBarrier(this, key) / gc->writeBarrier(this, value)
         // 当前 Phase 1.2 GC 骨架尚未实现 writeBarrier，后续阶段补全。
 
-        // 存储到哈希部分
-        self.hash.insert(key.clone(), value.clone());
+        // 存储到哈希部分。Value 的 Eq/Hash 已按字符串内容处理，因此即使
+        // 调用方没有使用同一个 StringPool 驻留，同内容字符串也会命中同一键。
+        let hash_key = key.clone();
+        if !self.hash.contains_key(&hash_key) {
+            self.hash_positions
+                .insert(hash_key.clone(), self.hash_order.len());
+            self.hash_order.push(hash_key.clone());
+        }
+        self.hash.insert(hash_key, value.clone());
     }
 
     /// 检查键是否存在且值不为 nil
@@ -167,7 +182,6 @@ impl Table {
             return false;
         }
 
-        // 检查哈希部分
         self.hash.get(key).is_some_and(|v| !v.is_nil())
     }
 
@@ -187,8 +201,17 @@ impl Table {
             return;
         }
 
-        // 从哈希部分删除
-        self.hash.remove(key);
+        let removed_key = self
+            .hash
+            .remove_entry(key)
+            .map(|(removed_key, _)| removed_key);
+
+        if let Some(removed_key) = removed_key
+            && let Some(pos) = self.hash_positions.remove(&removed_key)
+            && let Some(slot) = self.hash_order.get_mut(pos)
+        {
+            *slot = Value::Nil;
+        }
     }
 
     /// 清空表内容和元表引用
@@ -200,6 +223,8 @@ impl Table {
     pub fn clear(&mut self) {
         self.array.clear();
         self.hash.clear();
+        self.hash_order.clear();
+        self.hash_positions.clear();
         self.metatable = None;
         self.flags = 0;
     }
@@ -366,13 +391,9 @@ impl Table {
             }
 
             // 数组部分为空或全是 nil，检查哈希部分
-            if !self.hash.is_empty() {
-                let (k, v) = self.hash.iter().next().unwrap();
-                return Some((k.clone(), v.clone()));
-            }
+            return self.next_hash_from(0);
 
             // 表为空
-            return None;
         }
 
         // 查找当前键的位置
@@ -388,41 +409,30 @@ impl Table {
             }
 
             // 数组部分遍历完毕，转到哈希部分
-            if !self.hash.is_empty() {
-                let (k, v) = self.hash.iter().next().unwrap();
-                return Some((k.clone(), v.clone()));
-            }
-
-            return None;
+            return self.next_hash_from(0);
         }
 
         // 当前键在哈希部分
         // Lua 5.1 允许遍历过程中删除当前键，此时从任意剩余哈希条目继续
         if !self.hash.contains_key(key) {
-            if !self.hash.is_empty() {
-                let (k, v) = self.hash.iter().next().unwrap();
-                return Some((k.clone(), v.clone()));
-            }
-            return None;
+            return self.next_hash_from(0);
         }
 
-        // 需要在当前键之后查找。HashMap 没有顺序，因此使用特殊的迭代策略：
-        // 先收集所有键，找到当前键的位置，返回下一个。
-        // 注意：这比 C++ 低效，但保持语义正确。
-        // TODO Phase 1.4+: 考虑使用 IndexMap 或其他有序哈希容器优化迭代性能
-        let keys: Vec<&Value> = self.hash.keys().collect();
-        for (i, k) in keys.iter().enumerate() {
-            if *k == key {
-                if i + 1 < keys.len() {
-                    let next_key = keys[i + 1];
-                    let next_value = &self.hash[next_key];
-                    return Some(((*next_key).clone(), next_value.clone()));
-                }
-                break;
+        let next_pos = self.hash_positions.get(key).map(|pos| pos + 1).unwrap_or(0);
+        self.next_hash_from(next_pos)
+    }
+
+    fn next_hash_from(&self, start: usize) -> Option<(Value, Value)> {
+        for key in self.hash_order.iter().skip(start) {
+            if key.is_nil() {
+                continue;
+            }
+            if let Some(value) = self.hash.get(key)
+                && !value.is_nil()
+            {
+                return Some((key.clone(), value.clone()));
             }
         }
-
-        // 哈希部分遍历完毕
         None
     }
 
@@ -599,6 +609,9 @@ unsafe impl GcObject for Table {
         // 哈希部分的容量（估算）
         // HashMap 的内存布局比较复杂，使用简化的估算
         size += self.hash.len() * (std::mem::size_of::<Value>() * 2 + std::mem::size_of::<usize>());
+        size += self.hash_order.capacity() * std::mem::size_of::<Value>();
+        size += self.hash_positions.len()
+            * (std::mem::size_of::<Value>() + std::mem::size_of::<usize>());
 
         size
     }
@@ -824,6 +837,29 @@ mod tests {
 
         assert_eq!(table.get(&Value::String(s1)), Value::Number(1.0));
         assert_eq!(table.get(&Value::String(s2)), Value::Number(2.0));
+    }
+
+    #[test]
+    fn test_hash_string_key_matches_by_content_without_interning() {
+        let mut gc = GarbageCollector::new();
+        let mut table = Table::new();
+
+        let s1 = create_test_string(&mut gc, "same");
+        let s2 = create_test_string(&mut gc, "same");
+
+        assert_ne!(s1, s2);
+
+        table.set(&Value::String(s1), &Value::Number(1.0));
+        table.set(&Value::String(s2), &Value::Number(2.0));
+
+        assert_eq!(table.hash_size(), 1);
+        assert_eq!(table.get(&Value::String(s1)), Value::Number(2.0));
+        assert_eq!(table.get(&Value::String(s2)), Value::Number(2.0));
+        assert!(table.has(&Value::String(s2)));
+
+        table.remove(&Value::String(s2));
+        assert_eq!(table.get(&Value::String(s1)), Value::Nil);
+        assert_eq!(table.hash_size(), 0);
     }
 
     #[test]

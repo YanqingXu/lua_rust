@@ -222,6 +222,11 @@ impl BytecodeBuilder {
         self.proto.set_vararg(flag);
     }
 
+    /// 设置 Lua 5.1 可变参数标志位
+    pub fn set_vararg_flags(&mut self, flags: u8) {
+        self.proto.set_vararg_flags(flags);
+    }
+
     /// 获取最大栈大小
     pub fn max_stack_size(&self) -> u8 {
         self.proto.max_stack_size()

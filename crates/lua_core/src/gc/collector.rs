@@ -10,8 +10,10 @@
 use crate::gc::gc_object::GcObject;
 use crate::gc::gc_ref::GcRef;
 use crate::gc::header::GcObjectHeader;
+use crate::gc::header::bits;
 use crate::gc::strategy::{GcStrategy, MarkSweepGc};
 use crate::string_pool::StringPool;
+use crate::table::Table;
 use crate::types::GcColor;
 
 /// 垃圾回收器
@@ -30,6 +32,11 @@ pub struct GarbageCollector {
 
     /// 本轮标记中发现的弱表
     pub(crate) weak_tables: Vec<*mut GcObjectHeader>,
+
+    /// 当前进程生命周期内是否创建/标记过弱表。
+    ///
+    /// 自动弱表清理会用它避免在没有弱表的程序中频繁全堆扫描。
+    pub(crate) weak_table_seen: bool,
 
     /// 等待执行 `__gc` 终结器的 userdata（Phase 1.4+ 启用）
     pub(crate) pending_finalizers: Vec<*mut GcObjectHeader>,
@@ -60,6 +67,7 @@ impl GarbageCollector {
             roots: Vec::new(),
             gray_list: Vec::new(),
             weak_tables: Vec::new(),
+            weak_table_seen: false,
             pending_finalizers: Vec::new(),
             external_marked: Vec::new(),
             finalizers_running: false,
@@ -167,6 +175,7 @@ impl GarbageCollector {
         self.roots.clear();
         self.gray_list.clear();
         self.weak_tables.clear();
+        self.weak_table_seen = false;
         self.pending_finalizers.clear();
         self.external_marked.clear();
 
@@ -272,6 +281,46 @@ impl GarbageCollector {
         }
     }
 
+    /// Register a table for weak-entry cleanup without running a full GC cycle.
+    pub fn register_weak_table(&mut self, table: GcRef<Table>, weak_keys: bool, weak_values: bool) {
+        if !weak_keys && !weak_values {
+            return;
+        }
+        self.weak_table_seen = true;
+
+        let ptr = table.as_ptr() as *mut GcObjectHeader;
+        if ptr.is_null() {
+            return;
+        }
+
+        // SAFETY: ptr comes from a live table GcRef.
+        unsafe {
+            let mut marked = (*ptr).marked() & !bits::WEAKBITS;
+            if weak_keys {
+                marked |= bits::WEAKKEY;
+            }
+            if weak_values {
+                marked |= bits::WEAKVALUE;
+            }
+            (*ptr).set_marked(marked);
+        }
+
+        if !self.weak_tables.contains(&ptr) {
+            self.weak_tables.push(ptr);
+        }
+    }
+
+    /// Clear entries from tables explicitly registered as weak tables.
+    pub fn clear_registered_weak_tables(&mut self) {
+        self.clear_weak_table_entries();
+        self.weak_tables.clear();
+    }
+
+    /// Whether weak table maintenance has ever become necessary.
+    pub fn has_seen_weak_table(&self) -> bool {
+        self.weak_table_seen
+    }
+
     /// 检查对象是否会在当前 sweep 中被回收
     ///
     /// C++ 对应: `GarbageCollector::isObjectDead(GCObject* obj)`
@@ -322,6 +371,12 @@ impl GarbageCollector {
             crate::value::Value::Userdata(u) => {
                 let ptr = u.as_ptr() as *mut GcObjectHeader;
                 if self.pending_finalizers.contains(&ptr) {
+                    return true;
+                }
+                // Once a userdata finalizer has run, weak-value slots should be
+                // cleared on the next GC cycle even though this compatibility
+                // collector does not immediately sweep the userdata object.
+                if unsafe { (*ptr).is_finalized() } {
                     return true;
                 }
                 self.is_value_dead(value)

@@ -36,7 +36,7 @@ fn main() {
 }
 
 fn dump_file(filename: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let source = fs::read_to_string(filename)?;
+    let source = read_lua_source_file(filename)?;
 
     // Parse
     let mut parser = Parser::new(&source);
@@ -53,6 +53,15 @@ fn dump_file(filename: &str, format: &str) -> Result<(), Box<dyn std::error::Err
     }
 
     Ok(())
+}
+
+fn read_lua_source_file(filename: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let bytes = fs::read(filename)?;
+    Ok(lua_source_from_bytes(&bytes))
+}
+
+fn lua_source_from_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| char::from(*byte)).collect()
 }
 
 fn dump_text(proto: &lua_core::proto::Proto, filename: &str, source: &str) {

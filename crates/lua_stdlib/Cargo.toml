@@ -9,7 +9,10 @@ description = "Lua 5.1 standard libraries: base, math, string, table, io, os, co
 [dependencies]
 thiserror.workspace = true
 lua_core = { path = "../lua_core" }
+lua_compiler = { path = "../lua_compiler" }
 lua_vm   = { path = "../lua_vm" }
+
+[dev-dependencies]
 
 [lints]
 workspace = true

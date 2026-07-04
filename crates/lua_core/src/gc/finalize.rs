@@ -9,6 +9,12 @@
 //! C++ 参考: `lua_cpp/src/gc/gc_finalize.cpp`
 
 use crate::gc::collector::GarbageCollector;
+use crate::gc::gc_ref::GcRef;
+use crate::gc_string::GcString;
+use crate::table::Table;
+use crate::types::GcObjectType;
+use crate::userdata::Userdata;
+use crate::value::Value;
 
 impl GarbageCollector {
     /// 准备终结器：将带 `__gc` 的不可达 userdata 复活并加入待终结队列
@@ -25,6 +31,47 @@ impl GarbageCollector {
         // 如果有：标记 FINALIZED，加入 pendingFinalizers_，调用 markObject 复活
         //
         // 当前骨架：无操作（Userdata 未实现）
+    }
+
+    /// Return unreachable userdata that have a `__gc` metamethod.
+    ///
+    /// This is a VM-facing compatibility hook used before weak-table cleanup.
+    /// It marks selected userdata as finalized and keeps their pointers in
+    /// `pending_finalizers` so weak values can be cleared before `__gc` runs.
+    pub fn prepare_finalizable_userdata(&mut self) -> Vec<GcRef<Userdata>> {
+        let mut pending = Vec::new();
+        let mut current = self.all_objects;
+
+        while !current.is_null() {
+            // SAFETY: current walks the GC intrusive object list.
+            let next = unsafe { (*current).next() };
+            let should_finalize = unsafe {
+                (*current).gc_type() == GcObjectType::Userdata
+                    && (*current).is_white()
+                    && !(*current).is_finalized()
+                    && userdata_has_gc(current as *const Userdata)
+            };
+
+            if should_finalize {
+                // SAFETY: current is a valid userdata object from the GC list.
+                unsafe {
+                    (*current).mark_finalized();
+                    self.mark_object(current);
+                    pending.push(GcRef::from_ptr(current as *const Userdata));
+                }
+                if !self.pending_finalizers.contains(&current) {
+                    self.pending_finalizers.push(current);
+                }
+            }
+
+            current = next;
+        }
+
+        pending
+    }
+
+    pub fn clear_pending_finalizers(&mut self) {
+        self.pending_finalizers.clear();
     }
 
     /// 运行待终结队列中的终结器
@@ -44,4 +91,27 @@ impl GarbageCollector {
         //
         // 当前骨架：无操作
     }
+}
+
+unsafe fn userdata_has_gc(userdata_ptr: *const Userdata) -> bool {
+    // SAFETY: caller provides a valid userdata pointer from the GC object list.
+    let Some(metatable) = (unsafe { (*userdata_ptr).metatable() }) else {
+        return false;
+    };
+    metatable_has_field(metatable, "__gc")
+}
+
+fn metatable_has_field(metatable: GcRef<Table>, name: &str) -> bool {
+    let Some(table) = (unsafe { metatable.as_ref() }) else {
+        return false;
+    };
+    table.hash_entries().any(|(key, value)| {
+        !value.is_nil()
+            && matches!(
+                key,
+                Value::String(key_ref)
+                    if unsafe { key_ref.as_ref() }
+                        .is_some_and(|key_string: &GcString| key_string.data() == name)
+            )
+    })
 }

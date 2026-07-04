@@ -4,6 +4,9 @@
 //!
 //! C++ 参考: `lua_cpp/src/vm/state/call_info.hpp`
 
+use lua_core::proto::Proto;
+use lua_core::value::Value;
+
 /// 常量：接受所有返回值
 pub const LUA_MULTRET: i32 = -1;
 
@@ -22,8 +25,14 @@ pub struct CallInfo {
     pub top: usize,
     /// 保存的程序计数器（Lua 函数指向当前指令，C 函数为 None）
     pub savedpc: Option<usize>,
+    /// 当前 Lua 调用帧对应的函数原型。
+    pub proto: Option<*const Proto>,
     /// 期望返回值数量（-1 = LUA_MULTRET）
     pub nresults: i32,
+    /// 实际传入参数数量
+    pub nargs: i32,
+    /// 可变参数快照（不受局部变量覆盖实参槽影响）
+    pub varargs: Vec<Value>,
     /// 尾调用计数
     pub tailcalls: i32,
 }
@@ -35,7 +44,10 @@ impl CallInfo {
             base: 0,
             top: 0,
             savedpc: None,
+            proto: None,
             nresults: 0,
+            nargs: 0,
+            varargs: Vec::new(),
             tailcalls: 0,
         }
     }
@@ -47,7 +59,10 @@ impl CallInfo {
             base,
             top,
             savedpc: None,
+            proto: None,
             nresults: 0,
+            nargs: 0,
+            varargs: Vec::new(),
             tailcalls: 0,
         }
     }
@@ -57,7 +72,10 @@ impl CallInfo {
         self.base = 0;
         self.top = 0;
         self.savedpc = None;
+        self.proto = None;
         self.nresults = 0;
+        self.nargs = 0;
+        self.varargs.clear();
         self.tailcalls = 0;
     }
 }

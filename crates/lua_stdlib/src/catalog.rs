@@ -41,6 +41,16 @@ pub fn get_catalog() -> &'static [LibEntry] {
             open: crate::math::open_math,
         },
         LibEntry {
+            id: "io",
+            name: "io",
+            open: crate::io::open_io,
+        },
+        LibEntry {
+            id: "os",
+            name: "os",
+            open: crate::os::open_os,
+        },
+        LibEntry {
             id: "string",
             name: "string",
             open: crate::string::open_string,
@@ -49,6 +59,21 @@ pub fn get_catalog() -> &'static [LibEntry] {
             id: "table",
             name: "table",
             open: crate::table::open_table,
+        },
+        LibEntry {
+            id: "coroutine",
+            name: "coroutine",
+            open: crate::coroutine::open_coroutine,
+        },
+        LibEntry {
+            id: "debug",
+            name: "debug",
+            open: crate::debug::open_debug,
+        },
+        LibEntry {
+            id: "package",
+            name: "package",
+            open: crate::package::open_package,
         },
     ]
 }

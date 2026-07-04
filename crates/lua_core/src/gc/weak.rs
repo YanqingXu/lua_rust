@@ -23,16 +23,25 @@ impl GarbageCollector {
     ///
     /// C++ 对应: `GarbageCollector::clearWeakTableEntries()`
     pub fn clear_weak_table_entries(&mut self) {
-        // 克隆列表以避免在清理期间修改时出现借用冲突
-        let weak_tables: Vec<*mut GcObjectHeader> = self.weak_tables.clone();
+        // 克隆列表以避免在清理期间修改时出现借用冲突。兼容路径可能在
+        // 多次轻量 collect 后清空注册列表，所以同时从对象链补扫弱表位。
+        let mut weak_tables: Vec<*mut GcObjectHeader> = self.weak_tables.clone();
+        let mut current = self.all_objects;
+        while !current.is_null() {
+            // SAFETY: current walks the GC intrusive object list.
+            unsafe {
+                if (*current).gc_type() == crate::types::GcObjectType::Table
+                    && ((*current).marked() & bits::WEAKBITS) != 0
+                    && !weak_tables.contains(&current)
+                {
+                    weak_tables.push(current);
+                }
+                current = (*current).next();
+            }
+        }
 
         for &table_header in &weak_tables {
             if table_header.is_null() {
-                continue;
-            }
-
-            // 如果弱表本身已死，跳过
-            if self.is_object_dead(table_header) {
                 continue;
             }
 
@@ -75,7 +84,26 @@ impl GarbageCollector {
         while let Some((k, v)) = table.next(&key) {
             let mut should_remove = false;
 
-            if weak_keys && gc.is_value_dead(&k) {
+            let key_kept_alive_by_strong_value = weak_keys && !weak_values && k == v;
+            let key_pending_finalizer = matches!(
+                &k,
+                Value::Userdata(userdata)
+                    if gc
+                        .pending_finalizers
+                        .contains(&(userdata.as_ptr() as *mut GcObjectHeader))
+            );
+            let key_finalized_userdata = matches!(
+                &k,
+                Value::Userdata(userdata)
+                    if unsafe {
+                        (*(userdata.as_ptr() as *mut GcObjectHeader)).is_finalized()
+                    } && !key_pending_finalizer
+            );
+            if weak_keys
+                && (gc.is_value_dead(&k) || key_finalized_userdata)
+                && !key_kept_alive_by_strong_value
+                && !key_pending_finalizer
+            {
                 should_remove = true;
             }
             if weak_values && gc.is_weak_value_dead(&v) {

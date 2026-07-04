@@ -3,6 +3,7 @@
 //! 验证 Rust `Value` 实现与 C++ `Value` 类的行为等价性。
 //! C++ 参考测试: `lua_cpp/tests/unit/core/test_value.cpp`
 
+use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
 use lua_core::types::{Function, Table, Thread, Userdata, ValueType};
@@ -195,11 +196,15 @@ fn test_value_equality_different_type() {
 }
 
 #[test]
-fn test_value_equality_gc_pointer_identity() {
-    let p1 = unsafe { GcRef::<GcString>::from_ptr(0x1000 as *const _) };
-    let p2 = unsafe { GcRef::<GcString>::from_ptr(0x2000 as *const _) };
-    assert_eq!(Value::String(p1), Value::String(p1));
-    assert_ne!(Value::String(p1), Value::String(p2));
+fn test_value_equality_string_content() {
+    let mut gc = GarbageCollector::new();
+    let p1 = gc.create(GcString::new("same"));
+    let p2 = gc.create(GcString::new("same"));
+    let p3 = gc.create(GcString::new("different"));
+
+    assert_ne!(p1, p2);
+    assert_eq!(Value::String(p1), Value::String(p2));
+    assert_ne!(Value::String(p1), Value::String(p3));
 }
 
 #[test]

@@ -32,12 +32,8 @@ impl CodeGenerator {
         // 3. Fallback: 全局变量
         // SAFETY: self.gc is set during CodeGenerator::new() from a valid &mut
         // GarbageCollector reference that outlives the compilation process.
-        let gc: &mut lua_core::gc::collector::GarbageCollector =
-            unsafe { &mut *self.gc };
-        let const_idx = self
-            .builder
-            .add_string_constant(gc, name)
-            .unwrap_or(-1);
+        let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
+        let const_idx = self.builder.add_string_constant(gc, name).unwrap_or(-1);
         SymbolRef::new(SymbolKind::Global, const_idx, name)
     }
 

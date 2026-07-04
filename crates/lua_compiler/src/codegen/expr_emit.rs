@@ -14,7 +14,7 @@ use crate::codegen::types::{
     AccessKind, CallResultInfo, CallResultKind, CondResult, ImmediateKind, LValueKind, LValueRef,
     NO_JUMP, PatchList, ValueResult,
 };
-use crate::opcode::{self, MAXINDEXRK, OpCode};
+use crate::opcode::{self, LFIELDS_PER_FLUSH, MAXARG_C, MAXINDEXRK, OpCode};
 
 use crate::opcode::rk_ask;
 
@@ -33,8 +33,7 @@ impl CodeGenerator {
             Expr::Number(n) => ValueResult::make_number(n.value),
             Expr::String(s) => {
                 // SAFETY: self.gc is a valid pointer set during CodeGenerator::new()
-                let gc: &mut lua_core::gc::collector::GarbageCollector =
-                    unsafe { &mut *self.gc };
+                let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
                 let k = self
                     .builder
                     .add_string_constant(gc, &s.value)
@@ -398,7 +397,8 @@ impl CodeGenerator {
         if op == BinaryOp::And || op == BinaryOp::Or {
             let left = self.emit_value(&e.left);
             let left = self.force_single_value(left);
-            let result_reg = self.value_to_any_reg(left);
+            let result_reg = self.reg_alloc.alloc();
+            self.materialize_value(left, result_reg);
             let test_cond = if op == BinaryOp::And { 0 } else { 1 };
             self.code_abc(OpCode::TEST, result_reg, 0, test_cond, self.current_line);
             let skip_right = self.code_as_bx(OpCode::JMP, 0, NO_JUMP, self.current_line);
@@ -484,8 +484,9 @@ impl CodeGenerator {
             self.free_reg(rk_left);
         }
 
-        let pc = self.code_abc(arith_op, 0, rk_left, rk_right, self.current_line);
-        ValueResult::make_relocatable(pc)
+        let result_reg = self.reg_alloc.alloc();
+        self.code_abc(arith_op, result_reg, rk_left, rk_right, self.current_line);
+        ValueResult::make_register(result_reg, true, AccessKind::None)
     }
 
     /// 常量算术折叠
@@ -556,14 +557,100 @@ impl CodeGenerator {
     // 表构造器
     // ═══════════════════════════════════════════════════════════════
 
-    fn emit_value_table(&mut self, _table: &TableExpr) -> ValueResult {
+    fn emit_value_table(&mut self, table: &TableExpr) -> ValueResult {
         let pc = self.code_abc(OpCode::NEWTABLE, 0, 0, 0, self.current_line);
         let table_reg = self.reg_alloc.alloc();
         let mut inst = self.builder.instruction(pc).unwrap();
         opcode::set_arg_a(&mut inst, table_reg);
         self.builder.replace_instruction(pc, inst);
-        // TODO: full table field emission (SETTABLE, SETLIST)
+
+        let mut array_count = 0;
+        let mut hash_count = 0;
+        let mut pending_array = 0;
+
+        for (field_index, field) in table.fields.iter().enumerate() {
+            if let Some(key_expr) = &field.key {
+                let saved_freereg = table_reg + pending_array + 1;
+
+                let key = self.emit_value(key_expr);
+                let rk_key = self.value_to_rk(key);
+                let value = self.emit_value(&field.value);
+                let value = self.force_single_value(value);
+                let rk_value = self.value_to_rk(value);
+                self.code_abc(
+                    OpCode::SETTABLE,
+                    table_reg,
+                    rk_key,
+                    rk_value,
+                    self.current_line,
+                );
+
+                self.reg_alloc.set_freereg(saved_freereg);
+                hash_count += 1;
+            } else {
+                array_count += 1;
+                pending_array += 1;
+
+                let target_reg = table_reg + pending_array;
+                self.reg_alloc.ensure_at_least(target_reg + 1);
+
+                let is_last_field = field_index + 1 == table.fields.len();
+                if is_last_field && let Expr::Call(call) = field.value.as_ref() {
+                    let mut info = self.emit_call_expr(call, target_reg);
+                    self.set_open_multi_ret(&mut info);
+                    let block = (array_count - 1) / LFIELDS_PER_FLUSH + 1;
+                    self.emit_setlist(table_reg, 0, block);
+                    self.reg_alloc.set_freereg(table_reg + 1);
+                    pending_array = 0;
+                    continue;
+                }
+
+                if is_last_field && matches!(field.value.as_ref(), Expr::Vararg(_)) {
+                    let mut info = self.emit_vararg_expr();
+                    self.set_multi_ret_base(&mut info, target_reg);
+                    self.set_open_multi_ret(&mut info);
+                    let block = (array_count - 1) / LFIELDS_PER_FLUSH + 1;
+                    self.emit_setlist(table_reg, 0, block);
+                    self.reg_alloc.set_freereg(table_reg + 1);
+                    pending_array = 0;
+                    continue;
+                }
+
+                let value = self.emit_value(&field.value);
+                let value = self.force_single_value(value);
+                self.materialize_value(value, target_reg);
+                self.reg_alloc.ensure_at_least(target_reg + 1);
+
+                if pending_array == LFIELDS_PER_FLUSH {
+                    let block = (array_count - 1) / LFIELDS_PER_FLUSH + 1;
+                    self.emit_setlist(table_reg, pending_array, block);
+                    self.reg_alloc.set_freereg(table_reg + 1);
+                    pending_array = 0;
+                }
+            }
+        }
+
+        if pending_array > 0 {
+            let block = (array_count - 1) / LFIELDS_PER_FLUSH + 1;
+            self.emit_setlist(table_reg, pending_array, block);
+            self.reg_alloc.set_freereg(table_reg + 1);
+        }
+
+        let mut inst = self.builder.instruction(pc).unwrap();
+        opcode::set_arg_b(&mut inst, array_count.min(MAXARG_C));
+        opcode::set_arg_c(&mut inst, hash_count.min(MAXARG_C));
+        self.builder.replace_instruction(pc, inst);
+
         ValueResult::make_register(table_reg, true, AccessKind::None)
+    }
+
+    fn emit_setlist(&mut self, table_reg: i32, count: i32, block: i32) {
+        if block <= MAXARG_C {
+            self.code_abc(OpCode::SETLIST, table_reg, count, block, self.current_line);
+        } else {
+            self.code_abc(OpCode::SETLIST, table_reg, count, 0, self.current_line);
+            self.builder.emit_raw(self.current_line, block as u32);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -582,13 +669,12 @@ impl CodeGenerator {
         let table = self.emit_value(&e.table);
         let table_reg = self.value_to_any_reg(table);
         // SAFETY: self.gc is set during CodeGenerator::new() from a valid &mut GC
-        let gc: &mut lua_core::gc::collector::GarbageCollector =
-            unsafe { &mut *self.gc };
+        let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
         let k = self
             .builder
             .add_string_constant(gc, &e.member)
             .unwrap_or_else(|| self.builder.add_number_constant(0.0));
-        let rk_key = if k <= MAXINDEXRK { rk_ask(k) } else { k };
+        let rk_key = self.value_to_rk(ValueResult::make_constant(k));
         ValueResult::make_pending_load(AccessKind::Indexed, table_reg, -1, rk_key)
     }
 
@@ -596,9 +682,30 @@ impl CodeGenerator {
     // 函数表达式 → CLOSURE
     // ═══════════════════════════════════════════════════════════════
 
-    fn emit_value_function_expr(&mut self, _e: &FunctionExpr) -> ValueResult {
+    fn emit_value_function_expr(&mut self, e: &FunctionExpr) -> ValueResult {
+        let linedefined = e.location.line;
+        let lastlinedefined = if e.end_line > 0 {
+            e.end_line
+        } else {
+            linedefined
+        };
+        let function = self
+            .compile_function(
+                &e.params,
+                e.is_vararg,
+                &e.body,
+                linedefined,
+                lastlinedefined.max(linedefined),
+            )
+            .expect("function expression compilation should succeed");
         let reg = self.reg_alloc.alloc();
-        self.code_abx(OpCode::CLOSURE, reg, 0, self.current_line); // placeholder proto index
+        self.code_abx(
+            OpCode::CLOSURE,
+            reg,
+            function.proto_index,
+            self.current_line,
+        );
+        self.emit_closure_upvalues(&function.upvalues);
         ValueResult::make_register(reg, true, AccessKind::None)
     }
 
@@ -607,28 +714,95 @@ impl CodeGenerator {
     // ═══════════════════════════════════════════════════════════════
 
     pub fn emit_call_expr(&mut self, e: &CallExpr, _target_base: i32) -> CallResultInfo {
-        let func_val = self.emit_value(&e.func);
-        let base = self.value_to_any_reg(func_val);
+        let (base, first_arg_reg, implicit_args) = if e.is_method_call {
+            let Expr::Member(member) = e.func.as_ref() else {
+                panic!("method call must use a member expression as callee");
+            };
+            let obj = self.emit_value(&member.table);
+            let obj_reg = self.value_to_any_reg(obj);
 
-        let first_arg_reg = base + 1;
+            // SAFETY: self.gc is set during CodeGenerator::new() from a valid &mut GC.
+            let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
+            let method_key = self
+                .builder
+                .add_string_constant(gc, &member.member)
+                .unwrap_or_else(|| self.builder.add_number_constant(0.0));
+            let rk_key = if method_key <= MAXINDEXRK {
+                rk_ask(method_key)
+            } else {
+                self.value_to_any_reg(ValueResult::make_constant(method_key))
+            };
+
+            let base = if _target_base >= 0 {
+                _target_base
+            } else {
+                self.reg_alloc.current()
+            };
+            self.reg_alloc.ensure_at_least(base + 2);
+            self.code_abc(OpCode::SELF, base, obj_reg, rk_key, self.current_line);
+            (base, base + 2, 1)
+        } else {
+            let func_val = self.emit_value(&e.func);
+            let base = if _target_base >= 0 {
+                self.materialize_value(func_val, _target_base);
+                self.reg_alloc.ensure_at_least(_target_base + 1);
+                _target_base
+            } else {
+                match &func_val {
+                    ValueResult::RegisterRef {
+                        reg,
+                        owns_register: true,
+                        ..
+                    } if *reg >= self.active_var_count && *reg == self.reg_alloc.current() - 1 => {
+                        *reg
+                    }
+                    _ => {
+                        let base = self.reg_alloc.current();
+                        self.materialize_value(func_val, base);
+                        self.reg_alloc.ensure_at_least(base + 1);
+                        base
+                    }
+                }
+            };
+            (base, base + 1, 0)
+        };
+
+        let saved_free_reg = self.reg_alloc.current();
         self.reg_alloc.set_freereg(first_arg_reg);
         let _ = self
             .reg_alloc
             .check_stack(e.args.len() as i32, self.builder.max_stack_size() as i32);
 
         let nargs = e.args.len() as i32;
+        let mut last_arg_is_multi_ret = false;
         for (i, arg) in e.args.iter().enumerate() {
             let target_reg = first_arg_reg + i as i32;
-            let arg_val = self.emit_value(arg);
-            let arg_val = self.force_single_value(arg_val);
-            self.materialize_value(arg_val, target_reg);
+            let is_last_arg = i + 1 == e.args.len();
+            if is_last_arg && let Expr::Call(call) = arg.as_ref() {
+                let mut info = self.emit_call_expr(call, target_reg);
+                self.set_open_multi_ret(&mut info);
+                last_arg_is_multi_ret = true;
+            } else if is_last_arg && matches!(arg.as_ref(), Expr::Vararg(_)) {
+                let mut info = self.emit_vararg_expr();
+                self.set_multi_ret_base(&mut info, target_reg);
+                self.set_open_multi_ret(&mut info);
+                last_arg_is_multi_ret = true;
+            } else {
+                let arg_val = self.emit_value(arg);
+                let arg_val = self.force_single_value(arg_val);
+                self.materialize_value(arg_val, target_reg);
+            }
             self.reg_alloc.ensure_at_least(target_reg + 1);
         }
 
-        let b_arg = nargs + 1; // B = nargs+1
+        let b_arg = if last_arg_is_multi_ret {
+            0
+        } else {
+            nargs + implicit_args + 1
+        };
         let call_pc = self.code_abc(OpCode::CALL, base, b_arg, 2, self.current_line); // C=2 → 1 return
 
-        self.reg_alloc.set_freereg(base + 1);
+        self.reg_alloc.set_freereg(saved_free_reg.max(base + 1));
 
         CallResultInfo {
             kind: CallResultKind::Call,
@@ -639,13 +813,44 @@ impl CodeGenerator {
     }
 
     /// Vararg 表达式
-    fn emit_vararg_expr(&mut self) -> CallResultInfo {
+    pub fn emit_vararg_expr(&mut self) -> CallResultInfo {
         let pc = self.code_abc(OpCode::VARARG, 0, 1, 0, self.current_line);
         CallResultInfo {
             kind: CallResultKind::Vararg,
             base_reg: -1,
             instruction_pc: pc,
             open_multi_ret: false,
+        }
+    }
+
+    pub fn set_open_multi_ret(&mut self, info: &mut CallResultInfo) {
+        let mut inst = self.builder.instruction(info.instruction_pc).unwrap();
+        match info.kind {
+            CallResultKind::Call => opcode::set_arg_c(&mut inst, 0),
+            CallResultKind::Vararg => opcode::set_arg_b(&mut inst, 0),
+            CallResultKind::None => {}
+        }
+        self.builder.replace_instruction(info.instruction_pc, inst);
+        info.open_multi_ret = true;
+    }
+
+    pub fn set_wanted_results(&mut self, info: &mut CallResultInfo, wanted: i32) {
+        let mut inst = self.builder.instruction(info.instruction_pc).unwrap();
+        match info.kind {
+            CallResultKind::Call => opcode::set_arg_c(&mut inst, wanted + 1),
+            CallResultKind::Vararg => opcode::set_arg_b(&mut inst, wanted + 1),
+            CallResultKind::None => {}
+        }
+        self.builder.replace_instruction(info.instruction_pc, inst);
+        info.open_multi_ret = false;
+    }
+
+    pub fn set_multi_ret_base(&mut self, info: &mut CallResultInfo, base: i32) {
+        if info.kind == CallResultKind::Vararg {
+            let mut inst = self.builder.instruction(info.instruction_pc).unwrap();
+            opcode::set_arg_a(&mut inst, base);
+            self.builder.replace_instruction(info.instruction_pc, inst);
+            info.base_reg = base;
         }
     }
 
@@ -720,13 +925,12 @@ impl CodeGenerator {
                 let table_val = self.emit_value(&m.table);
                 let table_reg = self.value_to_any_reg(table_val);
                 // SAFETY: self.gc is set from a valid &mut GC during CodeGenerator::new()
-                let gc: &mut lua_core::gc::collector::GarbageCollector =
-                    unsafe { &mut *self.gc };
+                let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
                 let k = self
                     .builder
                     .add_string_constant(gc, &m.member)
                     .unwrap_or_else(|| self.builder.add_number_constant(0.0));
-                let rk_key = if k <= MAXINDEXRK { rk_ask(k) } else { k };
+                let rk_key = self.value_to_rk(ValueResult::make_constant(k));
                 let mut result = LValueRef::new();
                 result.kind = LValueKind::Indexed;
                 result.table_reg = table_reg;
