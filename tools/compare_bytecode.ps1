@@ -6,7 +6,7 @@
     tools, then diffs the output. Failures are saved to target/bytecode_diff/.
     Used from Phase 2 onward to validate compiler alignment.
 .PARAMETER InputDir
-    Directory containing .lua test fixture files.
+    Directory containing .lua test files.
 .PARAMETER CppBytecodeExe
     Path to the C++ lua_bytecode.exe binary.
 .PARAMETER RustBytecodeExe
@@ -16,7 +16,7 @@
 .PARAMETER JsonOutput
     Output results as JSON.
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File tools/compare_bytecode.ps1 -InputDir tests/fixtures/phase_2
+    powershell -NoProfile -ExecutionPolicy Bypass -File tools/compare_bytecode.ps1 -InputDir tests/lua/bytecode
 #>
 
 param(

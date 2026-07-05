@@ -5,7 +5,7 @@
     Runs each .lua file with both the C++ and Rust lua_app in trace mode,
     then diffs the JSONL trace output event-by-event. Used from Phase 3 onward.
 .PARAMETER InputDir
-    Directory containing .lua test fixture files.
+    Directory containing .lua test files.
 .PARAMETER CppAppExe
     Path to the C++ lua_app.exe binary.
 .PARAMETER RustAppExe
@@ -15,7 +15,7 @@
 .PARAMETER JsonOutput
     Output results as JSON.
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File tools/compare_vm_trace.ps1 -InputDir tests/fixtures/phase_3
+    powershell -NoProfile -ExecutionPolicy Bypass -File tools/compare_vm_trace.ps1 -InputDir tests/lua/runtime
 #>
 
 param(

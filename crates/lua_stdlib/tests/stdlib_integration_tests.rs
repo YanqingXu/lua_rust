@@ -78,6 +78,21 @@ fn lua_path_literal(path: &Path) -> String {
     format!("\"{}\"", path.replace('"', "\\\""))
 }
 
+fn alien_signals_dir() -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("lua")
+        .join("alien_signals");
+    assert!(
+        dir.is_dir(),
+        "alien_signals Lua tests should exist at {}",
+        dir.display()
+    );
+    dir
+}
+
 #[test]
 fn math_multi_arg_functions_return_results() {
     let (state, _gc) = compile_and_run("return math.pow(2, 8)");
@@ -1230,4 +1245,82 @@ fn generic_for_accepts_lua_iterator_functions() {
         "local function upto(n) local i = 0; return function() i = i + 1; if i <= n then return i end end end; local sum = 0; for i in upto(4) do sum = sum + i end; return sum",
     );
     assert_eq!(return_value(&state), Value::Number(10.0));
+}
+
+#[test]
+fn alien_signals_example_script_runs() {
+    let dir = alien_signals_dir();
+    let example_path = dir.join("example.lua");
+    assert!(
+        example_path.is_file(),
+        "alien_signals example should exist at {}",
+        example_path.display()
+    );
+    let example_lit = lua_path_literal(&example_path);
+    let source = format!(
+        "arg = {{ [0] = {example_lit} }}; local chunk = assert(loadfile({example_lit})); chunk(); return 1"
+    );
+
+    let (state, _gc) = compile_and_run(&source);
+    assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
+fn alien_signals_init_entry_loads_and_updates_reactive_graph() {
+    let dir = alien_signals_dir();
+    assert!(dir.join("init.lua").is_file());
+    let dir_lit = lua_path_literal(&dir);
+    let source = format!(
+        r#"
+        local dir = {dir_lit}
+        package.path = dir .. "/?.lua;" .. dir .. "/?/init.lua;" .. package.path
+
+        local function flatLoader(name)
+            return function()
+                return assert(loadfile(dir .. "/" .. name .. ".lua"))()
+            end
+        end
+
+        -- init.lua is the public module entry; the copied tests keep the
+        -- refactored.* modules flat, so the harness mirrors example.lua's loader.
+        package.preload["refactored"] = function()
+            return assert(loadfile(dir .. "/init.lua"))()
+        end
+        package.preload["refactored.constants"] = flatLoader("constants")
+        package.preload["refactored.tracer"] = flatLoader("tracer")
+        package.preload["refactored.scheduler"] = flatLoader("scheduler")
+        package.preload["refactored.graph"] = flatLoader("graph")
+        package.preload["refactored.engine"] = flatLoader("engine")
+        package.preload["refactored.primitives"] = flatLoader("primitives")
+
+        local s = require("refactored")
+        local count = s.signal(1, "count")
+        local doubled = s.computed(function()
+            return count() * 2
+        end, "doubled")
+        local observed = {{}}
+        local stop = s.effect(function()
+            observed[#observed + 1] = doubled()
+        end, "collector")
+
+        count(3)
+        local ok =
+            s.isSignal(count)
+            and s.isComputed(doubled)
+            and s.isEffect(stop)
+            and observed[1] == 2
+            and observed[2] == 6
+            and doubled() == 6
+
+        stop()
+        count(4)
+        if ok and observed[3] == nil then
+            return 1
+        end
+        return 0
+        "#
+    );
+
+    let (state, _gc) = compile_and_run(&source);
+    assert_eq!(return_value(&state), Value::Number(1.0));
 }

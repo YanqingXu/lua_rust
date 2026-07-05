@@ -59,16 +59,15 @@ module map comment documenting the planned C++→Rust module correspondence.
 | `docs/rust_migration/deviation_log.md` | Living log of approved C++/Rust behavioral deviations (empty — no deviations yet) |
 | `docs/rust_migration/phase_0_report.md` | This report |
 
-### Test Fixture Directories
+### Test Directories
 
 ```
-tests/fixtures/
-├── phase_1/   # Runtime core tests
-├── phase_2/   # Compiler tests
-├── phase_3/   # VM tests
-├── phase_4/   # Standard library tests
-└── phase_5/   # Integration tests
+tests/lua/
+tests/unit/
 ```
+
+Lua compatibility inputs are kept under `tests/lua/` and grouped by behavior area.
+Rust-side project unit test cases and supporting inputs are kept under `tests/unit/`.
 
 ---
 

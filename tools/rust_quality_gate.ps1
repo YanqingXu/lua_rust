@@ -133,12 +133,12 @@ try {
         $traceOk    = $true
 
         # Bytecode comparison — applicable from Phase 2 onward
-        $fixturesPhase2 = Join-Path $ProjectRoot "tests/fixtures/phase_2"
-        if ((Test-Path $cppBytecodeExe) -and (Test-Path $fixturesPhase2)) {
+        $bytecodeTests = Join-Path $ProjectRoot "tests/lua/bytecode"
+        if ((Test-Path $cppBytecodeExe) -and (Test-Path $bytecodeTests)) {
             Write-Host "  Running: compare_bytecode.ps1" -ForegroundColor Gray
             $bcScript = Join-Path $ScriptDir "compare_bytecode.ps1"
             if (Test-Path $bcScript) {
-                & $bcScript -InputDir $fixturesPhase2 -CppBytecodeExe $cppBytecodeExe
+                & $bcScript -InputDir $bytecodeTests -CppBytecodeExe $cppBytecodeExe
                 $bytecodeOk = ($LASTEXITCODE -eq 0)
             }
             else {
@@ -151,12 +151,12 @@ try {
         }
 
         # VM trace comparison — applicable from Phase 3 onward
-        $fixturesPhase3 = Join-Path $ProjectRoot "tests/fixtures/phase_3"
-        if ((Test-Path $cppAppExe) -and (Test-Path $fixturesPhase3)) {
+        $runtimeTests = Join-Path $ProjectRoot "tests/lua/runtime"
+        if ((Test-Path $cppAppExe) -and (Test-Path $runtimeTests)) {
             Write-Host "  Running: compare_vm_trace.ps1" -ForegroundColor Gray
             $traceScript = Join-Path $ScriptDir "compare_vm_trace.ps1"
             if (Test-Path $traceScript) {
-                & $traceScript -InputDir $fixturesPhase3 -CppAppExe $cppAppExe
+                & $traceScript -InputDir $runtimeTests -CppAppExe $cppAppExe
                 $traceOk = ($LASTEXITCODE -eq 0)
             }
             else {
