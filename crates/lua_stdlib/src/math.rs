@@ -2,7 +2,6 @@
 #![allow(clippy::collapsible_if, clippy::not_unsafe_ptr_arg_deref)]
 //!
 //! Lua 5.1 数学函数。
-//! C++ 参考: `lua_cpp/src/lib/mathlib.hpp/.cpp`
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

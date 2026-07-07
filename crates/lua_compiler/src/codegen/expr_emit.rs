@@ -3,7 +3,6 @@
 //! 实现 AST 表达式 → 字节码的 lowering：ValueResult（右值）、
 //! CondResult（条件）、LValueRef（左值）、CallResultInfo（调用）和全部 14 种 Expr 节点。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/codegen/expression_emitter.hpp/.cpp`
 
 use crate::ast::expr::{
     BinaryExpr, BinaryOp, CallExpr, Expr, FunctionExpr, IndexExpr, MemberExpr, TableExpr,
@@ -25,7 +24,6 @@ impl CodeGenerator {
 
     /// 发射表达式右值
     ///
-    /// C++ 对应: `ExpressionEmitter::emitValue()`
     pub fn emit_value(&mut self, expr: &Expr) -> ValueResult {
         match expr {
             Expr::Nil(_) => ValueResult::make_nil(),
@@ -72,7 +70,6 @@ impl CodeGenerator {
 
     /// 发射条件结果
     ///
-    /// C++ 对应: `ExpressionEmitter::emitCondResult()`
     pub fn emit_cond_result(&mut self, expr: &Expr) -> CondResult {
         // 短路求值: and/or
         if let Expr::Binary(b) = expr {

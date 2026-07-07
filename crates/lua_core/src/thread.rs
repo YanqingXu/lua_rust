@@ -13,7 +13,6 @@
 //! 指针占位。`mark_children` 仅标记 `caller` 线程；栈内容的标记将在
 //! Phase 3 通过 `gc.markState()` 启用。
 //!
-//! C++ 参考: `lua_cpp/src/core/thread.hpp`, `lua_cpp/src/core/thread.cpp`
 
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_object::GcObject;
@@ -25,9 +24,8 @@ use crate::types::GcObjectType;
 // CoroutineStatus 枚举
 // =====================================================================
 
-/// Lua 协程状态（与 C++ `ThreadStatus` 不同，这是 Lua 层面语义）
+/// Lua 协程状态（Lua 层面语义）
 ///
-/// C++ 对应: `Lua::CoroutineStatus` (enum class : u8)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CoroutineStatus {
@@ -72,7 +70,6 @@ impl std::fmt::Display for CoroutineStatus {
 /// - padding: (4 bytes)
 ///   总计约 56+ bytes
 ///
-/// C++ 对应: `Lua::Thread`（继承 `GCObject`）
 #[repr(C)]
 pub struct Thread {
     /// GC 对象头部（必须在结构体开头）
@@ -83,22 +80,18 @@ pub struct Thread {
     /// Phase 1.4: 不透明占位（`*mut c_void`）。
     /// Phase 3: 具体化为 `*mut LuaState`。
     ///
-    /// C++ 对应: `Thread::state_`（`UPtr<LuaState>`）
     state: *mut std::ffi::c_void,
 
     /// 协程状态
     ///
-    /// C++ 对应: `Thread::coStatus_`（`CoroutineStatus`）
     co_status: CoroutineStatus,
 
     /// 是否为首次 resume
     ///
-    /// C++ 对应: `Thread::firstResume_`
     first_resume: bool,
 
     /// Resume 链：调用当前协程的协程
     ///
-    /// C++ 对应: `Thread::caller_`（`Thread*`）
     caller: Option<GcRef<Thread>>,
 
     /// Resume 链：调用者的 LuaState
@@ -106,12 +99,10 @@ pub struct Thread {
     /// Phase 1.4: 不透明占位。
     /// Phase 3: 具体化为 `*mut LuaState`。
     ///
-    /// C++ 对应: `Thread::callerState_`（`LuaState*`）
     caller_state: *mut std::ffi::c_void,
 
     /// VM 重入保护：保存的嵌套执行计数
     ///
-    /// C++ 对应: `Thread::savedNexeccalls_`
     saved_nexeccalls: i32,
 }
 
@@ -120,7 +111,6 @@ impl Thread {
     ///
     /// 初始状态为 `Suspended`，LuaState 指针为空（Phase 3 初始化）。
     ///
-    /// C++ 对应: `Thread::Thread(UPtr<LuaState> state)` + `Thread::create()`
     pub fn new() -> Self {
         Self {
             header: GcObjectHeader::new(GcObjectType::Thread),
@@ -172,7 +162,6 @@ impl Thread {
     /// Phase 1.4: 返回不透明指针。
     /// Phase 3: 具体化为 `*mut LuaState`。
     ///
-    /// C++ 对应: `Thread::getLuaState() const`
     #[inline]
     pub fn lua_state(&self) -> *mut std::ffi::c_void {
         self.state
@@ -190,7 +179,6 @@ impl Thread {
 
     /// 获取调用者协程
     ///
-    /// C++ 对应: `Thread::getCaller() const`
     #[inline]
     pub fn caller(&self) -> Option<GcRef<Thread>> {
         self.caller
@@ -198,7 +186,6 @@ impl Thread {
 
     /// 设置调用者协程
     ///
-    /// C++ 对应: `Thread::setCaller(Thread* t)`
     pub fn set_caller(&mut self, caller: Option<GcRef<Thread>>) {
         // TODO Phase 1.3+: write barrier — gc->writeBarrier(this, caller)
         self.caller = caller;
@@ -275,7 +262,6 @@ unsafe impl GcObject for Thread {
     /// Phase 1.4: 标记 caller 协程。
     /// Phase 3: 还将通过 `gc.markState()` 标记 LuaState 栈上的所有值。
     ///
-    /// C++ 对应: `Thread::mark(GarbageCollector& gc)`
     unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
         // 标记 caller 协程
         if let Some(caller_ref) = self.caller {

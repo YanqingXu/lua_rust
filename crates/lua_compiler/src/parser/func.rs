@@ -2,7 +2,6 @@
 //!
 //! 实现全局/局部函数声明、函数表达式和参数列表解析。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/parser/parser_func.cpp`
 
 use crate::ast::SourceLocation;
 use crate::ast::expr::{Expr, FunctionExpr};
@@ -21,7 +20,6 @@ impl<'source> Parser<'source> {
     /// - `function t.a.b.c.foo() end` — 表成员函数
     /// - `function t:method() end` — 方法定义
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseFunctionStmt()`
     pub fn parse_function_stmt(&mut self) -> Result<Box<Stmt>, ParseError> {
         let line = self.current().line;
         let column = self.current().column;
@@ -99,7 +97,6 @@ impl<'source> Parser<'source> {
 
     /// 解析 function 表达式 `function(...) body end`
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseFunctionExpr()`
     pub fn parse_function_expr(&mut self) -> Result<Box<Expr>, ParseError> {
         let _guard = self.recursion_guard(Self::MAX_RECURSION_DEPTH)?;
 
@@ -137,7 +134,6 @@ impl<'source> Parser<'source> {
 
     /// 解析函数参数列表 `(name, ...)`
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseParamList()`
     pub fn parse_param_list(&mut self) -> Result<Vec<String>, ParseError> {
         let mut params = Vec::new();
 

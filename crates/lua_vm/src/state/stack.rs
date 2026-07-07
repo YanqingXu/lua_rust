@@ -2,7 +2,6 @@
 //!
 //! 动态扩展的 Lua 值栈，用于存储函数参数、局部变量和临时值。
 //!
-//! C++ 参考: `lua_cpp/src/vm/state/stack.hpp`
 
 use lua_core::value::Value;
 
@@ -15,7 +14,6 @@ const STACK_GROW_MARGIN: usize = 32;
 ///
 /// 管理 Lua 值的动态栈，支持 push/pop 操作和自动扩展。
 ///
-/// C++ 对应: `Lua::Stack`
 #[derive(Debug)]
 pub struct Stack {
     values: Vec<Value>,

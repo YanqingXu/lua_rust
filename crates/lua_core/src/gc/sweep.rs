@@ -3,7 +3,6 @@
 //! 回收所有未标记（白色）的对象。遍历侵入式链表，
 //! 移除白色对象并释放其内存，同时维护统计信息。
 //!
-//! C++ 参考: `lua_cpp/src/gc/gc_sweep.cpp`
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -21,7 +20,6 @@ impl GarbageCollector {
     ///
     /// 字符串对象被回收时会同步从 StringPool 中移除。
     ///
-    /// C++ 对应: `GarbageCollector::sweep(StringPool& stringPool)`
     pub fn sweep(&mut self, string_pool: &mut StringPool) -> usize {
         let mut collected = 0;
         let mut prev: *mut GcObjectHeader = std::ptr::null_mut();
@@ -74,7 +72,6 @@ impl GarbageCollector {
     /// 从所有内部列表中移除该对象，更新统计信息，
     /// 回收内存。如果是字符串对象，同步从 StringPool 中移除。
     ///
-    /// C++ 对应: `GarbageCollector::destroyObject(GCObject* obj, StringPool& stringPool)`
     pub(crate) fn destroy_object(
         &mut self,
         obj: *mut GcObjectHeader,

@@ -5,7 +5,6 @@
 //! - **数组部分**：存储连续的正整数键（1, 2, 3, ...），使用 `Vec<Value>` 实现 O(1) 访问
 //! - **哈希部分**：存储其他类型的键或非连续的整数键，使用 `HashMap<Value, Value>` 实现
 //!
-//! C++ 参考: `lua_cpp/src/core/table.hpp`, `lua_cpp/src/core/table.cpp`
 
 use std::collections::HashMap;
 
@@ -20,7 +19,7 @@ use crate::value::Value;
 // 常量
 // =====================================================================
 
-/// 数组索引的最大有效范围（对齐 C++ isArrayIndex 的限制）
+/// 数组索引的最大有效范围
 /// 防止过大的索引导致内存问题
 const MAX_ARRAY_INDEX: i32 = 1_000_000;
 
@@ -41,7 +40,6 @@ const MAX_ARRAY_INDEX: i32 = 1_000_000;
 /// - flags: u8 (1 byte)
 ///   总计约 105+ bytes
 ///
-/// C++ 对应: `Lua::Table`
 #[repr(C)]
 pub struct Table {
     /// GC 对象头部（必须在结构体开头）
@@ -69,7 +67,6 @@ pub struct Table {
 impl Table {
     /// 创建空表
     ///
-    /// C++ 对应: `Table::Table()`
     pub fn new() -> Self {
         Self {
             header: GcObjectHeader::new(GcObjectType::Table),
@@ -109,7 +106,6 @@ impl Table {
     /// 2. 否则从哈希部分获取
     /// 3. 如果键不存在，返回 nil
     ///
-    /// C++ 对应: `Table::get(const Value& key)`
     pub fn get(&self, key: &Value) -> Value {
         let mut index: i32 = 0;
         if Self::is_array_index(key, &mut index) {
@@ -128,7 +124,6 @@ impl Table {
     /// 4. 如果 key 是正整数且较小，存储到数组部分
     /// 5. 否则存储到哈希部分
     ///
-    /// C++ 对应: `Table::set(const Value& key, const Value& value)`
     pub fn set(&mut self, key: &Value, value: &Value) {
         // Lua 语义：nil 键不允许
         if key.is_nil() {
@@ -172,7 +167,6 @@ impl Table {
 
     /// 检查键是否存在且值不为 nil
     ///
-    /// C++ 对应: `Table::has(const Value& key)`
     pub fn has(&self, key: &Value) -> bool {
         let mut index: i32 = 0;
         if Self::is_array_index(key, &mut index) {
@@ -189,7 +183,6 @@ impl Table {
     ///
     /// 等价于 `set(key, &Value::Nil)`
     ///
-    /// C++ 对应: `Table::remove(const Value& key)`
     pub fn remove(&mut self, key: &Value) {
         self.flags = 0;
 
@@ -219,7 +212,6 @@ impl Table {
     /// 主要用于测试/关闭阶段重置固定 registry 等全局表，
     /// 避免其中保留已被 GC 清除的对象指针。
     ///
-    /// C++ 对应: `Table::clear()`
     pub fn clear(&mut self) {
         self.array.clear();
         self.hash.clear();
@@ -237,7 +229,6 @@ impl Table {
     ///
     /// Lua 数组使用 1-based 索引，即第一个元素的索引是 1。
     ///
-    /// C++ 对应: `Table::getArray(i32 index)`
     pub fn get_array(&self, index: i32) -> Value {
         // Lua 数组是 1-based
         if index < 1 {
@@ -258,11 +249,10 @@ impl Table {
     /// Lua 数组使用 1-based 索引。如果索引超出当前数组大小，
     /// 会自动扩展数组（中间的空位填充 nil）。
     ///
-    /// C++ 对应: `Table::setArray(i32 index, const Value& value)`
     pub fn set_array(&mut self, index: i32, value: &Value) {
         // Lua 数组是 1-based
         if index < 1 {
-            // C++ 同样忽略无效索引
+            // 无效数组索引不改变表内容
             return;
         }
 
@@ -283,7 +273,6 @@ impl Table {
 
     /// 获取数组部分的大小
     ///
-    /// C++ 对应: `Table::getArraySize()`
     #[inline]
     pub fn array_size(&self) -> usize {
         self.array.len()
@@ -294,7 +283,6 @@ impl Table {
     /// 返回数组部分中最后一个非 nil 值的索引。
     /// 这是 Lua 5.1 长度语义的完整二分搜索实现。
     ///
-    /// C++ 对应: `Table::length()`
     pub fn length(&self) -> usize {
         let array_size = self.array.len();
 
@@ -374,7 +362,6 @@ impl Table {
     /// 返回 `Some((next_key, next_value))` 如果找到下一个键值对，
     /// 返回 `None` 如果已到表尾。
     ///
-    /// C++ 对应: `Table::next(const Value& key, Value& nextKey, Value& nextValue)`
     pub fn next(&self, key: &Value) -> Option<(Value, Value)> {
         // 如果 key 是 nil，从头开始遍历
         if key.is_nil() {
@@ -442,7 +429,6 @@ impl Table {
 
     /// 获取元表
     ///
-    /// C++ 对应: `Table::getMetatable()`
     #[inline]
     pub fn metatable(&self) -> Option<GcRef<Table>> {
         self.metatable
@@ -450,7 +436,6 @@ impl Table {
 
     /// 设置元表
     ///
-    /// C++ 对应: `Table::setMetatable(Table* mt)`
     pub fn set_metatable(&mut self, mt: Option<GcRef<Table>>) {
         // TODO Phase 1.3: 写屏障 — gc->writeBarrier(this, mt)
         self.metatable = mt;
@@ -458,7 +443,6 @@ impl Table {
 
     /// 获取元方法缓存标志位
     ///
-    /// C++ 对应: `Table::getFlags()`
     #[inline]
     pub fn flags(&self) -> u8 {
         self.flags
@@ -466,7 +450,6 @@ impl Table {
 
     /// 设置元方法缓存标志位
     ///
-    /// C++ 对应: `Table::setFlags(u8 flags)`
     #[inline]
     pub fn set_flags(&mut self, flags: u8) {
         self.flags = flags;
@@ -478,7 +461,6 @@ impl Table {
 
     /// 获取哈希部分的大小
     ///
-    /// C++ 对应: `Table::getHashSize()`
     #[inline]
     pub fn hash_size(&self) -> usize {
         self.hash.len()
@@ -493,7 +475,6 @@ impl Table {
 
     /// 获取表的总元素数量
     ///
-    /// C++ 对应: `Table::getTotalSize()`
     #[inline]
     pub fn total_size(&self) -> usize {
         self.array.len() + self.hash.len()
@@ -510,7 +491,6 @@ impl Table {
     /// 2. 是正整数
     /// 3. 在合理的范围内（1 到 MAX_ARRAY_INDEX）
     ///
-    /// C++ 对应: `Table::isArrayIndex(const Value& key, i32& outIndex)`
     fn is_array_index(key: &Value, out_index: &mut i32) -> bool {
         // 必须是数字类型
         if !key.is_number() {
@@ -567,7 +547,6 @@ unsafe impl GcObject for Table {
     /// - 线程对象
     /// - 元表
     ///
-    /// C++ 对应: `Table::mark(GarbageCollector& gc)`
     unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
         // 标记数组部分中的 GC 对象
         for val in &self.array {
@@ -599,7 +578,6 @@ unsafe impl GcObject for Table {
     /// - 数组部分的容量
     /// - 哈希部分的容量（估算）
     ///
-    /// C++ 对应: `Table::getSize()`
     fn get_size(&self) -> usize {
         let mut size = std::mem::size_of::<Self>();
 
@@ -1071,9 +1049,9 @@ mod tests {
         table.set_array(1, &Value::Number(10.0));
         // 索引 2 是隐式 nil（数组自动扩展填充）
         table.set_array(3, &Value::Number(30.0));
-        // C++ 实现: array = [10.0, nil, 30.0]; arraySize = 3
+        // 当前数组布局: [10.0, nil, 30.0]，array_size = 3
         // array[2] (最后一个) 非 nil, hasIntegerKey(4) = false
-        // → 返回 3（对齐 C++ 行为）
+        // → 返回 3
         let len = table.length();
         assert_eq!(len, 3);
     }

@@ -2,9 +2,7 @@
 #![allow(clippy::collapsible_if, clippy::collapsible_match)]
 //!
 //! 基于寄存器的字节码解释器，实现全部 38 条 Lua 5.1 指令。
-//! 使用 Rust match 进行指令分发（编译器生成跳转表，性能对标 C++ switch）。
 //!
-//! C++ 参考: `lua_cpp/src/vm/vm.cpp`, `vm_handlers/`
 
 use lua_compiler::opcode::{self, OpCode};
 use lua_core::function::{CFunction, Function};
@@ -32,7 +30,6 @@ const MAX_STRING_LENGTH: usize = 64 * 1024 * 1024;
 
 /// 虚拟机主执行循环
 ///
-/// 对标 C++ `VM::executeProto()`。
 ///
 /// 参数：
 /// - `l`: Lua 线程状态
@@ -2682,7 +2679,7 @@ fn values_equal(lhs: &Value, rhs: &Value) -> bool {
                 _ => a.as_ptr() == b.as_ptr(),
             }
         }
-        // GC pointer types: compare pointer identity (same as C++)
+        // GC pointer types: compare pointer identity.
         (Value::Table(a), Value::Table(b)) => a.as_ptr() == b.as_ptr(),
         (Value::Function(a), Value::Function(b)) => a.as_ptr() == b.as_ptr(),
         (Value::Userdata(a), Value::Userdata(b)) => a.as_ptr() == b.as_ptr(),

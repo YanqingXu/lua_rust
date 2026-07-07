@@ -12,7 +12,6 @@
 //! - 函数定义 → `func.rs`
 //! - 表构造器 → `table.rs`
 //!
-//! C++ 参考: `lua_cpp/src/compiler/parser/`
 
 pub mod expr;
 pub mod func;
@@ -32,7 +31,6 @@ use std::fmt;
 
 /// 语法解析错误
 ///
-/// C++ 对应: `Lua::ParseError`
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub message: String,
@@ -64,7 +62,6 @@ impl std::error::Error for ParseError {}
 
 /// 错误恢复模式
 ///
-/// C++ 对应: `Lua::ParseRecoveryMode`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseRecoveryMode {
     /// 首次错误即退出
@@ -79,7 +76,6 @@ pub enum ParseRecoveryMode {
 
 /// 解析器配置
 ///
-/// C++ 对应: `Lua::ParserOptions`
 #[derive(Debug, Clone)]
 pub struct ParserOptions {
     pub recovery_mode: ParseRecoveryMode,
@@ -99,7 +95,6 @@ impl Default for ParserOptions {
 
 /// 函数语法作用域（用于跟踪局部变量和上值）
 ///
-/// C++ 对应: `Lua::Parser::Impl::FunctionSyntaxScope`
 #[derive(Debug, Clone)]
 struct FunctionSyntaxScope {
     line: i32,
@@ -115,7 +110,6 @@ struct FunctionSyntaxScope {
 ///
 /// 提供 LL(1) 前瞻和 Token 消费能力。
 ///
-/// C++ 对应: `Lua::Parser::Impl::TokenStream`
 struct TokenStream<'source> {
     lexer: Lexer<'source>,
     current: Token,
@@ -172,7 +166,6 @@ impl<'source> TokenStream<'source> {
 
 /// 解析状态
 ///
-/// C++ 对应: `Lua::Parser::Impl::ParseState`
 struct ParseState {
     recursion_depth: i32,
 }
@@ -205,7 +198,6 @@ impl ParseState {
 /// 守卫的生命周期始终短于 Parser（它在 `&mut self` 方法内创建），
 /// 因此该指针在守卫的 Drop 期间始终有效。
 ///
-/// C++ 对应: `Lua::Parser::Impl::RecursionGuard`
 struct RecursionGuard {
     state: *mut ParseState,
     entered: bool,
@@ -294,7 +286,6 @@ fn make_recovery_strategy(mode: ParseRecoveryMode) -> Box<dyn ErrorRecoveryStrat
 ///
 /// 使用递归下降算法解析 Lua 源代码。
 ///
-/// C++ 对应: `Lua::Parser`
 pub struct Parser<'source> {
     /// Token 流
     token_stream: TokenStream<'source>,
@@ -341,7 +332,6 @@ impl<'source> Parser<'source> {
 
     /// 解析源代码，返回 Chunk 或 ParseError
     ///
-    /// C++ 对应: `Lua::Parser::parse()`
     pub fn parse(&mut self) -> Result<Chunk, ParseError> {
         self.diagnostics.clear();
         self.function_scopes.clear();
@@ -438,7 +428,6 @@ impl<'source> Parser<'source> {
 
     /// 同步到下一个语句边界
     ///
-    /// C++ 对应: `Lua::Parser::Impl::synchronize()`
     fn synchronize(&mut self) {
         while !self.check(TokenType::Eos) {
             if self.match_token(TokenType::Semicolon) {
@@ -574,7 +563,6 @@ impl<'source> Parser<'source> {
 
 /// 获取 Token 的文本表示（用于错误消息）
 ///
-/// C++ 对应: `Lua::getTokenText()`
 fn get_token_text(token: &Token) -> String {
     if token.token_type == TokenType::Eos {
         return "<eof>".to_string();

@@ -1,27 +1,22 @@
 //! Lua 解释器基础类型定义
 //!
 //! 本模块定义了 Lua 解释器中使用的所有基础类型、类型别名和前向声明。
-//! 直接映射 C++ `src/common/types.hpp`。
 //!
 //! ## 命名约定
 //! - `CamelCase` 类型 (struct/enum) → `CamelCase`
 //! - `UPPER_CASE` 常量 → `UPPER_CASE`
-//! - 与 C++ `Lua::*` 命名空间对应
 
 // =====================================================================
 // Lua 数值类型别名
 // =====================================================================
 
 /// Lua 数字类型（64 位双精度浮点数）
-/// C++ 对应: `Lua::LuaNumber` = `f64` (double)
 pub type LuaNumber = f64;
 
 /// Lua 整数类型（64 位有符号整数）
-/// C++ 对应: `Lua::LuaInteger` = `i64` (int64_t)
 pub type LuaInteger = i64;
 
 /// Lua 字节类型
-/// C++ 对应: `lu_byte` = `u8` (uint8_t)
 pub type LuByte = u8;
 
 // =====================================================================
@@ -32,7 +27,6 @@ pub type LuByte = u8;
 ///
 /// 在 Phase 1.2 从占位 `*const T` 替换为真实的 `GcRef<T>` 安全包装器。
 ///
-/// C++ 对应: GC 裸指针（`GCString*`, `Table*`, 等）
 pub use crate::gc::gc_ref::GcRef;
 
 // =====================================================================
@@ -79,7 +73,7 @@ pub use crate::upvalue::Upvalue;
 /// Lua 值的类型标签
 ///
 /// 定义了 Lua 中所有可能的值类型。这些类型对应 Lua 5.1 中的类型系统。
-/// discriminant 值必须与 C++ `ValueType` 枚举完全一致。
+/// discriminant 值固定为 Lua 5.1 类型标签，方便 VM 和标准库稳定分发。
 ///
 /// 对应关系:
 /// - Nil          -> LUA_TNIL (0)
@@ -92,7 +86,6 @@ pub use crate::upvalue::Upvalue;
 /// - Userdata     -> LUA_TUSERDATA (7)
 /// - Thread       -> LUA_TTHREAD (8)
 ///
-/// C++ 对应: `Lua::ValueType` (enum class : u8)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum ValueType {
@@ -130,9 +123,8 @@ impl std::fmt::Display for ValueType {
 /// 垃圾回收对象的类型标签
 ///
 /// 定义了所有需要垃圾回收的对象类型，包括用户可见类型和内部类型。
-/// discriminant 值必须与 C++ `GcObjectType` 枚举完全一致。
+/// discriminant 值保持稳定，便于调试、序列化和 GC 分发。
 ///
-/// C++ 对应: `Lua::GCObjectType` (enum class : u8)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum GcObjectType {
@@ -156,7 +148,6 @@ pub enum GcObjectType {
 /// - Gray（灰色）：已访问但未扫描其引用的对象
 /// - Black（黑色）：已访问且已扫描所有引用的对象
 ///
-/// C++ 对应: `Lua::GCColor` (enum class : u8)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum GcColor {
@@ -173,7 +164,7 @@ pub enum GcColor {
 mod tests {
     use super::*;
 
-    /// 验证 ValueType discriminant 值与 C++ 定义一致
+    /// 验证 ValueType discriminant 值保持稳定
     #[test]
     fn test_value_type_discriminants() {
         assert_eq!(ValueType::Nil as u8, 0);
@@ -187,7 +178,7 @@ mod tests {
         assert_eq!(ValueType::Thread as u8, 8);
     }
 
-    /// 验证 GcObjectType discriminant 值与 C++ 定义一致
+    /// 验证 GcObjectType discriminant 值保持稳定
     #[test]
     fn test_gc_object_type_discriminants() {
         assert_eq!(GcObjectType::String as u8, 4);

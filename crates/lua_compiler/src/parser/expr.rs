@@ -11,7 +11,6 @@
 //! 8. parse_power_expr     — `^` (right-assoc)
 //! 9. parse_primary_expr   — literals, names, `(`, `{`, `function`
 //!
-//! C++ 参考: `lua_cpp/src/compiler/parser/parser_expr.cpp`
 
 use crate::ast::SourceLocation;
 use crate::ast::expr::{BinaryOp, Expr, UnaryOp};
@@ -24,7 +23,6 @@ impl<'source> Parser<'source> {
 
     /// parseExpression() — 表达式入口
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseExpression()`
     pub fn parse_expression(&mut self) -> Result<Box<Expr>, ParseError> {
         let _guard = self.recursion_guard(Self::MAX_RECURSION_DEPTH)?;
         self.parse_or_expr()
@@ -34,7 +32,6 @@ impl<'source> Parser<'source> {
 
     /// `or` 表达式 (优先级最低)
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseOrExpr()`
     fn parse_or_expr(&mut self) -> Result<Box<Expr>, ParseError> {
         let mut left = self.parse_and_expr()?;
 
@@ -50,7 +47,6 @@ impl<'source> Parser<'source> {
 
     /// `and` 表达式
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseAndExpr()`
     fn parse_and_expr(&mut self) -> Result<Box<Expr>, ParseError> {
         let mut left = self.parse_relational_expr()?;
 
@@ -66,7 +62,6 @@ impl<'source> Parser<'source> {
 
     /// 关系表达式 `<` `>` `<=` `>=` `==` `~=`
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseRelationalExpr()`
     fn parse_relational_expr(&mut self) -> Result<Box<Expr>, ParseError> {
         let mut left = self.parse_concat_expr()?;
 
@@ -93,7 +88,6 @@ impl<'source> Parser<'source> {
 
     /// 字符串连接 `..` （右结合）
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseConcatExpr()`
     fn parse_concat_expr(&mut self) -> Result<Box<Expr>, ParseError> {
         let mut left = self.parse_additive_expr()?;
 
@@ -111,7 +105,6 @@ impl<'source> Parser<'source> {
 
     /// 加减表达式 `+` `-`
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseAdditiveExpr()`
     fn parse_additive_expr(&mut self) -> Result<Box<Expr>, ParseError> {
         let mut left = self.parse_multiplicative_expr()?;
 
@@ -130,7 +123,6 @@ impl<'source> Parser<'source> {
 
     /// 乘除取模表达式 `*` `/` `%`
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseMultiplicativeExpr()`
     fn parse_multiplicative_expr(&mut self) -> Result<Box<Expr>, ParseError> {
         let mut left = self.parse_unary_expr()?;
 
@@ -156,7 +148,6 @@ impl<'source> Parser<'source> {
 
     /// 一元表达式 `not` `-` `#`
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseUnaryExpr()`
     fn parse_unary_expr(&mut self) -> Result<Box<Expr>, ParseError> {
         if self.check(TokenType::Not) {
             let op_token = self.current().clone();
@@ -184,7 +175,6 @@ impl<'source> Parser<'source> {
 
     /// 幂表达式 `^` （右结合）
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parsePowerExpr()`
     fn parse_power_expr(&mut self) -> Result<Box<Expr>, ParseError> {
         let mut left = self.parse_primary_expr()?;
 
@@ -204,7 +194,6 @@ impl<'source> Parser<'source> {
 
     /// 解析逗号分隔的表达式列表
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseExprList()`
     pub fn parse_expr_list(&mut self) -> Result<Vec<Box<Expr>>, ParseError> {
         let mut exprs = Vec::new();
 

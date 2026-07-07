@@ -3,7 +3,6 @@
 //! 管理子函数原型的编译生命周期：参数绑定、函数体编译、
 //! upvalue 闭包元数据和调试信息附加。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/codegen/function_compiler.hpp/.cpp`
 
 use lua_core::gc_string::GcString;
 use lua_core::proto::{Proto, VARARG_ISVARARG, VARARG_NEEDSARG};
@@ -21,7 +20,6 @@ impl CodeGenerator {
 
     /// 编译子函数体，返回 CompiledFunction
     ///
-    /// C++ 对应: `FunctionCompiler::compile()`
     pub fn compile_function(
         &mut self,
         params: &[String],
@@ -132,7 +130,6 @@ impl CodeGenerator {
 
     /// 发射闭包 upvalue 指令（在 CLOSURE 之后）
     ///
-    /// C++ 对应: `FunctionCompiler::emitClosureUpvalues()`
     pub fn emit_closure_upvalues(&mut self, upvalues: &[UpvalueCapture]) {
         for uv in upvalues {
             if uv.in_stack {

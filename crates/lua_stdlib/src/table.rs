@@ -1,7 +1,6 @@
 //! 表库 (Table Library)
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 //!
-//! Lua 5.1 表操作函数。C++ 参考: `lua_cpp/src/lib/tablelib.hpp/.cpp`
 
 use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;

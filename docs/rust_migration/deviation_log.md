@@ -1,38 +1,35 @@
 ---
 status: living
-last_updated: 2026-06-13
-applies_to: Documented behavioral deviations between C++23 and Rust implementations
+last_updated: 2026-07-07
+applies_to: Lua 5.1.5 compatibility and implementation notes
 ---
 
-# Deviation Log
+# Behavior Notes Log
 
-记录 Rust 实现与 C++ 基线之间的所有已批准行为偏差。
+记录项目中已经确认的 Lua 5.1.5 兼容性取舍、平台差异和实现说明。
 
-**核心原则：Rust 代码应保持与 C++ 相同的行为，除非偏差被明确记录并批准。**
-
-## Deviation Entry Format
+## Entry Format
 
 ```markdown
-### DEV-{NNN}: {Short Title}
+### NOTE-{NNN}: {Short Title}
 
 - **Date:** YYYY-MM-DD
-- **Phase:** {N}
-- **C++ file(s):** {path(s)}
+- **Area:** compiler / vm / stdlib / gc / cli / docs
 - **Rust file(s):** {path(s)}
-- **Description:** What differs and why.
-- **Impact:** What Lua behavior is affected.
-- **Mitigation:** How the deviation is minimized.
-- **Approved by:** {Orchestrator / Human maintainer}
+- **Description:** What behavior or implementation choice is being documented.
+- **Impact:** What Lua behavior or developer workflow is affected.
+- **Mitigation:** How the impact is minimized.
+- **Approved by:** {maintainer}
 ```
 
-## Active Deviations
+## Active Notes
 
-*No deviations recorded yet. Entries will be added as differences between C++ and Rust behavior are identified and approved during the migration.*
+目前没有登记项。
 
 ---
 
-## Deviation Registry
+## Registry
 
-| ID | Phase | Date | Title | Status |
+| ID | Area | Date | Title | Status |
 |---|---|---|---|---|
 | — | — | — | — | — |

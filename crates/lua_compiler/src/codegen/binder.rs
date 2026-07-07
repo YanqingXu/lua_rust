@@ -3,7 +3,6 @@
 //! 将 AST 中的 NameExpr 解析为 SymbolRef（Local → Upvalue → Global 三阶段查找），
 //! 并提供 SymbolRef → ValueResult / LValueRef 的转换。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/codegen/name_binder.hpp/.cpp`
 
 use crate::codegen::CodeGenerator;
 use crate::codegen::types::{
@@ -15,7 +14,6 @@ impl CodeGenerator {
 
     /// 解析名字到 SymbolRef（Local → Upvalue → Global 三阶段查找）
     ///
-    /// C++ 对应: `NameBinder::resolve()`
     pub fn resolve_name(&mut self, name: &str) -> SymbolRef {
         // 1. 查找局部变量
         let reg = self.find_local_var(name);
@@ -39,7 +37,6 @@ impl CodeGenerator {
 
     /// 将 SymbolRef 转为 ValueResult（读路径）
     ///
-    /// C++ 对应: `NameBinder::symbolToValue()`
     pub fn symbol_to_value(&self, sym: &SymbolRef) -> ValueResult {
         match sym.kind {
             SymbolKind::Local => ValueResult::make_register(sym.index, false, AccessKind::Local),
@@ -55,7 +52,6 @@ impl CodeGenerator {
 
     /// 将 SymbolRef 转为 LValueRef（写路径）
     ///
-    /// C++ 对应: `NameBinder::symbolToLValue()`
     pub fn symbol_to_lvalue(&self, sym: &SymbolRef) -> LValueRef {
         let mut result = LValueRef::new();
         match sym.kind {

@@ -7,7 +7,6 @@
 //! - 行号和列号跟踪
 //! - Token 预读机制（LL(1) 前瞻）
 //!
-//! C++ 参考: `lua_cpp/src/compiler/lexer/lexer.hpp`
 
 use std::collections::HashMap;
 

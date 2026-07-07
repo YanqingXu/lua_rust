@@ -3,7 +3,6 @@
 //! 实现语句块、if/while/repeat/for/do 控制流、
 //! 局部声明、return、break、赋值和函数调用语句。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/parser/parser_stmt.cpp`
 
 use crate::ast::SourceLocation;
 use crate::ast::expr::{Expr, NumberExpr};
@@ -20,7 +19,6 @@ impl<'source> Parser<'source> {
 
     /// 解析语句块（直到 end/eof/else/elseif/until）
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseBlock()`
     pub fn parse_block(&mut self) -> Result<Vec<Box<Stmt>>, ParseError> {
         let _guard = self.recursion_guard(Self::MAX_BLOCK_RECURSION_DEPTH)?;
 
@@ -61,7 +59,6 @@ impl<'source> Parser<'source> {
 
     /// 语句分发器
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseStatement()`
     fn parse_statement(&mut self) -> Result<Box<Stmt>, ParseError> {
         match self.current().token_type {
             TokenType::If => self.parse_if_stmt(),
@@ -80,7 +77,6 @@ impl<'source> Parser<'source> {
 
     /// if then (elseif then)* (else)? end
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseIfStmt()`
     fn parse_if_stmt(&mut self) -> Result<Box<Stmt>, ParseError> {
         let line = self.current().line;
         let column = self.current().column;
@@ -186,7 +182,6 @@ impl<'source> Parser<'source> {
 
     /// 解析 for 语句（数值 for 或 泛型 for）
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseForStmt()`
     fn parse_for_stmt(&mut self) -> Result<Box<Stmt>, ParseError> {
         let line = self.current().line;
         let column = self.current().column;
@@ -397,7 +392,6 @@ impl<'source> Parser<'source> {
 
     /// 表达式语句：赋值语句或独立函数调用
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseExprStmt()`
     fn parse_expr_stmt(&mut self) -> Result<Box<Stmt>, ParseError> {
         let first_token = self.current().clone();
 

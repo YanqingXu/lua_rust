@@ -1,0 +1,57 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug lua_app (REPL)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/x86_64-pc-windows-msvc/debug/lua_app.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_BACKTRACE": "1"
+            },
+            "preLaunchTask": "cargo build: lua_app",
+            "terminal": "integrated",
+            "sourceLanguages": [
+                "rust"
+            ]
+        },
+        {
+            "name": "Debug lua_app (current Lua file)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/x86_64-pc-windows-msvc/debug/lua_app.exe",
+            "args": [
+                "${file}"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_BACKTRACE": "1"
+            },
+            "preLaunchTask": "cargo build: lua_app",
+            "terminal": "integrated",
+            "sourceLanguages": [
+                "rust"
+            ]
+        },
+        {
+            "name": "Debug lua_bytecode (current Lua file)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/x86_64-pc-windows-msvc/debug/lua_bytecode.exe",
+            "args": [
+                "${file}"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_BACKTRACE": "1"
+            },
+            "preLaunchTask": "cargo build: lua_bytecode",
+            "terminal": "integrated",
+            "sourceLanguages": [
+                "rust"
+            ]
+        }
+    ]
+}

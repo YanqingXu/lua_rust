@@ -3,30 +3,13 @@
 //! Provides the foundational types, value system, GC infrastructure,
 //! string interning, and core object model for the Lua 5.1 register VM.
 //!
-//! ## Migration Status
-//! - Phase 1 target crate
-//! - C++ reference: `lua_cpp/src/core/`, `lua_cpp/src/gc/`, `lua_cpp/src/common/`
-//!
-//! ## Module Map (C++ → Rust)
-//! | C++ | Rust module | Status |
-//! |---|---|---|
-//! | `src/common/types.hpp` | `types` | ✅ P1.1 |
-//! | `src/core/value.hpp/.cpp` | `value` | ✅ P1.1 |
-//! | `src/core/gc_object.hpp` | `gc::header`, `gc::gc_object` | ✅ P1.2 |
-//! | `src/core/gc_string.hpp` | `gc_string` | ✅ P1.2 |
-//! | `src/core/string_pool.hpp/.cpp` | `string_pool` | ✅ P1.2 |
-//! | `src/gc/garbage_collector.hpp/.cpp` | `gc::collector` | ✅ P1.2 |
-//! | `src/gc/gc_strategy.hpp/.cpp` | `gc::strategy` | ✅ P1.2 |
-//! | `src/gc/gc_mark.cpp` | `gc::mark` | ✅ P1.3 |
-//! | `src/gc/gc_sweep.cpp` | `gc::sweep` | ✅ P1.3 |
-//! | `src/gc/gc_finalize.cpp` | `gc::finalize` | ✅ P1.3 (骨架) |
-//! | `src/gc/gc_weak.cpp` | `gc::weak` | ✅ P1.3 |
-//! | `src/core/table.hpp/.cpp` | `table` | ✅ P1.4 |
-//! | `src/core/function.hpp/.cpp` | `function` (Proto) | ✅ P1.4 |
-//! | `src/core/upvalue.hpp/.cpp` | `upvalue` | ✅ P1.4 |
-//! | `src/core/thread.hpp/.cpp` | `thread` | ✅ P1.4 |
-//! | `src/core/userdata.hpp/.cpp` | `userdata` | ✅ P1.4 |
-//! | `src/core/metatable.hpp/.cpp` | `metatable` | ✅ P1.4 |
+//! ## Module Guide
+//! - `types` / `value`: Lua 值标签和值表示。
+//! - `gc`: GC header、引用包装、标记、清扫、弱表与 finalizer。
+//! - `gc_string` / `string_pool`: 受 GC 管理的字符串与字符串驻留池。
+//! - `table` / `metatable`: 表结构、数组/哈希混合存储和元方法查找。
+//! - `proto` / `function` / `upvalue`: 函数原型、闭包和 upvalue。
+//! - `userdata` / `thread`: 完整用户数据和 Lua coroutine 对象。
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]

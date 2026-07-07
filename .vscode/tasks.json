@@ -1,0 +1,53 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo build: lua_app",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--package",
+                "lua_app",
+                "--bin",
+                "lua_app"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$rustc"
+            ]
+        },
+        {
+            "label": "cargo build: lua_bytecode",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--package",
+                "lua_bytecode",
+                "--bin",
+                "lua_bytecode"
+            ],
+            "group": "build",
+            "problemMatcher": [
+                "$rustc"
+            ]
+        },
+        {
+            "label": "cargo test: workspace",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "test",
+                "--workspace"
+            ],
+            "group": "test",
+            "problemMatcher": [
+                "$rustc"
+            ]
+        }
+    ]
+}

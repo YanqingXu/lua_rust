@@ -3,11 +3,9 @@
 //! 实现三色标记算法的标记传播：从根对象开始，递归标记所有可达对象。
 //! 包含增量写屏障以维护三色不变式。
 //!
-//! C++ 参考: `lua_cpp/src/gc/gc_mark.cpp`
 //!
 //! # Safety conventions
 //! 本模块中的函数接收原始指针并对其解引用，这是 GC 内部操作的固有模式，
-//! 与 C++ 参考实现一致。调用者负责保证指针有效性。
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -27,7 +25,6 @@ impl GarbageCollector {
     /// 3. 标记所有根对象为灰色
     /// 4. 传播标记
     ///
-    /// C++ 对应: `GarbageCollector::mark()`
     pub fn mark(&mut self) {
         // 1. 重置所有对象为白色（保留 FIXED 和 FINALIZED）
         let mut current = self.all_objects;
@@ -66,7 +63,6 @@ impl GarbageCollector {
     /// 从灰色列表中取出对象，将其标记为黑色，然后调用其
     /// `mark_children()` 方法报告引用关系。
     ///
-    /// C++ 对应: `GarbageCollector::propagateMarks()`
     pub fn propagate_marks(&mut self) {
         while let Some(obj) = self.gray_list.pop() {
             // SAFETY: obj is from gray_list, which only contains valid GC objects
@@ -134,7 +130,6 @@ impl GarbageCollector {
     /// 检查表的元表 `__mode` 字段以确定弱键/弱值模式，
     /// 并将弱表注册到 `weak_tables` 列表中。
     ///
-    /// C++ 对应: `GarbageCollector::markTable(Table* table)`
     pub fn mark_table(&mut self, table_header: *mut GcObjectHeader) {
         if table_header.is_null() {
             return;
@@ -238,7 +233,6 @@ impl GarbageCollector {
 
     /// 标记表内容（遵循弱键/弱值策略）
     ///
-    /// C++ 对应: `Table::markContents(GarbageCollector& gc, bool weakKeys, bool weakValues)`
     fn mark_table_contents(&mut self, table: &Table, weak_keys: bool, weak_values: bool) {
         // 单次遍历所有键值对
         let mut key = Value::Nil;
@@ -269,7 +263,6 @@ impl GarbageCollector {
     /// 如果 Value 包含可回收对象（String、Table、Function、
     /// Userdata、Thread），则标记该对象。
     ///
-    /// C++ 对应: `GarbageCollector::markValue(const Value& value)`
     pub fn mark_value(&mut self, value: &Value) {
         match value {
             Value::String(s) => {
@@ -319,7 +312,6 @@ impl GarbageCollector {
     /// 当黑色对象开始引用白色子对象时，立即标记该子对象并传播标记图。
     /// 防止同轮 sweep 回收新可达对象。
     ///
-    /// C++ 对应: `GarbageCollector::writeBarrier(GCObject* owner, GCObject* child)`
     pub fn write_barrier(&mut self, owner: *mut GcObjectHeader, child: *mut GcObjectHeader) {
         if owner.is_null() || child.is_null() {
             return;
@@ -342,7 +334,6 @@ impl GarbageCollector {
 
     /// Value 版本的写屏障
     ///
-    /// C++ 对应: `GarbageCollector::writeBarrier(GCObject* owner, const Value& value)`
     pub fn write_barrier_value(&mut self, owner: *mut GcObjectHeader, value: &Value) {
         match value {
             Value::String(s) => {
@@ -366,7 +357,6 @@ impl GarbageCollector {
 
     /// 非 GC 根的写屏障（如 GlobalState 侧表）
     ///
-    /// C++ 对应: `GarbageCollector::writeRootBarrier(GCObject* child)`
     pub fn write_root_barrier(&mut self, child: *mut GcObjectHeader) {
         if child.is_null() {
             return;

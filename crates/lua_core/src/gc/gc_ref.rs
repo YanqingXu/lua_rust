@@ -3,7 +3,6 @@
 //! `GcRef<T>` 是 GC 管理对象的安全引用句柄。它包装一个裸指针，
 //! 对外部 safe 代码隐藏指针细节，由 GC 系统保证指针有效性。
 //!
-//! C++ 对应: GC 裸指针（`GCString*`, `Table*`, etc.）
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -21,7 +20,6 @@ use std::ptr::NonNull;
 /// - GC 回收对象后，所有指向该对象的 `GcRef<T>` 变为悬空
 /// - `GcRef<T>` 不实现 `Send` 或 `Sync`（单线程 Lua VM）
 ///
-/// C++ 对应: 裸 GC 指针（`GCString*`, `Table*`, 等）
 // Manual Clone/Copy impls avoid requiring T: Clone / T: Copy bounds.
 // GcRef is always bitwise-copyable (it's just a pointer wrapper).
 pub struct GcRef<T> {
@@ -116,7 +114,7 @@ impl<T> Clone for GcRef<T> {
 // Manual Copy: always safe since GcRef is just a NonNull + PhantomData
 impl<T> Copy for GcRef<T> {}
 
-// GcRef<T> 的比较基于指针相等性（与 C++ GC 指针行为一致）
+// GcRef<T> 的比较基于指针相等性。
 impl<T> PartialEq for GcRef<T> {
     fn eq(&self, other: &Self) -> bool {
         self.as_ptr() == other.as_ptr()

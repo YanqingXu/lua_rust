@@ -3,7 +3,6 @@
 //! 弱表允许键和/或值被弱引用：当键或值仅被弱表引用时，GC 可以回收它们。
 //! 在 sweep 之前清理弱表中的死亡条目。
 //!
-//! C++ 参考: `lua_cpp/src/gc/gc_weak.cpp`
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -21,7 +20,6 @@ impl GarbageCollector {
     ///
     /// 必须在 sweep 删除白色对象之前调用，确保仍可安全检查键和值的颜色。
     ///
-    /// C++ 对应: `GarbageCollector::clearWeakTableEntries()`
     pub fn clear_weak_table_entries(&mut self) {
         // 克隆列表以避免在清理期间修改时出现借用冲突。兼容路径可能在
         // 多次轻量 collect 后清空注册列表，所以同时从对象链补扫弱表位。
@@ -69,7 +67,6 @@ impl GarbageCollector {
 
     /// 从单个表中移除弱引用死亡条目
     ///
-    /// C++ 对应: `Table::removeWeakEntries(const GarbageCollector& gc, bool weakKeys, bool weakValues)`
     fn remove_weak_entries_from_table(
         table: &mut Table,
         gc: &GarbageCollector,

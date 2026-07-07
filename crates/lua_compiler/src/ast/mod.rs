@@ -8,12 +8,10 @@
 //! - `visitor` — Visitor 模式（`ExprVisitor`、`StmtVisitor`、`AstVisitor` trait）
 //!
 //! ## 设计原则
-//! - 使用 Rust `enum` 实现类型安全的多态（对标 C++ `std::variant`）
 //! - 使用 `Box<Expr>` / `Box<Stmt>` 管理递归节点生命周期
 //! - 清晰的节点层次结构
 //! - 完整的位置信息（行号、列号）
 //!
-//! C++ 参考: `lua_cpp/src/compiler/ast.hpp`
 
 pub mod expr;
 pub mod stmt;

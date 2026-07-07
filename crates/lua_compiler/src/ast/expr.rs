@@ -2,7 +2,6 @@
 //!
 //! 定义所有 Lua 5.1 表达式类型（14 种），用于表示解析后的表达式结构。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/ast.hpp`
 
 use crate::ast::stmt::Stmt;
 
@@ -15,7 +14,6 @@ use crate::ast::stmt::Stmt;
 /// 所有 AST 节点共享的位置信息基类。
 /// 用于错误报告、调试和代码生成时的位置追踪。
 ///
-/// C++ 对应: `Lua::SourceLocation`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SourceLocation {
     /// 行号（1-based）
@@ -36,7 +34,6 @@ impl SourceLocation {
 
 /// 二元运算类型
 ///
-/// C++ 对应: `Lua::BinaryExpr::Op`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     // 算术运算
@@ -66,7 +63,6 @@ pub enum BinaryOp {
 
 /// 一元运算类型
 ///
-/// C++ 对应: `Lua::UnaryExpr::Op`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     /// `not`
@@ -83,7 +79,6 @@ pub enum UnaryOp {
 
 /// nil 字面量
 ///
-/// C++ 对应: `Lua::NilExpr`
 #[derive(Debug, Clone)]
 pub struct NilExpr {
     pub location: SourceLocation,
@@ -91,7 +86,6 @@ pub struct NilExpr {
 
 /// 布尔字面量
 ///
-/// C++ 对应: `Lua::BoolExpr`
 #[derive(Debug, Clone)]
 pub struct BoolExpr {
     pub location: SourceLocation,
@@ -100,7 +94,6 @@ pub struct BoolExpr {
 
 /// 数字字面量
 ///
-/// C++ 对应: `Lua::NumberExpr`
 #[derive(Debug, Clone)]
 pub struct NumberExpr {
     pub location: SourceLocation,
@@ -109,7 +102,6 @@ pub struct NumberExpr {
 
 /// 字符串字面量
 ///
-/// C++ 对应: `Lua::StringExpr`
 #[derive(Debug, Clone)]
 pub struct StringExpr {
     pub location: SourceLocation,
@@ -118,7 +110,6 @@ pub struct StringExpr {
 
 /// 变长参数 `...`
 ///
-/// C++ 对应: `Lua::VarargExpr`
 #[derive(Debug, Clone)]
 pub struct VarargExpr {
     pub location: SourceLocation,
@@ -126,7 +117,6 @@ pub struct VarargExpr {
 
 /// 标识符（变量名）
 ///
-/// C++ 对应: `Lua::NameExpr`
 #[derive(Debug, Clone)]
 pub struct NameExpr {
     pub location: SourceLocation,
@@ -135,7 +125,6 @@ pub struct NameExpr {
 
 /// 二元运算表达式
 ///
-/// C++ 对应: `Lua::BinaryExpr`
 #[derive(Debug, Clone)]
 pub struct BinaryExpr {
     pub location: SourceLocation,
@@ -146,7 +135,6 @@ pub struct BinaryExpr {
 
 /// 一元运算表达式
 ///
-/// C++ 对应: `Lua::UnaryExpr`
 #[derive(Debug, Clone)]
 pub struct UnaryExpr {
     pub location: SourceLocation,
@@ -156,7 +144,6 @@ pub struct UnaryExpr {
 
 /// 表构造器字段
 ///
-/// C++ 对应: `Lua::TableField`
 #[derive(Debug, Clone)]
 pub struct TableField {
     /// key = nil 表示数组部分（无键）
@@ -166,7 +153,6 @@ pub struct TableField {
 
 /// 表构造器表达式
 ///
-/// C++ 对应: `Lua::TableExpr`
 #[derive(Debug, Clone)]
 pub struct TableExpr {
     pub location: SourceLocation,
@@ -179,7 +165,6 @@ pub struct TableExpr {
 /// - 普通调用：`func(args)`
 /// - 方法调用：`obj:method(args)` - 等价于 `obj.method(obj, args)`
 ///
-/// C++ 对应: `Lua::CallExpr`
 #[derive(Debug, Clone)]
 pub struct CallExpr {
     pub location: SourceLocation,
@@ -191,7 +176,6 @@ pub struct CallExpr {
 
 /// 表索引访问 `table[key]`
 ///
-/// C++ 对应: `Lua::IndexExpr`
 #[derive(Debug, Clone)]
 pub struct IndexExpr {
     pub location: SourceLocation,
@@ -201,7 +185,6 @@ pub struct IndexExpr {
 
 /// 成员访问 `table.member`
 ///
-/// C++ 对应: `Lua::MemberExpr`
 #[derive(Debug, Clone)]
 pub struct MemberExpr {
     pub location: SourceLocation,
@@ -211,7 +194,6 @@ pub struct MemberExpr {
 
 /// 函数定义表达式
 ///
-/// C++ 对应: `Lua::FunctionExpr`
 #[derive(Debug, Clone)]
 pub struct FunctionExpr {
     pub location: SourceLocation,
@@ -227,7 +209,6 @@ pub struct FunctionExpr {
 /// 需要保留括号语义以对齐 Lua 5.1：
 /// `(exp)` 会将函数调用/vararg 的多返回值收敛为单值。
 ///
-/// C++ 对应: `Lua::ParenExpr`
 #[derive(Debug, Clone)]
 pub struct ParenExpr {
     pub location: SourceLocation,
@@ -235,7 +216,6 @@ pub struct ParenExpr {
 }
 
 // =====================================================================
-// 表达式枚举（14 种变体，对应 C++ ExprVariant）
 // =====================================================================
 
 /// Lua 5.1 表达式枚举
@@ -243,7 +223,6 @@ pub struct ParenExpr {
 /// 包含全部 14 种表达式节点类型。
 /// 使用 `Box<Expr>` 实现递归所有权。
 ///
-/// C++ 对应: `Lua::ExprVariant` (std::variant of 14 types)
 #[derive(Debug, Clone)]
 pub enum Expr {
     Nil(NilExpr),
@@ -268,7 +247,6 @@ pub const EXPR_NODE_COUNT: usize = 14;
 impl Expr {
     /// 获取表达式的行号
     ///
-    /// C++ 对应: `Lua::Expr::getLine()`
     pub fn line(&self) -> i32 {
         match self {
             Expr::Nil(e) => e.location.line,
@@ -290,7 +268,6 @@ impl Expr {
 
     /// 获取表达式的列号
     ///
-    /// C++ 对应: `Lua::Expr::getColumn()`
     pub fn column(&self) -> i32 {
         match self {
             Expr::Nil(e) => e.location.column,

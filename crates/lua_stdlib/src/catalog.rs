@@ -2,7 +2,6 @@
 //!
 //! 管理 Lua 5.1 全部标准库的注册和查询。
 //!
-//! C++ 参考: `lua_cpp/src/lib/lib_catalog.hpp/.cpp`
 
 use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;

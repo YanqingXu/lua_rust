@@ -9,7 +9,6 @@
 //!
 //! 状态转换：Open → Closed（当外部函数返回，栈上的变量被销毁时）
 //!
-//! C++ 参考: `lua_cpp/src/core/upvalue.hpp`, `lua_cpp/src/core/upvalue.cpp`
 
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_object::GcObject;
@@ -29,7 +28,6 @@ use crate::value::Value;
 /// - owner_stack: *mut () (8 bytes — opaque, Phase 3 类型化为 Stack*)
 ///   总计约 57+ bytes
 ///
-/// C++ 对应: `Lua::Upvalue`
 #[repr(C)]
 pub struct Upvalue {
     /// GC 对象头部（必须在结构体开头）
@@ -57,7 +55,6 @@ impl Upvalue {
     /// `stack_index`: 栈索引位置
     /// `owner_stack`: 所属栈的不透明指针（Phase 3 类型化为 `&Stack`）
     ///
-    /// C++ 对应: `Upvalue::createOpen(usize stackIndex, Stack& ownerStack)`
     pub fn new_open(stack_index: usize, owner_stack: *mut std::ffi::c_void) -> Self {
         Self {
             header: GcObjectHeader::new(GcObjectType::Upval),
@@ -71,7 +68,6 @@ impl Upvalue {
 
     /// 创建 Closed 状态的 Upvalue（独立存储值）
     ///
-    /// C++ 对应: `Upvalue::createClosed(const Value& value)`
     pub fn new_closed(value: Value) -> Self {
         Self {
             header: GcObjectHeader::new(GcObjectType::Upval),
@@ -150,7 +146,6 @@ impl Upvalue {
     ///
     /// `stack_value`: 从栈上读取的当前值
     ///
-    /// C++ 对应: `Upvalue::close(Stack& stack)`
     ///
     /// Phase 1.4: 接受显式的栈值参数（而非直接访问 Stack）。
     /// Phase 3 实现 Stack 后将改为通过 owner_stack 自动读取。
@@ -211,7 +206,6 @@ unsafe impl GcObject for Upvalue {
     /// - Closed 状态：标记 closed_value 中的 GC 对象
     /// - Open 状态：栈上的值由栈管理，不在此标记
     ///
-    /// C++ 对应: `Upvalue::mark(GarbageCollector& gc)`
     unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
         if self.is_closed() {
             // SAFETY: collector is valid during mark phase

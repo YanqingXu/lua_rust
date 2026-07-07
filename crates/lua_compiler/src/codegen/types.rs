@@ -3,7 +3,6 @@
 //! 定义字节码生成过程中使用的数据流类型：
 //! PatchList, ValueResult, CondResult, LValueRef, SymbolRef, CallResultInfo
 //!
-//! C++ 参考: `lua_cpp/src/compiler/codegen/codegen_types.hpp`
 
 // =====================================================================
 // 常量
@@ -20,7 +19,6 @@ pub const NO_JUMP: i32 = -1;
 ///
 /// 记录待回填的跳转指令位置列表。
 ///
-/// C++ 对应: `Lua::PatchList`
 #[derive(Debug, Clone)]
 pub struct PatchList {
     pub pcs: Vec<i32>,
@@ -75,7 +73,6 @@ impl Default for PatchList {
 
 /// 右值结果的访问类型
 ///
-/// C++ 对应: `Lua::ValueResult::AccessKind`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessKind {
     None,
@@ -89,7 +86,6 @@ pub enum AccessKind {
 
 /// 即时值的类型
 ///
-/// C++ 对应: `Lua::ValueResult::ImmediateKind`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImmediateKind {
     None,
@@ -103,7 +99,6 @@ pub enum ImmediateKind {
 /// 表示表达式的求值结果，支持多种形式：即时值、常量引用、寄存器引用、
 /// 待加载、可重定位、多返回值和待跳转。
 ///
-/// C++ 对应: `Lua::ValueResult`
 #[derive(Debug, Clone, Default)]
 pub enum ValueResult {
     /// 无结果
@@ -220,7 +215,6 @@ impl ValueResult {
 ///
 /// 记录条件表达式的真/假跳转链表。
 ///
-/// C++ 对应: `Lua::CondResult`
 #[derive(Debug, Clone)]
 pub struct CondResult {
     pub true_list: PatchList,
@@ -261,7 +255,6 @@ impl Default for CondResult {
 
 /// 左值引用的类型
 ///
-/// C++ 对应: `Lua::LValueRef::Kind`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LValueKind {
     None,
@@ -275,7 +268,6 @@ pub enum LValueKind {
 ///
 /// 表示可被赋值的存储位置（变量、上值、全局或索引表达式）。
 ///
-/// C++ 对应: `Lua::LValueRef`
 #[derive(Debug, Clone)]
 pub struct LValueRef {
     pub kind: LValueKind,
@@ -314,7 +306,6 @@ impl Default for LValueRef {
 
 /// 符号类型
 ///
-/// C++ 对应: `Lua::SymbolRef::Kind`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
     None,
@@ -327,7 +318,6 @@ pub enum SymbolKind {
 ///
 /// 将 NameExpr 中的名字解析为 Local / Upvalue / Global 绑定。
 ///
-/// C++ 对应: `Lua::SymbolRef`
 #[derive(Debug, Clone)]
 pub struct SymbolRef {
     pub kind: SymbolKind,
@@ -367,7 +357,6 @@ impl Default for SymbolRef {
 
 /// 调用结果类型
 ///
-/// C++ 对应: `Lua::CallResultInfo::Kind`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallResultKind {
     None,
@@ -377,7 +366,6 @@ pub enum CallResultKind {
 
 /// 调用结果信息
 ///
-/// C++ 对应: `Lua::CallResultInfo`
 #[derive(Debug, Clone)]
 pub struct CallResultInfo {
     pub kind: CallResultKind,
@@ -413,7 +401,6 @@ impl Default for CallResultInfo {
 
 /// 编译完成的函数信息
 ///
-/// C++ 对应: `Lua::CompiledFunction`
 #[derive(Debug, Clone)]
 pub struct CompiledFunction {
     pub proto_index: i32,
@@ -422,7 +409,6 @@ pub struct CompiledFunction {
 
 /// Upvalue 捕获信息
 ///
-/// C++ 对应: `Lua::UpvalueCapture`
 #[derive(Debug, Clone)]
 pub struct UpvalueCapture {
     pub name: String,
@@ -461,7 +447,6 @@ impl ParentFunctionContext {
 
 /// 局部变量调试信息
 ///
-/// C++ 对应: `Lua::LocalVar`
 #[derive(Debug, Clone)]
 pub struct LocalVar {
     pub name: String,
@@ -489,7 +474,6 @@ impl LocalVar {
 
 /// 代码块信息（用于 break 跳转管理）
 ///
-/// C++ 对应: `Lua::BlockInfo`
 #[derive(Debug, Clone)]
 pub struct BlockInfo {
     pub active_var_count: i32,

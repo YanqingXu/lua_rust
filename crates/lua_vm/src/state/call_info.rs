@@ -2,7 +2,28 @@
 //!
 //! 存储单次函数调用的上下文：函数位置、栈基址、PC、返回值期望等。
 //!
-//! C++ 参考: `lua_cpp/src/vm/state/call_info.hpp`
+//! 栈帧示意图（栈索引向右增长）：
+//!
+//! ```text
+//! 调用前/调用中：
+//!   caller frame ... | func | arg0 | arg1 | ... | local/temp ... | reserved |
+//!                       ^      ^                              ^             ^
+//!                       |      |                              |             |
+//!                    ci.func ci.base                      lua_State.top   ci.top
+//!
+//! 关系：
+//!   - ci.func：被调用函数对象所在的栈槽。
+//!   - ci.base：当前函数寄存器/参数区域起点，通常等于 ci.func + 1。
+//!   - ci.top：当前调用帧可使用栈空间的上界（不含该位置）。
+//!   - lua_State.top：当前实际使用到的栈顶（不含该位置），会在 ci.top 范围内移动。
+//!
+//! 返回后：
+//!   caller frame ... | ret0 | ret1 | ...
+//!                       ^
+//!                       |
+//!                    原 ci.func（返回值从这里覆盖调用表达式）
+//! ```
+//!
 
 use lua_core::proto::Proto;
 use lua_core::value::Value;
@@ -14,7 +35,6 @@ pub const LUA_MULTRET: i32 = -1;
 ///
 /// 存储单次函数调用的完整上下文。
 ///
-/// C++ 对应: `Lua::CallInfo`
 #[derive(Debug, Clone)]
 pub struct CallInfo {
     /// 函数对象在栈中的索引

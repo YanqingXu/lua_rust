@@ -3,7 +3,6 @@
 //! 封装对当前 Proto 的写操作：指令发射、行号信息、调试信息。
 //! 常量管理直接调用 Proto::add_constant()。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/codegen/bytecode_builder.hpp`
 
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
@@ -20,7 +19,6 @@ use crate::opcode::{self, OpCode};
 /// CodeGen 降低层的代码决定发射什么指令；
 /// Builder 负责 Proto 的底层数据操作。
 ///
-/// C++ 对应: `Lua::BytecodeBuilder`
 pub struct BytecodeBuilder {
     /// 当前绑定的 Proto
     proto: Proto,

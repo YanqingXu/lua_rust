@@ -1,5 +1,5 @@
 -- test_vararg.lua: 可变参数（vararg）功能测试
--- 测试 C++ Lua 解释器中 vararg 的完整实现
+-- 测试 Lua 5.1 vararg 的完整实现
 
 print("===== Vararg Test Suite =====")
 print("")

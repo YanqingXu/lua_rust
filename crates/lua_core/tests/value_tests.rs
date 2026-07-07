@@ -1,7 +1,6 @@
 //! Value 系统测试套件
 //!
-//! 验证 Rust `Value` 实现与 C++ `Value` 类的行为等价性。
-//! C++ 参考测试: `lua_cpp/tests/unit/core/test_value.cpp`
+//! 验证 Rust `Value` 实现的 Lua 5.1 值语义。
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;

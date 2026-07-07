@@ -1,7 +1,6 @@
 //! lua_bytecode — Lua 5.1 bytecode dumper
 //!
 //! Compiles Lua source files and displays their bytecode in readable format.
-//! C++ reference: `lua_cpp/src/bytecode/`.
 
 use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::opcode::{self, OpCode};

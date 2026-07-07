@@ -5,7 +5,6 @@
 //! 未解析的 JMP 指令编码为单向链表：sBx 字段指向下一条未解析的
 //! 跳转 PC，最终 patching 时统一回填真实目标地址。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/codegen/jump_patcher.hpp/.cpp`
 
 use crate::codegen::CodeGenerator;
 use crate::codegen::types::{NO_JUMP, PatchList};
@@ -16,7 +15,6 @@ impl CodeGenerator {
 
     /// 发射无条件跳转，返回跳转 PC
     ///
-    /// C++ 对应: `JumpPatcher::emitJump()`
     pub fn emit_jump(&mut self) -> i32 {
         let pending = self.jpc;
         self.jpc = NO_JUMP;
@@ -29,7 +27,6 @@ impl CodeGenerator {
 
     /// 发射条件跳转（指令 + 后续 JMP），返回跳转 PC
     ///
-    /// C++ 对应: `JumpPatcher::emitConditionalJump()`
     pub fn emit_conditional_jump(&mut self, mut op: OpCode, mut a: i32, b: i32, c: i32) -> i32 {
         if op == OpCode::TESTSET && a == NO_REG {
             op = OpCode::TEST;
@@ -46,7 +43,6 @@ impl CodeGenerator {
 
     /// 将整条跳转链表回填到目标 PC
     ///
-    /// C++ 对应: `JumpPatcher::patchList(i32, i32)`
     pub fn patch_list(&mut self, mut list: i32, target: i32) {
         while list != NO_JUMP {
             let next = self.get_jump(list);
@@ -57,7 +53,6 @@ impl CodeGenerator {
 
     /// 将 PatchList 回填到目标 PC
     ///
-    /// C++ 对应: `JumpPatcher::patchList(const PatchList&, i32)`
     pub fn patch_list_vec(&mut self, list: &PatchList, target: i32) {
         for &pc in &list.pcs {
             self.fix_jump(pc, target);
@@ -66,7 +61,6 @@ impl CodeGenerator {
 
     /// 将跳转链表回填到当前位置
     ///
-    /// C++ 对应: `JumpPatcher::patchToHere(i32)`
     pub fn patch_to_here(&mut self, list: i32) {
         let target = self.builder.instruction_count() as i32;
         self.concat_jump_list_into_jpc(list);
@@ -76,7 +70,6 @@ impl CodeGenerator {
 
     /// 将 PatchList 回填到当前位置
     ///
-    /// C++ 对应: `JumpPatcher::patchToHere(const PatchList&)`
     pub fn patch_list_to_here(&mut self, list: &PatchList) {
         let target = self.builder.instruction_count() as i32;
         self.patch_list_vec(list, target);
@@ -84,7 +77,6 @@ impl CodeGenerator {
 
     /// 刷新待处理的跳转到当前指令位置
     ///
-    /// C++ 对应: `JumpPatcher::flushPendingJumps()`
     pub fn flush_pending_jumps(&mut self) {
         let target = self.builder.instruction_count() as i32;
         self.patch_list(self.jpc, target);
@@ -93,7 +85,6 @@ impl CodeGenerator {
 
     /// 将右侧跳转链表连接到左侧链表的末尾
     ///
-    /// C++ 对应: `JumpPatcher::concatJumpList(i32&, i32)`
     pub fn concat_jump_list(&mut self, left: i32, right: i32) -> i32 {
         if right == NO_JUMP {
             return left;
@@ -120,7 +111,6 @@ impl CodeGenerator {
 
     /// 获取当前标签（下一条指令的 PC）
     ///
-    /// C++ 对应: `JumpPatcher::getLabel()`
     pub fn get_label(&self) -> i32 {
         self.builder.instruction_count() as i32
     }
@@ -131,7 +121,6 @@ impl CodeGenerator {
     ///
     /// 跳转的 sBx 编码的是到下一个跳转 PC 的偏移（而非最终目标）。
     ///
-    /// C++ 对应: `JumpPatcher::getJump(i32)`
     fn get_jump(&self, pc: i32) -> i32 {
         let inst = match self.builder.instruction(pc) {
             Some(i) => i,
@@ -146,7 +135,6 @@ impl CodeGenerator {
 
     /// 修正跳转指令的目标地址
     ///
-    /// C++ 对应: `JumpPatcher::fixJump(i32, i32)`
     pub fn fix_jump(&mut self, pc: i32, dest: i32) {
         let mut jump = match self.builder.instruction(pc) {
             Some(i) => i,
@@ -164,7 +152,6 @@ impl CodeGenerator {
 
     /// 收集链表为 PatchList
     ///
-    /// C++ 对应: `JumpPatcher::collectPatchList(i32)`
     pub fn collect_patch_list(&self, mut list: i32) -> PatchList {
         let mut result = PatchList::new();
         while list != NO_JUMP {

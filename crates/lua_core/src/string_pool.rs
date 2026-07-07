@@ -5,7 +5,6 @@
 //!
 //! 所有字符串通过 `intern()` 方法创建或获取，保证指针相等性。
 //!
-//! C++ 参考: `lua_cpp/src/core/string_pool.hpp`, `.cpp`
 
 use std::collections::HashMap;
 
@@ -23,10 +22,9 @@ use crate::gc_string::GcString;
 /// 3. 如果已存在 → 返回已有 `GcRef<GcString>`
 /// 4. 如果不存在 → 通过 GC 创建新 `GcString`，加入池，返回
 ///
-/// C++ 对应: `StringPool`
 pub struct StringPool {
     /// 字符串哈希表: key = 字符串内容, value = GC 引用
-    /// 使用 owned String 作为 key（C++ 同样使用 Str 避免悬空引用）
+    /// 使用 owned String 作为 key，避免驻留表持有悬空引用。
     pool: HashMap<String, GcRef<GcString>>,
 }
 
@@ -52,7 +50,6 @@ impl StringPool {
     /// 如果字符串已存在，返回已有的 `GcRef<GcString>`；
     /// 如果不存在，创建新的 `GcString` 并通过 GC 注册。
     ///
-    /// C++ 对应: `StringPool::intern(StrView str)`
     pub fn intern(&mut self, gc: &mut GarbageCollector, s: &str) -> GcRef<GcString> {
         // 在池中查找是否已存在
         if let Some(&existing) = self.pool.get(s) {
@@ -73,7 +70,6 @@ impl StringPool {
 
     /// 查找字符串 — 不创建新对象
     ///
-    /// C++ 对应: `StringPool::find(StrView str)`
     pub fn find(&self, s: &str) -> Option<GcRef<GcString>> {
         self.pool.get(s).copied()
     }
@@ -82,7 +78,6 @@ impl StringPool {
     ///
     /// 当 GC 回收字符串时调用，从池中移除对应条目。
     ///
-    /// C++ 对应: `StringPool::remove(GCString* str)`
     ///
     /// # Safety
     /// `gc_ref` 必须指向一个当前在池中的有效字符串。
@@ -115,7 +110,6 @@ impl StringPool {
 
     /// 预分配哈希表空间
     ///
-    /// C++ 对应: `StringPool::resize(usize newSize)`
     pub fn reserve(&mut self, additional: usize) {
         self.pool.reserve(additional);
     }

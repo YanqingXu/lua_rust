@@ -12,7 +12,6 @@
 //! 6. **上值名称** (`upvalue_names`): 闭包捕获的外部变量名称（调试用）
 //! 7. **元数据**: 源文件名、参数个数、可变参数标志、栈大小等
 //!
-//! C++ 参考: `lua_cpp/src/core/function.hpp`, `lua_cpp/src/core/function.cpp`
 //! 中的 `Lua::Proto` 类。
 
 use std::collections::HashMap;
@@ -31,7 +30,6 @@ use crate::value::Value;
 
 /// Lua 虚拟机指令（32 位无符号整数）
 ///
-/// C++ 对应: `Lua::Instruction` = `u32`
 pub type Instruction = u32;
 
 // =====================================================================
@@ -56,7 +54,6 @@ pub const VARARG_NEEDSARG: u8 = 4;
 /// 参考 Lua 5.1 的 `addk()` 实现。支持 nil、bool、number、string
 /// 四种常量类型。string 使用 `GcString` 的预计算哈希值。
 ///
-/// C++ 对应: `Lua::ConstantKey`（`std::variant<std::monostate, bool, f64, GCString*>`）
 #[derive(Debug, Clone)]
 pub enum ConstantKey {
     /// nil 常量
@@ -128,7 +125,6 @@ impl Eq for ConstantKey {}
 /// - `startpc`: 变量开始有效的字节码位置
 /// - `endpc`: 变量失效的字节码位置（不包含）
 ///
-/// C++ 对应: `Lua::LocVar`
 #[derive(Debug, Clone)]
 pub struct LocVar {
     /// 变量名称（驻留字符串）
@@ -185,7 +181,6 @@ impl Default for LocVar {
 /// - source: Option<GcRef<GcString>> (8 bytes)
 /// - 元数据字段 (8 bytes + 4 bytes padding)
 ///
-/// C++ 对应: `Lua::Proto`（继承 `GCObject`）
 #[repr(C)]
 pub struct Proto {
     /// GC 对象头部（必须在结构体开头）
@@ -225,7 +220,7 @@ pub struct Proto {
     lastlinedefined: i32,
 
     /// GC 链表指针：用于垃圾回收遍历子函数原型
-    /// 在 C++ 中用于增量 GC 和分代 GC
+    /// 预留给增量 GC 和分代 GC
     gclist: Option<GcRef<Proto>>,
 
     // ── 函数签名信息（字节类型）──────────────────────────────────
@@ -246,7 +241,6 @@ pub struct Proto {
 impl Proto {
     /// 创建新的函数原型
     ///
-    /// C++ 对应: `Proto::Proto()` — 所有字段初始化为默认值
     pub fn new() -> Self {
         Self {
             header: GcObjectHeader::new(GcObjectType::Proto),
@@ -344,7 +338,6 @@ impl Proto {
     ///
     /// 非常量类型（table/function 等）不参与去重，直接添加。
     ///
-    /// C++ 对应: `Proto::addConstant(const Value& value)`
     pub fn add_constant(&mut self, value: Value) -> usize {
         // 仅对常量类型执行去重
         if matches!(
@@ -372,7 +365,6 @@ impl Proto {
     /// binary chunk 反序列化必须保留 dump 时的常量表索引，
     /// 不能像编译期 `add_constant()` 一样对常量去重。
     ///
-    /// C++ 对应: `Proto::appendConstantSlot(const Value& value)`
     pub fn append_constant_slot(&mut self, value: Value) -> usize {
         let index = self.constants.len();
         self.constants.push(value);
@@ -382,7 +374,7 @@ impl Proto {
             Value::Nil | Value::Boolean(_) | Value::Number(_) | Value::String(_)
         ) {
             let key = ConstantKey::from(&self.constants[index]);
-            // 使用 entry().or_insert() 对齐 C++ std::unordered_map::emplace 语义:
+            // 使用 entry().or_insert() 保留首次插入的常量槽位:
             // 如果 key 已存在则不覆盖（保留首次写入的索引）
             self.constant_map.entry(key).or_insert(index);
         }
@@ -395,7 +387,6 @@ impl Proto {
     /// # Panics
     /// 如果 index 超出范围则 panic。
     ///
-    /// C++ 对应: `Proto::getConstant(usize index) const`
     pub fn constant(&self, index: usize) -> &Value {
         &self.constants[index]
     }
@@ -416,7 +407,6 @@ impl Proto {
 
     /// 添加指令
     ///
-    /// C++ 对应: `Proto::addInstruction(Instruction inst)`
     pub fn add_instruction(&mut self, inst: Instruction) -> usize {
         self.code.push(inst);
         self.code.len() - 1
@@ -427,7 +417,6 @@ impl Proto {
     /// # Panics
     /// 如果 index 超出范围则 panic。
     ///
-    /// C++ 对应: `Proto::getInstruction(usize index) const`
     #[inline]
     pub fn instruction(&self, index: usize) -> Instruction {
         self.code[index]
@@ -438,7 +427,6 @@ impl Proto {
     /// # Panics
     /// 如果 index 超出范围则 panic。
     ///
-    /// C++ 对应: `Proto::setInstruction(usize index, Instruction inst)`
     #[inline]
     pub fn set_instruction(&mut self, index: usize, inst: Instruction) {
         self.code[index] = inst;
@@ -466,14 +454,12 @@ impl Proto {
 
     /// 添加行号信息
     ///
-    /// C++ 对应: `Proto::addLineInfo(i32 line)`
     pub fn add_line_info(&mut self, line: i32) {
         self.line_info.push(line);
     }
 
     /// 获取指令对应的行号
     ///
-    /// C++ 对应: `Proto::getLine(usize pc) const`
     pub fn line(&self, pc: usize) -> i32 {
         self.line_info.get(pc).copied().unwrap_or(0)
     }
@@ -494,7 +480,6 @@ impl Proto {
 
     /// 添加子函数原型
     ///
-    /// C++ 对应: `Proto::addProto(Proto* proto)`
     pub fn add_proto(&mut self, proto: GcRef<Proto>) -> usize {
         self.sub_protos.push(proto);
         self.sub_protos.len() - 1
@@ -505,7 +490,6 @@ impl Proto {
     /// # Panics
     /// 如果 index 超出范围则 panic。
     ///
-    /// C++ 对应: `Proto::getSubProto(usize index) const`
     #[inline]
     pub fn sub_proto(&self, index: usize) -> GcRef<Proto> {
         self.sub_protos[index]
@@ -521,7 +505,6 @@ impl Proto {
 
     /// 添加局部变量信息
     ///
-    /// C++ 对应: `Proto::addLocVar(GCString* varname, i32 startpc, i32 endpc, i32 reg)`
     pub fn add_loc_var(
         &mut self,
         varname: Option<GcRef<GcString>>,
@@ -538,7 +521,6 @@ impl Proto {
     /// # Panics
     /// 如果 index 超出范围则 panic。
     ///
-    /// C++ 对应: `Proto::getLocVar(usize index) const`
     #[inline]
     pub fn loc_var(&self, index: usize) -> &LocVar {
         &self.locvars[index]
@@ -555,7 +537,6 @@ impl Proto {
     /// `local_number`: 局部变量编号（从 1 开始）
     /// `pc`: 程序计数器位置
     ///
-    /// C++ 对应: `Proto::getLocalVarInfo(i32 localNumber, i32 pc) const`
     pub fn local_var_info(&self, local_number: i32, pc: i32) -> Option<&LocVar> {
         let mut remaining = local_number;
 
@@ -578,7 +559,6 @@ impl Proto {
 
     /// 添加上值名称
     ///
-    /// C++ 对应: `Proto::addUpvalueName(GCString* name)`
     pub fn add_upvalue_name(&mut self, name: GcRef<GcString>) -> usize {
         self.upvalue_names.push(name);
         self.upvalue_names.len() - 1
@@ -586,7 +566,6 @@ impl Proto {
 
     /// 获取上值名称
     ///
-    /// C++ 对应: `Proto::getUpvalueName(usize index) const`
     #[inline]
     pub fn upvalue_name(&self, index: usize) -> Option<GcRef<GcString>> {
         self.upvalue_names.get(index).copied()
@@ -684,7 +663,6 @@ unsafe impl GcObject for Proto {
     /// 4. 所有局部变量的变量名
     /// 5. 所有上值名称
     ///
-    /// C++ 对应: `Proto::mark(GarbageCollector& gc)`
     unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
         // 1. 标记源文件名
         if let Some(source_ref) = self.source {

@@ -3,7 +3,6 @@
 //! 实现 AST 语句 → 字节码的 lowering：赋值、局部声明、控制流、
 //! 循环、return、函数定义等全部 13 种 Stmt 节点。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/codegen/statement_emitter.hpp/.cpp`
 
 use crate::ast::expr::Expr;
 use crate::ast::stmt::{

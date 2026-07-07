@@ -3,7 +3,6 @@
 //! `GcString` 实现 Lua 字符串驻留机制。相同内容的字符串在内存中
 //! 只存储一份，创建时预计算哈希值，字符串比较可通过指针比较完成。
 //!
-//! C++ 参考: `lua_cpp/src/core/gc_string.hpp`
 
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_object::GcObject;
@@ -28,7 +27,6 @@ const HASH_LIMIT: usize = 5;
 /// - 字符串不可变（无公开修改接口）
 /// - 哈希值在创建时预计算
 ///
-/// C++ 对应: `GCString`
 #[repr(C)]
 pub struct GcString {
     /// GC 对象头部（必须在结构体开头）
@@ -115,7 +113,6 @@ impl GcString {
     /// 使用与 Lua 5.1 `luaS_hash` 完全相同的算法。
     /// 对于长字符串（> 32 字节），采用采样策略。
     ///
-    /// C++ 对应: `GCString::computeHash()`
     pub fn compute_hash(s: &str) -> usize {
         let bytes = s.as_bytes();
         let l = bytes.len();

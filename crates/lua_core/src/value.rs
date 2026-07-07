@@ -1,9 +1,8 @@
 //! Lua 动态类型系统的核心 — Value 类型
 //!
-//! `Value` 是 Lua 解释器中所有值的统一表示。使用 Rust `enum` 替代
-//! C++ 的 `std::variant`，提供类型安全的动态类型系统。
+//! `Value` 是 Lua 解释器中所有值的统一表示。它使用 Rust `enum`
+//! 提供类型安全的动态类型系统。
 //!
-//! C++ 参考: `lua_cpp/src/core/value.hpp`, `lua_cpp/src/core/value.cpp`
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -16,7 +15,7 @@ use crate::types::{Function, LuaInteger, LuaNumber, Table, Thread, Userdata, Val
 // Value 枚举定义
 // =====================================================================
 
-/// Lua 5.1 值类型 — 直接映射 C++ `ValueVariant`（std::variant）
+/// Lua 5.1 值类型
 ///
 /// 在 64 位系统上，此 enum 大小约 16 字节。
 ///
@@ -312,7 +311,7 @@ impl PartialEq for Value {
 impl Eq for Value {}
 
 // =====================================================================
-// Hash（对齐 C++ ValueHash）
+// Hash（与 Lua 值相等语义配套）
 // =====================================================================
 
 impl Hash for Value {
@@ -344,7 +343,7 @@ impl Hash for Value {
 }
 
 // =====================================================================
-// Display（格式对齐 C++ Value::toString()）
+// Display（用于调试与错误信息）
 // =====================================================================
 
 impl fmt::Display for Value {

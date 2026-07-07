@@ -1,6 +1,5 @@
 //! OS 库 (Operating System Library)
 //!
-//! Lua 5.1 `os` 库的当前最小实现。C++ 参考: `lua_cpp/src/lib/oslib.*`
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};

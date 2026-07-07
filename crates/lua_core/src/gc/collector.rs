@@ -3,7 +3,6 @@
 //! `GarbageCollector` 管理所有 GC 对象的生命周期，实现三色标记-清除算法。
 //! Phase 1.3 补全了完整的标记传播、清扫回收、弱表清理和终结器框架。
 //!
-//! C++ 参考: `lua_cpp/src/gc/garbage_collector.hpp`, `.cpp`
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -323,7 +322,6 @@ impl GarbageCollector {
 
     /// 检查对象是否会在当前 sweep 中被回收
     ///
-    /// C++ 对应: `GarbageCollector::isObjectDead(GCObject* obj)`
     pub fn is_object_dead(&self, obj: *mut GcObjectHeader) -> bool {
         if obj.is_null() {
             return false;
@@ -341,7 +339,6 @@ impl GarbageCollector {
     ///
     /// 字符串永远被视为存活（字符串驻留保证了即使无其他引用也可达）。
     ///
-    /// C++ 对应: `GarbageCollector::isValueDead(const Value& value)`
     pub fn is_value_dead(&self, value: &crate::value::Value) -> bool {
         match value {
             crate::value::Value::String(_) => false,
@@ -364,7 +361,6 @@ impl GarbageCollector {
     ///
     /// 字符串永远不会被清理；userdata 在 pending_finalizers 中时视为已死。
     ///
-    /// C++ 对应: `GarbageCollector::isWeakValueDead(const Value& value)`
     pub fn is_weak_value_dead(&self, value: &crate::value::Value) -> bool {
         match value {
             crate::value::Value::String(_) => false,

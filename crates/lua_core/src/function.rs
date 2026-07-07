@@ -12,7 +12,6 @@
 //! - 环境表 (`env`)：控制函数的全局变量访问范围（Lua 5.1 的 setfenv/getfenv）
 //! - Proto 引用 / C 函数指针
 //!
-//! C++ 参考: `lua_cpp/src/core/function.hpp`, `lua_cpp/src/core/function.cpp`
 //! 中的 `Lua::Function` 类。
 
 use crate::gc::collector::GarbageCollector;
@@ -34,7 +33,6 @@ use crate::upvalue::Upvalue;
 /// Phase 1.4 使用不透明指针（`*mut c_void`）占位，
 /// Phase 3 实现 LuaState 后具体化为 `*mut LuaState`。
 ///
-/// C++ 对应: `Lua::CFunction` = `i32 (*)(LuaState* L)`
 pub type CFunction = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
 
 // =====================================================================
@@ -57,7 +55,6 @@ pub type CFunction = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
 /// - proto: Option<GcRef<Proto>> (8 bytes)
 /// - upvalues: Vec<GcRef<Upvalue>> (24 bytes)
 ///
-/// C++ 对应: `Lua::Function`（继承 `GCObject`）
 #[repr(C)]
 pub struct Function {
     /// GC 对象头部（必须在结构体开头）
@@ -95,9 +92,8 @@ pub struct Function {
 impl Function {
     /// 创建 C 函数闭包
     ///
-    /// C++ 对应: `Function::Function(CFunction func)`
     ///
-    /// 不同于 C++ 需要 null 检查，Rust 的类型系统保证函数指针始终有效。
+    /// Rust 的函数指针类型保证这里始终是有效函数。
     pub fn new_c(func: CFunction) -> Self {
         Self {
             header: GcObjectHeader::new(GcObjectType::Function),
@@ -113,7 +109,6 @@ impl Function {
 
     /// 创建 Lua 函数闭包
     ///
-    /// C++ 对应: `Function::Function(Proto* proto)`
     ///
     /// # Panics
     /// 如果 `proto` 为 null 则 panic。
@@ -149,7 +144,6 @@ impl Function {
 
     /// 获取 C 函数指针
     ///
-    /// C++ 对应: `Function::getCFunction() const`
     #[inline]
     pub fn c_function(&self) -> Option<CFunction> {
         self.c_function
@@ -159,7 +153,6 @@ impl Function {
 
     /// 获取函数原型（仅 Lua 函数有效）
     ///
-    /// C++ 对应: `Function::getProto() const`
     #[inline]
     pub fn proto(&self) -> Option<GcRef<Proto>> {
         self.proto
@@ -169,7 +162,6 @@ impl Function {
 
     /// 获取 Upvalue 数量
     ///
-    /// C++ 对应: `Function::getUpvalueCount() const`
     #[inline]
     pub fn upvalue_count(&self) -> usize {
         self.upvalues.len()
@@ -177,7 +169,6 @@ impl Function {
 
     /// 获取指定索引的 Upvalue
     ///
-    /// C++ 对应: `Function::getUpvalue(usize index) const`
     #[inline]
     pub fn upvalue(&self, index: usize) -> Option<GcRef<Upvalue>> {
         self.upvalues.get(index).copied()
@@ -188,7 +179,6 @@ impl Function {
     /// # Panics
     /// 如果 index 超出范围则 panic。
     ///
-    /// C++ 对应: `Function::setUpvalue(usize index, Upvalue* upvalue)`
     pub fn set_upvalue(&mut self, index: usize, upvalue: GcRef<Upvalue>) {
         // TODO Phase 1.3+: write barrier — gc->writeBarrier(this, upvalue)
         self.upvalues[index] = upvalue;
@@ -196,7 +186,6 @@ impl Function {
 
     /// 添加 Upvalue 到数组末尾
     ///
-    /// C++ 对应: `Function::addUpvalue(Upvalue* upvalue)`
     pub fn add_upvalue(&mut self, upvalue: GcRef<Upvalue>) {
         // TODO Phase 1.3+: write barrier — gc->writeBarrier(this, upvalue)
         self.upvalues.push(upvalue);
@@ -208,7 +197,6 @@ impl Function {
 
     /// 获取函数的环境表
     ///
-    /// C++ 对应: `Function::getEnv() const`
     #[inline]
     pub fn env(&self) -> Option<GcRef<Table>> {
         self.env
@@ -216,7 +204,6 @@ impl Function {
 
     /// 设置函数的环境表
     ///
-    /// C++ 对应: `Function::setEnv(Table* env)`
     pub fn set_env(&mut self, env: Option<GcRef<Table>>) {
         // TODO Phase 1.3+: write barrier — gc->writeBarrier(this, env)
         self.env = env;
@@ -226,7 +213,6 @@ impl Function {
 
     /// 获取上值数量（ClosureHeader 字段）
     ///
-    /// C++ 对应: `Function::getNumUpvalues() const`
     #[inline]
     pub fn num_upvalues(&self) -> u8 {
         self.nupvalues
@@ -234,7 +220,6 @@ impl Function {
 
     /// 获取 GC 链表指针（ClosureHeader 字段）
     ///
-    /// C++ 对应: `Function::getGCList() const`
     #[inline]
     pub fn gc_list(&self) -> Option<GcRef<Function>> {
         self.gclist
@@ -242,7 +227,6 @@ impl Function {
 
     /// 设置 GC 链表指针（ClosureHeader 字段）
     ///
-    /// C++ 对应: `Function::setGCList(GCObject* list)`
     #[inline]
     pub fn set_gc_list(&mut self, list: Option<GcRef<Function>>) {
         self.gclist = list;
@@ -272,7 +256,6 @@ unsafe impl GcObject for Function {
     /// 2. 标记所有上值（Upvalue）
     /// 3. 标记环境表（Table）
     ///
-    /// C++ 对应: `Function::mark(GarbageCollector& gc)`
     unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
         // 1. 标记函数原型（仅 Lua 函数）
         if let Some(proto_ref) = self.proto {

@@ -63,29 +63,3 @@ jobs:
       - name: Quality gate
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_quality_gate.ps1
-
-  # C++ baseline validation — runs only when C++ tools are built
-  cross-validate:
-    name: Cross-Language Validation
-    runs-on: windows-latest
-    needs: quality-gate
-    if: false  # Enable when Phase 2+ and C++ baseline is available in CI
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Bytecode comparison
-        shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/compare_bytecode.ps1 -InputDir tests/fixtures/
-
-      - name: VM trace comparison
-        shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/compare_vm_trace.ps1 -InputDir tests/fixtures/

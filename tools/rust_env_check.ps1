@@ -1,9 +1,8 @@
 <#
 .SYNOPSIS
-    Lua Rust Migration — Environment Check
+    Lua Rust — Environment Check
 .DESCRIPTION
-    Checks that all required Rust tools and C++ baseline binaries are available.
-    Used as the Phase 0+ pre-flight check before any migration work begins.
+    Checks that all required Rust tools and workspace crates are available.
 .PARAMETER InstallTools
     Attempt to install missing tools automatically.
 .PARAMETER Verbose
@@ -61,7 +60,7 @@ $RequiredTools = @(
     }
 )
 
-Write-Host "=== Lua Rust Migration Environment Check ===" -ForegroundColor Cyan
+Write-Host "=== Lua Rust Environment Check ===" -ForegroundColor Cyan
 Write-Host "  Project root: $ProjectRoot`n"
 
 $AllOk = $true
@@ -89,38 +88,6 @@ foreach ($tool in $RequiredTools) {
             }
         }
     }
-}
-
-# Check C++ baseline tools for cross-validation (optional in Phase 0)
-Write-Host "`n=== C++ Baseline Tools (for cross-validation) ===" -ForegroundColor Cyan
-$BaselineDir = Resolve-Path (Join-Path $ProjectRoot "..\lua_cpp\bin") -ErrorAction SilentlyContinue
-
-if ($BaselineDir) {
-    if (Test-Path (Join-Path $BaselineDir "lua_test.exe")) {
-        Write-Host "  [OK] lua_test.exe (C++ baseline)" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  [WARN] lua_test.exe not found at $BaselineDir" -ForegroundColor Yellow
-        Write-Host "    Build lua_cpp first for cross-validation capabilities"
-    }
-
-    if (Test-Path (Join-Path $BaselineDir "lua_bytecode.exe")) {
-        Write-Host "  [OK] lua_bytecode.exe (C++ baseline)" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  [WARN] lua_bytecode.exe not found at $BaselineDir" -ForegroundColor Yellow
-    }
-
-    if (Test-Path (Join-Path $BaselineDir "lua_app.exe")) {
-        Write-Host "  [OK] lua_app.exe (C++ baseline)" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  [WARN] lua_app.exe not found at $BaselineDir" -ForegroundColor Yellow
-    }
-}
-else {
-    Write-Host "  [INFO] C++ baseline directory not found — cross-validation unavailable" -ForegroundColor Gray
-    Write-Host "    Expected at: ..\lua_cpp\bin\" -ForegroundColor Gray
 }
 
 # Check workspace structure

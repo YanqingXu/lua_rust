@@ -2,7 +2,6 @@
 //!
 //! 定义所有 Lua 5.1 语句类型（13 种），用于表示解析后的语句结构。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/ast.hpp`
 
 use crate::ast::expr::{Expr, SourceLocation};
 
@@ -14,7 +13,6 @@ use crate::ast::expr::{Expr, SourceLocation};
 ///
 /// 包含条件表达式和对应的语句体。
 ///
-/// C++ 对应: `Lua::IfStmt::Branch`
 #[derive(Debug, Clone)]
 pub struct IfBranch {
     pub condition: Box<Expr>,
@@ -27,7 +25,6 @@ pub struct IfBranch {
 
 /// 空语句
 ///
-/// C++ 对应: `Lua::EmptyStmt`
 #[derive(Debug, Clone)]
 pub struct EmptyStmt {
     pub location: SourceLocation,
@@ -35,7 +32,6 @@ pub struct EmptyStmt {
 
 /// 赋值语句 `targets = values`
 ///
-/// C++ 对应: `Lua::AssignStmt`
 #[derive(Debug, Clone)]
 pub struct AssignStmt {
     pub location: SourceLocation,
@@ -47,7 +43,6 @@ pub struct AssignStmt {
 
 /// 局部变量声明 `local names = values`
 ///
-/// C++ 对应: `Lua::LocalStmt`
 #[derive(Debug, Clone)]
 pub struct LocalStmt {
     pub location: SourceLocation,
@@ -57,7 +52,6 @@ pub struct LocalStmt {
 
 /// 函数调用语句
 ///
-/// C++ 对应: `Lua::CallStmt`
 #[derive(Debug, Clone)]
 pub struct CallStmt {
     pub location: SourceLocation,
@@ -66,7 +60,6 @@ pub struct CallStmt {
 
 /// if 语句
 ///
-/// C++ 对应: `Lua::IfStmt`
 #[derive(Debug, Clone)]
 pub struct IfStmt {
     pub location: SourceLocation,
@@ -80,7 +73,6 @@ pub struct IfStmt {
 
 /// while 循环
 ///
-/// C++ 对应: `Lua::WhileStmt`
 #[derive(Debug, Clone)]
 pub struct WhileStmt {
     pub location: SourceLocation,
@@ -92,7 +84,6 @@ pub struct WhileStmt {
 
 /// repeat-until 循环
 ///
-/// C++ 对应: `Lua::RepeatStmt`
 #[derive(Debug, Clone)]
 pub struct RepeatStmt {
     pub location: SourceLocation,
@@ -104,7 +95,6 @@ pub struct RepeatStmt {
 
 /// 数值 for 循环 `for name = init, limit[, step] do body end`
 ///
-/// C++ 对应: `Lua::ForNumStmt`
 #[derive(Debug, Clone)]
 pub struct ForNumStmt {
     pub location: SourceLocation,
@@ -120,7 +110,6 @@ pub struct ForNumStmt {
 
 /// 泛型 for 循环 `for vars in iterators do body end`
 ///
-/// C++ 对应: `Lua::ForInStmt`
 #[derive(Debug, Clone)]
 pub struct ForInStmt {
     pub location: SourceLocation,
@@ -140,7 +129,6 @@ pub struct ForInStmt {
 /// - `function t.a.b.c.foo() end` — 表成员函数
 /// - `function t:method() end` — 方法定义（自动添加 self 参数）
 ///
-/// C++ 对应: `Lua::FunctionStmt`
 #[derive(Debug, Clone)]
 pub struct FunctionStmt {
     pub location: SourceLocation,
@@ -164,7 +152,6 @@ pub struct FunctionStmt {
 
 /// return 语句
 ///
-/// C++ 对应: `Lua::ReturnStmt`
 #[derive(Debug, Clone)]
 pub struct ReturnStmt {
     pub location: SourceLocation,
@@ -173,7 +160,6 @@ pub struct ReturnStmt {
 
 /// break 语句
 ///
-/// C++ 对应: `Lua::BreakStmt`
 #[derive(Debug, Clone)]
 pub struct BreakStmt {
     pub location: SourceLocation,
@@ -181,7 +167,6 @@ pub struct BreakStmt {
 
 /// do-end 块
 ///
-/// C++ 对应: `Lua::DoStmt`
 #[derive(Debug, Clone)]
 pub struct DoStmt {
     pub location: SourceLocation,
@@ -191,7 +176,6 @@ pub struct DoStmt {
 }
 
 // =====================================================================
-// 语句枚举（13 种变体，对应 C++ StmtVariant）
 // =====================================================================
 
 /// Lua 5.1 语句枚举
@@ -199,7 +183,6 @@ pub struct DoStmt {
 /// 包含全部 13 种语句节点类型。
 /// 使用 `Box<Stmt>` 实现递归所有权（如函数体内的语句）。
 ///
-/// C++ 对应: `Lua::StmtVariant` (std::variant of 13 types)
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Empty(EmptyStmt),
@@ -223,7 +206,6 @@ pub const STMT_NODE_COUNT: usize = 13;
 impl Stmt {
     /// 获取语句的行号
     ///
-    /// C++ 对应: `Lua::Stmt::getLine()`
     pub fn line(&self) -> i32 {
         match self {
             Stmt::Empty(s) => s.location.line,
@@ -244,7 +226,6 @@ impl Stmt {
 
     /// 获取语句的列号
     ///
-    /// C++ 对应: `Lua::Stmt::getColumn()`
     pub fn column(&self) -> i32 {
         match self {
             Stmt::Empty(s) => s.location.column,
@@ -268,7 +249,6 @@ impl Stmt {
     /// 对于 if/while/for/function/do 等块语句，返回 end 关键字的行号；
     /// 对于单行语句，返回其自身的行号。
     ///
-    /// C++ 对应: `Lua::Stmt::getEndLine()`
     pub fn end_line(&self) -> i32 {
         match self {
             Stmt::Empty(s) => s.location.line,
@@ -338,7 +318,6 @@ impl Stmt {
 ///
 /// 表示一个完整的 Lua 源文件或函数体。
 ///
-/// C++ 对应: `Lua::Chunk`
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub statements: Vec<Box<Stmt>>,

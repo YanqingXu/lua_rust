@@ -5,7 +5,6 @@
 //! setmetatable, getmetatable, rawget, rawset, rawequal, select,
 //! pcall, xpcall, next, pairs, ipairs, loadstring, dofile, collectgarbage 等。
 //!
-//! C++ 参考: `lua_cpp/src/lib/baselib.hpp/.cpp`
 
 use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::parser::Parser;

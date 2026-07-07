@@ -3,7 +3,6 @@
 //! 实现字面量、标识符、括号、表/函数表达式入口，
 //! 以及函数调用 `()`、索引 `[]`、成员访问 `.`、方法调用 `:` 等后缀链。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/parser/parser_primary.cpp`
 
 use crate::ast::SourceLocation;
 use crate::ast::expr::{
@@ -17,7 +16,6 @@ use crate::token::{TokenType, TokenValue};
 impl<'source> Parser<'source> {
     /// 基础表达式解析
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parsePrimaryExpr()`
     pub fn parse_primary_expr(&mut self) -> Result<Box<Expr>, ParseError> {
         let line = self.current().line;
         let column = self.current().column;
@@ -119,7 +117,6 @@ impl<'source> Parser<'source> {
 
     /// 后缀表达式链：处理函数调用、索引、成员访问、方法调用
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parsePostfixExpr()`
     fn parse_postfix_expr(&mut self, mut base: Box<Expr>) -> Result<Box<Expr>, ParseError> {
         loop {
             let line = self.current().line;

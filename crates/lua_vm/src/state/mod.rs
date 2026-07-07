@@ -2,7 +2,6 @@
 //!
 //! 定义 Lua 虚拟机核心运行时状态类型。
 //!
-//! C++ 参考: `lua_cpp/src/vm/state/`
 
 pub mod call_info;
 pub mod lua_state;

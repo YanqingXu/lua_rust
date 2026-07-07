@@ -2,13 +2,11 @@
 //!
 //! 管理临时寄存器的分配/回收和 maxStackSize 维护。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/register_allocator.hpp`
 
 /// 寄存器分配器
 ///
 /// 负责临时寄存器的分配/回收，以及 maxStackSize 的维护。
 ///
-/// C++ 对应: `Lua::RegisterAllocator`
 #[derive(Debug)]
 pub struct RegisterAllocator {
     // 下一个空闲寄存器

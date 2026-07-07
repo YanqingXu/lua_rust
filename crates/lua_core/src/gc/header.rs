@@ -1,9 +1,8 @@
 //! GC 对象头部 — 侵入式链表节点
 //!
 //! `GcObjectHeader` 是每个 GC 管理对象的前缀，提供侵入式链表链接
-//! 和三色标记算法的标记位。直接映射 C++ `GCObject` 的数据成员。
+//! 和三色标记算法的标记位。
 //!
-//! C++ 参考: `lua_cpp/src/core/gc_object.hpp`
 
 use std::cell::Cell;
 
@@ -13,9 +12,8 @@ use crate::types::GcObjectType;
 // GC 标记位常量
 // =====================================================================
 
-/// GC 标记位定义 — 与 C++ `GCBits` 命名空间完全对齐
+/// GC 标记位定义
 ///
-/// C++ 参考: `lua_cpp/src/core/gc_object.hpp` GCBits
 pub mod bits {
     use crate::types::LuByte;
 
@@ -44,7 +42,7 @@ pub mod bits {
 
 /// GC 对象头部 — 侵入式链表节点 + GC 标记
 ///
-/// 内存布局（`#[repr(C)]` 确保与 C++ 兼容）:
+/// 内存布局（`#[repr(C)]` 固定字段顺序）:
 /// - `next`: 8 字节（64 位指针）
 /// - `marked`: 1 字节（GC 标记位）
 /// - `gc_type`: 1 字节（GcObjectType 枚举）
@@ -53,7 +51,6 @@ pub mod bits {
 ///
 /// 使用 `Cell` 实现内部可变性，因为 GC 标记在共享引用下也需要修改。
 ///
-/// C++ 对应: `GCObject` 的数据成员部分
 #[repr(C)]
 pub struct GcObjectHeader {
     /// 侵入式链表指针 — 指向下一个 GC 对象
@@ -130,7 +127,6 @@ impl GcObjectHeader {
 
     /// 设置 GC 颜色
     ///
-    /// C++ 对应: `GCObject::setColor(GCColor color)`
     pub fn set_color(&self, color: crate::types::GcColor) {
         let m = self.marked.get();
         // 清除颜色位
@@ -220,7 +216,6 @@ mod tests {
         assert_eq!(h.marked(), 0);
         assert!(h.next().is_null());
         // marked=0 → neither WHITEBITS nor BLACK set → Gray
-        // (matches C++ behavior: fresh GCObject::marked_ = 0)
         assert!(h.is_gray());
     }
 

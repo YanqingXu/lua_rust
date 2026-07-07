@@ -3,7 +3,6 @@
 //! 每个 LuaState 代表一个独立的协程执行环境，包含值栈、调用栈、
 //! 全局表引用和线程状态。
 //!
-//! C++ 参考: `lua_cpp/src/vm/state/lua_state.hpp`
 
 use std::collections::HashMap;
 
@@ -21,7 +20,6 @@ use super::stack::Stack;
 
 /// 线程执行状态
 ///
-/// C++ 对应: `Lua::ThreadStatus`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ThreadStatus {
@@ -37,7 +35,6 @@ pub enum ThreadStatus {
 ///
 /// 管理单个 Lua 线程（协程）的完整执行环境。
 ///
-/// C++ 对应: `Lua::LuaState`
 #[derive(Debug)]
 pub struct LuaState {
     /// 值栈

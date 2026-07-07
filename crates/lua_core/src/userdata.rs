@@ -1,6 +1,6 @@
 //! Lua 用户数据对象 — GC 管理的原始字节缓冲区
 //!
-//! `Userdata` 允许将任意 C/C++/Rust 数据包装成 Lua 对象。
+//! `Userdata` 允许将任意 C/Rust 数据包装成 Lua 对象。
 //! Lua 5.1 支持两种用户数据：
 //! 1. **轻量用户数据** (Light Userdata): 简单的 `void*` 指针，不受 GC 管理（对应 `Value::LightUserdata`）
 //! 2. **完整用户数据** (Full Userdata): GC 管理的内存块，支持元表和终结器（本模块）
@@ -11,7 +11,6 @@
 //! - **终结器**：可选的数据析构回调，在 GC 回收时调用
 //! - **对齐保证**：缓冲区起始地址满足平台对齐要求
 //!
-//! C++ 参考: `lua_cpp/src/core/userdata.hpp`, `lua_cpp/src/core/userdata.cpp`
 
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_object::GcObject;
@@ -36,7 +35,6 @@ use crate::types::GcObjectType;
 /// - data_destructor: Option<unsafe fn(*mut u8)> (8 bytes)
 ///   总计约 56+ bytes
 ///
-/// C++ 对应: `Lua::Userdata`（继承 `GCObject`）
 #[repr(C)]
 pub struct Userdata {
     /// GC 对象头部（必须在结构体开头）
@@ -53,14 +51,12 @@ pub struct Userdata {
     /// 在 GC 回收此对象时调用，用于释放非平凡类型持有的外部资源。
     /// 回调接收 `data.as_mut_ptr()` 作为参数。
     ///
-    /// 对应 C++ 中 `UserdataBufferDeleter` 和 `dataDestructor_` 的组合。
     data_destructor: Option<unsafe fn(*mut u8)>,
 }
 
 impl Userdata {
     /// 创建指定大小的完整用户数据（零初始化）
     ///
-    /// C++ 对应: `Userdata::createFull(usize size)`
     pub fn new(size: usize) -> Self {
         Self {
             header: GcObjectHeader::new(GcObjectType::Userdata),
@@ -110,7 +106,6 @@ impl Userdata {
 
     /// 获取用户数据缓冲区的裸指针（不可变）
     ///
-    /// C++ 对应: `Userdata::getData() const`
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self.data.as_ptr()
@@ -129,7 +124,6 @@ impl Userdata {
     /// # Safety
     /// 调用者必须保证缓冲区中包含类型 `T` 的有效表示。
     ///
-    /// C++ 对应: `Userdata::getTypedData<T>() const`
     #[inline]
     pub unsafe fn data_as<T>(&self) -> Option<&T> {
         if std::mem::size_of::<T>() > self.data.len() {
@@ -156,7 +150,7 @@ impl Userdata {
 
     /// 将类型化数据写入用户数据缓冲区
     ///
-    /// 使用 `std::ptr::write` 进行原始写入以对齐 C++ placement new 语义。
+    /// 使用 `std::ptr::write` 进行原始写入，实现原地构造语义。
     ///
     /// # Panics
     /// 如果 `sizeof<T>() > self.len()` 则 panic。
@@ -164,7 +158,6 @@ impl Userdata {
     /// # Safety
     /// 如果已有析构器则 panic（防止重复构造）。
     ///
-    /// C++ 对应: `Userdata::constructData<T>(Args&&... args)`
     pub unsafe fn write_typed<T>(&mut self, value: T) {
         assert!(
             std::mem::size_of::<T>() <= self.data.len(),
@@ -194,7 +187,6 @@ impl Userdata {
 
     /// 获取元表
     ///
-    /// C++ 对应: `Userdata::getMetatable() const`
     #[inline]
     pub fn metatable(&self) -> Option<GcRef<Table>> {
         self.metatable
@@ -202,7 +194,6 @@ impl Userdata {
 
     /// 设置元表
     ///
-    /// C++ 对应: `Userdata::setMetatable(Table* mt)`
     pub fn set_metatable(&mut self, mt: Option<GcRef<Table>>) {
         // TODO Phase 1.3+: write barrier — gc->writeBarrier(this, mt)
         self.metatable = mt;
@@ -210,7 +201,6 @@ impl Userdata {
 
     /// 检查是否有元表
     ///
-    /// C++ 对应: `Userdata::hasMetatable() const`
     #[inline]
     pub fn has_metatable(&self) -> bool {
         self.metatable.is_some()
@@ -266,7 +256,6 @@ unsafe impl GcObject for Userdata {
     ///
     /// 仅标记元表（如果存在）。用户数据缓冲区的原始数据不包含 GC 引用。
     ///
-    /// C++ 对应: `Userdata::mark(GarbageCollector& gc)`
     unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
         if let Some(mt) = self.metatable {
             // SAFETY: mt is a valid GcRef<Table> held by this Userdata;

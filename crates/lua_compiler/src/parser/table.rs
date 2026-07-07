@@ -7,7 +7,6 @@
 //! - 命名键 `{name = value}`
 //! - 尾随分隔符 `{a, b,}`
 //!
-//! C++ 参考: `lua_cpp/src/compiler/parser/parser_table.cpp`
 
 use crate::ast::SourceLocation;
 use crate::ast::expr::{Expr, StringExpr, TableExpr, TableField};
@@ -18,7 +17,6 @@ use crate::token::TokenType;
 impl<'source> Parser<'source> {
     /// 解析表构造器 `{ [key =] value [, ...] }`
     ///
-    /// C++ 对应: `Lua::Parser::Impl::parseTableConstructor()`
     pub fn parse_table_constructor(&mut self) -> Result<Box<Expr>, ParseError> {
         let _guard = self.recursion_guard(Self::MAX_RECURSION_DEPTH)?;
 

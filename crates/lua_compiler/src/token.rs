@@ -2,7 +2,6 @@
 //!
 //! 定义语法分析阶段使用的 Token 类型、语义值和源代码位置信息。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/parser/token.hpp`
 
 // =====================================================================
 // TokenType 枚举
@@ -11,9 +10,8 @@
 /// Lua 词法标记类型
 ///
 /// 关键词从 257 开始以区分 ASCII 单字符标记（0-255 范围）。
-/// discriminant 值与 C++ `TokenType` 枚举完全一致。
+/// discriminant 值保持稳定，便于调试和表驱动分发。
 ///
-/// C++ 对应: `Lua::TokenType` (enum class : i32)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum TokenType {
@@ -191,7 +189,6 @@ impl std::fmt::Display for TokenType {
 
 /// Token 的语义值
 ///
-/// C++ 对应: `Lua::TokenValue` (std::variant<std::monostate, f64, Str>)
 #[derive(Debug, Clone)]
 pub enum TokenValue {
     /// 无值（关键词、运算符、分隔符）
@@ -208,7 +205,6 @@ pub enum TokenValue {
 
 /// 词法标记
 ///
-/// C++ 对应: `Lua::Token`
 #[derive(Debug, Clone)]
 pub struct Token {
     /// 标记类型

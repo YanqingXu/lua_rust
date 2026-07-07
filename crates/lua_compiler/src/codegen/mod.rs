@@ -13,7 +13,6 @@
 //! - `stmt_emit` — 语句/block/控制流 lowering (statement_emitter.hpp)
 //! - `func_comp` — 子函数编译与闭包 (function_compiler.hpp)
 //!
-//! C++ 参考: `lua_cpp/src/compiler/codegen/` (18 个文件)
 
 pub mod binder;
 pub mod builder;
@@ -85,7 +84,6 @@ impl From<ParseError> for CodegenError {
 /// 将 AST 编译为可执行的 Proto 对象。
 /// 实现完整的表达式/语句 lowering 和函数编译管线。
 ///
-/// C++ 对应: `Lua::CodeGenerator`
 pub struct CodeGenerator {
     pub builder: BytecodeBuilder,
     pub reg_alloc: RegisterAllocator,

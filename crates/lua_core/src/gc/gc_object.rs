@@ -1,7 +1,7 @@
 //! GC 对象 trait
 //!
 //! 所有可被 GC 管理的对象必须实现 `GcObject` trait。
-//! 直接映射 C++ `GCObject` 抽象基类的虚函数接口。
+//! 为 GC 管理对象提供统一的标记和大小查询接口。
 //!
 //! # Safety
 //!
@@ -10,7 +10,6 @@
 //! 2. `gc_header()` 返回有效的 header 引用
 //! 3. `mark_children()` 正确报告所有引用关系
 //!
-//! C++ 参考: `lua_cpp/src/core/gc_object.hpp`
 
 use crate::gc::header::GcObjectHeader;
 

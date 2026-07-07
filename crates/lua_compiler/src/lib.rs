@@ -3,18 +3,12 @@
 //! Lexing, parsing, and bytecode code generation for Lua 5.1 sources.
 //! Produces `Proto` objects consumable by the `lua_vm` execution engine.
 //!
-//! ## Migration Status
-//! - Phase 2 target crate
-//! - C++ reference: `lua_cpp/src/compiler/`
-//!
-//! ## Module Map (C++ → Rust)
-//! | C++ | Rust module | Status |
-//! |---|---|---|
-//! | `src/compiler/opcode.hpp/.cpp` | `opcode` | ✅ P2.1 |
-//! | `src/compiler/lexer/*` | `lexer`, `token` | ✅ P2.1 |
-//! | `src/compiler/parser/*` | `parser` | ✅ P2.3b |
-//! | `src/compiler/ast.hpp/.cpp` + `ast_visitor.hpp` | `ast` | ✅ P2.3a |
-//! | `src/compiler/codegen/*` | `codegen` | 🏗️ P2.4 (framework done: types/reg_alloc/builder) |
+//! ## Module Guide
+//! - `token` / `lexer`: Token 类型、源码位置和词法分析。
+//! - `ast`: Lua 语法树节点与访问器。
+//! - `parser`: 递归下降语法分析器。
+//! - `opcode`: Lua 5.1 指令编码、解码和元数据。
+//! - `codegen`: 作用域、寄存器分配、跳转回填和 `Proto` 生成。
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]

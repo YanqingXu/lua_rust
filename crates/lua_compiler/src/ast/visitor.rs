@@ -3,7 +3,6 @@
 //! 为 AST 的表达式和语句提供 visitor trait，支持遍历全部节点类型。
 //! Rust 编译器通过穷尽检查确保每个 visitor 覆盖所有节点变体。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/ast_visitor.hpp`
 
 use crate::ast::expr::{
     BinaryExpr, BoolExpr, CallExpr, Expr, FunctionExpr, IndexExpr, MemberExpr, NameExpr, NilExpr,
@@ -23,7 +22,6 @@ use crate::ast::stmt::{
 /// 实现者必须为全部 14 种表达式节点提供 `visit_*` 方法。
 /// Rust 编译器会检查 match 穷尽性，确保所有变体都被覆盖。
 ///
-/// C++ 对应: `Lua::ExprVisitor<Derived, R>`
 pub trait ExprVisitor<R = ()> {
     /// 访问 nil 字面量
     fn visit_nil(&mut self, expr: &NilExpr) -> R;
@@ -56,7 +54,6 @@ pub trait ExprVisitor<R = ()> {
 
     /// 分发表达式到对应的 visit 方法
     ///
-    /// C++ 对应: `Lua::ExprVisitor::visit(const Expr&)`
     fn visit_expr(&mut self, expr: &Expr) -> R {
         match expr {
             Expr::Nil(e) => self.visit_nil(e),
@@ -86,7 +83,6 @@ pub trait ExprVisitor<R = ()> {
 /// 实现者必须为全部 13 种语句节点提供 `visit_*` 方法。
 /// Rust 编译器会检查 match 穷尽性，确保所有变体都被覆盖。
 ///
-/// C++ 对应: `Lua::StmtVisitor<Derived, R>`
 pub trait StmtVisitor<R = ()> {
     /// 访问空语句
     fn visit_empty(&mut self, stmt: &EmptyStmt) -> R;
@@ -117,7 +113,6 @@ pub trait StmtVisitor<R = ()> {
 
     /// 分发语句到对应的 visit 方法
     ///
-    /// C++ 对应: `Lua::StmtVisitor::visit(const Stmt&)`
     fn visit_stmt(&mut self, stmt: &Stmt) -> R {
         match stmt {
             Stmt::Empty(s) => self.visit_empty(s),
@@ -146,7 +141,6 @@ pub trait StmtVisitor<R = ()> {
 /// 同时提供表达式和语句的访问能力。
 /// 实现此 trait 的类型必须同时实现 `ExprVisitor` 和 `StmtVisitor`。
 ///
-/// C++ 对应: `Lua::AstVisitor<Derived, R>`
 pub trait AstVisitor<R = ()>: ExprVisitor<R> + StmtVisitor<R> {
     /// 访问程序块
     fn visit_chunk(&mut self, chunk: &crate::ast::stmt::Chunk) -> R {

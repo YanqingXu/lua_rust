@@ -15,7 +15,6 @@
 //! - 其他操作：`__concat`, `__len`, `__call`
 //! - 特殊方法：`__gc`, `__mode`
 //!
-//! C++ 参考: `lua_cpp/src/core/metatable.hpp`, `lua_cpp/src/core/metatable.cpp`
 
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_ref::GcRef;
@@ -32,11 +31,10 @@ use crate::value::Value;
 /// 定义所有支持的元方法类型。枚举顺序与 Lua 5.1.5 保持一致。
 /// 前 5 个（`TM_INDEX` 到 `TM_EQ`）是"快速"元方法，具有 flags 缓存优化。
 ///
-/// discriminant 值必须与 C++ `TMS` 枚举完全一致。
+/// discriminant 值保持稳定，便于用位图缓存缺失元方法。
 ///
-/// C++ 对应: `Lua::TMS` (enum class : u8)
 ///
-/// 变体名使用 UPPER_CASE 以匹配 C++ 命名约定（`TM_INDEX`, `TM_ADD` 等）。
+/// 变体名使用 UPPER_CASE，便于和 Lua 元方法事件名区分。
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -127,7 +125,6 @@ impl TMS {
 /// 按照 `TMS` 枚举顺序定义，用于在元表中查找对应的元方法函数。
 /// 索引 `n` 对应 `TMS` discriminant 值为 `n` 的元方法。
 ///
-/// C++ 对应: `kMetamethodNames`
 pub const METAMETHOD_NAMES: [&str; TMS::TM_N as usize] = [
     "__index",    // TM_INDEX = 0
     "__newindex", // TM_NEWINDEX = 1
@@ -150,7 +147,6 @@ pub const METAMETHOD_NAMES: [&str; TMS::TM_N as usize] = [
 
 /// 获取元方法名称字符串
 ///
-/// C++ 对应: `getMetamethodName(TMS event)`
 #[inline]
 pub fn metamethod_name(event: TMS) -> &'static str {
     METAMETHOD_NAMES[event as usize]
@@ -180,7 +176,6 @@ pub fn metamethod_name(event: TMS) -> &'static str {
 /// # Safety
 /// `metatable` 中的 `GcRef<Table>` 必须有效（未被 GC 回收）。
 ///
-/// C++ 对应: `getMetamethod(GlobalState&, Table*, TMS)`
 pub fn get_metamethod(
     metatable: Option<GcRef<Table>>,
     event: TMS,
@@ -235,7 +230,6 @@ pub fn get_metamethod(
 /// # Panics
 /// 如果 `event > TMS::TM_EQ` 则 panic（非快速元方法不应使用此函数）。
 ///
-/// C++ 对应: `fastMetamethod(GlobalState&, Table*, TMS)`
 pub fn fast_metamethod(
     metatable: Option<GcRef<Table>>,
     event: TMS,

@@ -7,7 +7,6 @@
 //! - **iABx**:  `[OP:6][A:8][Bx:18]` — 两操作数格式（大索引）
 //! - **iAsBx**: `[OP:6][A:8][sBx:18]` — 两操作数格式（有符号偏移）
 //!
-//! C++ 参考: `lua_cpp/src/compiler/opcode.hpp`
 
 use lua_core::proto::Instruction;
 
@@ -17,7 +16,6 @@ use lua_core::proto::Instruction;
 
 /// 指令格式类型
 ///
-/// C++ 对应: `Lua::OpMode`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpMode {
     /// 三操作数格式: OP(6) A(8) C(9) B(9)
@@ -82,9 +80,8 @@ pub const LFIELDS_PER_FLUSH: i32 = 50;
 
 /// Lua 5.1 虚拟机操作码（38 个指令）
 ///
-/// discriminant 值必须与 C++ `OpCode` 枚举完全一致（0..37）。
+/// discriminant 值固定为 Lua 5.1 的 38 条 opcode 编号（0..37）。
 ///
-/// C++ 对应: `Lua::OpCode` (enum class : u8)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum OpCode {
@@ -220,7 +217,6 @@ impl OpCode {
 
 /// 操作数类型掩码
 ///
-/// C++ 对应: `Lua::OpArgMask`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpArgMask {
     /// 参数未使用
@@ -239,7 +235,6 @@ pub enum OpArgMask {
 
 /// 操作码功能分组
 ///
-/// C++ 对应: `Lua::VM::OpcodeGroup`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpcodeGroup {
     Unknown,
@@ -263,7 +258,6 @@ pub enum OpcodeGroup {
 
 /// 操作码元数据结构
 ///
-/// C++ 对应: `Lua::OpcodeMetadata`
 #[derive(Debug, Clone)]
 pub struct OpcodeMetadata {
     /// 操作码
@@ -294,7 +288,6 @@ pub struct OpcodeMetadata {
 ///
 /// 索引即为 `OpCode` 的 discriminant 值。
 ///
-/// C++ 对应: `Lua::kOpcodeMetadata`
 pub static OPCODE_METADATA: [OpcodeMetadata; 38] = [
     // MOVE
     OpcodeMetadata {
@@ -756,7 +749,6 @@ pub static OPCODE_METADATA: [OpcodeMetadata; 38] = [
 
 /// 未知操作码的元数据（越界查询时返回）
 ///
-/// C++ 对应: `Lua::kUnknownOpcodeMetadata`
 pub static UNKNOWN_OPCODE_METADATA: OpcodeMetadata = OpcodeMetadata {
     opcode: OpCode::MOVE, // 占位，实际不会被使用
     name: "UNKNOWN",
@@ -775,7 +767,6 @@ pub static UNKNOWN_OPCODE_METADATA: OpcodeMetadata = OpcodeMetadata {
 
 /// 获取操作码的元数据
 ///
-/// C++ 对应: `Lua::opcodeMetadata(OpCode op)`
 #[inline]
 pub fn opcode_metadata(op: OpCode) -> &'static OpcodeMetadata {
     let idx = op as usize;
@@ -838,7 +829,6 @@ const fn mask1(n: i32, p: i32) -> Instruction {
 
 /// 从指令中提取操作码
 ///
-/// C++ 对应: `GET_OPCODE(Instruction i)`
 #[inline]
 pub fn get_opcode(inst: Instruction) -> OpCode {
     let raw = ((inst >> POS_OP) & mask1(SIZE_OP, 0)) as u8;
@@ -847,7 +837,6 @@ pub fn get_opcode(inst: Instruction) -> OpCode {
 
 /// 从指令中提取 A 参数
 ///
-/// C++ 对应: `GETARG_A(Instruction i)`
 #[inline]
 pub fn get_arg_a(inst: Instruction) -> i32 {
     ((inst >> POS_A) & mask1(SIZE_A, 0)) as i32
@@ -855,7 +844,6 @@ pub fn get_arg_a(inst: Instruction) -> i32 {
 
 /// 从指令中提取 B 参数
 ///
-/// C++ 对应: `GETARG_B(Instruction i)`
 #[inline]
 pub fn get_arg_b(inst: Instruction) -> i32 {
     ((inst >> POS_B) & mask1(SIZE_B, 0)) as i32
@@ -863,7 +851,6 @@ pub fn get_arg_b(inst: Instruction) -> i32 {
 
 /// 从指令中提取 C 参数
 ///
-/// C++ 对应: `GETARG_C(Instruction i)`
 #[inline]
 pub fn get_arg_c(inst: Instruction) -> i32 {
     ((inst >> POS_C) & mask1(SIZE_C, 0)) as i32
@@ -871,7 +858,6 @@ pub fn get_arg_c(inst: Instruction) -> i32 {
 
 /// 从指令中提取 Bx 参数
 ///
-/// C++ 对应: `GETARG_Bx(Instruction i)`
 #[inline]
 pub fn get_arg_bx(inst: Instruction) -> i32 {
     ((inst >> POS_BX) & mask1(SIZE_BX, 0)) as i32
@@ -879,7 +865,6 @@ pub fn get_arg_bx(inst: Instruction) -> i32 {
 
 /// 从指令中提取 sBx 参数（有符号偏移）
 ///
-/// C++ 对应: `GETARG_sBx(Instruction i)`
 #[inline]
 pub fn get_arg_sbx(inst: Instruction) -> i32 {
     get_arg_bx(inst) - MAXARG_SBX
@@ -891,7 +876,6 @@ pub fn get_arg_sbx(inst: Instruction) -> i32 {
 
 /// 创建 iABC 格式指令
 ///
-/// C++ 对应: `CREATE_ABC(OpCode o, i32 a, i32 b, i32 c)`
 #[inline]
 pub fn create_abc(op: OpCode, a: i32, b: i32, c: i32) -> Instruction {
     ((op as Instruction) << POS_OP)
@@ -902,7 +886,6 @@ pub fn create_abc(op: OpCode, a: i32, b: i32, c: i32) -> Instruction {
 
 /// 创建 iABx 格式指令
 ///
-/// C++ 对应: `CREATE_ABx(OpCode o, i32 a, i32 bx)`
 #[inline]
 pub fn create_abx(op: OpCode, a: i32, bx: i32) -> Instruction {
     ((op as Instruction) << POS_OP)
@@ -912,7 +895,6 @@ pub fn create_abx(op: OpCode, a: i32, bx: i32) -> Instruction {
 
 /// 创建 iAsBx 格式指令
 ///
-/// C++ 对应: `CREATE_AsBx(OpCode o, i32 a, i32 sbx)`
 #[inline]
 pub fn create_as_bx(op: OpCode, a: i32, sbx: i32) -> Instruction {
     create_abx(op, a, sbx + MAXARG_SBX)
@@ -924,7 +906,6 @@ pub fn create_as_bx(op: OpCode, a: i32, sbx: i32) -> Instruction {
 
 /// 设置指令的 A 参数
 ///
-/// C++ 对应: `SETARG_A(Instruction& i, i32 a)`
 #[inline]
 pub fn set_arg_a(inst: &mut Instruction, a: i32) {
     *inst =
@@ -933,7 +914,6 @@ pub fn set_arg_a(inst: &mut Instruction, a: i32) {
 
 /// 设置指令的 B 参数
 ///
-/// C++ 对应: `SETARG_B(Instruction& i, i32 b)`
 #[inline]
 pub fn set_arg_b(inst: &mut Instruction, b: i32) {
     *inst =
@@ -942,7 +922,6 @@ pub fn set_arg_b(inst: &mut Instruction, b: i32) {
 
 /// 设置指令的 C 参数
 ///
-/// C++ 对应: `SETARG_C(Instruction& i, i32 c)`
 #[inline]
 pub fn set_arg_c(inst: &mut Instruction, c: i32) {
     *inst =
@@ -951,7 +930,6 @@ pub fn set_arg_c(inst: &mut Instruction, c: i32) {
 
 /// 设置指令的 sBx 参数
 ///
-/// C++ 对应: `SETARG_sBx(Instruction& i, i32 sbx)`
 #[inline]
 pub fn set_arg_sbx(inst: &mut Instruction, sbx: i32) {
     let encoded = (sbx + MAXARG_SBX) as Instruction;
@@ -964,7 +942,6 @@ pub fn set_arg_sbx(inst: &mut Instruction, sbx: i32) {
 
 /// 判断操作数是否为常量（RK 编码）
 ///
-/// C++ 对应: `ISK(i32 x)`
 #[inline]
 pub fn is_k(x: i32) -> bool {
     (x & BITRK) != 0
@@ -972,7 +949,6 @@ pub fn is_k(x: i32) -> bool {
 
 /// 从 RK 操作数中提取常量索引
 ///
-/// C++ 对应: `INDEXK(i32 r)`
 #[inline]
 pub fn index_k(r: i32) -> i32 {
     r & !BITRK
@@ -980,7 +956,6 @@ pub fn index_k(r: i32) -> i32 {
 
 /// 将常量索引编码为 RK 操作数
 ///
-/// C++ 对应: `RKASK(i32 x)`
 #[inline]
 pub fn rk_ask(x: i32) -> i32 {
     x | BITRK

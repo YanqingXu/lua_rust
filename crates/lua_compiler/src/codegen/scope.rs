@@ -3,7 +3,6 @@
 //! 管理局部变量激活/移除、代码块栈、break 跳转列表、
 //! upvalue 注册和 CLOSE 指令发射。
 //!
-//! C++ 参考: `lua_cpp/src/compiler/codegen/scope_manager.hpp/.cpp`
 
 use crate::codegen::CodeGenerator;
 use crate::codegen::types::{BlockInfo, LocalVar, PatchList, UpvalueCapture};
@@ -15,7 +14,6 @@ impl CodeGenerator {
 
     /// 添加局部变量，返回分配的寄存器槽位
     ///
-    /// C++ 对应: `ScopeManager::addLocalVar()`
     pub fn add_local_var(&mut self, name: impl Into<String>) -> i32 {
         let reg = self.reg_alloc.current();
         let startpc = self.builder.instruction_count() as i32;
@@ -29,7 +27,6 @@ impl CodeGenerator {
 
     /// 查找局部变量，返回寄存器槽位（-1 表示未找到）
     ///
-    /// C++ 对应: `ScopeManager::findLocalVar()`
     pub fn find_local_var(&self, name: &str) -> i32 {
         for var in self.local_vars.iter().rev() {
             if var.name == name && var.endpc == -1 {
@@ -41,7 +38,6 @@ impl CodeGenerator {
 
     /// 标记局部变量被捕获（用于 upvalue）
     ///
-    /// C++ 对应: `ScopeManager::markLocalCaptured()`
     pub fn mark_local_captured(&mut self, reg: i32) {
         for var in self.local_vars.iter_mut().rev() {
             if var.reg == reg && var.endpc == -1 {
@@ -53,7 +49,6 @@ impl CodeGenerator {
 
     /// 调整活动局部变量计数
     ///
-    /// C++ 对应: `ScopeManager::adjustLocalVars()`
     pub fn adjust_local_vars(&mut self, count: i32) {
         self.active_var_count += count;
         self.reg_alloc.reset_to_locals(self.active_var_count);
@@ -64,7 +59,6 @@ impl CodeGenerator {
 
     /// 移除局部变量到指定层级
     ///
-    /// C++ 对应: `ScopeManager::removeLocalVars()`
     pub fn remove_local_vars(&mut self, to_level: i32) -> Option<i32> {
         let close_pc = self.close_scope_upvalues(to_level);
         let pc = self.builder.instruction_count() as i32;
@@ -89,7 +83,6 @@ impl CodeGenerator {
 
     /// 关闭被捕获的局部变量（发射 CLOSE 指令）
     ///
-    /// C++ 对应: `ScopeManager::closeScopeUpvalues()`
     pub(crate) fn close_scope_upvalues(&mut self, level: i32) -> Option<i32> {
         if self.active_var_count <= level {
             return None;
@@ -154,7 +147,6 @@ impl CodeGenerator {
 
     /// 解析 upvalue（跨函数查找）
     ///
-    /// C++ 对应: `ScopeManager::resolveUpvalue()`
     pub fn resolve_upvalue(&mut self, name: &str) -> i32 {
         if self.parent_functions.is_empty() {
             return -1;
@@ -184,7 +176,6 @@ impl CodeGenerator {
 
     /// 进入代码块
     ///
-    /// C++ 对应: `ScopeManager::enterBlock()`
     pub fn enter_block(&mut self, is_breakable: bool) {
         let block = BlockInfo {
             active_var_count: self.active_var_count,
@@ -196,7 +187,6 @@ impl CodeGenerator {
 
     /// 离开代码块
     ///
-    /// C++ 对应: `ScopeManager::leaveBlock()`
     pub fn leave_block(&mut self) {
         let block = self.blocks.pop().expect("No block to leave");
         let close_pc = self.remove_local_vars(block.active_var_count);

@@ -1,31 +1,27 @@
 <#
 .SYNOPSIS
-    Lua Rust Migration — Quality Gate
+    Lua Rust — Quality Gate
 .DESCRIPTION
-    Runs the full quality gate for the Rust migration workspace:
-    format check, clippy lint, test suite, security audit, and cross-language validation.
-    Every Phase must end with a passing run of this script.
+    Runs the full quality gate for the Rust workspace:
+    format check, clippy lint, test suite, documentation, and security audit.
 .PARAMETER SkipFmt
     Skip cargo fmt --check.
 .PARAMETER SkipClippy
     Skip cargo clippy.
 .PARAMETER SkipAudit
     Skip cargo audit (use when audit DB is not available).
-.PARAMETER SkipCrossValidate
-    Skip cross-language bytecode/VM trace comparison.
 .PARAMETER JsonOutput
     Output results as JSON to stdout.
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_quality_gate.ps1
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_quality_gate.ps1 -SkipAudit -SkipCrossValidate
+    powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_quality_gate.ps1 -SkipAudit
 #>
 
 param(
     [switch]$SkipFmt,
     [switch]$SkipClippy,
     [switch]$SkipAudit,
-    [switch]$SkipCrossValidate,
     [switch]$JsonOutput
 )
 
@@ -39,20 +35,19 @@ $Results = [ordered]@{
     Test         = $null
     Doc          = $null
     Audit        = $null
-    CrossValidate = $null
 }
 $GateStart = Get-Date
 
-Write-Host "=== Rust Migration Quality Gate ===" -ForegroundColor Cyan
+Write-Host "=== Rust Quality Gate ===" -ForegroundColor Cyan
 Write-Host "  Project: $ProjectRoot"
 Write-Host "  Time:    $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n"
 
 Push-Location $ProjectRoot
 
 try {
-    # ── 1/6: Format Check ──────────────────────────────────────────
+    # ── 1/5: Format Check ──────────────────────────────────────────
     if (-not $SkipFmt) {
-        Write-Host "[1/6] Format Check (cargo fmt --check)" -ForegroundColor Yellow
+        Write-Host "[1/5] Format Check (cargo fmt --check)" -ForegroundColor Yellow
         $fmtOutput = cargo fmt --check 2>&1
         $Results.Format = ($LASTEXITCODE -eq 0)
         $status = if ($Results.Format) { "PASS" } else { "FAIL" }
@@ -63,13 +58,13 @@ try {
         }
     }
     else {
-        Write-Host "[1/6] Format Check — SKIPPED" -ForegroundColor Gray
+        Write-Host "[1/5] Format Check — SKIPPED" -ForegroundColor Gray
         $Results.Format = $true
     }
 
-    # ── 2/6: Clippy Lint ────────────────────────────────────────────
+    # ── 2/5: Clippy Lint ────────────────────────────────────────────
     if (-not $SkipClippy) {
-        Write-Host "`n[2/6] Clippy Lint (cargo clippy --workspace -- -D warnings)" -ForegroundColor Yellow
+        Write-Host "`n[2/5] Clippy Lint (cargo clippy --workspace -- -D warnings)" -ForegroundColor Yellow
         $clippyOutput = cargo clippy --workspace -- -D warnings 2>&1
         $Results.Clippy = ($LASTEXITCODE -eq 0)
         $status = if ($Results.Clippy) { "PASS" } else { "FAIL" }
@@ -80,12 +75,12 @@ try {
         }
     }
     else {
-        Write-Host "`n[2/6] Clippy Lint — SKIPPED" -ForegroundColor Gray
+        Write-Host "`n[2/5] Clippy Lint — SKIPPED" -ForegroundColor Gray
         $Results.Clippy = $true
     }
 
-    # ── 3/6: Test Suite ─────────────────────────────────────────────
-    Write-Host "`n[3/6] Test Suite (cargo nextest run --workspace)" -ForegroundColor Yellow
+    # ── 3/5: Test Suite ─────────────────────────────────────────────
+    Write-Host "`n[3/5] Test Suite (cargo nextest run --workspace)" -ForegroundColor Yellow
     $testOutput = cargo nextest run --workspace 2>&1
     $Results.Test = ($LASTEXITCODE -eq 0)
     $status = if ($Results.Test) { "PASS" } else { "FAIL" }
@@ -98,17 +93,17 @@ try {
         }
     }
 
-    # ── 4/6: Documentation ──────────────────────────────────────────
-    Write-Host "`n[4/6] Documentation (cargo doc --no-deps)" -ForegroundColor Yellow
+    # ── 4/5: Documentation ──────────────────────────────────────────
+    Write-Host "`n[4/5] Documentation (cargo doc --no-deps)" -ForegroundColor Yellow
     $docOutput = cargo doc --no-deps 2>&1
     $Results.Doc = ($LASTEXITCODE -eq 0)
     $status = if ($Results.Doc) { "PASS" } else { "FAIL" }
     $color  = if ($Results.Doc) { "Green" } else { "Red" }
     Write-Host "  Result: $status" -ForegroundColor $color
 
-    # ── 5/6: Security Audit ─────────────────────────────────────────
+    # ── 5/5: Security Audit ─────────────────────────────────────────
     if (-not $SkipAudit) {
-        Write-Host "`n[5/6] Security Audit (cargo audit)" -ForegroundColor Yellow
+        Write-Host "`n[5/5] Security Audit (cargo audit)" -ForegroundColor Yellow
         $auditOutput = cargo audit 2>&1
         $auditExit = $LASTEXITCODE
         # cargo audit exits 0 on success, non-zero on vulnerabilities found
@@ -118,64 +113,8 @@ try {
         Write-Host "  Result: $status" -ForegroundColor $color
     }
     else {
-        Write-Host "`n[5/6] Security Audit — SKIPPED" -ForegroundColor Gray
+        Write-Host "`n[5/5] Security Audit — SKIPPED" -ForegroundColor Gray
         $Results.Audit = $true
-    }
-
-    # ── 6/6: Cross-Language Validation ──────────────────────────────
-    if (-not $SkipCrossValidate) {
-        Write-Host "`n[6/6] Cross-Language Validation" -ForegroundColor Yellow
-
-        $cppBytecodeExe = Join-Path $ProjectRoot "..\lua_cpp\bin\lua_bytecode.exe"
-        $cppAppExe      = Join-Path $ProjectRoot "..\lua_cpp\bin\lua_app.exe"
-
-        $bytecodeOk = $true
-        $traceOk    = $true
-
-        # Bytecode comparison — applicable from Phase 2 onward
-        $bytecodeTests = Join-Path $ProjectRoot "tests/lua/bytecode"
-        if ((Test-Path $cppBytecodeExe) -and (Test-Path $bytecodeTests)) {
-            Write-Host "  Running: compare_bytecode.ps1" -ForegroundColor Gray
-            $bcScript = Join-Path $ScriptDir "compare_bytecode.ps1"
-            if (Test-Path $bcScript) {
-                & $bcScript -InputDir $bytecodeTests -CppBytecodeExe $cppBytecodeExe
-                $bytecodeOk = ($LASTEXITCODE -eq 0)
-            }
-            else {
-                Write-Host "    compare_bytecode.ps1 not found" -ForegroundColor Yellow
-                $bytecodeOk = $true  # not a failure of this gate
-            }
-        }
-        else {
-            Write-Host "  Bytecode comparison: N/A (Phase 2+ feature)" -ForegroundColor Gray
-        }
-
-        # VM trace comparison — applicable from Phase 3 onward
-        $runtimeTests = Join-Path $ProjectRoot "tests/lua/runtime"
-        if ((Test-Path $cppAppExe) -and (Test-Path $runtimeTests)) {
-            Write-Host "  Running: compare_vm_trace.ps1" -ForegroundColor Gray
-            $traceScript = Join-Path $ScriptDir "compare_vm_trace.ps1"
-            if (Test-Path $traceScript) {
-                & $traceScript -InputDir $runtimeTests -CppAppExe $cppAppExe
-                $traceOk = ($LASTEXITCODE -eq 0)
-            }
-            else {
-                Write-Host "    compare_vm_trace.ps1 not found" -ForegroundColor Yellow
-                $traceOk = $true
-            }
-        }
-        else {
-            Write-Host "  VM trace comparison: N/A (Phase 3+ feature)" -ForegroundColor Gray
-        }
-
-        $Results.CrossValidate = ($bytecodeOk -and $traceOk)
-        $status = if ($Results.CrossValidate) { "PASS (or N/A)" } else { "FAIL" }
-        $color  = if ($Results.CrossValidate) { "Green" } else { "Red" }
-        Write-Host "  Result: $status" -ForegroundColor $color
-    }
-    else {
-        Write-Host "`n[6/6] Cross-Language Validation — SKIPPED" -ForegroundColor Gray
-        $Results.CrossValidate = $true
     }
 }
 finally {
