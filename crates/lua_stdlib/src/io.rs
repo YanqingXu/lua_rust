@@ -1210,6 +1210,7 @@ fn write_direct(
                     .create(true)
                     .write(true)
                     .read(true)
+                    .truncate(false)
                     .open(&path)?,
             );
         }
@@ -1221,6 +1222,7 @@ fn write_direct(
             .create(true)
             .write(true)
             .read(true)
+            .truncate(false)
             .open(&path)?;
         handle.seek(SeekFrom::Start(pos as u64))?;
         handle.write_all(&lua_bytes_from_str(appended))?;

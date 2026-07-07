@@ -525,7 +525,7 @@ unsafe extern "C" fn lua_debug_sethook(l_ptr: *mut std::ffi::c_void) -> i32 {
     target.debug_hook_count = count;
     target.debug_hook_countdown = count;
     target.debug_hook_active = false;
-    if target_ptr == l as *mut LuaState {
+    if std::ptr::eq(target_ptr, l) {
         let (line, pc, proto) = current_caller_location(l).unwrap_or((-1, usize::MAX, None));
         target.debug_hook_last_line = line;
         target.debug_hook_last_pc = pc;
@@ -638,7 +638,7 @@ unsafe extern "C" fn lua_debug_getlocal(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     // SAFETY: target_ptr is either l or a coroutine LuaState owned by a live Thread.
     let target = unsafe { &mut *target_ptr };
-    let include_current = target_ptr != l as *mut LuaState;
+    let include_current = !std::ptr::eq(target_ptr, l);
 
     let level = match l.at(level_arg).cloned().unwrap_or(Value::Nil) {
         Value::Number(value) if value >= 0.0 => value as usize,
@@ -687,7 +687,7 @@ unsafe extern "C" fn lua_debug_setlocal(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     // SAFETY: target_ptr is either l or a coroutine LuaState owned by a live Thread.
     let target = unsafe { &mut *target_ptr };
-    let include_current = target_ptr != l as *mut LuaState;
+    let include_current = !std::ptr::eq(target_ptr, l);
 
     let level = match l.at(level_arg).cloned().unwrap_or(Value::Nil) {
         Value::Number(value) if value >= 0.0 => value as usize,
@@ -1106,7 +1106,7 @@ fn frame_function_ref(l: &LuaState, ci: &lua_vm::state::CallInfo) -> Option<GcRe
         // SAFETY: function refs read from active stack slots stay live during this call.
         let func = unsafe { func_ref.as_ref() }?;
         let func_proto = func.proto()?;
-        if func_proto.as_ptr() as *const Proto != frame_proto {
+        if !std::ptr::eq(func_proto.as_ptr(), frame_proto) {
             return None;
         }
     }
@@ -1121,7 +1121,7 @@ fn frame_proto_ptr(l: &LuaState, ci: &lua_vm::state::CallInfo) -> Option<*const 
     let func_ref = frame_function_ref(l, ci)?;
     // SAFETY: validated function refs are held by live call frame slots.
     let func = unsafe { func_ref.as_ref() }?;
-    func.proto().map(|proto| proto.as_ptr() as *const Proto)
+    func.proto().map(|proto| proto.as_ptr())
 }
 
 fn active_lines(proto: &lua_core::proto::Proto) -> Vec<i32> {

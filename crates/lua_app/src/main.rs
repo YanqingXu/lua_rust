@@ -225,11 +225,11 @@ fn run_app(args: &[String], options: &AppOptions) -> i32 {
         }
     }
 
-    if options.interactive || (options.mode == RunMode::Repl && options.script_file.is_none()) {
-        if let Err(err) = run_quiet_interactive(&mut state, &mut gc, &mut string_pool) {
-            eprintln!("{err}");
-            return 1;
-        }
+    if (options.interactive || (options.mode == RunMode::Repl && options.script_file.is_none()))
+        && let Err(err) = run_quiet_interactive(&mut state, &mut gc, &mut string_pool)
+    {
+        eprintln!("{err}");
+        return 1;
     }
 
     0

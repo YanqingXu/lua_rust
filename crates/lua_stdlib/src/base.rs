@@ -453,6 +453,8 @@ fn mark_lua_roots_for_weak_cleanup(l: &LuaState, gc: &mut GarbageCollector) {
 
         let proto_ptr: *const Proto = match l.stack.at(ci.func) {
             Some(Value::Function(func_ref)) => {
+                // SAFETY: func_ref was read from a live call frame slot while
+                // the VM is marking reachable state.
                 let Some(func) = (unsafe { func_ref.as_ref() }) else {
                     continue;
                 };
@@ -490,9 +492,11 @@ fn mark_lua_roots_for_weak_cleanup(l: &LuaState, gc: &mut GarbageCollector) {
 fn mark_open_upvalues(l: &LuaState, gc: &mut GarbageCollector) {
     let mut current = l.open_upvalues;
     while let Some(upvalue_ref) = current {
+        // SAFETY: open_upvalues only contains live Upvalue refs allocated by GC.
         let Some(upvalue) = (unsafe { upvalue_ref.as_ref() }) else {
             break;
         };
+        // SAFETY: upvalue_ref points to a GC-managed Upvalue object.
         unsafe {
             gc.mark_object(upvalue_ref.as_ptr() as *mut GcObjectHeader);
         }
@@ -510,6 +514,8 @@ fn run_userdata_finalizer(
     gc: &mut GarbageCollector,
     userdata: GcRef<Userdata>,
 ) -> Result<(), Value> {
+    // SAFETY: userdata is held in the pending-finalizer list and remains live
+    // until the finalizer call path has finished.
     let finalizer = unsafe { userdata.as_ref() }
         .and_then(|userdata| userdata.metatable())
         .and_then(|metatable| metatable_field(metatable, "__gc"));
@@ -531,7 +537,7 @@ fn poll_gcinfo_kb(l: &mut LuaState) -> f64 {
     l.gcinfo_polls = l.gcinfo_polls.saturating_add(1);
     if l.gc_stopped {
         l.gcinfo_kb += 24.0;
-    } else if l.gcinfo_polls % 8 == 0 {
+    } else if l.gcinfo_polls.is_multiple_of(8) {
         finish_gcinfo_cycle(l);
     } else {
         l.gcinfo_kb += 8.0;

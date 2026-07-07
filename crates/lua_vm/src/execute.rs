@@ -1202,7 +1202,7 @@ fn frame_proto_for_gc(l: &LuaState, ci: &crate::state::CallInfo) -> Option<*cons
     if !func.is_lua_function() {
         return None;
     }
-    func.proto().map(|proto| proto.as_ptr() as *const Proto)
+    func.proto().map(|proto| proto.as_ptr())
 }
 
 fn mark_open_upvalues(l: &LuaState, gc: &mut GarbageCollector) {

@@ -45,6 +45,8 @@ impl GarbageCollector {
         while !current.is_null() {
             // SAFETY: current walks the GC intrusive object list.
             let next = unsafe { (*current).next() };
+            // SAFETY: current is a valid GC list node. The Userdata cast is
+            // guarded by the type tag before userdata_has_gc inspects it.
             let should_finalize = unsafe {
                 (*current).gc_type() == GcObjectType::Userdata
                     && (*current).is_white()
@@ -102,6 +104,8 @@ unsafe fn userdata_has_gc(userdata_ptr: *const Userdata) -> bool {
 }
 
 fn metatable_has_field(metatable: GcRef<Table>, name: &str) -> bool {
+    // SAFETY: metatable came from a live userdata object, and finalizer
+    // preparation runs before sweep frees unreachable GC objects.
     let Some(table) = (unsafe { metatable.as_ref() }) else {
         return false;
     };
@@ -109,9 +113,12 @@ fn metatable_has_field(metatable: GcRef<Table>, name: &str) -> bool {
         !value.is_nil()
             && matches!(
                 key,
-                Value::String(key_ref)
-                    if unsafe { key_ref.as_ref() }
+                Value::String(key_ref) if {
+                    // SAFETY: string keys in this table remain allocated while
+                    // finalizer preparation runs before sweep.
+                    unsafe { key_ref.as_ref() }
                         .is_some_and(|key_string: &GcString| key_string.data() == name)
+                }
             )
     })
 }

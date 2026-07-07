@@ -94,10 +94,12 @@ impl GarbageCollector {
             );
             let key_finalized_userdata = matches!(
                 &k,
-                Value::Userdata(userdata)
-                    if unsafe {
-                        (*(userdata.as_ptr() as *mut GcObjectHeader)).is_finalized()
-                    } && !key_pending_finalizer
+                Value::Userdata(userdata) if {
+                    let header = userdata.as_ptr() as *mut GcObjectHeader;
+                    // SAFETY: userdata is a GC reference stored in the table
+                    // key; weak cleanup runs before sweep frees the header.
+                    unsafe { (*header).is_finalized() }
+                } && !key_pending_finalizer
             );
             if weak_keys
                 && (gc.is_value_dead(&k) || key_finalized_userdata)

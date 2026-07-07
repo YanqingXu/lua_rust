@@ -376,6 +376,8 @@ impl GarbageCollector {
                 // Once a userdata finalizer has run, weak-value slots should be
                 // cleared on the next GC cycle even though this compatibility
                 // collector does not immediately sweep the userdata object.
+                // SAFETY: ptr comes from a userdata GcRef stored in this Value;
+                // weak cleanup checks it before sweep can release the header.
                 if unsafe { (*ptr).is_finalized() } {
                     return true;
                 }
