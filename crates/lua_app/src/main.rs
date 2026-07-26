@@ -186,7 +186,13 @@ fn print_usage(program: &str) {
 }
 
 fn run_app(args: &[String], options: &AppOptions) -> i32 {
-    let mut runtime = Runtime::new();
+    let mut runtime = match Runtime::try_new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
     let status = match runtime.parts_mut() {
         Ok(mut parts) => {
             let (state, gc, string_pool) = parts.split_mut();

@@ -50,7 +50,7 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
 - base、math、string、table、io、os、coroutine、debug、package 已有较宽的函数表面。
 - M1.8 shutdown、P1 collector provenance、managed Proto 与 publication-root
   基础完成后，fmt、all-targets Clippy、warning-free rustdoc、
-  `cargo check --workspace --all-targets` 和 725 个全 workspace Debug tests
+  `cargo check --workspace --all-targets` 和 733 个全 workspace Debug tests
   已再次通过；远程 CI 不再允许隐式跳过 security audit。
 - fixture manifest 当前共 131 项：101 个 non-official、24 个 official 和
   6 个 differential（4 个 M0 focused cases，加 2 个 M1 raw-byte cases）。
@@ -141,7 +141,7 @@ M4 必须建立在 M1 和 M3 的生命周期、allocator 和公开状态合同�
 | 里程碑 | 状态 | 当前证据或入口 |
 |---|---|---|
 | M0 | `completed` | 本地统一 M0 gate 通过，0 hard failure、3 项已登记债务；详见 [M0 收口报告](docs/rust_migration/m0_report.md)。 |
-| M1 | `active` | P1 provenance、managed Proto、shutdown 与临时对象根基础已完成；StateHandle exhaustion、coroutine trampoline、Upvalue owner 和生产 publication 迁移是下一主线。 |
+| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象根基础与 StateHandle fail-closed identity/generation 已完成；coroutine trampoline、Upvalue owner 和生产 publication 迁移是下一主线。 |
 | M2 | `active-limited` | 原两例 bytecode 指令/常量/metadata 已对齐；C++ local-name 证据缺口、nested Proto 大量差异、88 个 non-official 差异和真实 VM trace 仍开放。 |
 | M3 | `pending` | 等待 M1 的字节表示和生命周期合同稳定。 |
 | M4 | `pending` | 等待 M1/M3 的 runtime、allocator 与公开状态合同。 |
@@ -544,7 +544,7 @@ bytecode parity 差异和真实 VM trace unsupported；它们不会把报告误�
 | M1.2 GcString/StringPool | `completed-local` | 单一 ByteString payload、byte-key interning、0x00–0xff/NUL/invalid UTF-8/identity/hash 测试通过，旧 text API 静态扫描为零。 |
 | M1.3 编译器和宿主边界 | `partial` | lexer/parser/codegen、string/io/package、CLI source 与 chunk name 已迁移并有 raw-byte 双 oracle case；真实 dump/load、未来 C API，以及所有生产 GcString 强制 intern 尚未完成。 |
 | M1.4 Runtime owner | `partial` | pinned RuntimeHeap、owner-thread/phase/active guard、main roots 与 scoped parts 已实现；P1 `ObjectId + live table + checked borrow` 已拒绝 foreign/stale/address-reuse handle，LightUserdata 也已拆型。LuaState 仍保存 transitional GC/StringPool backpointer，尚无统一 Heap/allocator/services owner。 |
-| M1.5 Coroutine state | `partial` | StateArena 独占 coroutine Box，StateHandle 校验 runtime/slot/generation/borrow，关闭会 drain 并失效 generation；但 RuntimeId `fetch_add` 与 slot generation 仍会回绕，安全构造器可伪造 handle，现有递归 resume 也阻止安全的跨 state Upvalue owner。 |
+| M1.5 Coroutine state | `partial` | StateArena 独占 coroutine Box；不可复制 issuer 只为新 runtime namespace 发行 handle，RuntimeId checked allocator 永不回绕，safe raw 构造已删除，generation `u64::MAX` 最后发行后永久退休，关闭前校验 arena/free-list/count。现有递归 resume 仍阻止安全的跨 state Upvalue owner，main state 也仍是 external arena slot。 |
 | M1.6 悬垂 registry | `completed-local` | pseudo dump/source thread-local registry 已删除，`string.dump` 在 M3 serializer 前稳定返回 unsupported。 |
 | M1.7 Root inventory | `partial` | 23/23 inventory schema 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO` 和临时对象根 registry 已实现。当前为 20 partial、1 unsafe（`OPEN_UPVALUES`）、2 missing（temporary state/fixed strings），仍禁止 destructive sweep。 |
 | M1.8 确定性 shutdown | `partial` | Runtime close/Drop 以 state→非 fixed Thread→其余非 fixed→fixed 顺序释放，object/root/string/queue/state/count 均归零；7 layout、fixed/ordinary DropProbe、open-upvalue close 与 1000 轮耐久测试通过。关闭期 Lua `__gc`、显式 IO/module service drain 和 allocator live bytes 仍是公开 debt。 |
@@ -1178,10 +1178,11 @@ M0 已在本地完成，M1 基础层已推进到 managed owner/publication root 
 1. 已完成 LightUserdata 拆型与 `ObjectId + collector live table`；继续保持
    live sweep 禁用，直到 `Value::String` 内容 Eq/Hash、执行层 scoped borrow
    和唯一 Heap owner 都闭环。
-2. top-level/active/debug Proto 已全部改为受管 `GcRef<Proto>`。下一次首先让
-   RuntimeId/StateHandle issuance 与 slot generation exhaustion fail-closed；
-   然后把 coroutine resume 改为一次只借用一个 state 的 Runtime trampoline，
-   再将 open Upvalue 的 raw Stack owner 改为 `StateHandle + stack index`。
+2. top-level/active/debug Proto 已全部改为受管 `GcRef<Proto>`；
+   RuntimeId/StateHandle issuance 与 slot generation exhaustion 也已
+   fail-closed。下一步把 coroutine resume 改为一次只借用一个 state 的
+   Runtime trampoline，再将 open Upvalue 的 raw Stack owner 改为
+   `StateHandle + stack index`。
 3. lexical temporary-object registry、HRTB `PublicationTxn/Rooted`、panic/nested
    cleanup 和 mark seed 已完成基础实现。下一步增加 temporary state roots，并
    迁移 Proto→Function、compiler builder、IO/library graph、VM temporaries和
@@ -1205,7 +1206,7 @@ M0 已在本地完成，M1 基础层已推进到 managed owner/publication root 
 在上述 M1 硬门全部关闭前，不开始正式 C API、binary chunk、动态模块，也不
 把 core 单元测试中的 `sweep` 接到 live VM。
 
-### 16.1 下次续接检查点（2026-07-26）
+### 16.1 当前续接检查点（2026-07-26）
 
 本轮收口时已经完成并验证：
 
@@ -1221,19 +1222,24 @@ M0 已在本地完成，M1 基础层已推进到 managed owner/publication root 
   `target/compatibility/bytecode-schema-v2-original-two/report.json` 与
   `target/compatibility/bytecode-closure-schema-v2/report.json`（target
   artifact 不提交）。
-- 最终收口验证：fmt/check、725 个 workspace tests、all-targets Clippy、
+- StateHandle identity/generation 前置切片：并发 checked RuntimeId、
+  non-Clone issuer、raw 构造 compile-fail、MAX-generation retirement、
+  free-list/count preflight 与真实 stale/foreign trace 均有回归。
+- 最新验证：fmt/check、733 个 workspace tests、all-targets Clippy、
   warning-free rustdoc、23/23 root inventory、差分比较器与 parity runner
   自测全部通过；fixture manifest 校验为 131 项。
 
 下次不要从头审计，按以下顺序继续：
 
-1. 完成尚未落地的 StateHandle 前置切片：checked RuntimeId allocator、禁止安全
-   伪造 handle、generation `u64::MAX` slot retirement；当前代码仍使用
-   `NEXT_RUNTIME_ID.fetch_add` 和 `wrapping_add`。
-2. 实现 Runtime coroutine trampoline，保证状态切换前释放父 `StateBorrow`。
+1. 已完成 StateHandle 前置切片：checked/concurrent RuntimeId allocator、
+   non-Clone issuer namespace、raw 安全构造 compile-fail、generation
+   `u64::MAX` 最后一代与永久 slot retirement、free-list/count shutdown
+   preflight；不存在 `fetch_add`/`wrapping_add` 回绕路径。
+2. 当前第一开发项：实现 Runtime coroutine trampoline，保证状态切换前释放父
+   `StateBorrow`。
 3. 把 open Upvalue 改为 `Open { owner: StateHandle, index }`，删除 intrusive
    raw owner/next，并让 reachable Upvalue enqueue owner state；关闭必须先于
-   generation invalidation。
+   generation advance/retirement。
 4. 实现 `TEMPORARY_STATE_ROOTS/PendingState`，再扩展 typed publication API并按
    compiler → library/package → IO → coroutine → VM/app/results 顺序迁移。
 5. 完成所有生产字符串 canonical interning 或 scoped Eq/Hash，建立唯一 Heap

@@ -875,13 +875,23 @@ mod tests {
     #[test]
     fn mark_only_reports_stale_and_foreign_state_handles_without_dereference() {
         let mut runtime = Runtime::new();
-        let main_handle = runtime.main_state_handle.expect("main state handle");
-        let stale = StateHandle::new(
-            runtime.id(),
-            main_handle.slot(),
-            main_handle.generation().wrapping_add(1),
-        );
-        let foreign = StateHandle::new(RuntimeId::new(u64::MAX), 0, 1);
+        let stale = {
+            let mut parts = runtime.parts_mut().expect("runtime parts");
+            let (state, _, _) = parts.split_mut();
+            state
+                .insert_coroutine_state(LuaState::new())
+                .expect("stale candidate is inserted")
+        };
+        // SAFETY: RuntimeHeap is pinned and no execution guard is live.
+        let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
+        heap.state_arena
+            .remove_owned(stale)
+            .expect("stale candidate is removed");
+
+        let foreign_runtime = Runtime::new();
+        let foreign = foreign_runtime
+            .main_state_handle
+            .expect("foreign main state handle");
 
         {
             let mut parts = runtime.parts_mut().expect("runtime parts");

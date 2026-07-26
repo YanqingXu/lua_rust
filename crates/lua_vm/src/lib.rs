@@ -19,7 +19,7 @@ pub use execute::{
     ExecResult, RuntimeError, execute_proto, resume_lua_thread, start_lua_call_at_stack,
 };
 pub use runtime::{
-    Runtime, RuntimeAccessError, RuntimeCloseReport, RuntimeId, RuntimePartsMut, RuntimePhase,
-    StateArena, StateHandle, StateResolveError,
+    Runtime, RuntimeAccessError, RuntimeCloseReport, RuntimeId, RuntimeIdExhausted,
+    RuntimePartsMut, RuntimePhase, StateArena, StateHandle, StateResolveError,
 };
 pub use state::{CallInfo, LUA_MULTRET, LuaState, Stack, ThreadStatus};

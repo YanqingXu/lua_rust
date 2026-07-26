@@ -148,7 +148,7 @@ non-official 中执行 92 个、按分类跳过 9 个 helper；
 |---|---|---|
 | Lua 5.1 完整兼容性 | M0 验证闭环已建立，但 non-official 仍有 88 个语义差异，official strict/slow suite 也尚未全通过。 | [M0 收口报告](docs/rust_migration/m0_report.md)、M2 总门槛 |
 | `_VERSION` | 项目有意返回 `Lua 5.1 (C core prototype)`，不是 stock 的 `Lua 5.1`。 | [NOTE-001](docs/rust_migration/deviation_log.md#note-001-项目扩展-_version-值) |
-| GC 与 runtime lifecycle | Runtime shutdown 与 collector provenance 基础已完成，但 stdlib collect path 仍不执行真实 sweep，计数/step 为模拟；open-Upvalue owner、临时状态根、barrier/finalizer 未闭环。 | [NOTE-002](docs/rust_migration/deviation_log.md#note-002-gc-可观察行为尚未形成真实回收闭环)、[NOTE-009](docs/rust_migration/deviation_log.md#note-009-runtime-与-coroutine-所有权未闭环) |
+| GC 与 runtime lifecycle | Runtime shutdown、collector provenance 与 StateHandle checked identity/MAX-generation retirement 基础已完成，但 stdlib collect path 仍不执行真实 sweep，计数/step 为模拟；coroutine trampoline、open-Upvalue owner、临时状态根、barrier/finalizer 未闭环。 | [NOTE-002](docs/rust_migration/deviation_log.md#note-002-gc-可观察行为尚未形成真实回收闭环)、[NOTE-009](docs/rust_migration/deviation_log.md#note-009-runtime-与-coroutine-所有权未闭环) |
 | 任意字节字符串 | ByteString/GcString/StringPool 与主要编译器/stdlib/IO 边界已支持 invalid UTF-8、NUL 和 high bytes；所有生产字符串强制 canonical interning、binary chunk 与 C API 边界尚未完成。 | [NOTE-007](docs/rust_migration/deviation_log.md#note-007-lua-字符串尚未采用任意字节表示)、[NOTE-010](docs/rust_migration/deviation_log.md#note-010-lua-字符串-intern-hash-选择固定-c-的前向采样) |
 | 默认标准流 | 提交基线使用 memory file；宿主标准流修复已通过本地 process tests、完整 M0 fixture gate 与 4-case 双 oracle，尚待远程 CI 首次运行。 | [NOTE-004](docs/rust_migration/deviation_log.md#note-004-默认标准流从-memory-file-迁移到宿主流) |
 | C API / FFI | 没有 `lua_capi` crate、公开 headers、稳定 ABI 或 C consumer。 | [NOTE-008](docs/rust_migration/deviation_log.md#note-008-lua-51-c-apiabi-尚不存在) |

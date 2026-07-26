@@ -185,7 +185,7 @@
         "current": "Runtime::trace_roots_mark_only always seeds and validates main_state_handle before scanning state roots.",
         "target": "RuntimeRootTracer enqueues the main StateHandle before object propagation."
       },
-      "missing_risk": "The main Box remains externally owned rather than arena-owned; explicit close now validates, detaches, generation-invalidates, and drops it, but live collection still lacks one arena-owned state model.",
+      "missing_risk": "The main Box remains externally owned rather than arena-owned; explicit close now validates, detaches, advances or permanently retires its generation without wrap, and drops it, but live collection still lacks one arena-owned state model.",
       "planned_test": {
         "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
         "layer": "lua_vm runtime_ownership",

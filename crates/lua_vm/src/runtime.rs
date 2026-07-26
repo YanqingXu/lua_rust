@@ -23,15 +23,16 @@
 //! destructive collection remains disabled.
 
 use std::marker::{PhantomData, PhantomPinned};
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, ThreadId};
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
-pub use lua_core::state_handle::{RuntimeId, StateHandle};
+use lua_core::state_handle::StateHandleIssuer;
+pub use lua_core::state_handle::{RuntimeId, RuntimeIdExhausted, StateHandle};
 use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
 use thiserror::Error;
@@ -44,8 +45,6 @@ pub use root_trace::{
     MarkOnlyReport, RootEdgeCount, RuntimeRootKind, StateTraceFailure, UnresolvedObjectEdge,
     UnsafeTraceGap, UnsafeTraceGapKind,
 };
-
-static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Lifecycle phase of a `Runtime`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,6 +194,14 @@ pub enum StateResolveError {
         /// Current slot generation.
         actual: u64,
     },
+    /// The slot exhausted its generation namespace and can never be reused.
+    #[error("state slot {slot} is permanently retired at generation {generation}")]
+    RetiredSlot {
+        /// Permanently retired slot index.
+        slot: usize,
+        /// Final generation issued by the slot.
+        generation: u64,
+    },
     /// A valid-generation slot currently contains no state.
     #[error("state slot {slot} generation {generation} is vacant")]
     Vacant {
@@ -229,6 +236,12 @@ pub enum StateResolveError {
         /// Owned slot index.
         slot: usize,
     },
+    /// Internal StateArena bookkeeping disagreed before a destructive action.
+    #[error("state arena invariant violated: {reason}")]
+    ArenaInvariant {
+        /// Stable diagnostic describing the rejected invariant.
+        reason: &'static str,
+    },
 }
 
 struct StateSlot {
@@ -236,6 +249,7 @@ struct StateSlot {
     state: Option<NonNull<LuaState>>,
     owned: bool,
     borrowed: bool,
+    retired: bool,
 }
 
 /// Runtime-owned generational arena for Lua coroutine states.
@@ -245,7 +259,7 @@ struct StateSlot {
 /// identity, and exclusive-borrow state. References are created only inside a
 /// higher-ranked closure and therefore cannot escape the resolution scope.
 pub struct StateArena {
-    runtime_id: RuntimeId,
+    handle_issuer: StateHandleIssuer,
     slots: Vec<StateSlot>,
     free_slots: Vec<usize>,
     live_owned_states: usize,
@@ -258,28 +272,53 @@ struct StateArenaDrainReport {
 }
 
 impl StateArena {
-    fn new(runtime_id: RuntimeId) -> Self {
+    fn new(handle_issuer: StateHandleIssuer) -> Self {
         Self {
-            runtime_id,
+            handle_issuer,
             slots: Vec::new(),
             free_slots: Vec::new(),
             live_owned_states: 0,
         }
     }
 
+    fn runtime_id(&self) -> RuntimeId {
+        self.handle_issuer.runtime_id()
+    }
+
     fn reserve_slot(&mut self) -> StateHandle {
-        let slot = if let Some(slot) = self.free_slots.pop() {
-            slot
-        } else {
-            self.slots.push(StateSlot {
-                generation: 1,
-                state: None,
-                owned: false,
-                borrowed: false,
-            });
-            self.slots.len() - 1
+        let slot = loop {
+            match self.free_slots.pop() {
+                Some(slot_index)
+                    if self.slots.get(slot_index).is_some_and(|slot| {
+                        !slot.retired && slot.state.is_none() && !slot.owned && !slot.borrowed
+                    }) =>
+                {
+                    break slot_index;
+                }
+                Some(_) => {
+                    // Fail closed if an internal free-list entry is stale or
+                    // duplicated: discard it instead of overwriting a live or
+                    // permanently retired slot.
+                }
+                None => {
+                    self.slots.push(StateSlot {
+                        generation: 1,
+                        state: None,
+                        owned: false,
+                        borrowed: false,
+                        retired: false,
+                    });
+                    break self.slots.len() - 1;
+                }
+            }
         };
-        StateHandle::new(self.runtime_id, slot, self.slots[slot].generation)
+        self.issue_handle(slot)
+    }
+
+    fn issue_handle(&self, slot: usize) -> StateHandle {
+        let generation = NonZeroU64::new(self.slots[slot].generation)
+            .expect("StateArena generations are always non-zero");
+        self.handle_issuer.issue(slot, generation)
     }
 
     fn attach_external(&mut self, state: NonNull<LuaState>) -> StateHandle {
@@ -291,6 +330,10 @@ impl StateArena {
     }
 
     fn insert_owned(&mut self, mut state: Box<LuaState>) -> StateHandle {
+        let next_live_owned_states = self
+            .live_owned_states
+            .checked_add(1)
+            .expect("StateArena live owned-state count overflow");
         let handle = self.reserve_slot();
         let arena = NonNull::from(&mut *self);
         state.attach_runtime_state(handle, arena);
@@ -300,7 +343,7 @@ impl StateArena {
         let slot = &mut self.slots[handle.slot()];
         slot.state = Some(state);
         slot.owned = true;
-        self.live_owned_states += 1;
+        self.live_owned_states = next_live_owned_states;
         handle
     }
 
@@ -308,9 +351,9 @@ impl StateArena {
         &self,
         handle: StateHandle,
     ) -> Result<(usize, NonNull<LuaState>), StateResolveError> {
-        if handle.runtime_id() != self.runtime_id {
+        if handle.runtime_id() != self.runtime_id() {
             return Err(StateResolveError::ForeignRuntime {
-                expected: self.runtime_id,
+                expected: self.runtime_id(),
                 actual: handle.runtime_id(),
             });
         }
@@ -319,6 +362,12 @@ impl StateArena {
                 slot: handle.slot(),
             });
         };
+        if slot.retired {
+            return Err(StateResolveError::RetiredSlot {
+                slot: handle.slot(),
+                generation: slot.generation,
+            });
+        }
         if slot.generation != handle.generation() {
             return Err(StateResolveError::StaleGeneration {
                 slot: handle.slot(),
@@ -472,8 +521,12 @@ impl StateArena {
             return Err(StateResolveError::NotOwned { slot: slot_index });
         }
 
+        let next_live_owned_states = self
+            .live_owned_states
+            .checked_sub(1)
+            .expect("occupied owned slot requires a positive live count");
         self.vacate_slot(slot_index);
-        self.live_owned_states -= 1;
+        self.live_owned_states = next_live_owned_states;
         // SAFETY: owned slots are created exclusively with Box::into_raw,
         // removed at most once, and have just been made vacant.
         unsafe {
@@ -503,8 +556,12 @@ impl StateArena {
                 continue;
             }
 
+            let next_live_owned_states = self
+                .live_owned_states
+                .checked_sub(1)
+                .expect("occupied owned slot requires a positive live count");
             self.vacate_slot(slot_index);
-            self.live_owned_states -= 1;
+            self.live_owned_states = next_live_owned_states;
             // SAFETY: each owned slot originates from exactly one Box::into_raw
             // and was made vacant before ownership is reconstructed here.
             let mut state = unsafe { Box::from_raw(state.as_ptr()) };
@@ -520,6 +577,7 @@ impl StateArena {
     }
 
     fn validate_owned_drain(&self) -> Result<(), StateResolveError> {
+        self.validate_internal_invariants()?;
         for (slot_index, slot) in self.slots.iter().enumerate() {
             if slot.owned && slot.state.is_some() && slot.borrowed {
                 return Err(StateResolveError::AlreadyBorrowed {
@@ -531,13 +589,104 @@ impl StateArena {
         Ok(())
     }
 
+    fn validate_internal_invariants(&self) -> Result<(), StateResolveError> {
+        for &slot_index in &self.free_slots {
+            if slot_index >= self.slots.len() {
+                return Err(StateResolveError::ArenaInvariant {
+                    reason: "free-list index is outside the slot table",
+                });
+            }
+        }
+
+        let mut occupied_owned = 0_usize;
+        for (slot_index, slot) in self.slots.iter().enumerate() {
+            if slot.generation == 0 {
+                return Err(StateResolveError::ArenaInvariant {
+                    reason: "slot generation is zero",
+                });
+            }
+
+            let free_entries = self
+                .free_slots
+                .iter()
+                .filter(|&&candidate| candidate == slot_index)
+                .count();
+            if free_entries > 1 {
+                return Err(StateResolveError::ArenaInvariant {
+                    reason: "free-list contains a duplicate slot",
+                });
+            }
+
+            if slot.retired {
+                if slot.state.is_some()
+                    || slot.owned
+                    || slot.borrowed
+                    || free_entries != 0
+                    || slot.generation != u64::MAX
+                {
+                    return Err(StateResolveError::ArenaInvariant {
+                        reason: "retired slot is occupied, reusable, or below generation max",
+                    });
+                }
+                continue;
+            }
+
+            match slot.state {
+                Some(_) => {
+                    if free_entries != 0 {
+                        return Err(StateResolveError::ArenaInvariant {
+                            reason: "occupied slot appears in the free-list",
+                        });
+                    }
+                    if slot.owned {
+                        occupied_owned = occupied_owned.checked_add(1).ok_or(
+                            StateResolveError::ArenaInvariant {
+                                reason: "occupied owned-state count overflowed",
+                            },
+                        )?;
+                    }
+                }
+                None => {
+                    if slot.owned || slot.borrowed || free_entries != 1 {
+                        return Err(StateResolveError::ArenaInvariant {
+                            reason: "vacant reusable slot has invalid flags or free-list count",
+                        });
+                    }
+                }
+            }
+        }
+
+        if occupied_owned != self.live_owned_states {
+            return Err(StateResolveError::ArenaInvariant {
+                reason: "live owned-state count disagrees with occupied slots",
+            });
+        }
+        Ok(())
+    }
+
     fn vacate_slot(&mut self, slot_index: usize) {
+        let retires = self.slots[slot_index].generation == u64::MAX;
+        if !retires {
+            // Ensure the only potentially allocating operation happens before
+            // the state pointer is cleared. If reserve panics, ownership and
+            // generation remain unchanged.
+            self.free_slots.reserve(1);
+        }
+
         let slot = &mut self.slots[slot_index];
+        debug_assert!(!slot.retired);
         slot.state = None;
         slot.owned = false;
         slot.borrowed = false;
-        slot.generation = next_generation(slot.generation);
-        self.free_slots.push(slot_index);
+        if retires {
+            slot.retired = true;
+        } else {
+            slot.generation = slot
+                .generation
+                .checked_add(1)
+                .expect("non-retiring generation can always advance");
+            self.free_slots.push(slot_index);
+        }
     }
 
     fn live_owned_state_count(&self) -> usize {
@@ -586,11 +735,6 @@ impl Drop for StateBorrow {
         let released = unsafe { arena.as_mut() }.release(self.handle);
         debug_assert!(released);
     }
-}
-
-fn next_generation(generation: u64) -> u64 {
-    let next = generation.wrapping_add(1);
-    if next == 0 { 1 } else { next }
 }
 
 impl LuaState {
@@ -651,9 +795,9 @@ struct RuntimeHeap {
 }
 
 impl RuntimeHeap {
-    fn new(runtime_id: RuntimeId) -> Self {
+    fn new(handle_issuer: StateHandleIssuer) -> Self {
         Self {
-            state_arena: StateArena::new(runtime_id),
+            state_arena: StateArena::new(handle_issuer),
             gc: GarbageCollector::new(),
             string_pool: StringPool::new(),
             _pin: PhantomPinned,
@@ -685,9 +829,30 @@ impl Runtime {
     ///
     /// The legacy `LuaState::gc` and `LuaState::string_pool` pointers target
     /// the pinned heap and stay stable even when the `Runtime` value moves.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process-wide RuntimeId namespace is exhausted. Hosts that
+    /// need to report that terminal condition should call [`Runtime::try_new`].
+    #[allow(
+        clippy::new_without_default,
+        reason = "Default would hide terminal RuntimeId exhaustion; hosts can use try_new"
+    )]
     pub fn new() -> Self {
-        let id = RuntimeId::new(NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed));
-        let mut heap = Box::pin(RuntimeHeap::new(id));
+        Self::try_new().expect("process-wide RuntimeId namespace is exhausted")
+    }
+
+    /// Try to create a running runtime without allowing RuntimeId reuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeIdExhausted`] after the process-wide monotonic identity
+    /// namespace is exhausted. No heap, roots, or state slots are allocated on
+    /// that failure path.
+    pub fn try_new() -> Result<Self, RuntimeIdExhausted> {
+        let handle_issuer = StateHandleIssuer::try_new()?;
+        let id = handle_issuer.runtime_id();
+        let mut heap = Box::pin(RuntimeHeap::new(handle_issuer));
 
         // SAFETY: `RuntimeHeap` is pinned for the remainder of the Runtime's
         // life. We take field addresses and never move out of the heap.
@@ -706,7 +871,7 @@ impl Runtime {
         main_state
             .attach_runtime_state(main_state_handle, NonNull::from(&mut heap_mut.state_arena));
 
-        Self {
+        Ok(Self {
             id,
             owner_thread: thread::current().id(),
             phase: RuntimePhase::Running,
@@ -718,7 +883,7 @@ impl Runtime {
             shutdown_summary: None,
             heap,
             _not_send_or_sync: PhantomData,
-        }
+        })
     }
 
     /// Return this runtime's process-unique diagnostic identifier.
@@ -1027,12 +1192,6 @@ impl Runtime {
     }
 }
 
-impl Default for Runtime {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for Runtime {
     fn drop(&mut self) {
         // A RuntimePartsMut guard exclusively borrows the Runtime, so safe Rust
@@ -1095,6 +1254,18 @@ mod tests {
 
     fn move_runtime(runtime: Runtime) -> Runtime {
         runtime
+    }
+
+    #[test]
+    fn try_new_issues_distinct_nonzero_runtime_namespaces() {
+        let first = Runtime::try_new().expect("first runtime namespace is available");
+        let second = Runtime::try_new().expect("second runtime namespace is available");
+
+        assert_ne!(first.id(), second.id());
+        assert_ne!(first.id().get(), 0);
+        assert_ne!(second.id().get(), 0);
+        assert_ne!(first.id().get(), u64::MAX);
+        assert_ne!(second.id().get(), u64::MAX);
     }
 
     #[test]
@@ -1217,6 +1388,47 @@ mod tests {
     }
 
     #[test]
+    fn close_preflight_rejects_free_list_corruption_before_mutation() {
+        let mut runtime = Runtime::new();
+        let removed = {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (state, _, _) = parts.split_mut();
+            state
+                .insert_coroutine_state(LuaState::new())
+                .expect("child is inserted")
+        };
+        // SAFETY: RuntimeHeap is pinned and no execution guard is live.
+        let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
+        heap.state_arena
+            .remove_owned(removed)
+            .expect("child is removed");
+        heap.state_arena.free_slots.push(removed.slot());
+
+        assert!(matches!(
+            runtime.close(),
+            Err(RuntimeAccessError::StateArena {
+                source: StateResolveError::ArenaInvariant {
+                    reason: "free-list contains a duplicate slot"
+                },
+                ..
+            })
+        ));
+        assert_eq!(runtime.phase(), RuntimePhase::Running);
+        assert!(runtime.main_state.is_some());
+        assert!(runtime.global_root.is_some());
+
+        // Repair the deliberately injected duplicate and prove normal shutdown
+        // remains available after the fail-closed preflight.
+        // SAFETY: RuntimeHeap remains pinned and the failed close did not
+        // create an execution guard or mutate arena ownership.
+        let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
+        assert_eq!(heap.state_arena.free_slots.pop(), Some(removed.slot()));
+        runtime
+            .close()
+            .expect("close succeeds after test corruption is repaired");
+    }
+
+    #[test]
     fn arena_rejects_current_foreign_and_nested_active_states() {
         let mut runtime = Runtime::new();
         let main_handle = runtime
@@ -1297,17 +1509,127 @@ mod tests {
     }
 
     #[test]
+    fn generation_max_is_issued_once_then_the_slot_is_permanently_retired() {
+        let issuer =
+            StateHandleIssuer::try_new().expect("test runtime namespace should be available");
+        let mut arena = StateArena::new(issuer);
+        let original = arena.insert_owned(Box::new(LuaState::new()));
+        let slot_index = original.slot();
+
+        arena.slots[slot_index].generation = u64::MAX - 1;
+        let penultimate = arena.issue_handle(slot_index);
+        arena
+            .remove_owned(penultimate)
+            .expect("penultimate generation can be removed");
+
+        assert_eq!(arena.slots[slot_index].generation, u64::MAX);
+        assert!(!arena.slots[slot_index].retired);
+        assert_eq!(
+            arena
+                .free_slots
+                .iter()
+                .filter(|&&slot| slot == slot_index)
+                .count(),
+            1
+        );
+
+        let final_handle = arena.insert_owned(Box::new(LuaState::new()));
+        assert_eq!(final_handle.slot(), slot_index);
+        assert_eq!(final_handle.generation(), u64::MAX);
+        assert!(matches!(
+            arena.validate(penultimate),
+            Err(StateResolveError::StaleGeneration {
+                requested,
+                actual,
+                ..
+            }) if requested == u64::MAX - 1 && actual == u64::MAX
+        ));
+
+        arena
+            .remove_owned(final_handle)
+            .expect("final generation can be removed exactly once");
+        assert!(arena.slots[slot_index].retired);
+        assert!(arena.slots[slot_index].state.is_none());
+        assert!(!arena.free_slots.contains(&slot_index));
+        assert!(matches!(
+            arena.validate(final_handle),
+            Err(StateResolveError::RetiredSlot {
+                slot,
+                generation: u64::MAX
+            }) if slot == slot_index
+        ));
+        assert!(matches!(
+            arena.validate(original),
+            Err(StateResolveError::RetiredSlot { .. })
+        ));
+
+        let replacement = arena.insert_owned(Box::new(LuaState::new()));
+        assert_ne!(replacement.slot(), slot_index);
+        assert_eq!(replacement.generation(), 1);
+        assert_eq!(arena.live_owned_state_count(), 1);
+        arena
+            .remove_owned(replacement)
+            .expect("replacement state can be removed");
+        assert_eq!(arena.live_owned_state_count(), 0);
+    }
+
+    #[test]
+    fn duplicate_or_occupied_free_list_entries_cannot_overwrite_a_live_slot() {
+        let issuer =
+            StateHandleIssuer::try_new().expect("test runtime namespace should be available");
+        let mut arena = StateArena::new(issuer);
+        let first = arena.insert_owned(Box::new(LuaState::new()));
+        arena
+            .remove_owned(first)
+            .expect("first state can be removed");
+
+        let recycled_slot = first.slot();
+        arena.free_slots.push(recycled_slot);
+        let recycled = arena.insert_owned(Box::new(LuaState::new()));
+        assert_eq!(recycled.slot(), recycled_slot);
+
+        let other = arena.insert_owned(Box::new(LuaState::new()));
+        assert_ne!(other.slot(), recycled_slot);
+        assert_eq!(arena.live_owned_state_count(), 2);
+        assert!(arena.validate(recycled).is_ok());
+        assert!(arena.validate(other).is_ok());
+
+        arena
+            .remove_owned(recycled)
+            .expect("recycled state can be removed");
+        arena
+            .remove_owned(other)
+            .expect("other state can be removed");
+        assert_eq!(arena.live_owned_state_count(), 0);
+    }
+
+    #[test]
     fn arena_releases_one_thousand_owned_states_back_to_baseline() {
-        let mut arena = StateArena::new(RuntimeId::new(u64::MAX));
+        let issuer =
+            StateHandleIssuer::try_new().expect("test runtime namespace should be available");
+        let mut arena = StateArena::new(issuer);
         let baseline = arena.live_owned_state_count();
+        let mut first_handle = None;
+        let mut previous_generation = 0;
 
         for _ in 0..1_000 {
             let handle = arena.insert_owned(Box::new(LuaState::new()));
+            first_handle.get_or_insert(handle);
+            assert!(handle.generation() > previous_generation);
+            previous_generation = handle.generation();
             assert_eq!(arena.live_owned_state_count(), baseline + 1);
             arena
                 .remove_owned(handle)
                 .expect("an occupied owned slot can be released exactly once");
             assert_eq!(arena.live_owned_state_count(), baseline);
+            assert!(matches!(
+                arena.validate(handle),
+                Err(StateResolveError::StaleGeneration { .. })
+            ));
+            assert!(matches!(
+                arena.validate(first_handle.expect("first handle is recorded")),
+                Err(StateResolveError::StaleGeneration { .. })
+            ));
         }
     }
 
@@ -1335,6 +1657,69 @@ mod tests {
                 .validate(child_handle),
             Err(StateResolveError::StaleGeneration { .. })
         ));
+    }
+
+    #[test]
+    fn close_retires_a_coroutine_at_generation_max_without_reuse_or_wrap() {
+        let mut runtime = Runtime::new();
+        let child_handle = {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (state, _, _) = parts.split_mut();
+            state
+                .insert_coroutine_state(LuaState::new())
+                .expect("child is inserted")
+        };
+
+        // SAFETY: RuntimeHeap is pinned and no execution guard is live.
+        let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
+        let arena = &mut heap.state_arena;
+        let slot_index = child_handle.slot();
+        arena.slots[slot_index].generation = u64::MAX;
+        let final_handle = arena.issue_handle(slot_index);
+        let arena_ptr = NonNull::from(&mut *arena);
+        let mut child_state = arena.slots[slot_index]
+            .state
+            .expect("child slot remains occupied");
+        // SAFETY: the slot owns this live Box and the test has exclusive
+        // Runtime access; this only synchronizes its diagnostic handle with
+        // the forced boundary generation.
+        unsafe {
+            child_state
+                .as_mut()
+                .attach_runtime_state(final_handle, arena_ptr);
+        }
+
+        let first = runtime.close().expect("runtime closes at generation max");
+        assert_eq!(first.drained_coroutine_states, 1);
+        let slot = &runtime.heap.as_ref().get_ref().state_arena.slots[slot_index];
+        assert!(slot.retired);
+        assert_eq!(slot.generation, u64::MAX);
+        assert!(slot.state.is_none());
+        assert!(
+            !runtime
+                .heap
+                .as_ref()
+                .get_ref()
+                .state_arena
+                .free_slots
+                .contains(&slot_index)
+        );
+        assert!(matches!(
+            runtime
+                .heap
+                .as_ref()
+                .get_ref()
+                .state_arena
+                .validate(final_handle),
+            Err(StateResolveError::RetiredSlot { .. })
+        ));
+
+        let second = runtime.close().expect("second close is idempotent");
+        assert!(second.already_closed);
+        assert_eq!(
+            runtime.heap.as_ref().get_ref().state_arena.slots[slot_index].generation,
+            u64::MAX
+        );
     }
 
     #[test]

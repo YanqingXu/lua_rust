@@ -39,21 +39,21 @@ is not closed:
   at `crates/lua_core/src/gc/collector.rs:405-422`;
 - `clear_all` keeps fixed objects at
   `crates/lua_core/src/gc/collector.rs:169-208`;
-- coroutine creation transfers `Box<LuaState>` into a raw pointer at
-  `crates/lua_stdlib/src/coroutine.rs:211-232`, with no matching
-  `Box::from_raw`;
-- `Thread::mark_children` does not trace either associated state at
-  `crates/lua_core/src/thread.rs:260-275`;
-- coroutine and debug helpers manufacture `&'static mut LuaState` at
-  `crates/lua_stdlib/src/coroutine.rs:348-363` and
-  `crates/lua_stdlib/src/debug.rs:1479-1490`;
+- `StateArena` now owns coroutine `Box<LuaState>` allocations and reconstructs
+  them during removal/shutdown; `Thread` stores and traces a validated
+  `StateHandle`. The main state is still an externally owned arena slot, and
+  recursive coroutine resume still nests state borrows instead of transferring
+  execution through a Runtime trampoline;
+- coroutine/debug lookup is scoped through `with_resolved_state_mut`, but open
+  Upvalues still identify their owner with raw Stack/list pointers rather than
+  `StateHandle + stack index`;
 - M1.6 removed the dump shim that kept unrooted `GcRef<Proto>` values in
   thread-local maps; `string.dump` now fails explicitly until the M3
   serializer exists, and source loaders no longer recognize the private
   pseudo-dump prefix;
-- the collector's mark entry point starts only from its explicit pointer roots
-  at `crates/lua_core/src/gc/mark.rs:28-59`; it has no authoritative
-  `Runtime`/`LuaState` root callback;
+- `Runtime::trace_roots_mark_only` now provides the canonical object/state
+  fixed-point root callback, but temporary state roots, pending finalizers,
+  fixed strings, and several production publication paths remain incomplete;
 - the two VM-side weak-cleanup scanners at
   `crates/lua_vm/src/execute.rs:1137-1188` and
   `crates/lua_stdlib/src/base.rs:432-495` disagree and are not safe sweep root
@@ -232,20 +232,27 @@ The target handle is conceptually:
 
 ```rust,ignore
 pub struct StateHandle {
-    runtime: RuntimeId,
-    slot: u32,
-    generation: u32,
+    runtime_id: RuntimeId,
+    slot: usize,
+    generation: u64,
 }
 ```
 
 The handle representation belongs in a dependency-neutral module; the arena
-belongs to `lua_vm`.
+belongs to `lua_vm`. The implemented issuance boundary is a non-`Clone`,
+non-`Copy` `StateHandleIssuer`: its checked process-global allocator reserves
+zero as invalid and `u64::MAX` as the permanent exhausted sentinel, and only
+issues `1..=u64::MAX - 1`. An issuer can create handles only in its own fresh
+namespace; safe code cannot rebuild an existing `RuntimeId` or a handle from
+raw integers. `Runtime::try_new` reports terminal identity exhaustion before
+allocating a heap, while `Runtime::new` fails closed by panicking.
 
 Requirements:
 
 1. the arena is the sole owner of every `LuaState`;
 2. `Thread` stores a `StateHandle`, never `*mut c_void` or `Box<LuaState>`;
-3. a slot generation changes before reuse;
+3. a slot generation changes before reuse and never wraps: generation
+   `u64::MAX` may be issued once, then its vacant slot is permanently retired;
 4. runtime id, slot bounds, generation, and occupancy are checked on every
    lookup;
 5. a stale or foreign handle produces a deterministic runtime error;
@@ -259,7 +266,12 @@ Requirements:
 9. an unreachable `Thread` causes its state to close before the thread and
    other GC objects are freed;
 10. open upvalues identify their owner by `StateHandle + stack index`, not by
-    a pointer to a movable `Stack`.
+    a pointer to a movable `Stack`;
+11. retired, occupied, borrowed, and duplicate free-list entries are never
+    reused; close validates arena counts and free-list invariants before any
+    destructive mutation;
+12. every fallible free-list capacity operation happens before clearing an
+    owned state pointer, so unwind cannot orphan its Box.
 
 Arena membership alone is not reachability. The main/running state is traced
 from `GlobalRoots`; another state is traced only after a reachable `Thread`
@@ -451,7 +463,8 @@ restart operate on collector state rather than simulated counters in
 6. clear native/module/IO service roots while those services are still alive;
 7. clear global, registry, primitive-metatable, fixed-string, running-thread,
    and temporary roots;
-8. remove all `LuaState` arena slots and invalidate their generations;
+8. remove all `LuaState` arena slots and advance or permanently retire their
+   generations without wrap;
 9. destroy Thread objects first, then all other ordinary objects, then fixed
    objects;
 10. clear string-pool indexes and collector work queues;
@@ -497,6 +510,29 @@ handles; a second main state and foreign handle are rejected.
 
 Acceptance: stale slot reuse and cross-runtime lookup fail; 1,000
 create/release coroutine cycles return the live-state count to baseline.
+
+#### B.1 Implemented identity/generation substrate
+
+The StateHandle issuance/exhaustion slice is complete locally:
+
+- Runtime identity allocation is atomic, monotonic, non-zero, concurrent-safe,
+  and permanently returns `RuntimeIdExhausted` at its reserved sentinel;
+- the arena privately owns the only issuer for its runtime namespace;
+  compile-fail tests reject raw `RuntimeId`/`StateHandle` construction and
+  issuer cloning;
+- ordinary vacate advances with `checked_add`; the final generation is issued
+  once and the next vacate marks the slot retired without placing it on the
+  free-list;
+- stale/foreign/retired handles are rejected before dereference, malformed or
+  duplicate free-list entries cannot overwrite occupied slots, and shutdown
+  preflights arena invariants before mutation;
+- concurrent allocation, 1,000 reuse cycles, MAX-generation reuse/retirement,
+  corrupted free-list, real stale/foreign tracing, and MAX-generation close
+  have focused regressions.
+
+Phase B remains incomplete because main-state ownership, Runtime coroutine
+trampoline execution, and `StateHandle + stack index` open-Upvalue ownership
+are still outstanding.
 
 ### C. Registry and dump lifetime — M1.6
 
@@ -646,10 +682,10 @@ therefore does not claim complete M1.8 or Lua-compatible close semantics.
 1. validate owner thread, zero active executions, the main external arena slot,
    and every owned arena slot before mutation;
 2. drain owned coroutine states in deterministic slot order, close only
-   collector-validated open Upvalues, invalidate each generation, and drop the
-   state;
-3. close validated main-state Upvalues, detach/invalidate its external slot,
-   and drop the main Box;
+   collector-validated open Upvalues, advance or permanently retire each
+   generation without wrap, and drop the state;
+3. close validated main-state Upvalues, detach and advance/retire its external
+   slot, and drop the main Box;
 4. clear Runtime global/registry handles and collector roots;
 5. call `GarbageCollector::destroy_all` with the live StringPool;
 6. destroy non-fixed Threads, other non-fixed objects, and fixed objects in
@@ -746,7 +782,7 @@ update.
 | U-01 | A managed object's header is at the layout position expected by collector dispatch. | Sealed managed-object construction plus layout/type-tag tests. |
 | U-02 | A GC handle is dereferenced only after heap id, generation, type, and liveness validation. | P1 checked collector entry points use pointer + process-global ObjectId + tag; final enforcement still requires Heap-owned scoped lookup and removal of transitional direct `GcRef::as_ref` call sites. |
 | U-03 | A scoped object reference cannot coexist with destructive collection or a second mutable reference. | `VmContext` borrow and no stored raw collector alias. |
-| U-04 | A `StateHandle` names one occupied slot in its originating runtime and generation. | Checked arena lookup and generation bump before reuse. |
+| U-04 | A `StateHandle` names one occupied slot in its originating runtime and generation. | Non-duplicable namespace issuer, opaque identities, checked arena lookup, checked generation advance, MAX-generation retirement, and close-time arena invariant preflight. |
 | U-05 | An open Upvalue's state and stack slot remain valid until it is closed. | State-handle ownership; close before state removal; bounds checks. |
 | U-06 | Active Function/Proto metadata is a validated GC edge, never an unrooted raw pointer. | Handle-bearing `CallInfo`; trace active frame owner. |
 | U-07 | An FFI `LuaState` pointer is valid only for the dynamic callback extent. | Scoped reconstruction inside each callback; no `'static` helper. |

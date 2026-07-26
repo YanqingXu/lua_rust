@@ -200,17 +200,25 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   `crates/lua_stdlib/src/coroutine.rs`；
   `crates/lua_core/src/thread.rs`；
   `crates/lua_core/src/gc/collector.rs`。
-- **当前行为：** 多个运行时服务通过裸指针拼装；coroutine 使用
-  `Box::into_raw(LuaState)` 后交给 `Thread`，没有可审计的统一释放路径；
-  collector Drop 也不销毁对象。
+- **当前行为：** pinned Runtime/StateArena 已独占 coroutine Box，Thread
+  只保存受 runtime/slot/generation 校验的 handle；RuntimeId 不回绕且不可由
+  safe raw integer 重建，generation `u64::MAX` 释放后永久退休。Runtime
+  close/Drop 已执行 state→Thread→ordinary→fixed 的 Rust-owned 确定性销毁。
+  但 main state 仍是 external arena slot，LuaState 仍保存 transitional
+  GC/StringPool backpointer，递归 resume 尚无 Runtime trampoline，open
+  Upvalue 仍使用 raw Stack owner；Lua `__gc`、IO/module service drain 与
+  allocator live-byte 合同也未闭环。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
   close、coroutine lifecycle 和 allocator live-byte 合同。
-- **测试与任务：** 1000 轮 state/coroutine create-close、drop counter、
-  allocator live/peak、Miri/ASan 等；M1.4、M1.5、M1.7、M1.8、M1.13。
-- **影响：** 长生命周期或反复创建 state/coroutine 时存在泄漏和别名安全风险；
-  当前不能声称 deterministic shutdown。
-- **处置状态：** `open`。Runtime owner、generational handle 或等价设计及
-  lifecycle 验收完成前保持开放。
+- **测试与任务：** 1000 轮 state/coroutine create-close、fixed/ordinary
+  DropProbe、并发 RuntimeId 唯一性、MAX-generation retirement、free-list
+  preflight 与关闭归零已通过；allocator live/peak、真实 finalizer/service
+  close、Miri/ASan 等仍在 M1.4、M1.5、M1.7、M1.8、M1.13。
+- **影响：** 已能声称当前 Rust-owned 对象的 deterministic shutdown
+  substrate，但递归跨 state 执行和 raw Upvalue owner 仍有别名/UAF 风险，
+  也不能声称完整 Lua close 或 live collection。
+- **处置状态：** `open`。Runtime trampoline、Upvalue owner、唯一 Heap/service
+  owner、Lua-visible close 与 lifecycle 验收全部完成前保持开放。
 
 ### NOTE-010: Lua 字符串 intern hash 选择固定 C++ 的前向采样
 

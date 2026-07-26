@@ -341,7 +341,12 @@ mod tests {
         let mut t = Thread::new();
         assert!(t.state_handle().is_none());
 
-        let handle = StateHandle::new(crate::state_handle::RuntimeId::new(7), 3, 2);
+        let issuer = crate::state_handle::StateHandleIssuer::try_new()
+            .expect("runtime namespace is available");
+        let handle = issuer.issue(
+            3,
+            std::num::NonZeroU64::new(2).expect("generation is non-zero"),
+        );
         t.set_state_handle(handle);
         assert_eq!(t.state_handle(), Some(handle));
     }

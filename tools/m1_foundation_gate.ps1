@@ -503,7 +503,7 @@ $openDebts = @(
     [ordered]@{
         id = "generational-gc-handles-and-temporary-roots"
         blocks = "destructive sweep"
-        detail = "GcRef now carries non-reused ObjectId provenance validated by the collector live table; lexical object/state publication roots are not yet complete."
+        detail = "GcRef carries non-reused ObjectId provenance, and StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement; lexical object/state publication roots are not yet complete."
     },
     [ordered]@{
         id = "string-content-equality-without-collector-borrow"
@@ -520,7 +520,7 @@ $result = [ordered]@{
         "m1-foundation-gate"
     }
     mode = if ($Smoke) { "smoke" } else { "full" }
-    scope = "ByteString, GcRef provenance, managed Proto roots, temporary object-root foundation, Runtime/StateArena shutdown, and byte differential"
+    scope = "ByteString, GcRef provenance, managed Proto roots, temporary object-root foundation, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
     checksPassed = $failures.Count -eq 0
     foundationPassed = (
         $failures.Count -eq 0 -and
