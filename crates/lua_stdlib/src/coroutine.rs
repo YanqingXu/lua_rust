@@ -240,16 +240,19 @@ fn create_thread(
     co_state.number_metatable = l.number_metatable;
     co_state.push_value(entry);
 
+    // Publish the owning Thread into the not-yet-inserted state before the
+    // arena makes that state addressable. This avoids borrowing a second
+    // LuaState merely to complete the State -> Thread edge after insertion.
+    // The reverse Thread -> StateHandle edge is installed before the Thread
+    // value is exposed to Lua. A future PendingState transaction will make
+    // allocation failure rollback and temporary-root tracing explicit.
+    let thread_ref = gc.create(Thread::new());
+    co_state.current_thread = Some(thread_ref);
     let handle = l
         .insert_coroutine_state(co_state)
         .map_err(|err| diagnostic_string_value(gc, &format!("invalid coroutine state: {err}")))?;
-    let mut thread = Thread::new();
-    thread.set_state_handle(handle);
-    let thread_ref = gc.create(thread);
-    l.with_resolved_state_mut(handle, |state| {
-        state.current_thread = Some(thread_ref);
-    })
-    .map_err(|err| diagnostic_string_value(gc, &format!("invalid coroutine state: {err}")))?;
+    with_thread_mut(thread_ref, |thread| thread.set_state_handle(handle))
+        .ok_or_else(|| lua_ascii_value(gc, b"invalid coroutine"))?;
     Ok(thread_ref)
 }
 

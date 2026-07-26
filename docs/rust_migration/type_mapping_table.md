@@ -1,6 +1,6 @@
 ---
 status: current
-last_updated: 2026-07-07
+last_updated: 2026-07-26
 applies_to: Rust internal type reference for the Lua interpreter
 ---
 
@@ -26,6 +26,7 @@ applies_to: Rust internal type reference for the Lua interpreter
 | 可选字段 | `Option<T>` | 例如函数原型、元表、可选返回值数量。 |
 | 错误传播 | `Result<T, E>` | 编译器错误和运行时错误都显式返回。 |
 | GC 引用 | `GcRef<T>` | 对 GC 管理对象的轻量句柄。 |
+| 运行时状态身份 | `RuntimeId` + `StateHandle` | 以不可伪造的运行时身份、slot 和非零 generation 定位状态；解析必须先校验全部身份字段。 |
 | 宿主函数 | `fn(...) -> Result<..., ...>` | 标准库函数通过统一调用边界接入 VM。 |
 | 共享可变运行时 | 显式状态对象 | `LuaState`、`GarbageCollector` 等由调用方显式传递。 |
 
@@ -46,6 +47,10 @@ applies_to: Rust internal type reference for the Lua interpreter
 | `Upvalue` | `crates/lua_core/src/upvalue.rs` | 闭包捕获变量。 |
 | `Thread` | `crates/lua_core/src/thread.rs` | Coroutine 对象。 |
 | `Userdata` | `crates/lua_core/src/userdata.rs` | 完整用户数据。 |
+| `RuntimeId` | `crates/lua_core/src/state_handle.rs` | 进程内单调且不复用的运行时诊断身份；`0` 无效、`u64::MAX` 为永久耗尽哨兵，原始整数构造不对安全代码开放。 |
+| `RuntimeIdExhausted` | `crates/lua_core/src/state_handle.rs` | `RuntimeId` 命名空间永久耗尽错误；失败后不回绕到零，也不复用旧身份。 |
+| `StateHandleIssuer` | `crates/lua_core/src/state_handle.rs` | 不可 `Clone`/`Copy` 的独占发行能力，只能在其新分配的 `RuntimeId` 命名空间内创建句柄。 |
+| `StateHandle` | `crates/lua_core/src/state_handle.rs` | `RuntimeId` + slot + generation 值句柄；安全代码不能从原始组件构造。slot generation 非零递增，`u64::MAX` 可发行一次，释放后该槽永久退役。 |
 
 ## Compiler
 

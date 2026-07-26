@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Characterize coroutine.resume of a Normal ancestor before the Runtime trampoline is implemented",
+  "classification": "characterization-only",
+  "gate": false,
+  "implementationStatus": "pending-lua-rust",
+  "fixture": "tests/characterization/coroutine-normal-ancestor.lua",
+  "stabilityRuns": 3,
+  "provenance": {
+    "cppBuildReport": "target/compatibility/cpp-oracle-build.json",
+    "officialBuildReport": "target/compatibility/lua51-oracle-build.json"
+  },
+  "normalization": {
+    "stdout": ["crlf-to-lf"],
+    "stderr": ["crlf-to-lf"]
+  },
+  "observations": [
+    {
+      "id": "cpp-87c15e6",
+      "role": "project-target",
+      "sourceRepository": "https://github.com/YanqingXu/lua.git",
+      "sourceCommit": "87c15e69ceb94eb74e28226ccbefb7e196635711",
+      "expectedExit": 0,
+      "stdout": {
+        "byteLength": 266,
+        "sha256": "bad37c42fcfd369f22fdc9d9ec8d1ce46caaa2e8fa755fe03a41a6e91b2591d2",
+        "base64": "MQltYWluOmJlZm9yZQlzdXNwZW5kZWQJc3VzcGVuZGVkCS0JLQoyCUE6ZW50ZXIJZnJvbS1tYWluCXJ1bm5pbmcJc3VzcGVuZGVkCS0KMwlCOmVudGVyCWZyb20tQQlub3JtYWwJcnVubmluZwktCjQJQTphZnRlci1CCWZyb20tQgluaWwJcnVubmluZwlub3JtYWwKNQlCOmFmdGVyLUEJdHJ1ZQlBLWRvbmUJZGVhZAlydW5uaW5nCjYJQTphZnRlci1CCW5pbAluaWwJcnVubmluZwlkZWFkCjcJbWFpbjphZnRlci1BCWZhbHNlCTxyZXN1bWUtZXJyb3I+CWRlYWQJZGVhZAo=",
+        "utf8": "1\tmain:before\tsuspended\tsuspended\t-\t-\n2\tA:enter\tfrom-main\trunning\tsuspended\t-\n3\tB:enter\tfrom-A\tnormal\trunning\t-\n4\tA:after-B\tfrom-B\tnil\trunning\tnormal\n5\tB:after-A\ttrue\tA-done\tdead\trunning\n6\tA:after-B\tnil\tnil\trunning\tdead\n7\tmain:after-A\tfalse\t<resume-error>\tdead\tdead\n"
+      },
+      "stderr": {
+        "byteLength": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "base64": "",
+        "utf8": ""
+      }
+    },
+    {
+      "id": "official-lua51",
+      "role": "secondary-reference",
+      "sourceRelease": "Lua 5.1.5",
+      "sourceArchiveUrl": "https://www.lua.org/ftp/lua-5.1.5.tar.gz",
+      "sourceArchiveSha256": "2640fc56a795f29d28ef15e13c34a47e223960b0240e8cb0a82d9b0738695333",
+      "expectedExit": 0,
+      "stdout": {
+        "byteLength": 234,
+        "sha256": "0488432cb01117da75f229ab0f43bd1c1ea174853ebde5f1ab62853265f805f6",
+        "base64": "MQltYWluOmJlZm9yZQlzdXNwZW5kZWQJc3VzcGVuZGVkCS0JLQoyCUE6ZW50ZXIJZnJvbS1tYWluCXJ1bm5pbmcJc3VzcGVuZGVkCS0KMwlCOmVudGVyCWZyb20tQQlub3JtYWwJcnVubmluZwktCjQJQjphZnRlci1BCWZhbHNlCTxyZXN1bWUtZXJyb3I+CW5vcm1hbAlydW5uaW5nCjUJQTphZnRlci1CCXRydWUJQi1kb25lCXJ1bm5pbmcJZGVhZAo2CW1haW46YWZ0ZXItQQl0cnVlCUEtZG9uZQlkZWFkCWRlYWQK",
+        "utf8": "1\tmain:before\tsuspended\tsuspended\t-\t-\n2\tA:enter\tfrom-main\trunning\tsuspended\t-\n3\tB:enter\tfrom-A\tnormal\trunning\t-\n4\tB:after-A\tfalse\t<resume-error>\tnormal\trunning\n5\tA:after-B\ttrue\tB-done\trunning\tdead\n6\tmain:after-A\ttrue\tA-done\tdead\tdead\n"
+      },
+      "stderr": {
+        "byteLength": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "base64": "",
+        "utf8": ""
+      }
+    }
+  ],
+  "notes": [
+    "The C++ target accepts resuming A while A is Normal, re-enters A, and executes A:after-B twice.",
+    "Official Lua 5.1.5 rejects resuming the Normal ancestor and completes in ordinary LIFO order.",
+    "The checker binds both executed binaries to the existing provenance build reports and their SHA-256 values.",
+    "This manifest is not part of a compatibility gate and does not approve a deviation."
+  ]
+}

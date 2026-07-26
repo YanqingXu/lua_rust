@@ -8,6 +8,12 @@
 //! together through `Runtime::parts_mut`; the returned guard records both the
 //! Runtime execution and main-state arena borrow.
 //!
+//! The first coroutine-trampoline substrate additionally provides a
+//! Runtime-owned turn driver. It confines one state borrow to one callback,
+//! releases that guard before resolving a requested next handle, and retains
+//! only owned `StateHandle`/result values between turns. Coroutine status,
+//! result delivery, and VM continuation semantics remain a later integration.
+//!
 //! M1.8 adds explicit deterministic reclamation for shutdown only.
 //! `Runtime::close` drains coroutine states, closes collector-validated open
 //! Upvalues while their stacks are alive, detaches the main state, clears
@@ -78,7 +84,7 @@ pub enum RuntimeAccessError {
         /// Current lifecycle phase.
         phase: RuntimePhase,
     },
-    /// Close was requested while execution borrows are active.
+    /// An exclusive Runtime operation was requested during active execution.
     #[error("runtime {runtime_id:?} has {count} active execution(s)")]
     ActiveExecutions {
         /// Runtime being closed.
@@ -100,6 +106,23 @@ pub enum RuntimeAccessError {
         /// Arena validation failure.
         source: StateResolveError,
     },
+}
+
+/// Result produced by one Runtime-owned state execution turn.
+///
+/// This is the ownership substrate for the future coroutine trampoline. A
+/// `Switch` ends the current state borrow before the Runtime acquires the next
+/// handle; `Complete` ends the driver session.
+#[allow(
+    dead_code,
+    reason = "M1 Runtime turn substrate is integrated before coroutine dispatch"
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeTurn<T> {
+    /// Release the current state and acquire `StateHandle` for the next turn.
+    Switch(StateHandle),
+    /// Release the current state and return the completed value.
+    Complete(T),
 }
 
 /// Result of explicit Runtime teardown.
@@ -218,6 +241,16 @@ pub enum StateResolveError {
         /// Borrowed slot generation.
         generation: u64,
     },
+    /// Nested arena resolution was attempted during a Runtime-owned turn.
+    #[error(
+        "runtime turn already owns state slot {slot} generation {generation}; publish a switch instead"
+    )]
+    TurnBorrowActive {
+        /// Slot owned by the active Runtime turn.
+        slot: usize,
+        /// Generation owned by the active Runtime turn.
+        generation: u64,
+    },
     /// Resolution attempted to recreate the caller's current mutable state.
     #[error("cannot resolve the currently mutably borrowed LuaState")]
     CurrentState,
@@ -263,6 +296,18 @@ pub struct StateArena {
     slots: Vec<StateSlot>,
     free_slots: Vec<usize>,
     live_owned_states: usize,
+    turn_borrow: Option<StateHandle>,
+    #[cfg(test)]
+    turn_borrow_events: Vec<TurnBorrowEvent>,
+    #[cfg(test)]
+    peak_turn_borrowed_slots: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnBorrowEvent {
+    Acquired(StateHandle),
+    Released(StateHandle),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -278,6 +323,11 @@ impl StateArena {
             slots: Vec::new(),
             free_slots: Vec::new(),
             live_owned_states: 0,
+            turn_borrow: None,
+            #[cfg(test)]
+            turn_borrow_events: Vec::new(),
+            #[cfg(test)]
+            peak_turn_borrowed_slots: 0,
         }
     }
 
@@ -434,6 +484,7 @@ impl StateArena {
             // mutable borrow ends before the target-state closure starts, so
             // nested state resolution cannot overlap an arena `&mut` borrow.
             let arena_ref = unsafe { arena.as_mut() };
+            arena_ref.reject_active_turn()?;
             let state = arena_ref.resolve(handle, current_state)?;
             arena_ref.slots[handle.slot()].borrowed = true;
             state
@@ -442,8 +493,80 @@ impl StateArena {
             arena,
             handle,
             state,
+            kind: StateBorrowKind::Nested,
         };
         Ok(borrow.with_mut(f))
+    }
+
+    /// Borrow exactly one state for one Runtime-owned execution turn.
+    ///
+    /// The returned value is owned and the state reference is confined to the
+    /// HRTB callback. `StateBorrow` is dropped before this method returns,
+    /// including while unwinding from a callback panic.
+    fn with_turn_state_mut<R>(
+        mut arena: NonNull<Self>,
+        handle: StateHandle,
+        f: impl for<'state> FnOnce(&'state mut LuaState) -> R,
+    ) -> Result<R, StateResolveError> {
+        let state = {
+            // SAFETY: Runtime passes its pinned arena. No reference into the
+            // arena is retained after this short acquisition scope.
+            let arena_ref = unsafe { arena.as_mut() };
+            arena_ref.begin_turn_borrow(handle)?
+        };
+        let mut borrow = StateBorrow {
+            arena,
+            handle,
+            state,
+            kind: StateBorrowKind::Turn,
+        };
+        Ok(borrow.with_mut(f))
+    }
+
+    fn reject_active_turn(&self) -> Result<(), StateResolveError> {
+        if let Some(handle) = self.turn_borrow {
+            return Err(StateResolveError::TurnBorrowActive {
+                slot: handle.slot(),
+                generation: handle.generation(),
+            });
+        }
+        Ok(())
+    }
+
+    fn begin_turn_borrow(
+        &mut self,
+        handle: StateHandle,
+    ) -> Result<NonNull<LuaState>, StateResolveError> {
+        let (_, state) = self.validate(handle)?;
+        self.reject_active_turn()?;
+
+        if let Some((slot_index, slot)) = self
+            .slots
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| slot.borrowed)
+        {
+            return Err(StateResolveError::AlreadyBorrowed {
+                slot: slot_index,
+                generation: slot.generation,
+            });
+        }
+
+        #[cfg(test)]
+        self.turn_borrow_events.reserve(2);
+
+        self.slots[handle.slot()].borrowed = true;
+        self.turn_borrow = Some(handle);
+
+        #[cfg(test)]
+        {
+            let borrowed_slots = self.slots.iter().filter(|slot| slot.borrowed).count();
+            self.peak_turn_borrowed_slots = self.peak_turn_borrowed_slots.max(borrowed_slots);
+            self.turn_borrow_events
+                .push(TurnBorrowEvent::Acquired(handle));
+        }
+
+        Ok(state)
     }
 
     fn begin_direct_borrow(
@@ -451,6 +574,7 @@ impl StateArena {
         handle: StateHandle,
         expected_state: NonNull<LuaState>,
     ) -> Result<(), StateResolveError> {
+        self.reject_active_turn()?;
         let (slot_index, state) = self.validate(handle)?;
         if state != expected_state {
             return Err(StateResolveError::PointerMismatch);
@@ -473,6 +597,26 @@ impl StateArena {
         let was_borrowed = self.slots[slot_index].borrowed;
         self.slots[slot_index].borrowed = false;
         was_borrowed
+    }
+
+    fn release_turn(&mut self, handle: StateHandle) -> bool {
+        if self.turn_borrow != Some(handle) {
+            return false;
+        }
+        let released = self.release(handle);
+        if released {
+            self.turn_borrow = None;
+            #[cfg(test)]
+            {
+                debug_assert!(
+                    self.turn_borrow_events.len() < self.turn_borrow_events.capacity(),
+                    "turn acquisition reserves its non-allocating release event"
+                );
+                self.turn_borrow_events
+                    .push(TurnBorrowEvent::Released(handle));
+            }
+        }
+        released
     }
 
     fn detach_external(
@@ -661,10 +805,42 @@ impl StateArena {
                 reason: "live owned-state count disagrees with occupied slots",
             });
         }
+
+        if let Some(handle) = self.turn_borrow {
+            if handle.runtime_id() != self.runtime_id() {
+                return Err(StateResolveError::ArenaInvariant {
+                    reason: "active turn handle belongs to another runtime",
+                });
+            }
+            let Some(slot) = self.slots.get(handle.slot()) else {
+                return Err(StateResolveError::ArenaInvariant {
+                    reason: "active turn handle points outside the slot table",
+                });
+            };
+            if slot.retired
+                || slot.generation != handle.generation()
+                || slot.state.is_none()
+                || !slot.borrowed
+            {
+                return Err(StateResolveError::ArenaInvariant {
+                    reason: "active turn handle disagrees with its borrowed slot",
+                });
+            }
+            if self.slots.iter().filter(|slot| slot.borrowed).count() != 1 {
+                return Err(StateResolveError::ArenaInvariant {
+                    reason: "active Runtime turn does not own exactly one state slot",
+                });
+            }
+        }
         Ok(())
     }
 
     fn vacate_slot(&mut self, slot_index: usize) {
+        debug_assert!(
+            self.turn_borrow
+                .is_none_or(|handle| handle.slot() != slot_index),
+            "an active Runtime turn cannot vacate its state"
+        );
         let retires = self.slots[slot_index].generation == u64::MAX;
         if !retires {
             // Ensure the only potentially allocating operation happens before
@@ -696,6 +872,7 @@ impl StateArena {
 
 impl Drop for StateArena {
     fn drop(&mut self) {
+        self.turn_borrow = None;
         for slot in &mut self.slots {
             let Some(state) = slot.state.take() else {
                 continue;
@@ -717,6 +894,13 @@ struct StateBorrow {
     arena: NonNull<StateArena>,
     handle: StateHandle,
     state: NonNull<LuaState>,
+    kind: StateBorrowKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StateBorrowKind {
+    Nested,
+    Turn,
 }
 
 impl StateBorrow {
@@ -732,7 +916,12 @@ impl Drop for StateBorrow {
         let mut arena = self.arena;
         // SAFETY: StateBorrow never escapes the resolving LuaState call. The
         // pinned RuntimeHeap and its StateArena therefore still exist.
-        let released = unsafe { arena.as_mut() }.release(self.handle);
+        let released = match self.kind {
+            // SAFETY: StateBorrow never escapes the resolving LuaState call.
+            StateBorrowKind::Nested => unsafe { arena.as_mut() }.release(self.handle),
+            // SAFETY: the pinned arena outlives this scoped turn borrow.
+            StateBorrowKind::Turn => unsafe { arena.as_mut() }.release_turn(self.handle),
+        };
         debug_assert!(released);
     }
 }
@@ -996,6 +1185,83 @@ impl Runtime {
         })
     }
 
+    /// Drive state execution as a sequence of non-overlapping turns.
+    ///
+    /// This M1 substrate deliberately does not implement coroutine semantics.
+    /// It establishes the Runtime ownership rule the coroutine trampoline will
+    /// use: the callback receives exactly one validated `LuaState`, returns an
+    /// owned [`RuntimeTurn`], and the state guard is dropped before a requested
+    /// next handle is resolved. The session counts as one active execution even
+    /// when it spans many turns.
+    ///
+    /// A callback panic releases both the state slot and active-execution count
+    /// during unwinding. Foreign, stale, retired, vacant, or already-borrowed
+    /// handles fail closed through [`RuntimeAccessError::StateArena`].
+    #[allow(
+        dead_code,
+        reason = "M1 Runtime turn substrate is integrated before coroutine dispatch"
+    )]
+    pub(crate) fn drive_state_turns<T>(
+        &mut self,
+        initial: StateHandle,
+        mut execute_turn: impl for<'turn> FnMut(
+            StateHandle,
+            &'turn mut LuaState,
+            &'turn mut GarbageCollector,
+            &'turn mut StringPool,
+        ) -> RuntimeTurn<T>,
+    ) -> Result<T, RuntimeAccessError> {
+        self.check_owner()?;
+        if self.phase != RuntimePhase::Running {
+            return Err(RuntimeAccessError::NotRunning {
+                runtime_id: self.id,
+                phase: self.phase,
+            });
+        }
+        if self.main_state.is_none() || self.main_state_handle.is_none() {
+            return Err(RuntimeAccessError::MainStateUnavailable {
+                runtime_id: self.id,
+            });
+        }
+        if self.active_executions != 0 {
+            return Err(RuntimeAccessError::ActiveExecutions {
+                runtime_id: self.id,
+                count: self.active_executions,
+            });
+        }
+
+        let next_active_executions = self
+            .active_executions
+            .checked_add(1)
+            .expect("runtime active-execution counter overflow");
+        self.active_executions = next_active_executions;
+        let _active_execution = ActiveExecutionGuard {
+            active_executions: &mut self.active_executions,
+        };
+        let runtime_id = self.id;
+
+        // SAFETY: RuntimeHeap was pinned during construction and no API moves
+        // its fields. The arena and service fields are disjoint, and state
+        // references are confined to one HRTB callback at a time.
+        let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
+        let arena = NonNull::from(&mut heap.state_arena);
+        let gc = &mut heap.gc;
+        let string_pool = &mut heap.string_pool;
+        let mut current = initial;
+
+        loop {
+            let outcome = StateArena::with_turn_state_mut(arena, current, |state| {
+                execute_turn(current, state, gc, string_pool)
+            })
+            .map_err(|source| RuntimeAccessError::StateArena { runtime_id, source })?;
+
+            match outcome {
+                RuntimeTurn::Switch(next) => current = next,
+                RuntimeTurn::Complete(value) => return Ok(value),
+            }
+        }
+    }
+
     /// Deterministically reclaim Runtime-owned Rust states and GC allocations.
     ///
     /// Close is idempotent after the first successful call. This M1.8 partial
@@ -1202,6 +1468,19 @@ impl Drop for Runtime {
     }
 }
 
+struct ActiveExecutionGuard<'runtime> {
+    active_executions: &'runtime mut usize,
+}
+
+impl Drop for ActiveExecutionGuard<'_> {
+    fn drop(&mut self) {
+        *self.active_executions = self
+            .active_executions
+            .checked_sub(1)
+            .expect("active Runtime session owns one execution count");
+    }
+}
+
 /// Scoped mutable access to the three execution components.
 #[must_use = "dropping the guard ends the active execution borrow"]
 pub struct RuntimePartsMut<'runtime> {
@@ -1326,6 +1605,215 @@ mod tests {
             Err(RuntimeAccessError::WrongThread { .. })
         ));
         runtime.owner_thread = owner_thread;
+    }
+
+    #[test]
+    fn turn_driver_releases_before_switch_and_allows_handle_reentry() {
+        let mut runtime = Runtime::new();
+        let main = runtime
+            .main_state_handle
+            .expect("main state handle is registered");
+        let child = {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (state, _, _) = parts.split_mut();
+            state
+                .insert_coroutine_state(LuaState::new())
+                .expect("child is inserted")
+        };
+
+        let mut turn_index = 0_usize;
+        let completed = runtime
+            .drive_state_turns(main, |handle, state, _, _| {
+                assert_eq!(state.state_handle(), Some(handle));
+                let nested_target = if handle == main { child } else { main };
+                assert!(matches!(
+                    state.with_resolved_state_mut(nested_target, |_| ()),
+                    Err(StateResolveError::TurnBorrowActive {
+                        slot,
+                        generation,
+                    }) if slot == handle.slot() && generation == handle.generation()
+                ));
+
+                let outcome = match turn_index {
+                    0 => {
+                        assert_eq!(handle, main);
+                        RuntimeTurn::Switch(child)
+                    }
+                    1 => {
+                        assert_eq!(handle, child);
+                        RuntimeTurn::Switch(main)
+                    }
+                    2 => {
+                        assert_eq!(handle, main);
+                        RuntimeTurn::Complete("finished")
+                    }
+                    _ => panic!("driver executed an unexpected extra turn"),
+                };
+                turn_index += 1;
+                outcome
+            })
+            .expect("all turn handles resolve");
+
+        assert_eq!(completed, "finished");
+        assert_eq!(turn_index, 3);
+        assert_eq!(runtime.active_execution_count(), 0);
+        let arena = &runtime.heap.as_ref().get_ref().state_arena;
+        assert_eq!(arena.peak_turn_borrowed_slots, 1);
+        assert_eq!(
+            arena.turn_borrow_events,
+            vec![
+                TurnBorrowEvent::Acquired(main),
+                TurnBorrowEvent::Released(main),
+                TurnBorrowEvent::Acquired(child),
+                TurnBorrowEvent::Released(child),
+                TurnBorrowEvent::Acquired(main),
+                TurnBorrowEvent::Released(main),
+            ]
+        );
+        assert!(arena.turn_borrow.is_none());
+        assert!(arena.slots.iter().all(|slot| !slot.borrowed));
+    }
+
+    #[test]
+    fn turn_driver_restores_state_and_active_count_when_callback_panics() {
+        let mut runtime = Runtime::new();
+        let main = runtime
+            .main_state_handle
+            .expect("main state handle is registered");
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = runtime
+                .drive_state_turns::<()>(main, |_, _, _, _| panic!("intentional turn panic"));
+        }));
+        assert!(panic_result.is_err());
+        assert_eq!(runtime.active_execution_count(), 0);
+        {
+            let arena = &runtime.heap.as_ref().get_ref().state_arena;
+            assert_eq!(
+                arena.turn_borrow_events,
+                vec![
+                    TurnBorrowEvent::Acquired(main),
+                    TurnBorrowEvent::Released(main)
+                ]
+            );
+            assert!(arena.turn_borrow.is_none());
+            assert!(arena.slots.iter().all(|slot| !slot.borrowed));
+        }
+
+        let result = runtime
+            .drive_state_turns(main, |handle, _, _, _| {
+                assert_eq!(handle, main);
+                RuntimeTurn::Complete(7_u8)
+            })
+            .expect("the same handle can be borrowed after unwinding");
+        assert_eq!(result, 7);
+        assert_eq!(runtime.active_execution_count(), 0);
+    }
+
+    #[test]
+    fn turn_driver_fails_closed_for_foreign_stale_and_borrowed_handles() {
+        let mut runtime = Runtime::new();
+        let main = runtime
+            .main_state_handle
+            .expect("main state handle is registered");
+        let foreign = Runtime::new();
+        let foreign_handle = foreign
+            .main_state_handle
+            .expect("foreign main handle is registered");
+
+        assert!(matches!(
+            runtime.drive_state_turns(foreign_handle, |_, _, _, _| { RuntimeTurn::Complete(()) }),
+            Err(RuntimeAccessError::StateArena {
+                source: StateResolveError::ForeignRuntime { .. },
+                ..
+            })
+        ));
+        assert_eq!(runtime.active_execution_count(), 0);
+
+        let stale = {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (state, _, _) = parts.split_mut();
+            state
+                .insert_coroutine_state(LuaState::new())
+                .expect("child is inserted")
+        };
+        // SAFETY: RuntimeHeap is pinned and no execution guard is live.
+        let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
+        heap.state_arena
+            .remove_owned(stale)
+            .expect("test child can be removed");
+        assert!(matches!(
+            runtime.drive_state_turns(stale, |_, _, _, _| RuntimeTurn::Complete(())),
+            Err(RuntimeAccessError::StateArena {
+                source: StateResolveError::StaleGeneration { .. },
+                ..
+            })
+        ));
+        assert_eq!(runtime.active_execution_count(), 0);
+
+        let main_ptr = NonNull::from(
+            runtime
+                .main_state
+                .as_deref_mut()
+                .expect("main state remains available"),
+        );
+        // SAFETY: RuntimeHeap is pinned and the test releases this synthetic
+        // direct borrow before any teardown or further state access.
+        let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
+        heap.state_arena
+            .begin_direct_borrow(main, main_ptr)
+            .expect("test can mark the main slot borrowed");
+        assert!(matches!(
+            runtime.drive_state_turns(main, |_, _, _, _| RuntimeTurn::Complete(())),
+            Err(RuntimeAccessError::StateArena {
+                source: StateResolveError::AlreadyBorrowed { .. },
+                ..
+            })
+        ));
+        assert_eq!(runtime.active_execution_count(), 0);
+        // SAFETY: the same pinned arena owns the synthetic borrow above.
+        let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
+        assert!(heap.state_arena.release(main));
+        assert!(heap.state_arena.slots.iter().all(|slot| !slot.borrowed));
+    }
+
+    #[test]
+    fn turn_driver_enforces_owner_and_running_phase_before_activation() {
+        let mut runtime = Runtime::new();
+        let main = runtime
+            .main_state_handle
+            .expect("main state handle is registered");
+        let owner = runtime.owner_thread_id();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(thread::current().id()).unwrap())
+            .join()
+            .unwrap();
+        runtime.owner_thread = receiver.recv().unwrap();
+
+        assert!(matches!(
+            runtime.drive_state_turns(main, |_, _, _, _| RuntimeTurn::Complete(())),
+            Err(RuntimeAccessError::WrongThread { .. })
+        ));
+        assert_eq!(runtime.active_execution_count(), 0);
+
+        runtime.owner_thread = owner;
+        runtime.active_executions = 1;
+        assert!(matches!(
+            runtime.drive_state_turns(main, |_, _, _, _| RuntimeTurn::Complete(())),
+            Err(RuntimeAccessError::ActiveExecutions { count: 1, .. })
+        ));
+        assert_eq!(runtime.active_execution_count(), 1);
+        runtime.active_executions = 0;
+
+        runtime.close().expect("runtime closes");
+        assert!(matches!(
+            runtime.drive_state_turns(main, |_, _, _, _| RuntimeTurn::Complete(())),
+            Err(RuntimeAccessError::NotRunning {
+                phase: RuntimePhase::Closed,
+                ..
+            })
+        ));
+        assert_eq!(runtime.active_execution_count(), 0);
     }
 
     #[test]

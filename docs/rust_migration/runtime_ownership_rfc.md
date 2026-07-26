@@ -98,6 +98,10 @@ observable and ownership contracts:
   `lua_cpp/src/core/thread.hpp:27-68`,
   `lua_cpp/src/core/thread.hpp:117-128`, and
   `lua_cpp/src/core/thread.cpp:487-499`;
+- `Thread::resume` rejects only `Dead` and `Running`, changes its caller from
+  `Running` to `Normal`, and therefore deliberately permits a `Normal`
+  ancestor to be resumed:
+  `lua_cpp/src/core/thread.cpp:84-383`;
 - GC objects record their collector owner:
   `lua_cpp/src/core/gc_object.hpp:159-164` and
   `lua_cpp/src/core/gc_object.hpp:199-249`;
@@ -260,9 +264,10 @@ Requirements:
    reference whose lifetime is detached from an arena borrow;
 7. the active execution stack records which states are busy and is also a GC
    root/busy-close signal;
-8. resuming a coroutine uses an arena operation such as a checked
-   `get_two_mut`/execution guard, so main and coroutine states cannot be
-   mutably aliased;
+8. coroutine execution is driven as Runtime-owned turns: the current
+   `LuaState` borrow is dropped before an owned switch request is processed or
+   the next state is borrowed. A scheduler frame may retain handles and rooted
+   values, but never a state reference;
 9. an unreachable `Thread` causes its state to close before the thread and
    other GC objects are freed;
 10. open upvalues identify their owner by `StateHandle + stack index`, not by
@@ -276,6 +281,49 @@ Requirements:
 Arena membership alone is not reachability. The main/running state is traced
 from `GlobalRoots`; another state is traced only after a reachable `Thread`
 enqueues its handle.
+
+#### 4.3.1 Coroutine activation, including `Normal` ancestor re-entry
+
+The pinned C++ target and stock Lua 5.1.5 intentionally differ at one critical
+state-machine edge. The focused fixture
+`tests/characterization/coroutine-normal-ancestor.lua` runs `A -> B -> A`:
+while B is running, A is its `Normal` ancestor. The checked characterization
+artifact and replay tool are:
+
+- `tests/compatibility/coroutine-normal-ancestor-characterization.json`;
+- `tools/check_coroutine_normal_ancestor_characterization.ps1`.
+
+The C++ target accepts the second resume, executes A's pending continuation,
+returns A's result to B, and later executes the same A continuation again when
+the original A-to-B activation unwinds. Stock Lua rejects the second resume as
+`cannot resume normal coroutine` and completes in ordinary LIFO order. Three
+repetitions lock the normalized C++ stdout at SHA-256
+`bad37c42fcfd369f22fdc9d9ec8d1ce46caaa2e8fa755fe03a41a6e91b2591d2`
+and the stock stdout at
+`0488432cb01117da75f229ab0f43bd1c1ea174853ebde5f1ab62853265f805f6`.
+This is a non-gating characterization while Rust remains incomplete; it is
+not an approved deviation from the project target. The replay tool supports
+Windows PowerShell 5.1 and PowerShell 7, consumes the existing C++ and stock
+Lua build-provenance reports, and rejects an executable whose SHA-256 does not
+match the reported build.
+
+Consequences for the trampoline design:
+
+1. scheduling state is an activation stack, not a set of unique active
+   `StateHandle` values. The same state may occur in more than one activation;
+2. `Suspended` and an active-chain `Normal` target are resumable under the C++
+   contract. `Running` and `Dead` remain errors. A `Normal` target outside the
+   active chain is an internal invariant failure;
+3. every activation frame owns its caller/callee handles, prior statuses and
+   caller link, resume-versus-wrap envelope, exact result destination,
+   continuation/PC, execution-count state, and rooted transfer payload;
+4. the Runtime borrows at most one state during a turn. A resume callback
+   publishes an owned request, returns from the VM turn, and releases the
+   caller borrow before the target is resolved—even when the target is an
+   ancestor;
+5. no safety shortcut may silently reject all `Normal` targets. If the project
+   later chooses stock behavior instead, that choice requires a separately
+   approved deviation with an exact differential expectation.
 
 ### 4.4 `VmContext`
 
@@ -533,6 +581,49 @@ The StateHandle issuance/exhaustion slice is complete locally:
 Phase B remains incomplete because main-state ownership, Runtime coroutine
 trampoline execution, and `StateHandle + stack index` open-Upvalue ownership
 are still outstanding.
+
+#### B.2 Implemented Runtime turn-borrow substrate (partial)
+
+`Runtime::drive_state_turns` and `RuntimeTurn::{Switch, Complete}` now provide
+a crate-private ownership substrate for the future coroutine driver. One
+session counts as one active Runtime execution, but it does not keep a
+`LuaState` reference between turns. Each iteration:
+
+1. validates and borrows exactly one `StateHandle`;
+2. confines the state, collector, and string-pool references to a
+   higher-ranked callback;
+3. receives an owned `Switch` or `Complete` outcome;
+4. drops the state guard before resolving the next handle.
+
+While a Runtime turn is active, nested `with_resolved_state_mut` and direct
+owner borrows fail with `TurnBorrowActive`. Starting a turn also rejects any
+pre-existing borrowed slot. Test-only acquisition/release instrumentation
+proves the exact `main -> child -> main` event order and a peak of one borrowed
+slot. Panic unwind releases the turn marker, state borrow, and active-execution
+count; foreign, stale, and already-borrowed handles fail closed; a released
+handle can be selected again in a later turn. These tests increase the
+workspace total from 733 to 737.
+
+Coroutine creation also now installs `State -> Thread` before inserting the
+state, then binds `Thread -> StateHandle` before exposing the Thread value.
+This removes its former initialization-only second-state borrow. It does not
+replace the still-missing `PendingState` rollback/root transaction.
+
+This substrate is deliberately not a completed coroutine trampoline:
+
+- `coroutine.resume` and `wrap` still recursively resolve and execute another
+  state through `RuntimePartsMut`/`with_resolved_state_mut`;
+- no runtime-native request mailbox, deferred C-call continuation, activation
+  frame stack, or rooted transfer buffer exists yet;
+- app and stdlib test harnesses still use the long-lived `RuntimePartsMut`
+  production entry;
+- debug cross-state operations remain outside this turn protocol;
+- raw GC/StringPool backpointers and open-Upvalue Stack owners remain.
+
+Live destructive collection therefore remains disabled. The next slice must
+add a scoped request capability and a distinct VM exit for `resume`/`wrap`,
+then exercise it through an opt-in Runtime driver before production entry
+migration.
 
 ### C. Registry and dump lifetime — M1.6
 

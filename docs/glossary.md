@@ -1,6 +1,6 @@
 ---
 status: current
-last_checked: 2026-07-07
+last_checked: 2026-07-26
 applies_to: Lua 5.1.5 terminology used by this Rust interpreter
 ---
 
@@ -27,6 +27,10 @@ applies_to: Lua 5.1.5 terminology used by this Rust interpreter
 | GcObject | `lua_core::gc::gc_object::GcObject` | `crates/lua_core/src/gc/gc_object.rs` | GC 管理对象的 unsafe trait。 |
 | GCString | `lua_core::gc_string::GcString` | `crates/lua_core/src/gc_string.rs` | GC 管理的字符串对象。 |
 | GcRef | `lua_core::gc::gc_ref::GcRef<T>` | `crates/lua_core/src/gc/gc_ref.rs` | 不透明 GC 引用句柄。 |
+| RuntimeId | `lua_core::state_handle::RuntimeId` | `crates/lua_core/src/state_handle.rs` | 进程内单调分配且不复用的运行时诊断身份；`0` 无效，`u64::MAX` 是永久耗尽哨兵，可发行范围为 `1..=u64::MAX - 1`。安全代码不能由整数重建已有身份。 |
+| RuntimeIdExhausted | `lua_core::state_handle::RuntimeIdExhausted` | `crates/lua_core/src/state_handle.rs` | 进程级 `RuntimeId` 命名空间已永久耗尽的显式错误；`Runtime::try_new()` 在分配堆、根和状态槽前返回该错误。 |
+| StateHandleIssuer | `lua_core::state_handle::StateHandleIssuer` | `crates/lua_core/src/state_handle.rs` | 为一个新 `RuntimeId` 命名空间发行 `StateHandle` 的独占能力；不可 `Clone`/`Copy`，也不能选择或重建其他运行时身份。 |
+| StateHandle | `lua_core::state_handle::StateHandle` | `crates/lua_core/src/state_handle.rs` | 由 `RuntimeId`、arena slot 和非零 generation 组成的值句柄；安全代码不能从原始组件重建已有运行时的句柄。解析前必须校验三部分；generation 达到 `u64::MAX` 的槽在释放后永久退役，不回绕或复用。 |
 | OpCode | `lua_compiler::opcode::OpCode` | `crates/lua_compiler/src/opcode.rs` | Lua 5.1 的 38 条字节码指令枚举。 |
 | Instruction | `lua_compiler::opcode::Instruction` | `crates/lua_compiler/src/opcode.rs` | 32-bit 指令编码。 |
 | Lexer | `lua_compiler::lexer::Lexer` | `crates/lua_compiler/src/lexer.rs` | 词法分析器。 |

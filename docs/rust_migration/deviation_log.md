@@ -205,15 +205,21 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   safe raw integer 重建，generation `u64::MAX` 释放后永久退休。Runtime
   close/Drop 已执行 state→Thread→ordinary→fixed 的 Rust-owned 确定性销毁。
   但 main state 仍是 external arena slot，LuaState 仍保存 transitional
-  GC/StringPool backpointer，递归 resume 尚无 Runtime trampoline，open
+  GC/StringPool backpointer，递归 resume 尚无 Runtime trampoline：父 state
+  borrow 在子 VM 的完整执行期保持存活，caller 也未切换为 `Normal`。open
   Upvalue 仍使用 raw Stack owner；Lua `__gc`、IO/module service drain 与
-  allocator live-byte 合同也未闭环。
+  allocator live-byte 合同也未闭环。coroutine 创建已先建立
+  State→Thread、再插入 arena 并绑定 Thread→StateHandle，去掉了初始化时的
+  第二个 state borrow，但仍缺少可回滚、可追踪的 `PendingState`。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
   close、coroutine lifecycle 和 allocator live-byte 合同。
 - **测试与任务：** 1000 轮 state/coroutine create-close、fixed/ordinary
   DropProbe、并发 RuntimeId 唯一性、MAX-generation retirement、free-list
-  preflight 与关闭归零已通过；allocator live/peak、真实 finalizer/service
-  close、Miri/ASan 等仍在 M1.4、M1.5、M1.7、M1.8、M1.13。
+  preflight 与关闭归零已通过。`coroutine-normal-ancestor.lua` 及其独立
+  characterization 工具进一步锁定了固定 C++ 允许 `A→B→A` 激活环、而
+  stock Lua 拒绝 `Normal` 祖先的差异；当前 Rust 尚未对齐该 C++ 行为。
+  allocator live/peak、真实 finalizer/service close、Miri/ASan 等仍在
+  M1.4、M1.5、M1.7、M1.8、M1.13。
 - **影响：** 已能声称当前 Rust-owned 对象的 deterministic shutdown
   substrate，但递归跨 state 执行和 raw Upvalue owner 仍有别名/UAF 风险，
   也不能声称完整 Lua close 或 live collection。

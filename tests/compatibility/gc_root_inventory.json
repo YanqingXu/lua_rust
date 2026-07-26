@@ -627,25 +627,25 @@
       "source_locations": [
         {
           "path": "crates/lua_vm/src/runtime.rs",
-          "line": 293,
-          "symbol": "StateArena::insert_owned before Thread publication"
+          "line": 347,
+          "symbol": "StateArena::insert_owned before StateHandle publication"
         },
         {
           "path": "crates/lua_stdlib/src/coroutine.rs",
-          "line": 171,
+          "line": 250,
           "symbol": "coroutine State to Thread publication"
         }
       ],
       "status": "missing",
       "owner": {
-        "current": "A newly inserted coroutine state can occupy an arena slot before a reachable Thread publishes its StateHandle.",
+        "current": "Coroutine creation now allocates the Thread and installs State -> Thread before arena insertion, then binds Thread -> StateHandle before exposing the Thread value. The intermediate Thread/state pair is still unreachable and has neither a PendingState rollback guard nor a temporary state root.",
         "target": "Runtime publication owns a branded PendingState that rolls the arena slot back unless State-to-Thread publication commits."
       },
       "tracer": {
         "current": "Arena membership is intentionally not a root and there is no temporary state-root queue.",
         "target": "RuntimeRootTracer seeds validated temporary StateHandles independently from temporary GC-object roots."
       },
-      "missing_risk": "A future allocation-triggered state prepass can close an unpublished coroutine state, or an allocation failure can leave an unreachable occupied slot without rollback.",
+      "missing_risk": "A future allocation-triggered state prepass can close the unreachable inserted state before Thread publication, and an allocation/panic boundary can still leave an unreachable Thread or occupied slot without transactional rollback.",
       "planned_test": {
         "name": "pending_state_rolls_back_or_publishes_atomically",
         "layer": "lua_vm runtime_ownership",

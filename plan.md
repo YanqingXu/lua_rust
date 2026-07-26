@@ -49,9 +49,10 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
 - VM 已覆盖函数、闭包、upvalue、vararg、多返回、循环、表、主要 metamethod 和 coroutine。
 - base、math、string、table、io、os、coroutine、debug、package 已有较宽的函数表面。
 - M1.8 shutdown、P1 collector provenance、managed Proto 与 publication-root
-  基础完成后，fmt、all-targets Clippy、warning-free rustdoc、
-  `cargo check --workspace --all-targets` 和 733 个全 workspace Debug tests
-  已再次通过；远程 CI 不再允许隐式跳过 security audit。
+  基础及 Runtime turn-borrow substrate 完成后，fmt、all-targets Clippy、
+  warning-free rustdoc、`cargo check --workspace --all-targets` 和 737 个
+  全 workspace Debug tests 已再次通过；远程 CI 不再允许隐式跳过
+  security audit。
 - fixture manifest 当前共 131 项：101 个 non-official、24 个 official 和
   6 个 differential（4 个 M0 focused cases，加 2 个 M1 raw-byte cases）。
 - 101 个 non-official 中执行 92 个、跳过 9 个 helper；92/92 退出码一致，
@@ -78,10 +79,10 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
 | Bytecode parity | schema v2 已补齐 constant/sub-Proto/function/line/upvalue 证据；原两例 opcode/constant/metadata 已完全一致，各只剩 2 项由固定 C++ printer 不输出 local names 导致的 fail-closed 证据差异。扩展 closure case 仍触发 500 条真实差异上限 | P0 |
 | VM trace parity | runner 自检通过，但两端真实 `--trace-diff` 支持仍缺失 | P0 |
 | C API | 无 `lua_capi`、公开头、staticlib/cdylib 和 123 项官方 API 合同 | P1 |
-| 二进制块 | `string.dump` 是进程内 registry，不是可持久化 binary chunk | P1 |
+| 二进制块 | 旧进程内 registry 已删除；`string.dump` 在真实 serializer 前显式返回 unsupported，尚无可持久化 binary chunk | P1 |
 | 动态模块 | `package.loadlib` 明确不支持动态库 | P1 |
 | 生产能力 | sandbox、预算、取消、owner-thread、metrics、worker 尚未迁移 | P2 |
-| 文档 | M0/Phase 1–5 报告与 9 项 deviation 已建立；后续随证据持续更新 | P1 |
+| 文档 | M0/Phase 1–5 报告与 11 项 deviation 已建立；后续随证据持续更新 | P1 |
 
 ## 3. 执行原则
 
@@ -141,7 +142,7 @@ M4 必须建立在 M1 和 M3 的生命周期、allocator 和公开状态合同�
 | 里程碑 | 状态 | 当前证据或入口 |
 |---|---|---|
 | M0 | `completed` | 本地统一 M0 gate 通过，0 hard failure、3 项已登记债务；详见 [M0 收口报告](docs/rust_migration/m0_report.md)。 |
-| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象根基础与 StateHandle fail-closed identity/generation 已完成；coroutine trampoline、Upvalue owner 和生产 publication 迁移是下一主线。 |
+| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象根基础、StateHandle fail-closed identity/generation 与 Runtime turn-borrow substrate 已完成；coroutine NativeRequest/activation trampoline、Upvalue owner 和生产 publication 迁移是下一主线。 |
 | M2 | `active-limited` | 原两例 bytecode 指令/常量/metadata 已对齐；C++ local-name 证据缺口、nested Proto 大量差异、88 个 non-official 差异和真实 VM trace 仍开放。 |
 | M3 | `pending` | 等待 M1 的字节表示和生命周期合同稳定。 |
 | M4 | `pending` | 等待 M1/M3 的 runtime、allocator 与公开状态合同。 |
@@ -433,6 +434,35 @@ bytecode parity 差异和真实 VM trace unsupported；它们不会把报告误�
   - Thread 回收时 State 一定释放；
   - debug/coroutine API 不返回超出作用域的引用。
 
+当前 trampoline 细化执行顺序：
+
+1. **已完成本地基座：** 固定 C++/stock 的 `Normal` 祖先重入
+   characterization；实现 `Runtime::drive_state_turns`，保证每个 turn 只借
+   一个 state、`Switch` 前释放借用、panic 后恢复 slot 与 active count。
+2. **下一切片：** 引入 scoped native mailbox/capability 与独立
+   `VmExit::NativeRequest`，只让 `coroutine.resume`/`wrap_runner` 发布
+   `ResumeRequest`，禁止在 callback 内递归解析/执行 target。生产入口使用
+   sealed context/窄能力，不把可 `mem::take` 或转存 raw pointer 的完整
+   `&mut LuaState/GC/StringPool` 暴露给 runtime-native callback。
+3. C 调用帧进入 deferred 状态并保存 nonce、`func_pos`、wanted result、
+   caller CI/PC；Runtime driver 在 caller guard Drop 后再验证和借 target。
+4. Runtime 维护 activation frame 栈而非“唯一 active handle 集合”，允许固定
+   C++ 的 `A→B→A` `Normal` 祖先激活环；`Running`/`Dead` 仍拒绝。
+5. transfer args/results/error、Thread handle 与 deferred frame 必须进入
+   Runtime-owned rooted buffer；在此之前继续禁止 allocation-triggered/live
+   sweep。
+6. 对齐 caller `Running↔Normal`、callee `Running/Suspended/Dead`、
+   caller link、`allow_yield`、saved execution count、resume/wrap envelope、
+   精确 0/1/多返回与 error identity/traceback。
+7. 先以 opt-in Runtime driver 跑 focused tests，再迁 app/stdlib harness；
+   最后处理 debug 跨 state API，并让 production `RuntimePartsMut` 执行路径
+   不再绕过调度器。
+8. 验收包含普通 A→B→C、`Normal` 祖先重入顺序、yield/resume args、
+   pcall/C boundary、wrap error、panic/fault cleanup、临时根、数千层链与
+   peak borrowed slots 始终为 1；补充“首 turn 成功后 Switch 到
+   foreign/stale/borrowed target”及 turn 内 coroutine create 触发 arena
+   slot 扩容的回归。
+
 #### M1.6 移除悬垂 registry
 
 - 删除 `dump.rs` 中 thread-local `GcRef<Proto>` registry。
@@ -544,7 +574,7 @@ bytecode parity 差异和真实 VM trace unsupported；它们不会把报告误�
 | M1.2 GcString/StringPool | `completed-local` | 单一 ByteString payload、byte-key interning、0x00–0xff/NUL/invalid UTF-8/identity/hash 测试通过，旧 text API 静态扫描为零。 |
 | M1.3 编译器和宿主边界 | `partial` | lexer/parser/codegen、string/io/package、CLI source 与 chunk name 已迁移并有 raw-byte 双 oracle case；真实 dump/load、未来 C API，以及所有生产 GcString 强制 intern 尚未完成。 |
 | M1.4 Runtime owner | `partial` | pinned RuntimeHeap、owner-thread/phase/active guard、main roots 与 scoped parts 已实现；P1 `ObjectId + live table + checked borrow` 已拒绝 foreign/stale/address-reuse handle，LightUserdata 也已拆型。LuaState 仍保存 transitional GC/StringPool backpointer，尚无统一 Heap/allocator/services owner。 |
-| M1.5 Coroutine state | `partial` | StateArena 独占 coroutine Box；不可复制 issuer 只为新 runtime namespace 发行 handle，RuntimeId checked allocator 永不回绕，safe raw 构造已删除，generation `u64::MAX` 最后发行后永久退休，关闭前校验 arena/free-list/count。现有递归 resume 仍阻止安全的跨 state Upvalue owner，main state 也仍是 external arena slot。 |
+| M1.5 Coroutine state | `partial` | StateArena 独占 coroutine Box；不可复制 issuer 只为新 runtime namespace 发行 handle，RuntimeId checked allocator 永不回绕，safe raw 构造已删除，generation `u64::MAX` 最后发行后永久退休，关闭前校验 arena/free-list/count。crate-private turn driver 已证明 `main→child→main` 每 turn 只借一个 slot、切换前 release、panic cleanup 与同 handle 重入；create 也不再为 State→Thread 初始化借第二个 state。生产 resume/wrap 仍递归，NativeRequest/deferred activation/rooted transfer 未实现，main state 仍是 external arena slot。 |
 | M1.6 悬垂 registry | `completed-local` | pseudo dump/source thread-local registry 已删除，`string.dump` 在 M3 serializer 前稳定返回 unsupported。 |
 | M1.7 Root inventory | `partial` | 23/23 inventory schema 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO` 和临时对象根 registry 已实现。当前为 20 partial、1 unsafe（`OPEN_UPVALUES`）、2 missing（temporary state/fixed strings），仍禁止 destructive sweep。 |
 | M1.8 确定性 shutdown | `partial` | Runtime close/Drop 以 state→非 fixed Thread→其余非 fixed→fixed 顺序释放，object/root/string/queue/state/count 均归零；7 layout、fixed/ordinary DropProbe、open-upvalue close 与 1000 轮耐久测试通过。关闭期 Lua `__gc`、显式 IO/module service drain 和 allocator live bytes 仍是公开 debt。 |
@@ -1180,8 +1210,10 @@ M0 已在本地完成，M1 基础层已推进到 managed owner/publication root 
    和唯一 Heap owner 都闭环。
 2. top-level/active/debug Proto 已全部改为受管 `GcRef<Proto>`；
    RuntimeId/StateHandle issuance 与 slot generation exhaustion 也已
-   fail-closed。下一步把 coroutine resume 改为一次只借用一个 state 的
-   Runtime trampoline，再将 open Upvalue 的 raw Stack owner 改为
+   fail-closed；Runtime turn-borrow substrate 已证明每轮单 state 借用和
+   release-before-switch。下一步以 scoped mailbox +
+   `VmExit::NativeRequest` 把 coroutine resume/wrap 接入 activation-frame
+   driver，再将 open Upvalue 的 raw Stack owner 改为
    `StateHandle + stack index`。
 3. lexical temporary-object registry、HRTB `PublicationTxn/Rooted`、panic/nested
    cleanup 和 mark seed 已完成基础实现。下一步增加 temporary state roots，并
@@ -1225,9 +1257,22 @@ M0 已在本地完成，M1 基础层已推进到 managed owner/publication root 
 - StateHandle identity/generation 前置切片：并发 checked RuntimeId、
   non-Clone issuer、raw 构造 compile-fail、MAX-generation retirement、
   free-list/count preflight 与真实 stale/foreign trace 均有回归。
-- 最新验证：fmt/check、733 个 workspace tests、all-targets Clippy、
+- Runtime turn-borrow substrate：`main→child→main` 的 acquire/release 顺序、
+  peak borrowed slot = 1、panic cleanup、foreign/stale/borrowed/owner/phase
+  fail-closed 均有回归；coroutine create 已先建立 State→Thread 再绑定
+  handle，不再为初始化借第二个 state。
+- 固定 C++ `Normal` 祖先重入 characterization 已独立锁定：
+  C++ stdout SHA-256 为
+  `bad37c42fcfd369f22fdc9d9ec8d1ce46caaa2e8fa755fe03a41a6e91b2591d2`，
+  stock 为
+  `0488432cb01117da75f229ab0f43bd1c1ea174853ebde5f1ab62853265f805f6`；
+  当前非 gate、无 approved deviation。
+- 最新验证：fmt/check、737 个 workspace tests、all-targets Clippy、
   warning-free rustdoc、23/23 root inventory、差分比较器与 parity runner
-  自测全部通过；fixture manifest 校验为 131 项。
+  自测全部通过；fixture manifest 校验为 131 项；两个 coroutine oracle
+  各重复 3 次通过精确字节校验。characterization checker 已同时通过
+  Windows PowerShell 5.1 与 PowerShell 7，并将实际执行文件的 SHA-256
+  绑定到现有 C++/Lua 5.1.5 provenance build reports。
 
 下次不要从头审计，按以下顺序继续：
 
@@ -1235,17 +1280,23 @@ M0 已在本地完成，M1 基础层已推进到 managed owner/publication root 
    non-Clone issuer namespace、raw 安全构造 compile-fail、generation
    `u64::MAX` 最后一代与永久 slot retirement、free-list/count shutdown
    preflight；不存在 `fetch_add`/`wrapping_add` 回绕路径。
-2. 当前第一开发项：实现 Runtime coroutine trampoline，保证状态切换前释放父
-   `StateBorrow`。
-3. 把 open Upvalue 改为 `Open { owner: StateHandle, index }`，删除 intrusive
+2. 已完成 coroutine trampoline 的第一基座：Runtime 每 turn 单借用、
+   release-before-switch、panic cleanup 和相同 handle 后续重借；这还是
+   crate-private opt-in substrate，不能标成生产 trampoline 完成。
+3. 当前第一开发项：新增 scoped native mailbox/capability、
+   `VmExit::NativeRequest`、deferred C call 与 Runtime activation frame；
+   先迁 `coroutine.resume`/`wrap_runner`，并保留固定 C++ 允许 `Normal`
+   祖先重入及 continuation 二次执行的目标语义。
+4. 把 open Upvalue 改为 `Open { owner: StateHandle, index }`，删除 intrusive
    raw owner/next，并让 reachable Upvalue enqueue owner state；关闭必须先于
    generation advance/retirement。
-4. 实现 `TEMPORARY_STATE_ROOTS/PendingState`，再扩展 typed publication API并按
+5. 实现 `TEMPORARY_STATE_ROOTS/PendingState` 与 trampoline rooted transfer
+   buffer，再扩展 typed publication API并按
    compiler → library/package → IO → coroutine → VM/app/results 顺序迁移。
-5. 完成所有生产字符串 canonical interning 或 scoped Eq/Hash，建立唯一 Heap
+6. 完成所有生产字符串 canonical interning 或 scoped Eq/Hash，建立唯一 Heap
    owner后，才接 Runtime-only full collection；incremental/barrier/weak/
    finalizer 最后推进。
-6. M2 并行下一步是为固定 C++ bytecode printer 的 local-name 证据建立受审计
+7. M2 并行下一步是为固定 C++ bytecode printer 的 local-name 证据建立受审计
    方案，并从 closure artifact 的第一个 Proto/PC 差异开始修，不能直接处理
    截断后的 500 条列表。
 
@@ -1257,5 +1308,6 @@ cargo check --workspace --all-targets
 cargo test --workspace --all-targets --quiet
 cargo clippy --workspace --all-targets -- -D warnings
 pwsh -NoProfile -File tools/check_gc_root_inventory.ps1
+pwsh -NoProfile -File tools/check_coroutine_normal_ancestor_characterization.ps1
 pwsh -NoProfile -File tools/run_lua51_differential.ps1 -ComparatorSelfTestOnly
 ```
