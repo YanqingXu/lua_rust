@@ -10,6 +10,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  LUA_CPP_ORACLE_ROOT: ${{ github.workspace }}\lua_cpp_oracle
 
 jobs:
   quality-gate:
@@ -20,6 +21,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
+
+      - name: Checkout pinned C++ oracle
+        uses: actions/checkout@v4
+        with:
+          repository: YanqingXu/lua
+          ref: 87c15e69ceb94eb74e28226ccbefb7e196635711
+          path: lua_cpp_oracle
           fetch-depth: 0
 
       - name: Setup Rust
@@ -42,24 +51,40 @@ jobs:
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_env_check.ps1
 
-      - name: Format check
-        run: cargo fmt --check
-
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
-
-      - name: Build workspace
-        run: cargo build --workspace
-
-      - name: Test workspace
-        run: cargo nextest run --workspace
-
-      - name: Documentation
-        run: cargo doc --no-deps
-
-      - name: Security audit
-        run: cargo audit
-
-      - name: Quality gate
+      - name: M0 compatibility gate
+        if: always()
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/rust_quality_gate.ps1
+        run: >-
+          powershell -NoProfile -ExecutionPolicy Bypass
+          -File tools/m0_compatibility_gate.ps1
+          -CppRoot "$env:LUA_CPP_ORACLE_ROOT"
+
+      - name: Enforce oracle baseline-change policy
+        if: always() && github.event_name == 'pull_request'
+        shell: powershell
+        env:
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: >-
+          powershell -NoProfile -ExecutionPolicy Bypass
+          -File tools/check_oracle_change.ps1
+          -BaseRef "${{ github.base_ref }}"
+          -Labels "$env:PR_LABELS"
+          -ResultPath target/compatibility/oracle-change.json
+
+      - name: M1 foundation and quality gate
+        if: always()
+        shell: powershell
+        run: >-
+          powershell -NoProfile -ExecutionPolicy Bypass
+          -File tools/m1_foundation_gate.ps1
+          -CppRoot "$env:LUA_CPP_ORACLE_ROOT"
+
+      - name: Upload compatibility metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-metadata
+          path: |
+            target/compatibility/*.json
+            target/compatibility/**/*.json
+          if-no-files-found: error

@@ -49,11 +49,11 @@ pub type CFunction = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
 /// - is_c: bool (1 byte)
 /// - nupvalues: u8 (1 byte)
 /// - padding: (6 bytes)
-/// - gclist: Option<GcRef<Function>> (8 bytes)
-/// - env: Option<GcRef<Table>> (8 bytes)
-/// - c_function: Option<CFunction> (8 bytes)
-/// - proto: Option<GcRef<Proto>> (8 bytes)
-/// - upvalues: Vec<GcRef<Upvalue>> (24 bytes)
+/// - gclist: `Option<GcRef<Function>>`
+/// - env: `Option<GcRef<Table>>`
+/// - c_function: `Option<CFunction>` (8 bytes)
+/// - proto: `Option<GcRef<Proto>>`
+/// - upvalues: `Vec<GcRef<Upvalue>>` (24 bytes)
 ///
 #[repr(C)]
 pub struct Function {
@@ -259,29 +259,17 @@ unsafe impl GcObject for Function {
     unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
         // 1. 标记函数原型（仅 Lua 函数）
         if let Some(proto_ref) = self.proto {
-            // SAFETY: proto_ref is a valid GcRef<Proto> held by this Function;
-            // collector is valid during mark phase.
-            unsafe {
-                collector.mark_object(proto_ref.as_ptr() as *mut GcObjectHeader);
-            }
+            collector.mark_registered(proto_ref);
         }
 
         // 2. 标记所有上值
         for uv in &self.upvalues {
-            // SAFETY: uv is a valid GcRef<Upvalue> held by this Function;
-            // collector is valid during mark phase.
-            unsafe {
-                collector.mark_object(uv.as_ptr() as *mut GcObjectHeader);
-            }
+            collector.mark_registered(*uv);
         }
 
         // 3. 标记环境表
         if let Some(env_ref) = self.env {
-            // SAFETY: env_ref is a valid GcRef<Table> held by this Function;
-            // collector is valid during mark phase.
-            unsafe {
-                collector.mark_object(env_ref.as_ptr() as *mut GcObjectHeader);
-            }
+            collector.mark_registered(env_ref);
         }
     }
 
@@ -501,6 +489,8 @@ mod tests {
 
         gc.reset_marks();
 
+        // SAFETY: `f_ref` is a live function registered with `gc`, and the
+        // same collector is exclusively borrowed for the mark operation.
         unsafe {
             let f_ptr = f_ref.as_ptr();
             (*f_ptr).mark_children(&mut gc);
@@ -508,6 +498,8 @@ mod tests {
 
         // Proto 应被标记
         let proto_header = proto.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: `proto` remains registered with `gc`; marking does not free
+        // or relocate it, and its header is the leading field.
         unsafe {
             assert!(!(*proto_header).is_white(), "Proto should be marked");
         }
@@ -525,12 +517,16 @@ mod tests {
 
         gc.reset_marks();
 
+        // SAFETY: `f_ref` is live and registered with the exclusively borrowed
+        // collector used by `mark_children`.
         unsafe {
             let f_ptr = f_ref.as_ptr();
             (*f_ptr).mark_children(&mut gc);
         }
 
         let uv_header = uv.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: `uv` remains allocated in `gc`; marking only changes header
+        // state and never relocates the object.
         unsafe {
             assert!(!(*uv_header).is_white(), "Upvalue should be marked");
         }
@@ -548,12 +544,16 @@ mod tests {
 
         gc.reset_marks();
 
+        // SAFETY: `f_ref` is a live registered function and `gc` is the
+        // collector that owns all of its referenced children.
         unsafe {
             let f_ptr = f_ref.as_ptr();
             (*f_ptr).mark_children(&mut gc);
         }
 
         let table_header = env_table.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: `env_table` remains live in `gc`, and marking does not
+        // relocate or release it.
         unsafe {
             assert!(!(*table_header).is_white(), "Env table should be marked");
         }
@@ -571,6 +571,8 @@ mod tests {
         gc.reset_marks();
 
         // 标记 C 函数 — 不会 panic（没有 proto 可标记）
+        // SAFETY: `f_ref` is live and registered with `gc`, which is
+        // exclusively borrowed during child marking.
         unsafe {
             let f_ptr = f_ref.as_ptr();
             (*f_ptr).mark_children(&mut gc);
@@ -578,6 +580,8 @@ mod tests {
 
         // 环境表应被标记
         let table_header = env_table.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: `env_table` remains owned by `gc`; only its mark bits were
+        // changed by the preceding operation.
         unsafe {
             assert!(!(*table_header).is_white(), "Env table should be marked");
         }

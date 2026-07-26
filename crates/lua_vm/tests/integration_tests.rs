@@ -22,8 +22,9 @@ fn compile_and_run(source: &str) -> (LuaState, GarbageCollector) {
     let proto = cg
         .generate(&chunk, "<test>")
         .expect("Codegen should succeed");
+    let proto = gc.create(proto);
 
-    let _ = execute_proto(&mut state, &proto, &mut gc);
+    let _ = execute_proto(&mut state, proto, &mut gc);
     (state, gc)
 }
 

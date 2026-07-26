@@ -99,7 +99,7 @@ fn open_library(l: &mut LuaState, gc: &mut GarbageCollector, entry: &LibEntry) {
     // We use a helper pattern: push the table ref, open the library (which
     // registers functions into it), then set as global
     let lib_ref = lib_table;
-    let name_str = gc.create(GcString::new(entry.name));
+    let name_str = gc.create(GcString::from_bytes(entry.name.as_bytes()));
 
     // Set empty table as global first, so open function can find it
     if let Some(gt) = l.global_table {
@@ -121,7 +121,7 @@ pub fn register_in_table(
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::new(name));
+    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
     let func_obj = gc.create(Function::new_c(func));
     table.set(&Value::String(name_str), &Value::Function(func_obj));
 }
@@ -136,7 +136,7 @@ pub unsafe fn register_global(
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::new(name));
+    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
     let func_obj = gc.create(Function::new_c(func));
     // SAFETY: caller guarantees global_table is a valid GC-rooted table
     unsafe {

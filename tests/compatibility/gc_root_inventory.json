@@ -1,0 +1,716 @@
+{
+  "schema_version": 1,
+  "description": "Fail-closed inventory of every runtime or collector root required before lua_rust may sweep a live VM.",
+  "provenance_audit": {
+    "implemented": "GcRef carries a process-global non-reused ObjectId; each collector validates address, ObjectId, and concrete tag in an authoritative live table. LightUserdata is a separate arbitrary-pointer type, and collector explicit roots retain erased pointer + ObjectId + tag handles.",
+    "remaining_sweep_blocker": "Safe Value::String equality and hashing still preserve byte-content semantics by dereferencing without a collector borrow. Direct production GcString creation prevents an unproven switch to identity semantics. Transitional unsafe GcRef::as_ref call sites, missing temporary roots, and the absent unique Heap owner also keep live sweep disabled."
+  },
+  "status_values": [
+    "implemented",
+    "partial",
+    "missing",
+    "unsafe"
+  ],
+  "root_kinds": [
+    {
+      "root_kind": "COLLECTOR_EXPLICIT_ROOT",
+      "source_locations": [
+        {
+          "path": "crates/lua_core/src/gc/collector.rs",
+          "line": 27,
+          "symbol": "GarbageCollector::roots"
+        },
+        {
+          "path": "crates/lua_core/src/gc/mark.rs",
+          "line": 61,
+          "symbol": "GarbageCollector::begin_mark_only"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "GarbageCollector stores erased pointer + ObjectId + concrete tag root handles; ObjectId is process-global and never reused.",
+        "target": "Heap owns scoped RootToken entries with HeapId and generation validation."
+      },
+      "tracer": {
+        "current": "begin_mark_only validates every root's address, ObjectId, and tag against the collector live table before header access, then reports rejected roots without dereference.",
+        "target": "RuntimeRootTracer seeds validated collector roots and labels them with RootKind."
+      },
+      "missing_risk": "Address-reuse provenance is closed for collector roots, but storage remains unscoped and is not yet a Heap-owned lexical RootToken; temporary-publication roots and the unique Heap lifetime are still missing.",
+      "planned_test": {
+        "name": "mark_only_seed_rejects_unregistered_explicit_root_without_dereference; address_reuse_injection_rejects_old_object_id_at_same_pointer",
+        "layer": "lua_core GC integration",
+        "assertion": "A registered explicit root is marked, foreign/stale roots are rejected before dereference, and a stale ObjectId cannot validate when the same address is test-injected with a replacement identity."
+      }
+    },
+    {
+      "root_kind": "GLOBAL_TABLE",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/lua_state.rs",
+          "line": 55,
+          "symbol": "LuaState::global_table"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 374,
+          "symbol": "snapshot_state GLOBAL_TABLE"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "Runtime owns the canonical global-root GcRef, registers it as a collector root, and reachable LuaState values copy the handle.",
+        "target": "Runtime::GlobalRoots owns one validated global-table handle."
+      },
+      "tracer": {
+        "current": "Runtime::trace_roots_mark_only marks both the Runtime global root and every reachable state's global_table.",
+        "target": "RuntimeRootTracer always traces GlobalRoots::global_table."
+      },
+      "missing_risk": "The handles still lack heap generation validation and destructive/full/incremental collection is not wired to this mark-only tracer.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "Runtime and state global-table edges are black in the mark-only live set without changing object count."
+      }
+    },
+    {
+      "root_kind": "GLOBAL_ENVIRONMENTS",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/lua_state.rs",
+          "line": 57,
+          "symbol": "LuaState::thread_env"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 375,
+          "symbol": "snapshot_state GLOBAL_ENVIRONMENTS"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "Each LuaState stores copyable table handles and stdlib code assigns them directly.",
+        "target": "LuaState owns validated handles and all assignments use VmContext root barriers."
+      },
+      "tracer": {
+        "current": "The Runtime state snapshot marks thread_env and chunk_env for every StateHandle reached through the two-queue traversal.",
+        "target": "StateTracer marks both environments for every reachable state."
+      },
+      "missing_risk": "Direct assignments still lack provenance checks/root barriers and destructive collection is intentionally disconnected.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "Both main-state environment handles are marked by the canonical snapshot and absent retired roots remain white."
+      }
+    },
+    {
+      "root_kind": "REGISTRY",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/lua_state.rs",
+          "line": 64,
+          "symbol": "LuaState::registry"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 377,
+          "symbol": "snapshot_state REGISTRY"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "Runtime owns one persistent registry table and installs its handle in the main LuaState; debug.getregistry is not migrated yet.",
+        "target": "GlobalRoots owns one fixed, persistent registry table per Runtime."
+      },
+      "tracer": {
+        "current": "The mark-only tracer seeds Runtime::registry_root and scans registry handles in every reachable state.",
+        "target": "RuntimeRootTracer marks GlobalRoots::registry in every collection."
+      },
+      "missing_risk": "debug.getregistry does not yet return the Runtime table and no destructive collection consumes the tracer.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "Runtime and main-state registry handles are marked by the live-set traversal without object destruction."
+      }
+    },
+    {
+      "root_kind": "PRIMITIVE_METATABLES",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/lua_state.rs",
+          "line": 63,
+          "symbol": "LuaState primitive metatable fields"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 378,
+          "symbol": "snapshot_state PRIMITIVE_METATABLES"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "LuaState stores only nil, boolean, and number metatables, with direct assignments.",
+        "target": "GlobalRoots owns the complete ValueType-indexed primitive metatable set."
+      },
+      "tracer": {
+        "current": "The mark-only state snapshot marks every installed nil, boolean, and number metatable.",
+        "target": "RuntimeRootTracer marks every installed primitive metatable."
+      },
+      "missing_risk": "Only three primitive types have slots, assignments lack barriers, and destructive collection is not wired to the snapshot.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "All three currently representable primitive metatables are marked in the live-set report."
+      }
+    },
+    {
+      "root_kind": "MAIN_STATE_ENTRY",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/runtime.rs",
+          "line": 574,
+          "symbol": "Runtime::main_state_handle"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 292,
+          "symbol": "main StateHandle queue seed"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "Runtime owns the boxed main state and registers its stable address as one external generational StateArena slot.",
+        "target": "StateArena owns the main slot and GlobalRoots stores its StateHandle."
+      },
+      "tracer": {
+        "current": "Runtime::trace_roots_mark_only always seeds and validates main_state_handle before scanning state roots.",
+        "target": "RuntimeRootTracer enqueues the main StateHandle before object propagation."
+      },
+      "missing_risk": "The main Box remains externally owned rather than arena-owned; explicit close now validates, detaches, generation-invalidates, and drops it, but live collection still lacks one arena-owned state model.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_ownership",
+        "assertion": "The report contains exactly the Runtime main handle and all roots reachable only through its state snapshot."
+      }
+    },
+    {
+      "root_kind": "RUNNING_THREAD",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/lua_state.rs",
+          "line": 61,
+          "symbol": "LuaState::current_thread"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 386,
+          "symbol": "snapshot_state RUNNING_THREAD"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "A per-state current_thread handle and Thread caller links approximate execution state.",
+        "target": "GlobalRoots and Runtime::active_execution own validated running Thread/State handles."
+      },
+      "tracer": {
+        "current": "Every validated reachable state publishes current_thread into the object queue; the API rejects any active execution borrow.",
+        "target": "RuntimeRootTracer marks the running thread and enqueues every active StateHandle."
+      },
+      "missing_risk": "Runtime does not yet own a separate running-thread root stack and direct current_thread assignment lacks a barrier.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_ownership",
+        "assertion": "current_thread is marked and trace_roots_mark_only rejects a nonzero active-execution count."
+      }
+    },
+    {
+      "root_kind": "MAIN_STACK",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/stack.rs",
+          "line": 18,
+          "symbol": "Stack"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 409,
+          "symbol": "snapshot_state MAIN_STACK active window"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "LuaState owns Stack and separate logical top/call-window metadata.",
+        "target": "The main StateArena slot owns one canonical logical stack window."
+      },
+      "tracer": {
+        "current": "The mark-only state snapshot scans exactly 0..LuaState::top and reports top/Stack inconsistencies without reading past initialized values.",
+        "target": "StateTracer marks the complete active window and nils retired slots."
+      },
+      "missing_risk": "Retired slots are excluded but not yet nilled; publication barriers and destructive collector integration remain absent.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "An unnamed active temporary is marked while a copied value beyond logical top remains white."
+      }
+    },
+    {
+      "root_kind": "COROUTINE_STACK",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/runtime.rs",
+          "line": 204,
+          "symbol": "StateArena"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 340,
+          "symbol": "reachable Thread StateHandle queue edge"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "StateArena owns coroutine LuaState boxes and Thread stores a runtime/generation-validated StateHandle.",
+        "target": "StateArena owns the coroutine slot and Thread owns one generational StateHandle."
+      },
+      "tracer": {
+        "current": "Each reachable Thread enqueues its StateHandle; arena membership alone is never seeded as a root, and state/object queues iterate to a fixed point.",
+        "target": "Tracing a reachable Thread enqueues its state and caller-state handles."
+      },
+      "missing_risk": "Explicit Runtime close drains every coroutine state before heap teardown, but unreachable-state removal is still not integrated with live Thread sweep.",
+      "planned_test": {
+        "name": "mark_only_reaches_two_queue_fixed_point_without_rooting_arena_membership",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "A reachable Thread-state-stack chain is marked across multiple queue turns while an occupied but unreachable arena state and its payload are absent."
+      }
+    },
+    {
+      "root_kind": "CALL_FUNCTION",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/call_info.rs",
+          "line": 40,
+          "symbol": "CallInfo::func"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 434,
+          "symbol": "snapshot_state CALL_FUNCTION"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "CallInfo stores a stack index; selected active frames mark the indexed Value.",
+        "target": "Each active frame has a validated function-slot contract traced by StateTracer."
+      },
+      "tracer": {
+        "current": "The mark-only snapshot scans function slots only for CallInfo records through current_ci and reports out-of-bounds slots.",
+        "target": "StateTracer marks every active frame function slot exactly once."
+      },
+      "missing_risk": "CallInfo still stores an unvalidated integer slot and destructive collection is not wired to the snapshot.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "The active frame function is marked while an inactive frame's retained vararg does not enter the live set."
+      }
+    },
+    {
+      "root_kind": "ACTIVE_PROTO",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/call_info.rs",
+          "line": 50,
+          "symbol": "CallInfo::proto"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 460,
+          "symbol": "snapshot_state ACTIVE_PROTO"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "Every active Lua CallInfo stores an ObjectId-bearing GcRef<Proto>; LuaState no longer duplicates a raw current_proto pointer, and popped/unwound frames clear Proto and varargs.",
+        "target": "Active frames retain the managed Proto handle through a unified VM execution context with scoped collector borrows."
+      },
+      "tracer": {
+        "current": "The mark-only state snapshot marks each active CallInfo Proto handle directly, including pseudo-frames with no Function stack slot; stale or foreign handles are rejected by collector provenance checks.",
+        "target": "The same canonical StateTracer feeds destructive collection at a proven safe point."
+      },
+      "missing_risk": "VM execution validates the handle before dereference but still uses a scoped unsafe borrow under the explicit no-destructive-sweep execution invariant; the canonical tracer is not yet wired to collection.",
+      "planned_test": {
+        "name": "active_call_info_proto_is_rooted_without_a_function_slot",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "A managed active Proto is marked directly even when the active frame has no Function value in its function slot."
+      }
+    },
+    {
+      "root_kind": "CALL_VARARGS",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/call_info.rs",
+          "line": 55,
+          "symbol": "CallInfo::varargs"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 450,
+          "symbol": "snapshot_state CALL_VARARGS"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "Each CallInfo owns a Vec<Value> vararg snapshot.",
+        "target": "Active CallInfo owns varargs and reset frames clear all handles."
+      },
+      "tracer": {
+        "current": "The mark-only snapshot scans varargs only for active CallInfo records through current_ci.",
+        "target": "StateTracer scans only active frame varargs."
+      },
+      "missing_risk": "Inactive CallInfo reset/clearing and destructive collector integration remain incomplete.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "An active vararg-only object is marked while a retained inactive-frame vararg remains white."
+      }
+    },
+    {
+      "root_kind": "OPEN_UPVALUES",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/lua_state.rs",
+          "line": 96,
+          "symbol": "LuaState::open_upvalues"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 460,
+          "symbol": "snapshot_state OPEN_UPVALUES"
+        }
+      ],
+      "status": "unsafe",
+      "owner": {
+        "current": "LuaState owns a GcRef linked-list head; each open Upvalue stores a raw stack pointer and index.",
+        "target": "Reachable State owns the list; Upvalue stores StateHandle plus checked stack index."
+      },
+      "tracer": {
+        "current": "The mark-only snapshot validates and marks the open-list head, Upvalue tracing retains successors, and the active stack window retains open slots; raw owner_stack is reported as an explicit gap.",
+        "target": "StateTracer marks the list and its owner slots; state close converts every node before arena removal."
+      },
+      "missing_risk": "Runtime close validates list membership, checks owner_stack/bounds, reports debt, and closes Upvalues before state removal; live sweep still cannot rely on the raw owner_stack representation.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "The open Upvalue and its active stack value are marked, and the raw owner-Stack representation is present in unsafe_gaps."
+      }
+    },
+    {
+      "root_kind": "THREAD_CALLER_CHAIN",
+      "source_locations": [
+        {
+          "path": "crates/lua_core/src/thread.rs",
+          "line": 95,
+          "symbol": "Thread::caller"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 337,
+          "symbol": "Thread caller/state propagation report"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "Thread stores a caller GcRef and one generational StateHandle; no caller-state raw pointer remains.",
+        "target": "Thread stores validated caller Thread and StateHandle edges."
+      },
+      "tracer": {
+        "current": "Object tracing marks caller Thread edges, and every reached Thread independently enqueues its validated StateHandle.",
+        "target": "ObjectTracer marks caller and enqueues caller_state."
+      },
+      "missing_risk": "GcRef caller provenance remains unchecked and close/sweep ordering is not implemented.",
+      "planned_test": {
+        "name": "mark_only_reaches_two_queue_fixed_point_without_rooting_arena_membership",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "A two-Thread graph reports its caller edge and reaches both states across the object/state fixed point."
+      }
+    },
+    {
+      "root_kind": "DEBUG_HOOK",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/lua_state.rs",
+          "line": 76,
+          "symbol": "LuaState::debug_hook"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 389,
+          "symbol": "snapshot_state DEBUG_HOOK"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "LuaState stores a Value and stdlib assigns it directly.",
+        "target": "Reachable State owns the hook and assignment uses a root barrier."
+      },
+      "tracer": {
+        "current": "The mark-only snapshot marks debug_hook for every reachable state and scans the complete active stack window.",
+        "target": "StateTracer always marks it and uses a wide stack window while a hook is active."
+      },
+      "missing_risk": "Hook assignment lacks a root barrier and real collection remains disconnected from this tracer.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "The hook Value and active unnamed temporaries are both marked by the state snapshot."
+      }
+    },
+    {
+      "root_kind": "DEBUG_PROTO",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/lua_state.rs",
+          "line": 116,
+          "symbol": "LuaState::debug_hook_skip_proto"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 399,
+          "symbol": "snapshot_state DEBUG_PROTO"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "LuaState stores an ObjectId-bearing GcRef<Proto> for one-shot hook line suppression and clears it immediately after the matching instruction.",
+        "target": "Debug state uses a validated frame/Proto identity scoped by the owning Runtime."
+      },
+      "tracer": {
+        "current": "The mark-only state snapshot marks debug_hook_skip_proto directly; debug inspection validates Proto handles against the owning collector before dereference.",
+        "target": "The canonical StateTracer feeds destructive collection at a proven safe point."
+      },
+      "missing_risk": "Destructive collection remains disabled during debug callbacks, and debug Proto reads still use validated transitional unsafe borrows rather than a scoped Heap/VmContext API.",
+      "planned_test": {
+        "name": "debug_line_skip_is_one_shot_and_matches_full_object_identity",
+        "layer": "lua_vm execute",
+        "assertion": "A same-line different-ObjectId Proto does not consume the skip; the matching managed Proto consumes it once and the next instruction is no longer suppressed."
+      }
+    },
+    {
+      "root_kind": "YIELDED_VALUES",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/lua_state.rs",
+          "line": 98,
+          "symbol": "LuaState::yielded_values"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 392,
+          "symbol": "snapshot_state YIELDED_VALUES"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "LuaState owns a Vec<Value> populated by coroutine.yield.",
+        "target": "The coroutine StateArena slot owns and clears yielded values through VmContext."
+      },
+      "tracer": {
+        "current": "The mark-only snapshot marks all yielded_values for every reachable state.",
+        "target": "StateTracer marks yielded values for every reachable suspended state."
+      },
+      "missing_risk": "Mutation barriers and destructive collector integration are still missing.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "An object reachable only from yielded_values is black in the mark-only live set."
+      }
+    },
+    {
+      "root_kind": "LAST_ERROR",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/state/lua_state.rs",
+          "line": 104,
+          "symbol": "LuaState::last_error"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 395,
+          "symbol": "snapshot_state LAST_ERROR"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "LuaState stores an Option<Value> assigned directly by coroutine code.",
+        "target": "Reachable State owns last_error and assignment uses a root barrier."
+      },
+      "tracer": {
+        "current": "The mark-only snapshot marks last_error for every reachable state.",
+        "target": "StateTracer marks the error until it is explicitly cleared."
+      },
+      "missing_risk": "Assignment/clear barriers and destructive collector integration are still missing.",
+      "planned_test": {
+        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "An object reachable only through last_error is black in the mark-only live set."
+      }
+    },
+    {
+      "root_kind": "PENDING_FINALIZERS",
+      "source_locations": [
+        {
+          "path": "crates/lua_core/src/gc/collector.rs",
+          "line": 41,
+          "symbol": "GarbageCollector::pending_finalizers"
+        },
+        {
+          "path": "crates/lua_core/src/gc/finalize.rs",
+          "line": 39,
+          "symbol": "prepare_finalizable_userdata"
+        },
+        {
+          "path": "crates/lua_core/src/gc/sweep.rs",
+          "line": 75,
+          "symbol": "destroy_object"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "GarbageCollector stores GcRef<Userdata> entries carrying ObjectId; finalizer entry points are still split between a stub and a compatibility path.",
+        "target": "Heap owns a validated finalizer queue whose entries remain roots through protected callback completion."
+      },
+      "tracer": {
+        "current": "Collector mark does not seed pending_finalizers; queue membership is identity-aware, central destroy_object prunes entries before drop, and Runtime close reports then discards the remaining queue without Lua callbacks.",
+        "target": "RuntimeRootTracer marks every pending entry and central destruction prunes it before free."
+      },
+      "missing_risk": "Address-reuse aliasing is closed, but pending entries are not canonical roots; reentrant/error paths can still skip later finalizers or free the finalizer closure graph.",
+      "planned_test": {
+        "name": "persistent_queues_do_not_reidentify_reused_addresses; pending_finalizers_are_rooted_pruned_and_drained",
+        "layer": "lua_stdlib gc_semantics",
+        "assertion": "A replacement allocation at the same address is not inherited by the old queue identity; future reentrant/erroring finalizers all run once and close ends with an empty queue."
+      }
+    },
+    {
+      "root_kind": "TEMPORARY_PROTECTED_ROOTS",
+      "source_locations": [
+        {
+          "path": "crates/lua_app/src/main.rs",
+          "line": 338,
+          "symbol": "compile_or_load_function Proto publication gap"
+        },
+        {
+          "path": "crates/lua_stdlib/src/io.rs",
+          "line": 116,
+          "symbol": "create_file unregistered construction graph"
+        },
+        {
+          "path": "crates/lua_compiler/src/codegen/mod.rs",
+          "line": 132,
+          "symbol": "CodeGenerator::generate"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "GarbageCollector::with_publication provides a higher-ranked PublicationTxn and branded Rooted handle. New allocations enter an ObjectId-bearing temporary-root registry before the handle is exposed; panic/nested-scope Drop removes exact identities, and safe raw-handle escape is limited to promotion into the explicit collector root set.",
+        "target": "Heap owns publication transactions with typed Table/Function/Proto/Userdata edge-publish operations and makes unprotected production allocation unavailable."
+      },
+      "tracer": {
+        "current": "GarbageCollector::begin_mark_only validates and seeds active temporary object roots, with separate seeded/rejected counts.",
+        "target": "RuntimeRootTracer seeds every active temporary-root scope."
+      },
+      "missing_risk": "The registry/API foundation is tested, but compiler, IO, coroutine, library registration, VM temporaries, result Vecs, and direct production gc.create calls have not migrated. Allocation-triggered collection therefore remains disabled.",
+      "planned_test": {
+        "name": "allocation_is_seeded_until_transaction_drop; nested_and_panic_scopes_release_exact_roots; allocation_during_object_construction_preserves_temporaries",
+        "layer": "lua_vm runtime_gc_roots",
+        "assertion": "The foundation seeds exact temporary identities and returns to zero after 1,000 scopes; future forced-GC-at-every-allocation tests must preserve compiler, IO, coroutine, and closure construction intermediates."
+      }
+    },
+    {
+      "root_kind": "TEMPORARY_STATE_ROOTS",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/runtime.rs",
+          "line": 293,
+          "symbol": "StateArena::insert_owned before Thread publication"
+        },
+        {
+          "path": "crates/lua_stdlib/src/coroutine.rs",
+          "line": 171,
+          "symbol": "coroutine State to Thread publication"
+        }
+      ],
+      "status": "missing",
+      "owner": {
+        "current": "A newly inserted coroutine state can occupy an arena slot before a reachable Thread publishes its StateHandle.",
+        "target": "Runtime publication owns a branded PendingState that rolls the arena slot back unless State-to-Thread publication commits."
+      },
+      "tracer": {
+        "current": "Arena membership is intentionally not a root and there is no temporary state-root queue.",
+        "target": "RuntimeRootTracer seeds validated temporary StateHandles independently from temporary GC-object roots."
+      },
+      "missing_risk": "A future allocation-triggered state prepass can close an unpublished coroutine state, or an allocation failure can leave an unreachable occupied slot without rollback.",
+      "planned_test": {
+        "name": "pending_state_rolls_back_or_publishes_atomically",
+        "layer": "lua_vm runtime_ownership",
+        "assertion": "GC/failure injection between arena insertion, Thread allocation, binding, and stack publication either preserves the state through commit or removes the slot and advances/retire its generation exactly once."
+      }
+    },
+    {
+      "root_kind": "LIBRARY_LIVE_HANDLES",
+      "source_locations": [
+        {
+          "path": "crates/lua_stdlib/src/io.rs",
+          "line": 109,
+          "symbol": "create_file"
+        },
+        {
+          "path": "crates/lua_stdlib/src/io.rs",
+          "line": 1488,
+          "symbol": "with_file_data and with_file_data_mut"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "IO resources live in graph-owned Userdata and typed access is confined to HRTB callbacks over an explicitly aligned payload.",
+        "target": "Object graphs or explicit runtime RootToken values own every live library handle; access is scoped by VmContext."
+      },
+      "tracer": {
+        "current": "There is no inventory-backed library root provider; correctness depends on informal stack/table comments.",
+        "target": "ObjectTracer follows graph-owned handles and RuntimeRootTracer labels any explicit service cache root."
+      },
+      "missing_risk": "Runtime close runs Rust typed payload destructors, but library-specific Lua close hooks and a complete inventory-backed service-root provider remain absent.",
+      "planned_test": {
+        "name": "library_resources_follow_graph_lifetime_and_close_once",
+        "layer": "lua_stdlib gc_semantics",
+        "assertion": "A live file/iterator survives collection, unreachable resources close once, and runtime close leaves no service root."
+      }
+    },
+    {
+      "root_kind": "FIXED_STRINGS",
+      "source_locations": [
+        {
+          "path": "crates/lua_core/src/gc_string.rs",
+          "line": 99,
+          "symbol": "GcString::mark_fixed"
+        },
+        {
+          "path": "crates/lua_core/src/gc/collector.rs",
+          "line": 236,
+          "symbol": "GarbageCollector::destroy_all fixed-object pass"
+        }
+      ],
+      "status": "missing",
+      "owner": {
+        "current": "Fixed marking exists and Runtime shutdown destroy_all releases fixed objects last with a live StringPool, but no Runtime fixed-string owner initializes the required set.",
+        "target": "GlobalRoots owns fixed metamethod/error strings and Heap shutdown explicitly destroys them last."
+      },
+      "tracer": {
+        "current": "Fixed bits prevent sweep, but no runtime root inventory initializes or traces the required set.",
+        "target": "RuntimeRootTracer labels fixed strings; Heap::destroy_all frees them after ordinary objects."
+      },
+      "missing_risk": "Required emergency strings and their tracing owner are absent; standalone GarbageCollector Drop still lacks a StringPool even though Runtime close reclaims fixed objects.",
+      "planned_test": {
+        "name": "destroy_all_drops_every_layout_thread_first_and_fixed_last",
+        "layer": "lua_core GC shutdown",
+        "assertion": "A fixed interned string is destroyed only in the fixed pass, removed from the live StringPool, and all collector accounting reaches zero."
+      }
+    }
+  ]
+}

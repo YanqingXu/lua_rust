@@ -24,7 +24,7 @@ use crate::value::Value;
 /// - is_open: bool (1 byte)
 /// - stack_index: usize (8 bytes)
 /// - closed_value: Value (16 bytes)
-/// - next: Option<GcRef<Upvalue>> (8 bytes)
+/// - next: `Option<GcRef<Upvalue>>`
 /// - owner_stack: *mut () (8 bytes — opaque, Phase 3 类型化为 Stack*)
 ///   总计约 57+ bytes
 ///
@@ -204,14 +204,18 @@ unsafe impl GcObject for Upvalue {
     /// 标记 Upvalue 引用的 GC 对象
     ///
     /// - Closed 状态：标记 closed_value 中的 GC 对象
-    /// - Open 状态：栈上的值由栈管理，不在此标记
+    /// - Open 状态：栈上的值由状态根追踪器标记
+    /// - Both states: mark the intrusive open-list successor when present
     ///
     unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
         if self.is_closed() {
             // SAFETY: collector is valid during mark phase
             Self::mark_value(&self.closed_value, collector);
         }
-        // Open 状态：栈上的值由 LuaState 栈标记路径负责
+        if let Some(next) = self.next {
+            collector.mark_registered(next);
+        }
+        // Open 状态的栈值由 LuaState 活跃窗口标记路径负责。
     }
 
     fn get_size(&self) -> usize {
@@ -222,28 +226,7 @@ unsafe impl GcObject for Upvalue {
 impl Upvalue {
     /// 标记 Value 中引用的 GC 对象（辅助方法）
     fn mark_value(val: &Value, collector: &mut GarbageCollector) {
-        // SAFETY: all match arms dereference valid GcRef pointers;
-        // collector is valid during mark phase.
-        unsafe {
-            match val {
-                Value::String(s) => {
-                    collector.mark_object(s.as_ptr() as *mut GcObjectHeader);
-                }
-                Value::Table(t) => {
-                    collector.mark_object(t.as_ptr() as *mut GcObjectHeader);
-                }
-                Value::Function(f) => {
-                    collector.mark_object(f.as_ptr() as *mut GcObjectHeader);
-                }
-                Value::Userdata(u) => {
-                    collector.mark_object(u.as_ptr() as *mut GcObjectHeader);
-                }
-                Value::Thread(t) => {
-                    collector.mark_object(t.as_ptr() as *mut GcObjectHeader);
-                }
-                _ => {}
-            }
-        }
+        collector.mark_registered_value(val);
     }
 }
 
@@ -273,6 +256,8 @@ impl std::fmt::Debug for Upvalue {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::approx_constant)]
+
     use super::*;
     use crate::gc::collector::GarbageCollector;
     use crate::gc::gc_ref::GcRef;
@@ -418,7 +403,8 @@ mod tests {
         gc.reset_marks();
 
         // 标记 upvalue 的子对象
-        // SAFETY: uv_ref is valid
+        // SAFETY: `uv_ref` is live and registered with `gc`, and that same
+        // collector is exclusively borrowed for child marking.
         unsafe {
             let uv_ptr = uv_ref.as_ptr();
             (*uv_ptr).mark_children(&mut gc);
@@ -426,6 +412,8 @@ mod tests {
 
         // Table 应被标记
         let table_header = table_ref.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: `table_ref` remains registered with `gc`; marking does not
+        // release or relocate the table.
         unsafe {
             assert!(!(*table_header).is_white(), "Table should be marked");
         }
@@ -442,6 +430,8 @@ mod tests {
         gc.reset_marks();
 
         // 标记 open upvalue 不应 panic
+        // SAFETY: `uv_ref` is live in the exclusively borrowed collector, and
+        // the open upvalue has no child pointer to dereference.
         unsafe {
             let uv_ptr = uv_ref.as_ptr();
             (*uv_ptr).mark_children(&mut gc);
@@ -455,19 +445,23 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let s_ref = pool.intern(&mut gc, "captured");
+        let s_ref = pool.intern_bytes(&mut gc, b"captured");
         let uv = Upvalue::new_closed(Value::String(s_ref));
         let uv_ref = gc.create(uv);
 
         gc.reset_marks();
 
         // 标记应传播到字符串
+        // SAFETY: `uv_ref` is a live registered upvalue and `gc` owns the
+        // interned string referenced by it.
         unsafe {
             let uv_ptr = uv_ref.as_ptr();
             (*uv_ptr).mark_children(&mut gc);
         }
 
         let s_header = s_ref.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: `s_ref` remains interned and registered with `gc`; the mark
+        // operation only updates its header bits.
         unsafe {
             assert!(!(*s_header).is_white(), "String should be marked");
         }

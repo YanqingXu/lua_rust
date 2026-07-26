@@ -11,6 +11,9 @@ use lua_core::value::Value;
 use lua_vm::execute::call_value;
 use lua_vm::state::LuaState;
 
+const STRING_DUMP_UNSUPPORTED: &str =
+    "string.dump is unsupported until Lua 5.1 binary chunk serialization is implemented";
+
 pub fn open_string(l: &mut LuaState, gc: &mut GarbageCollector) {
     let string_lib = find_lib_table(l, "string");
     if string_lib.is_null() {
@@ -40,7 +43,7 @@ fn reg(
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::new(name));
+    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
     let func_obj = gc.create(Function::new_c(func));
     // SAFETY: table points to the library table created and rooted by open_library.
     unsafe {
@@ -51,7 +54,7 @@ fn reg(
 fn reg_gmatch_aliases(gc: &mut GarbageCollector, table: *mut Table) {
     let func_obj = gc.create(Function::new_c(lua_string_gmatch));
     for name in ["gmatch", "gfind"] {
-        let name_str = gc.create(GcString::new(name));
+        let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
         // SAFETY: table points to the library table created and rooted by open_library.
         unsafe {
             (*table).set(&Value::String(name_str), &Value::Function(func_obj));
@@ -68,7 +71,7 @@ fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
             if let Value::String(key_ref) = key
                 // SAFETY: key is held by the rooted global table.
                 && let Some(key_str) = unsafe { key_ref.as_ref() }
-                && key_str.data() == name
+                && key_str.as_bytes() == name.as_bytes()
                 && let Value::Table(t) = val
             {
                 return *t;
@@ -78,16 +81,11 @@ fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
     GcRef::null()
 }
 
-unsafe fn to_lua(l_ptr: *mut std::ffi::c_void) -> &'static mut LuaState {
-    // SAFETY: l_ptr is passed by the VM CALL handler and points to the active LuaState.
-    unsafe { &mut *(l_ptr as *mut LuaState) }
-}
-
 fn string_arg(l: &LuaState, idx: i32) -> Option<Vec<u8>> {
     match l.at(idx) {
         Some(Value::String(s)) => {
             // SAFETY: string argument is on the active Lua stack.
-            unsafe { s.as_ref() }.map(|s| lua_bytes_from_str(s.data()))
+            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
         }
         Some(Value::Number(n)) => Some(number_to_lua_string(*n).into_bytes()),
         _ => None,
@@ -99,7 +97,11 @@ fn number_arg(l: &LuaState, idx: i32) -> Option<f64> {
         Some(Value::Number(n)) => Some(*n),
         Some(Value::String(s)) => {
             // SAFETY: string argument is on the active Lua stack.
-            unsafe { s.as_ref() }.and_then(|s| s.data().parse::<f64>().ok())
+            unsafe { s.as_ref() }.and_then(|s| {
+                std::str::from_utf8(s.as_bytes())
+                    .ok()
+                    .and_then(|text| text.parse::<f64>().ok())
+            })
         }
         _ => None,
     }
@@ -113,39 +115,22 @@ fn number_to_lua_string(n: f64) -> String {
     }
 }
 
-fn bytes_to_string(bytes: Vec<u8>) -> String {
-    bytes.into_iter().map(char::from).collect()
-}
-
-fn lua_bytes_from_str(text: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(text.len());
-    for ch in text.chars() {
-        let code = ch as u32;
-        if code <= 0xff {
-            bytes.push(code as u8);
-        } else {
-            let mut buf = [0; 4];
-            bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-        }
-    }
-    bytes
-}
-
-fn make_lua_string(l: &mut LuaState, text: &str) -> Option<GcRef<GcString>> {
+fn make_lua_string(l: &mut LuaState, bytes: &[u8]) -> Option<GcRef<GcString>> {
     let gc_ptr = l.gc?;
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
     Some(if let Some(pool_ptr) = l.string_pool {
         // SAFETY: string_pool is installed from a live StringPool owned by the host.
         let pool = unsafe { &mut *pool_ptr };
-        pool.find(text).unwrap_or_else(|| pool.intern(gc, text))
+        pool.find_bytes(bytes)
+            .unwrap_or_else(|| pool.intern_bytes(gc, bytes))
     } else {
-        gc.create(GcString::new(text))
+        gc.create(GcString::from_bytes(bytes))
     })
 }
 
-fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
-    let Some(string_ref) = make_lua_string(l, text) else {
+fn push_lua_string(l: &mut LuaState, bytes: &[u8]) -> bool {
+    let Some(string_ref) = make_lua_string(l, bytes) else {
         return false;
     };
     l.push_value(Value::String(string_ref));
@@ -166,8 +151,8 @@ fn lua_string_position(pos: i32, len: usize) -> i32 {
 }
 
 unsafe extern "C" fn lua_string_len(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(s) = string_arg(l, 1) else {
         return -1;
     };
@@ -176,8 +161,8 @@ unsafe extern "C" fn lua_string_len(l_ptr: *mut std::ffi::c_void) -> i32 {
 }
 
 unsafe extern "C" fn lua_string_byte(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(s) = string_arg(l, 1) else {
         return -1;
     };
@@ -201,8 +186,8 @@ unsafe extern "C" fn lua_string_byte(l_ptr: *mut std::ffi::c_void) -> i32 {
 }
 
 unsafe extern "C" fn lua_string_char(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let nargs = l.get_top();
     let mut bytes = Vec::with_capacity(nargs.max(0) as usize);
 
@@ -217,29 +202,22 @@ unsafe extern "C" fn lua_string_char(l_ptr: *mut std::ffi::c_void) -> i32 {
         bytes.push(byte as u8);
     }
 
-    if push_lua_string(l, &bytes_to_string(bytes)) {
-        1
-    } else {
-        -1
-    }
+    if push_lua_string(l, &bytes) { 1 } else { -1 }
 }
 
 unsafe extern "C" fn lua_string_dump(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
-    let Some(Value::Function(func_ref)) = l.at(1).cloned() else {
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
+    if !matches!(l.at(1), Some(Value::Function(_))) {
         return string_format_error(l, "bad argument #1 to 'dump' (function expected)");
-    };
-    let Some(dumped) = crate::dump::dump_function(func_ref) else {
-        return string_format_error(l, "unable to dump function");
-    };
+    }
 
-    if push_lua_string(l, &dumped) { 1 } else { -1 }
+    string_format_error(l, STRING_DUMP_UNSUPPORTED)
 }
 
 unsafe extern "C" fn lua_string_format(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(format_bytes) = string_arg(l, 1) else {
         return string_format_error(l, "bad argument #1 to 'format' (string expected)");
     };
@@ -257,8 +235,8 @@ unsafe extern "C" fn lua_string_format(l_ptr: *mut std::ffi::c_void) -> i32 {
 }
 
 unsafe extern "C" fn lua_string_find(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(source) = string_arg(l, 1) else {
         return string_format_error(l, "bad argument #1 to 'find' (string expected)");
     };
@@ -309,8 +287,8 @@ unsafe extern "C" fn lua_string_find(l_ptr: *mut std::ffi::c_void) -> i32 {
 }
 
 unsafe extern "C" fn lua_string_match(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(source) = string_arg(l, 1) else {
         return string_format_error(l, "bad argument #1 to 'match' (string expected)");
     };
@@ -347,8 +325,11 @@ unsafe extern "C" fn lua_string_match(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
 
     if found.captures.is_empty() {
-        let result = bytes_to_string(source[found.start..found.end].to_vec());
-        if push_lua_string(l, &result) { 1 } else { -1 }
+        if push_lua_string(l, &source[found.start..found.end]) {
+            1
+        } else {
+            -1
+        }
     } else if push_captures(l, &source, &found.captures) {
         found.captures.len() as i32
     } else {
@@ -357,8 +338,8 @@ unsafe extern "C" fn lua_string_match(l_ptr: *mut std::ffi::c_void) -> i32 {
 }
 
 unsafe extern "C" fn lua_string_gsub(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(source) = string_arg(l, 1) else {
         return -1;
     };
@@ -399,10 +380,10 @@ unsafe extern "C" fn lua_string_gsub(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
 
         output.extend_from_slice(&source[cursor..found.start]);
-        let Some(replacement_text) = gsub_replacement(l, &source, &found, &replacement) else {
+        let Some(replacement_bytes) = gsub_replacement(l, &source, &found, &replacement) else {
             return -1;
         };
-        output.extend_from_slice(&lua_bytes_from_str(&replacement_text));
+        output.extend_from_slice(&replacement_bytes);
         count += 1;
 
         if found.end == found.start {
@@ -415,8 +396,7 @@ unsafe extern "C" fn lua_string_gsub(l_ptr: *mut std::ffi::c_void) -> i32 {
     }
 
     output.extend_from_slice(&source[cursor..]);
-    let result = bytes_to_string(output);
-    if !push_lua_string(l, &result) {
+    if !push_lua_string(l, &output) {
         return -1;
     }
     l.push_value(Value::Number(count as f64));
@@ -424,8 +404,8 @@ unsafe extern "C" fn lua_string_gsub(l_ptr: *mut std::ffi::c_void) -> i32 {
 }
 
 unsafe extern "C" fn lua_string_gmatch(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(source) = string_arg(l, 1) else {
         return string_format_error(l, "bad argument #1 to 'gmatch' (string expected)");
     };
@@ -443,12 +423,10 @@ unsafe extern "C" fn lua_string_gmatch(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     let state_ref = gc.create(Table::new());
     let iter_ref = gc.create(Function::new_c(lua_string_gmatch_iter));
-    let source_text = bytes_to_string(source);
-    let pattern_text = bytes_to_string(pattern);
-    let Some(source_ref) = make_lua_string(l, &source_text) else {
+    let Some(source_ref) = make_lua_string(l, &source) else {
         return -1;
     };
-    let Some(pattern_ref) = make_lua_string(l, &pattern_text) else {
+    let Some(pattern_ref) = make_lua_string(l, &pattern) else {
         return -1;
     };
 
@@ -468,8 +446,8 @@ unsafe extern "C" fn lua_string_gmatch(l_ptr: *mut std::ffi::c_void) -> i32 {
 }
 
 unsafe extern "C" fn lua_string_gmatch_iter(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(Value::Table(state_ref)) = l.at(1).cloned() else {
         return 0;
     };
@@ -501,8 +479,11 @@ unsafe extern "C" fn lua_string_gmatch_iter(l_ptr: *mut std::ffi::c_void) -> i32
     }
 
     if found.captures.is_empty() {
-        let result = bytes_to_string(source[found.start..found.end].to_vec());
-        if push_lua_string(l, &result) { 1 } else { -1 }
+        if push_lua_string(l, &source[found.start..found.end]) {
+            1
+        } else {
+            -1
+        }
     } else if push_captures(l, &source, &found.captures) {
         found.captures.len() as i32
     } else {
@@ -511,8 +492,8 @@ unsafe extern "C" fn lua_string_gmatch_iter(l_ptr: *mut std::ffi::c_void) -> i32
 }
 
 unsafe extern "C" fn lua_string_sub(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(s) = string_arg(l, 1) else {
         return -1;
     };
@@ -533,11 +514,11 @@ unsafe extern "C" fn lua_string_sub(l_ptr: *mut std::ffi::c_void) -> i32 {
     }
 
     let result = if start > end {
-        String::new()
+        Vec::new()
     } else {
         let start_idx = (start - 1) as usize;
         let end_idx = end as usize;
-        bytes_to_string(s[start_idx..end_idx].to_vec())
+        s[start_idx..end_idx].to_vec()
     };
     if push_lua_string(l, &result) { 1 } else { -1 }
 }
@@ -577,7 +558,7 @@ struct FormatSpec {
     conv: u8,
 }
 
-fn format_lua_string(l: &LuaState, format: &[u8]) -> Result<String, String> {
+fn format_lua_string(l: &LuaState, format: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut idx = 0usize;
     let mut arg_idx = 2i32;
@@ -603,11 +584,11 @@ fn format_lua_string(l: &LuaState, format: &[u8]) -> Result<String, String> {
         arg_idx += 1;
 
         let piece = format_value_with_spec(&arg, &spec)?;
-        out.extend_from_slice(&lua_bytes_from_str(&piece));
+        out.extend_from_slice(&piece);
         idx = next_idx;
     }
 
-    Ok(bytes_to_string(out))
+    Ok(out)
 }
 
 fn parse_format_spec(format: &[u8], mut idx: usize) -> Result<(FormatSpec, usize), String> {
@@ -683,51 +664,35 @@ fn parse_format_spec(format: &[u8], mut idx: usize) -> Result<(FormatSpec, usize
     Ok((spec, idx + 1))
 }
 
-fn format_value_with_spec(value: &Value, spec: &FormatSpec) -> Result<String, String> {
+fn format_value_with_spec(value: &Value, spec: &FormatSpec) -> Result<Vec<u8>, String> {
     match spec.conv {
         b's' => Ok(apply_string_precision_and_width(
-            value_to_format_string(value),
+            value_to_format_bytes(value),
             spec,
         )),
         b'q' => Ok(lua_quote_string(&value_to_format_bytes(value))),
         b'c' => {
-            let n = numeric_value(value)? as u32;
-            let ch = char::from_u32(n).unwrap_or('\0').to_string();
-            Ok(apply_width(ch, spec, false))
+            let byte = numeric_value(value)? as i32 as u8;
+            Ok(apply_byte_width(vec![byte], spec))
         }
-        b'd' | b'i' => Ok(format_integer(
-            numeric_value(value)? as i64,
-            10,
-            false,
-            spec,
-        )),
-        b'u' => Ok(format_unsigned_integer(
-            numeric_value(value)? as u64,
-            10,
-            false,
-            spec,
-        )),
-        b'o' => Ok(format_unsigned_integer(
-            numeric_value(value)? as u64,
-            8,
-            false,
-            spec,
-        )),
-        b'x' => Ok(format_unsigned_integer(
-            numeric_value(value)? as u64,
-            16,
-            false,
-            spec,
-        )),
-        b'X' => Ok(format_unsigned_integer(
-            numeric_value(value)? as u64,
-            16,
-            true,
-            spec,
-        )),
-        b'f' => Ok(format_float_fixed(numeric_value(value)?, spec)),
-        b'e' | b'E' => Ok(format_float_exp(numeric_value(value)?, spec)),
-        b'g' | b'G' => Ok(format_float_general(numeric_value(value)?, spec)),
+        b'd' | b'i' => {
+            Ok(format_integer(numeric_value(value)? as i64, 10, false, spec).into_bytes())
+        }
+        b'u' => {
+            Ok(format_unsigned_integer(numeric_value(value)? as u64, 10, false, spec).into_bytes())
+        }
+        b'o' => {
+            Ok(format_unsigned_integer(numeric_value(value)? as u64, 8, false, spec).into_bytes())
+        }
+        b'x' => {
+            Ok(format_unsigned_integer(numeric_value(value)? as u64, 16, false, spec).into_bytes())
+        }
+        b'X' => {
+            Ok(format_unsigned_integer(numeric_value(value)? as u64, 16, true, spec).into_bytes())
+        }
+        b'f' => Ok(format_float_fixed(numeric_value(value)?, spec).into_bytes()),
+        b'e' | b'E' => Ok(format_float_exp(numeric_value(value)?, spec).into_bytes()),
+        b'g' | b'G' => Ok(format_float_general(numeric_value(value)?, spec).into_bytes()),
         _ => Err(format!(
             "invalid option '%{}' to 'format'",
             char::from(spec.conv)
@@ -736,7 +701,7 @@ fn format_value_with_spec(value: &Value, spec: &FormatSpec) -> Result<String, St
 }
 
 fn string_format_error(l: &mut LuaState, message: &str) -> i32 {
-    if !push_lua_string(l, message) {
+    if !push_lua_string(l, message.as_bytes()) {
         return -1;
     }
     -1
@@ -748,9 +713,10 @@ fn value_to_format_string(value: &Value) -> String {
         Value::Boolean(b) => b.to_string(),
         Value::Number(n) => number_to_lua_string(*n),
         Value::String(s) => {
-            // SAFETY: value is an argument on the active Lua stack.
+            // SAFETY: this is only a diagnostic fallback; `%s` and `%q` use
+            // value_to_format_bytes and retain the original Lua bytes.
             unsafe { s.as_ref() }
-                .map(|s| s.data().to_string())
+                .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default()
         }
         Value::Table(t) => format!("table: {:p}", t.as_ptr()),
@@ -766,7 +732,7 @@ fn value_to_format_bytes(value: &Value) -> Vec<u8> {
         Value::String(s) => {
             // SAFETY: value is an argument on the active Lua stack.
             unsafe { s.as_ref() }
-                .map(|s| lua_bytes_from_str(s.data()))
+                .map(|s| s.as_bytes().to_vec())
                 .unwrap_or_default()
         }
         _ => value_to_format_string(value).into_bytes(),
@@ -779,18 +745,39 @@ fn numeric_value(value: &Value) -> Result<f64, String> {
         Value::String(s) => {
             // SAFETY: value is an argument on the active Lua stack.
             unsafe { s.as_ref() }
-                .and_then(|s| s.data().trim().parse::<f64>().ok())
+                .and_then(|s| std::str::from_utf8(s.as_bytes()).ok())
+                .and_then(|text| text.trim().parse::<f64>().ok())
                 .ok_or_else(|| "string.format: number expected".to_string())
         }
         _ => Err("string.format: number expected".to_string()),
     }
 }
 
-fn apply_string_precision_and_width(mut value: String, spec: &FormatSpec) -> String {
+fn apply_string_precision_and_width(mut value: Vec<u8>, spec: &FormatSpec) -> Vec<u8> {
     if let Some(precision) = spec.precision {
-        value = bytes_to_string(value.into_bytes().into_iter().take(precision).collect());
+        value.truncate(precision);
     }
-    apply_width(value, spec, false)
+    apply_byte_width(value, spec)
+}
+
+fn apply_byte_width(mut value: Vec<u8>, spec: &FormatSpec) -> Vec<u8> {
+    let Some(width) = spec.width else {
+        return value;
+    };
+    if value.len() >= width {
+        return value;
+    }
+
+    let pad_len = width - value.len();
+    if spec.left {
+        value.resize(width, b' ');
+        value
+    } else {
+        let mut padded = Vec::with_capacity(width);
+        padded.resize(pad_len, b' ');
+        padded.extend_from_slice(&value);
+        padded
+    }
 }
 
 fn apply_width(value: String, spec: &FormatSpec, zero_after_sign: bool) -> String {
@@ -982,7 +969,7 @@ fn trim_float_trailing_zeroes(value: &mut String) {
     }
 }
 
-fn lua_quote_string(bytes: &[u8]) -> String {
+fn lua_quote_string(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(b'"');
     for &byte in bytes {
@@ -1000,7 +987,7 @@ fn lua_quote_string(bytes: &[u8]) -> String {
         }
     }
     out.push(b'"');
-    bytes_to_string(out)
+    out
 }
 
 fn find_gsub_match(source: &[u8], pattern: &[u8], start_idx: usize) -> Option<PatternMatch> {
@@ -1024,13 +1011,13 @@ fn find_gsub_match(source: &[u8], pattern: &[u8], start_idx: usize) -> Option<Pa
 }
 
 fn set_state_value(l: &mut LuaState, state: &mut Table, key: &str, value: Value) -> Option<()> {
-    let key_ref = make_lua_string(l, key)?;
+    let key_ref = make_lua_string(l, key.as_bytes())?;
     state.set(&Value::String(key_ref), &value);
     Some(())
 }
 
 fn state_value(l: &mut LuaState, state: &Table, key: &str) -> Option<Value> {
-    let key_ref = make_lua_string(l, key)?;
+    let key_ref = make_lua_string(l, key.as_bytes())?;
     Some(state.get(&Value::String(key_ref)))
 }
 
@@ -1038,7 +1025,7 @@ fn state_string_field(l: &mut LuaState, state: &Table, key: &str) -> Option<Vec<
     match state_value(l, state, key)? {
         Value::String(s) => {
             // SAFETY: gmatch state table keeps the string reachable while iterating.
-            unsafe { s.as_ref() }.map(|s| lua_bytes_from_str(s.data()))
+            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
         }
         _ => None,
     }
@@ -1599,24 +1586,24 @@ fn gsub_replacement(
     source: &[u8],
     found: &PatternMatch,
     replacement: &Value,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     match replacement {
         Value::String(template_ref) => {
             // SAFETY: replacement argument is on the active Lua stack.
-            let template = lua_bytes_from_str(unsafe { template_ref.as_ref() }?.data());
-            match expand_replacement_template(&template, source, found) {
-                Ok(text) => Some(text),
+            let template = unsafe { template_ref.as_ref() }?.as_bytes();
+            match expand_replacement_template(template, source, found) {
+                Ok(bytes) => Some(bytes),
                 Err(message) => {
-                    push_lua_string(l, &message);
+                    push_lua_string(l, message.as_bytes());
                     None
                 }
             }
         }
-        Value::Number(n) => Some(number_to_lua_string(*n)),
+        Value::Number(n) => Some(number_to_lua_string(*n).into_bytes()),
         Value::Table(table_ref) => {
             let key = gsub_table_key(l, source, found)?;
             let value = gsub_table_replacement_value(l, *table_ref, &key)?;
-            replacement_value_to_string(source, found, &value)
+            replacement_value_to_bytes(source, found, &value)
         }
         Value::Function(_) => gsub_function_replacement(l, source, found, replacement),
         _ => None,
@@ -1628,9 +1615,9 @@ fn gsub_function_replacement(
     source: &[u8],
     found: &PatternMatch,
     replacement: &Value,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     let Some(gc_ptr) = l.gc else {
-        push_lua_string(l, "gsub unavailable without an active GC");
+        push_lua_string(l, b"gsub unavailable without an active GC");
         return None;
     };
     let args = gsub_function_args(l, source, found)?;
@@ -1642,24 +1629,23 @@ fn gsub_function_replacement(
             if let Some(error_value) = err.error_value() {
                 l.push_value(error_value);
             } else {
-                push_lua_string(l, &err.message);
+                push_lua_string(l, err.message.as_bytes());
             }
             return None;
         }
     };
     let value = results.first().cloned().unwrap_or(Value::Nil);
-    if let Some(text) = replacement_value_to_string(source, found, &value) {
-        return Some(text);
+    if let Some(bytes) = replacement_value_to_bytes(source, found, &value) {
+        return Some(bytes);
     }
 
-    push_lua_string(l, "invalid replacement value (a string expected)");
+    push_lua_string(l, b"invalid replacement value (a string expected)");
     None
 }
 
 fn gsub_function_args(l: &mut LuaState, source: &[u8], found: &PatternMatch) -> Option<Vec<Value>> {
     if found.captures.is_empty() {
-        let text = bytes_to_string(source[found.start..found.end].to_vec());
-        return make_lua_string(l, &text).map(|s| vec![Value::String(s)]);
+        return make_lua_string(l, &source[found.start..found.end]).map(|s| vec![Value::String(s)]);
     }
 
     found
@@ -1673,8 +1659,7 @@ fn gsub_table_key(l: &mut LuaState, source: &[u8], found: &PatternMatch) -> Opti
     if let Some(capture) = found.captures.first() {
         capture_to_value(l, source, capture)
     } else {
-        let text = bytes_to_string(source[found.start..found.end].to_vec());
-        make_lua_string(l, &text).map(Value::String)
+        make_lua_string(l, &source[found.start..found.end]).map(Value::String)
     }
 }
 
@@ -1708,7 +1693,7 @@ fn gsub_table_replacement_value(
         }
     }
 
-    push_lua_string(l, "'__index' chain too long");
+    push_lua_string(l, b"'__index' chain too long");
     None
 }
 
@@ -1719,7 +1704,7 @@ fn lookup_string_metamethod(metatable: GcRef<Table>, name: &str) -> Option<Value
         if let Value::String(key_ref) = key
             // SAFETY: key is held by the metatable.
             && let Some(key_string) = unsafe { key_ref.as_ref() }
-            && key_string.data() == name
+            && key_string.as_bytes() == name.as_bytes()
             && !value.is_nil()
         {
             return Some(value.clone());
@@ -1735,7 +1720,7 @@ fn call_index_metamethod(
     key: &Value,
 ) -> Option<Value> {
     let Some(gc_ptr) = l.gc else {
-        push_lua_string(l, "gsub unavailable without an active GC");
+        push_lua_string(l, b"gsub unavailable without an active GC");
         return None;
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -1746,7 +1731,7 @@ fn call_index_metamethod(
             if let Some(error_value) = err.error_value() {
                 l.push_value(error_value);
             } else {
-                push_lua_string(l, &err.message);
+                push_lua_string(l, err.message.as_bytes());
             }
             None
         }
@@ -1756,28 +1741,23 @@ fn call_index_metamethod(
 fn capture_to_value(l: &mut LuaState, source: &[u8], capture: &Capture) -> Option<Value> {
     match capture {
         Capture::Open(_) => None,
-        Capture::Range(start, end) => {
-            let text = bytes_to_string(source[*start..*end].to_vec());
-            make_lua_string(l, &text).map(Value::String)
-        }
+        Capture::Range(start, end) => make_lua_string(l, &source[*start..*end]).map(Value::String),
         Capture::Position(pos) => Some(Value::Number((*pos + 1) as f64)),
     }
 }
 
-fn replacement_value_to_string(
+fn replacement_value_to_bytes(
     source: &[u8],
     found: &PatternMatch,
     value: &Value,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     match value {
-        Value::Nil | Value::Boolean(false) => {
-            Some(bytes_to_string(source[found.start..found.end].to_vec()))
-        }
+        Value::Nil | Value::Boolean(false) => Some(source[found.start..found.end].to_vec()),
         Value::String(s) => {
             // SAFETY: table replacement value is reachable from an active table argument.
-            unsafe { s.as_ref() }.map(|s| s.data().to_string())
+            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
         }
-        Value::Number(n) => Some(number_to_lua_string(*n)),
+        Value::Number(n) => Some(number_to_lua_string(*n).into_bytes()),
         _ => None,
     }
 }
@@ -1786,7 +1766,7 @@ fn expand_replacement_template(
     template: &[u8],
     source: &[u8],
     found: &PatternMatch,
-) -> Result<String, String> {
+) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut idx = 0usize;
     while idx < template.len() {
@@ -1812,7 +1792,7 @@ fn expand_replacement_template(
             idx += 1;
         }
     }
-    Ok(bytes_to_string(out))
+    Ok(out)
 }
 
 fn replacement_capture_bytes(
@@ -1836,8 +1816,7 @@ fn push_captures(l: &mut LuaState, source: &[u8], captures: &[Capture]) -> bool 
         match capture {
             Capture::Open(_) => return false,
             Capture::Range(start, end) => {
-                let result = bytes_to_string(source[*start..*end].to_vec());
-                if !push_lua_string(l, &result) {
+                if !push_lua_string(l, &source[*start..*end]) {
                     return false;
                 }
             }
@@ -1848,50 +1827,38 @@ fn push_captures(l: &mut LuaState, source: &[u8], captures: &[Capture]) -> bool 
 }
 
 unsafe extern "C" fn lua_string_upper(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(mut s) = string_arg(l, 1) else {
         return -1;
     };
     s.make_ascii_uppercase();
-    if push_lua_string(l, &bytes_to_string(s)) {
-        1
-    } else {
-        -1
-    }
+    if push_lua_string(l, &s) { 1 } else { -1 }
 }
 
 unsafe extern "C" fn lua_string_lower(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(mut s) = string_arg(l, 1) else {
         return -1;
     };
     s.make_ascii_lowercase();
-    if push_lua_string(l, &bytes_to_string(s)) {
-        1
-    } else {
-        -1
-    }
+    if push_lua_string(l, &s) { 1 } else { -1 }
 }
 
 unsafe extern "C" fn lua_string_reverse(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(mut s) = string_arg(l, 1) else {
         return -1;
     };
     s.reverse();
-    if push_lua_string(l, &bytes_to_string(s)) {
-        1
-    } else {
-        -1
-    }
+    if push_lua_string(l, &s) { 1 } else { -1 }
 }
 
 unsafe extern "C" fn lua_string_rep(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
+    let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
     let Some(s) = string_arg(l, 1) else {
         return -1;
     };
@@ -1900,9 +1867,9 @@ unsafe extern "C" fn lua_string_rep(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     let count = n as i32;
     let result = if count <= 0 {
-        String::new()
+        Vec::new()
     } else {
-        bytes_to_string(s).repeat(count as usize)
+        s.repeat(count as usize)
     };
     if push_lua_string(l, &result) { 1 } else { -1 }
 }

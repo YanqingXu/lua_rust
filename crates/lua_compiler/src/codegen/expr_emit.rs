@@ -17,7 +17,7 @@ use crate::opcode::{self, LFIELDS_PER_FLUSH, MAXARG_C, MAXINDEXRK, OpCode};
 
 use crate::opcode::rk_ask;
 
-impl CodeGenerator {
+impl CodeGenerator<'_> {
     // ═══════════════════════════════════════════════════════════════
     // 公开入口
     // ═══════════════════════════════════════════════════════════════
@@ -30,11 +30,8 @@ impl CodeGenerator {
             Expr::Boolean(b) => ValueResult::make_boolean(b.value),
             Expr::Number(n) => ValueResult::make_number(n.value),
             Expr::String(s) => {
-                // SAFETY: self.gc is a valid pointer set during CodeGenerator::new()
-                let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
                 let k = self
-                    .builder
-                    .add_string_constant(gc, &s.value)
+                    .add_byte_string_constant(s.value.as_bytes())
                     .unwrap_or_else(|| {
                         // Fallback: add as number constant if string constant fails
                         self.builder.add_number_constant(0.0)
@@ -665,11 +662,8 @@ impl CodeGenerator {
     fn emit_value_member(&mut self, e: &MemberExpr) -> ValueResult {
         let table = self.emit_value(&e.table);
         let table_reg = self.value_to_any_reg(table);
-        // SAFETY: self.gc is set during CodeGenerator::new() from a valid &mut GC
-        let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
         let k = self
-            .builder
-            .add_string_constant(gc, &e.member)
+            .add_string_constant(&e.member)
             .unwrap_or_else(|| self.builder.add_number_constant(0.0));
         let rk_key = self.value_to_rk(ValueResult::make_constant(k));
         ValueResult::make_pending_load(AccessKind::Indexed, table_reg, -1, rk_key)
@@ -718,11 +712,8 @@ impl CodeGenerator {
             let obj = self.emit_value(&member.table);
             let obj_reg = self.value_to_any_reg(obj);
 
-            // SAFETY: self.gc is set during CodeGenerator::new() from a valid &mut GC.
-            let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
             let method_key = self
-                .builder
-                .add_string_constant(gc, &member.member)
+                .add_string_constant(&member.member)
                 .unwrap_or_else(|| self.builder.add_number_constant(0.0));
             let rk_key = if method_key <= MAXINDEXRK {
                 rk_ask(method_key)
@@ -921,11 +912,8 @@ impl CodeGenerator {
             Expr::Member(m) => {
                 let table_val = self.emit_value(&m.table);
                 let table_reg = self.value_to_any_reg(table_val);
-                // SAFETY: self.gc is set from a valid &mut GC during CodeGenerator::new()
-                let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
                 let k = self
-                    .builder
-                    .add_string_constant(gc, &m.member)
+                    .add_string_constant(&m.member)
                     .unwrap_or_else(|| self.builder.add_number_constant(0.0));
                 let rk_key = self.value_to_rk(ValueResult::make_constant(k));
                 let mut result = LValueRef::new();

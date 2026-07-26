@@ -3,6 +3,8 @@
 //! 定义语法分析阶段使用的 Token 类型、语义值和源代码位置信息。
 //!
 
+use lua_core::byte_string::ByteString;
+
 // =====================================================================
 // TokenType 枚举
 // =====================================================================
@@ -195,8 +197,10 @@ pub enum TokenValue {
     None,
     /// 数值字面量
     Number(f64),
-    /// 字符串字面量内容（不含引号）
-    String(String),
+    /// 字符串字面量内容（不含引号）。
+    ///
+    /// Lua 字符串是任意字节序列，不能假设为 UTF-8。
+    String(ByteString),
 }
 
 // =====================================================================
@@ -211,8 +215,11 @@ pub struct Token {
     pub token_type: TokenType,
     /// 语义值（数值或字符串）
     pub value: TokenValue,
-    /// 源代码词素文本
-    pub lexeme: String,
+    /// 源代码词素原始字节。
+    ///
+    /// 对 Name/Number/关键字，Lexer 保证这些字节为 ASCII；字符串和错误
+    /// token 则可能包含 NUL 或无效 UTF-8。
+    pub lexeme: ByteString,
     /// 错误消息（仅 Error 类型）
     pub error_message: String,
     /// 源代码行号（1-based）
@@ -223,11 +230,11 @@ pub struct Token {
 
 impl Token {
     /// 创建新的 Token
-    pub fn new(token_type: TokenType, lexeme: String, line: i32, column: i32) -> Self {
+    pub fn new(token_type: TokenType, lexeme: impl AsRef<[u8]>, line: i32, column: i32) -> Self {
         Self {
             token_type,
             value: TokenValue::None,
-            lexeme,
+            lexeme: ByteString::from_bytes(lexeme.as_ref()),
             error_message: String::new(),
             line,
             column,
@@ -235,11 +242,11 @@ impl Token {
     }
 
     /// 创建带数值的 Token
-    pub fn new_number(lexeme: String, value: f64, line: i32, column: i32) -> Self {
+    pub fn new_number(lexeme: impl AsRef<[u8]>, value: f64, line: i32, column: i32) -> Self {
         Self {
             token_type: TokenType::Number,
             value: TokenValue::Number(value),
-            lexeme,
+            lexeme: ByteString::from_bytes(lexeme.as_ref()),
             error_message: String::new(),
             line,
             column,
@@ -247,11 +254,16 @@ impl Token {
     }
 
     /// 创建带字符串值的 Token
-    pub fn new_string(lexeme: String, value: String, line: i32, column: i32) -> Self {
+    pub fn new_string(
+        lexeme: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        line: i32,
+        column: i32,
+    ) -> Self {
         Self {
             token_type: TokenType::String,
-            value: TokenValue::String(value),
-            lexeme,
+            value: TokenValue::String(ByteString::from_bytes(value.as_ref())),
+            lexeme: ByteString::from_bytes(lexeme.as_ref()),
             error_message: String::new(),
             line,
             column,
@@ -264,12 +276,17 @@ impl Token {
     }
 
     /// 创建带源词素的错误 Token
-    pub fn new_error_with_lexeme(message: String, lexeme: String, line: i32, column: i32) -> Self {
+    pub fn new_error_with_lexeme(
+        message: String,
+        lexeme: impl AsRef<[u8]>,
+        line: i32,
+        column: i32,
+    ) -> Self {
         let msg = message.clone();
         Self {
             token_type: TokenType::Error,
             value: TokenValue::None,
-            lexeme,
+            lexeme: ByteString::from_bytes(lexeme.as_ref()),
             error_message: msg,
             line,
             column,
@@ -281,7 +298,7 @@ impl Token {
         Self {
             token_type: TokenType::Eos,
             value: TokenValue::None,
-            lexeme: String::new(),
+            lexeme: ByteString::from_bytes(b""),
             error_message: String::new(),
             line,
             column,
@@ -373,9 +390,9 @@ mod tests {
 
     #[test]
     fn test_token_new() {
-        let t = Token::new(TokenType::Name, "foo".to_string(), 1, 5);
+        let t = Token::new(TokenType::Name, "foo", 1, 5);
         assert_eq!(t.token_type, TokenType::Name);
-        assert_eq!(t.lexeme, "foo");
+        assert_eq!(t.lexeme.as_bytes(), b"foo");
         assert_eq!(t.line, 1);
         assert_eq!(t.column, 5);
         assert!(t.is_name());
@@ -383,16 +400,16 @@ mod tests {
 
     #[test]
     fn test_token_new_number() {
-        let t = Token::new_number("42".to_string(), 42.0, 3, 10);
+        let t = Token::new_number("42", 42.0, 3, 10);
         assert!(t.is_number());
         assert!(matches!(t.value, TokenValue::Number(42.0)));
     }
 
     #[test]
     fn test_token_new_string() {
-        let t = Token::new_string("\"hello\"".to_string(), "hello".to_string(), 2, 1);
+        let t = Token::new_string(b"\"hello\"", b"hello", 2, 1);
         assert!(t.is_string());
-        assert!(matches!(t.value, TokenValue::String(ref s) if s == "hello"));
+        assert!(matches!(t.value, TokenValue::String(ref s) if s.as_bytes() == b"hello"));
     }
 
     #[test]

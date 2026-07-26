@@ -1,0 +1,35 @@
+schema_version = 1
+differential_report_schema_version = 1
+cli_report_schema_version = 1
+
+[cpp]
+repository = "https://github.com/YanqingXu/lua.git"
+commit = "87c15e69ceb94eb74e28226ccbefb7e196635711"
+short_commit = "87c15e6"
+
+[lua]
+release = "Lua 5.1.5"
+source_archive_url = "https://www.lua.org/ftp/lua-5.1.5.tar.gz"
+source_archive_sha256 = "2640fc56a795f29d28ef15e13c34a47e223960b0240e8cb0a82d9b0738695333"
+
+[official_suite]
+name = "Lua 5.1 official test suite (lua5.1-tests)"
+archive_url = "https://www.lua.org/tests/lua5.1-tests.tar.gz"
+archive_published = "2016-01-18"
+archive_sha256 = "49e4ca6561f82ea605908c5041ab5fad66ed9930fa0686675bd51b02767f18ad"
+manifest = "tests/compatibility/lua51-official-sources.json"
+vendored_root = "tests/lua/official"
+vendored_policy = "tracked-subset"
+
+[differential]
+manifest = "tests/compatibility/lua51-differential-cases.json"
+version_probe = "tests/compatibility/lua51-version-probe.lua"
+required_lanes = ["official-lua51", "cpp-87c15e6"]
+
+[provisioning]
+official_lua_build_script = "tools/build_lua51_oracle.ps1"
+cpp_build_script = "tools/build_cpp_oracle.ps1"
+
+[baseline_change]
+required_label = "oracle-baseline-change"
+require_diff_summary = true

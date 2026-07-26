@@ -191,7 +191,7 @@ impl<'source> Parser<'source> {
         if !crate::parser::is_name(self.current()) {
             return Err(self.make_error("Expected variable name after 'for'"));
         }
-        let var_name = Self::token_string(self.current()).to_string();
+        let var_name = Self::token_name(self.current()).to_string();
         self.advance();
 
         // 数值 for: for name = init, limit[, step] do body end
@@ -235,7 +235,7 @@ impl<'source> Parser<'source> {
                 if !crate::parser::is_name(self.current()) {
                     return Err(self.make_error("Expected variable name in for-in loop"));
                 }
-                vars.push(Self::token_string(self.current()).to_string());
+                vars.push(Self::token_name(self.current()).to_string());
                 self.advance();
                 if !self.match_token(TokenType::Comma) {
                     break;
@@ -280,7 +280,7 @@ impl<'source> Parser<'source> {
             if !crate::parser::is_name(self.current()) {
                 return Err(self.make_error("Expected variable name in local statement"));
             }
-            let name = Self::token_string(self.current()).to_string();
+            let name = Self::token_name(self.current()).to_string();
             let tok = self.current().clone();
             self.declare_local_name(&name, &tok)?;
             names.push(name);
@@ -313,7 +313,7 @@ impl<'source> Parser<'source> {
         if !crate::parser::is_name(self.current()) {
             return Err(self.make_error("Expected function name after 'local function'"));
         }
-        let name = Self::token_string(self.current()).to_string();
+        let name = Self::token_name(self.current()).to_string();
         let name_tok = self.current().clone();
         self.declare_local_name(&name, &name_tok)?;
         self.advance();

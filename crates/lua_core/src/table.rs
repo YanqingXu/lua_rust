@@ -36,7 +36,7 @@ const MAX_ARRAY_INDEX: i32 = 1_000_000;
 /// - header: GcObjectHeader (16 bytes)
 /// - array: `Vec<Value>` (24 bytes)
 /// - hash: `HashMap<Value, Value>` (~56 bytes)
-/// - metatable: `Option<GcRef<Table>>` (8 bytes)
+/// - metatable: `Option<GcRef<Table>>`
 /// - flags: u8 (1 byte)
 ///   总计约 105+ bytes
 ///
@@ -561,13 +561,7 @@ unsafe impl GcObject for Table {
 
         // 标记元表
         if let Some(mt) = self.metatable {
-            // SAFETY: mark_children is an unsafe fn, caller guarantees
-            // collector is valid during the mark phase.
-            let header_ptr = mt.as_ptr() as *mut GcObjectHeader;
-            // SAFETY: header_ptr derives from a valid GcRef<Table>.
-            unsafe {
-                collector.mark_object(header_ptr);
-            }
+            collector.mark_registered(mt);
         }
     }
 
@@ -600,49 +594,7 @@ impl Table {
     ///
     /// 辅助方法，供 `mark_children` 和后续 `markContents` 使用。
     fn mark_value(val: &Value, collector: &mut GarbageCollector) {
-        match val {
-            Value::String(s) => {
-                let header_ptr = s.as_ptr() as *mut GcObjectHeader;
-                // SAFETY: s is a valid GC reference
-                unsafe {
-                    collector.mark_object(header_ptr);
-                }
-            }
-            Value::Table(t) => {
-                let header_ptr = t.as_ptr() as *mut GcObjectHeader;
-                // SAFETY: t is a valid GC reference; header_ptr points to a
-                // registered GcObjectHeader in the GC's intrusive list.
-                unsafe {
-                    collector.mark_object(header_ptr);
-                }
-            }
-            Value::Function(f) => {
-                let header_ptr = f.as_ptr() as *mut GcObjectHeader;
-                // SAFETY: f is a valid GC reference; header_ptr points to a
-                // registered GcObjectHeader in the GC's intrusive list.
-                unsafe {
-                    collector.mark_object(header_ptr);
-                }
-            }
-            Value::Userdata(u) => {
-                let header_ptr = u.as_ptr() as *mut GcObjectHeader;
-                // SAFETY: u is a valid GC reference; header_ptr points to a
-                // registered GcObjectHeader in the GC's intrusive list.
-                unsafe {
-                    collector.mark_object(header_ptr);
-                }
-            }
-            Value::Thread(t) => {
-                let header_ptr = t.as_ptr() as *mut GcObjectHeader;
-                // SAFETY: t is a valid GC reference; header_ptr points to a
-                // registered GcObjectHeader in the GC's intrusive list.
-                unsafe {
-                    collector.mark_object(header_ptr);
-                }
-            }
-            // Nil, Boolean, Number, LightUserdata 不引用 GC 对象
-            _ => {}
-        }
+        collector.mark_registered_value(val);
     }
 }
 
@@ -667,6 +619,8 @@ impl std::fmt::Debug for Table {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::approx_constant)]
+
     use super::*;
     use crate::gc::collector::GarbageCollector;
     use crate::gc::gc_ref::GcRef;
@@ -681,7 +635,7 @@ mod tests {
 
     /// 创建一个测试用的字符串并注册到 GC
     fn create_test_string(gc: &mut GarbageCollector, s: &str) -> GcRef<GcString> {
-        gc.create(GcString::new(s))
+        gc.create(GcString::from_utf8_text(s))
     }
 
     // ── 创建和基本属性测试 ─────────────────────────────────────
@@ -1154,12 +1108,16 @@ mod tests {
         gc.reset_marks();
 
         // 标记 table 的子对象
+        // SAFETY: `table_ref` is live and registered with `gc`, and the same
+        // collector is exclusively borrowed for child marking.
         unsafe {
             let table = &*table_ref.as_ptr();
             table.mark_children(&mut gc);
         }
 
         // 验证：字符串和元表应该被标记为灰色（非白色）
+        // SAFETY: both references remain registered with `gc`; marking changes
+        // only their headers and does not free or relocate either object.
         unsafe {
             let s_header = s_ref.as_ptr() as *mut GcObjectHeader;
             assert!(!(*s_header).is_white(), "String should be marked");

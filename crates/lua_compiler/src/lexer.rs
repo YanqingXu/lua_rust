@@ -58,12 +58,12 @@ fn lookup_keyword(ident: &str) -> Option<TokenType> {
 
 /// Lua 词法分析器
 ///
-/// 从源代码字符串中提取 Token 流。
+/// 从 Lua 源代码字节中提取 Token 流。
 pub struct Lexer<'source> {
     /// 完整的源代码（生命周期锚点）
-    _source: &'source str,
-    /// 剩余待扫描的源代码（字节切片）
-    rest: &'source str,
+    _source: &'source [u8],
+    /// 剩余待扫描的源代码
+    rest: &'source [u8],
     /// 当前行号（1-based）
     line: i32,
     /// 当前列号（1-based）
@@ -73,8 +73,17 @@ pub struct Lexer<'source> {
 }
 
 impl<'source> Lexer<'source> {
-    /// 从源代码字符串创建 Lexer
+    /// 从 UTF-8 文本创建 Lexer。
+    ///
+    /// 这是兼容入口；Lua 源码的规范入口是 [`Lexer::from_bytes`]。
     pub fn new(source: &'source str) -> Self {
+        Self::from_bytes(source.as_bytes())
+    }
+
+    /// 从任意 Lua 源码字节创建 Lexer。
+    ///
+    /// 字符串字面量和长字符串不经过 UTF-8 解码。
+    pub fn from_bytes(source: &'source [u8]) -> Self {
         Self {
             _source: source,
             rest: source,
@@ -123,34 +132,33 @@ impl<'source> Lexer<'source> {
 
     // ── 字符操作 ──────────────────────────────────────────────────
 
-    /// 前进一个字符并返回
-    fn advance(&mut self) -> Option<char> {
-        let c = self.advance_raw()?;
-        if c == '\n' {
+    /// 前进一个字节并返回。
+    fn advance(&mut self) -> Option<u8> {
+        let byte = self.advance_raw()?;
+        if byte == b'\n' {
             self.line += 1;
             self.column = 1;
         } else {
             self.column += 1;
         }
-        Some(c)
+        Some(byte)
     }
 
-    fn advance_raw(&mut self) -> Option<char> {
-        let c = self.rest.chars().next()?;
-        let len = c.len_utf8();
-        self.rest = &self.rest[len..];
-        Some(c)
+    fn advance_raw(&mut self) -> Option<u8> {
+        let (&byte, rest) = self.rest.split_first()?;
+        self.rest = rest;
+        Some(byte)
     }
 
-    fn is_newline(c: char) -> bool {
-        c == '\n' || c == '\r'
+    fn is_newline(byte: u8) -> bool {
+        byte == b'\n' || byte == b'\r'
     }
 
-    fn consume_newline(&mut self) -> String {
+    fn consume_newline(&mut self) -> Vec<u8> {
         let first = self.advance_raw().expect("expected newline");
         debug_assert!(Self::is_newline(first));
 
-        let mut consumed = String::from(first);
+        let mut consumed = vec![first];
         if self.peek().is_some_and(Self::is_newline) && self.peek() != Some(first) {
             consumed.push(self.advance_raw().unwrap());
         }
@@ -160,20 +168,18 @@ impl<'source> Lexer<'source> {
         consumed
     }
 
-    /// 查看当前字符（不前进）
-    fn peek(&self) -> Option<char> {
-        self.rest.chars().next()
+    /// 查看当前字节（不前进）
+    fn peek(&self) -> Option<u8> {
+        self.rest.first().copied()
     }
 
-    /// 查看下一个字符（不前进）
-    fn peek_next(&self) -> Option<char> {
-        let mut chars = self.rest.chars();
-        chars.next(); // skip current
-        chars.next()
+    /// 查看下一个字节（不前进）
+    fn peek_next(&self) -> Option<u8> {
+        self.rest.get(1).copied()
     }
 
-    /// 如果当前字符匹配，则前进并返回 true
-    fn match_char(&mut self, expected: char) -> bool {
+    /// 如果当前字节匹配，则前进并返回 true
+    fn match_byte(&mut self, expected: u8) -> bool {
         if self.peek() == Some(expected) {
             self.advance();
             true
@@ -202,16 +208,16 @@ impl<'source> Lexer<'source> {
 
             match c {
                 // 空白字符
-                ' ' | '\t' => {
+                b' ' | b'\t' => {
                     self.advance();
                     continue;
                 }
-                '\r' | '\n' => {
+                b'\r' | b'\n' => {
                     self.consume_newline();
                     continue;
                 }
                 // 注释
-                '-' if self.peek_next() == Some('-') => {
+                b'-' if self.peek_next() == Some(b'-') => {
                     self.advance(); // consume first '-'
                     self.advance(); // consume second '-'
                     if let Some(err) = self.skip_comment() {
@@ -219,7 +225,7 @@ impl<'source> Lexer<'source> {
                     }
                     continue;
                 }
-                '#' if self.line == 1 && self.column == 1 => {
+                b'#' if self.line == 1 && self.column == 1 => {
                     self.advance(); // consume first-line shebang/special comment marker
                     self.skip_line_comment();
                     continue;
@@ -233,123 +239,118 @@ impl<'source> Lexer<'source> {
 
         match c {
             // 单字符分隔符
-            '(' => self.make_token(
-                TokenType::from_char(c).unwrap_or(TokenType::Error),
-                c,
+            b'(' => self.make_token(
+                TokenType::from_byte(c).unwrap_or(TokenType::Error),
+                [c],
                 line,
                 col,
             ),
-            ')' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
-            '{' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
-            '}' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
-            ';' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
-            ',' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
-            ']' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
+            b')' => self.make_token(TokenType::from_byte(c).unwrap(), [c], line, col),
+            b'{' => self.make_token(TokenType::from_byte(c).unwrap(), [c], line, col),
+            b'}' => self.make_token(TokenType::from_byte(c).unwrap(), [c], line, col),
+            b';' => self.make_token(TokenType::from_byte(c).unwrap(), [c], line, col),
+            b',' => self.make_token(TokenType::from_byte(c).unwrap(), [c], line, col),
+            b']' => self.make_token(TokenType::from_byte(c).unwrap(), [c], line, col),
 
             // [ 可能是长字符串
-            '[' => self.try_long_string_or_token(line, col),
+            b'[' => self.try_long_string_or_token(line, col),
 
             // 单字符运算符
-            '+' | '*' | '/' | '^' | '%' | '-' | '#' => self.make_token(
-                TokenType::from_char(c).unwrap_or(TokenType::Error),
-                c,
+            b'+' | b'*' | b'/' | b'^' | b'%' | b'-' | b'#' => self.make_token(
+                TokenType::from_byte(c).unwrap_or(TokenType::Error),
+                [c],
                 line,
                 col,
             ),
 
-            ':' => self.make_token(TokenType::from_char(c).unwrap(), c, line, col),
+            b':' => self.make_token(TokenType::from_byte(c).unwrap(), [c], line, col),
 
-            '<' => {
-                let tt = if self.match_char('=') {
+            b'<' => {
+                let tt = if self.match_byte(b'=') {
                     TokenType::Le
                 } else {
-                    TokenType::from_char(c).unwrap_or(TokenType::Error)
+                    TokenType::from_byte(c).unwrap_or(TokenType::Error)
                 };
                 let lex = if tt == TokenType::Le {
-                    "<=".to_string()
+                    b"<=".as_slice()
                 } else {
-                    c.to_string()
+                    b"<".as_slice()
                 };
                 self.make_token(tt, lex, line, col)
             }
 
-            '>' => {
-                let tt = if self.match_char('=') {
+            b'>' => {
+                let tt = if self.match_byte(b'=') {
                     TokenType::Ge
                 } else {
-                    TokenType::from_char(c).unwrap_or(TokenType::Error)
+                    TokenType::from_byte(c).unwrap_or(TokenType::Error)
                 };
                 let lex = if tt == TokenType::Ge {
-                    ">=".to_string()
+                    b">=".as_slice()
                 } else {
-                    c.to_string()
+                    b">".as_slice()
                 };
                 self.make_token(tt, lex, line, col)
             }
 
-            '=' => {
-                let tt = if self.match_char('=') {
+            b'=' => {
+                let tt = if self.match_byte(b'=') {
                     TokenType::Eq
                 } else {
-                    TokenType::from_char(c).unwrap_or(TokenType::Error)
+                    TokenType::from_byte(c).unwrap_or(TokenType::Error)
                 };
                 let lex = if tt == TokenType::Eq {
-                    "==".to_string()
+                    b"==".as_slice()
                 } else {
-                    c.to_string()
+                    b"=".as_slice()
                 };
                 self.make_token(tt, lex, line, col)
             }
 
-            '~' => {
-                if self.match_char('=') {
-                    self.make_token(TokenType::Ne, "~=".to_string(), line, col)
+            b'~' => {
+                if self.match_byte(b'=') {
+                    self.make_token(TokenType::Ne, b"~=", line, col)
                 } else {
                     Token::new_error("unexpected symbol '~'".to_string(), line, col)
                 }
             }
 
-            '.' => {
-                if self.match_char('.') {
-                    if self.match_char('.') {
-                        self.make_token(TokenType::Dots, "...".to_string(), line, col)
+            b'.' => {
+                if self.match_byte(b'.') {
+                    if self.match_byte(b'.') {
+                        self.make_token(TokenType::Dots, b"...", line, col)
                     } else {
-                        self.make_token(TokenType::Concat, "..".to_string(), line, col)
+                        self.make_token(TokenType::Concat, b"..", line, col)
                     }
                 } else if self.peek().is_some_and(|nc| nc.is_ascii_digit()) {
                     // 小数：.5 → 0.5
                     self.scan_fractional_number(line, col)
                 } else {
-                    self.make_token(TokenType::from_char(c).unwrap(), c, line, col)
+                    self.make_token(TokenType::from_byte(c).unwrap(), [c], line, col)
                 }
             }
 
             // 字符串
-            '"' | '\'' => self.scan_short_string(c, line, col),
+            b'"' | b'\'' => self.scan_short_string(c, line, col),
 
             // 数字
-            '0'..='9' => self.scan_number(c, line, col),
+            b'0'..=b'9' => self.scan_number(c, line, col),
 
             // 标识符或关键字
-            'a'..='z' | 'A'..='Z' | '_' => self.scan_identifier(c, line, col),
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.scan_identifier(c, line, col),
 
-            // 非法字符
-            _ => Token::new_error_with_lexeme(
-                format!("unexpected character '{}'", c),
-                c.to_string(),
-                line,
-                col,
-            ),
+            // 非法字节。错误 token 保留原始字节，不进行 lossy 解码。
+            _ => Token::new_error_with_lexeme(format!("unexpected byte 0x{c:02X}"), [c], line, col),
         }
     }
 
     // ── 数字扫描 ──────────────────────────────────────────────────
 
-    fn scan_number(&mut self, first: char, line: i32, col: i32) -> Token {
-        let mut lexeme = String::from(first);
+    fn scan_number(&mut self, first: u8, line: i32, col: i32) -> Token {
+        let mut lexeme = String::from(char::from(first));
 
         // 检查十六进制
-        if first == '0' && self.peek() == Some('x') {
+        if first == b'0' && self.peek() == Some(b'x') {
             lexeme.push('x');
             self.advance();
             self.scan_hex_number(lexeme, line, col)
@@ -361,30 +362,30 @@ impl<'source> Lexer<'source> {
     fn scan_decimal_number(&mut self, mut lexeme: String, line: i32, col: i32) -> Token {
         // 整数部分
         while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            lexeme.push(self.advance().unwrap());
+            lexeme.push(char::from(self.advance().unwrap()));
         }
 
         // 小数部分
-        if self.peek() == Some('.') && self.peek_next() != Some('.') {
-            lexeme.push(self.advance().unwrap()); // '.'
+        if self.peek() == Some(b'.') && self.peek_next() != Some(b'.') {
+            lexeme.push(char::from(self.advance().unwrap())); // '.'
             while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                lexeme.push(self.advance().unwrap());
+                lexeme.push(char::from(self.advance().unwrap()));
             }
         }
 
         // 指数部分
-        if self.peek() == Some('e') || self.peek() == Some('E') {
+        if self.peek() == Some(b'e') || self.peek() == Some(b'E') {
             let next = self.peek_next();
             if next.is_some_and(|c| c.is_ascii_digit())
-                || ((next == Some('+') || next == Some('-'))
+                || ((next == Some(b'+') || next == Some(b'-'))
                     && self.peek_ahead(2).is_some_and(|c| c.is_ascii_digit()))
             {
-                lexeme.push(self.advance().unwrap()); // 'e' or 'E'
-                if self.peek() == Some('+') || self.peek() == Some('-') {
-                    lexeme.push(self.advance().unwrap());
+                lexeme.push(char::from(self.advance().unwrap())); // 'e' or 'E'
+                if self.peek() == Some(b'+') || self.peek() == Some(b'-') {
+                    lexeme.push(char::from(self.advance().unwrap()));
                 }
                 while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                    lexeme.push(self.advance().unwrap());
+                    lexeme.push(char::from(self.advance().unwrap()));
                 }
             }
         }
@@ -397,25 +398,25 @@ impl<'source> Lexer<'source> {
     fn scan_hex_number(&mut self, mut lexeme: String, line: i32, col: i32) -> Token {
         // 十六进制数字
         while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
-            lexeme.push(self.advance().unwrap());
+            lexeme.push(char::from(self.advance().unwrap()));
         }
 
         // 小数部分 (0x1.2p3)
-        if self.peek() == Some('.') && self.peek_next().is_some_and(|c| c.is_ascii_hexdigit()) {
-            lexeme.push(self.advance().unwrap()); // '.'
+        if self.peek() == Some(b'.') && self.peek_next().is_some_and(|c| c.is_ascii_hexdigit()) {
+            lexeme.push(char::from(self.advance().unwrap())); // '.'
             while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
-                lexeme.push(self.advance().unwrap());
+                lexeme.push(char::from(self.advance().unwrap()));
             }
         }
 
         // 指数部分 (p+3, p-3)
-        if self.peek() == Some('p') || self.peek() == Some('P') {
-            lexeme.push(self.advance().unwrap());
-            if self.peek() == Some('+') || self.peek() == Some('-') {
-                lexeme.push(self.advance().unwrap());
+        if self.peek() == Some(b'p') || self.peek() == Some(b'P') {
+            lexeme.push(char::from(self.advance().unwrap()));
+            if self.peek() == Some(b'+') || self.peek() == Some(b'-') {
+                lexeme.push(char::from(self.advance().unwrap()));
             }
             while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                lexeme.push(self.advance().unwrap());
+                lexeme.push(char::from(self.advance().unwrap()));
             }
         }
 
@@ -434,7 +435,7 @@ impl<'source> Lexer<'source> {
     fn scan_fractional_number(&mut self, line: i32, col: i32) -> Token {
         let mut lexeme = String::from(".");
         while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            lexeme.push(self.advance().unwrap());
+            lexeme.push(char::from(self.advance().unwrap()));
         }
 
         let value: f64 = lexeme.parse().unwrap_or(0.0);
@@ -443,84 +444,86 @@ impl<'source> Lexer<'source> {
 
     // ── 字符串扫描 ────────────────────────────────────────────────
 
-    fn scan_short_string(&mut self, quote: char, line: i32, col: i32) -> Token {
-        let mut lexeme = String::from(quote);
-        let mut value = String::new();
+    fn scan_short_string(&mut self, quote: u8, line: i32, col: i32) -> Token {
+        let mut lexeme = vec![quote];
+        let mut value = Vec::new();
 
         loop {
             match self.advance() {
                 None => {
-                    return Token::new_error("unterminated string".to_string(), line, col);
+                    return Token::new_error_with_lexeme(
+                        "unterminated string".to_string(),
+                        lexeme,
+                        line,
+                        col,
+                    );
                 }
-                Some('\n') | Some('\r') => {
-                    return Token::new_error("unterminated string".to_string(), line, col);
+                Some(b'\n') | Some(b'\r') => {
+                    return Token::new_error_with_lexeme(
+                        "unterminated string".to_string(),
+                        lexeme,
+                        line,
+                        col,
+                    );
                 }
                 Some(c) if c == quote => {
                     lexeme.push(c);
                     return Token::new_string(lexeme, value, line, col);
                 }
-                Some('\\') => {
-                    lexeme.push('\\');
+                Some(b'\\') => {
+                    lexeme.push(b'\\');
                     match self.peek() {
                         None => {
-                            return Token::new_error("unterminated string".to_string(), line, col);
+                            return Token::new_error_with_lexeme(
+                                "unterminated string".to_string(),
+                                lexeme,
+                                line,
+                                col,
+                            );
                         }
                         Some(ec) if Self::is_newline(ec) => {
                             let newline = self.consume_newline();
-                            lexeme.push_str(&newline);
-                            value.push('\n');
+                            lexeme.extend_from_slice(&newline);
+                            value.push(b'\n');
                         }
                         Some(ec) => {
                             self.advance();
                             lexeme.push(ec);
                             match ec {
-                                'a' => value.push('\x07'),
-                                'b' => value.push('\x08'),
-                                'f' => value.push('\x0C'),
-                                'n' => value.push('\n'),
-                                'r' => value.push('\r'),
-                                't' => value.push('\t'),
-                                'v' => value.push('\x0B'),
-                                '\\' => value.push('\\'),
-                                '"' => value.push('"'),
-                                '\'' => value.push('\''),
-                                '0'..='9' => {
+                                b'a' => value.push(0x07),
+                                b'b' => value.push(0x08),
+                                b'f' => value.push(0x0c),
+                                b'n' => value.push(b'\n'),
+                                b'r' => value.push(b'\r'),
+                                b't' => value.push(b'\t'),
+                                b'v' => value.push(0x0b),
+                                b'\\' => value.push(b'\\'),
+                                b'"' => value.push(b'"'),
+                                b'\'' => value.push(b'\''),
+                                b'0'..=b'9' => {
                                     // 十进制转义 \ddd
-                                    let mut digits = String::from(ec);
+                                    let mut code = u16::from(ec - b'0');
                                     for _ in 0..2 {
                                         if self.peek().is_some_and(|c| c.is_ascii_digit()) {
                                             let d = self.advance().unwrap();
                                             lexeme.push(d);
-                                            digits.push(d);
+                                            code = code * 10 + u16::from(d - b'0');
                                         } else {
                                             break;
                                         }
                                     }
-                                    let code: u32 = digits.parse().unwrap_or(0);
-                                    if let Some(ch) = char::from_u32(code) {
-                                        value.push(ch);
+                                    if code > u16::from(u8::MAX) {
+                                        return Token::new_error_with_lexeme(
+                                            "decimal escape too large".to_string(),
+                                            lexeme,
+                                            line,
+                                            col,
+                                        );
                                     }
-                                }
-                                'x' => {
-                                    // 十六进制转义 \xXX
-                                    let mut hex = String::new();
-                                    for _ in 0..2 {
-                                        if self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
-                                            let d = self.advance().unwrap();
-                                            lexeme.push(d);
-                                            hex.push(d);
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                    if let Ok(code) = u32::from_str_radix(&hex, 16)
-                                        && let Some(ch) = char::from_u32(code)
-                                    {
-                                        value.push(ch);
-                                    }
+                                    value.push(code as u8);
                                 }
                                 _ => {
-                                    // 未知转义序列 → 保留原字符
+                                    // Lua 5.1：未知转义仅丢弃反斜杠。
                                     value.push(ec);
                                 }
                             }
@@ -543,12 +546,12 @@ impl<'source> Lexer<'source> {
 
         // 读取 = 的数量
         let mut level = 0i32;
-        while self.peek() == Some('=') {
+        while self.peek() == Some(b'=') {
             self.advance();
             level += 1;
         }
 
-        if self.peek() == Some('[') {
+        if self.peek() == Some(b'[') {
             self.advance(); // consume second '['
             return self.scan_long_string(level, line, col);
         }
@@ -557,50 +560,51 @@ impl<'source> Lexer<'source> {
         self.rest = rest_snapshot;
         self.line = line_snapshot;
         self.column = col_snapshot;
-        self.make_token(TokenType::from_char('[').unwrap(), "[", line, col)
+        self.make_token(TokenType::from_byte(b'[').unwrap(), b"[", line, col)
     }
 
     fn scan_long_string(&mut self, level: i32, line: i32, col: i32) -> Token {
-        let mut lexeme = String::from("[");
-        for _ in 0..level {
-            lexeme.push('=');
-        }
-        lexeme.push('[');
+        let mut lexeme = vec![b'['];
+        lexeme.resize(1 + level as usize, b'=');
+        lexeme.push(b'[');
 
-        let mut value = String::new();
+        let mut value = Vec::new();
 
         // Lua 5.1: skip first newline after opening bracket
         if self.peek().is_some_and(Self::is_newline) {
-            lexeme.push_str(&self.consume_newline());
+            lexeme.extend_from_slice(&self.consume_newline());
         }
 
         loop {
             match self.peek() {
                 None => {
-                    return Token::new_error("unfinished long string".to_string(), line, col);
+                    return Token::new_error_with_lexeme(
+                        "unfinished long string".to_string(),
+                        lexeme,
+                        line,
+                        col,
+                    );
                 }
-                Some(']') => {
+                Some(b']') => {
                     self.advance();
-                    lexeme.push(']');
+                    lexeme.push(b']');
                     // 检查是否是结束分隔符 ]=*]
                     let mut close_level = 0i32;
-                    while close_level < level && self.peek() == Some('=') {
+                    while close_level < level && self.peek() == Some(b'=') {
                         lexeme.push(self.advance().unwrap());
                         close_level += 1;
                     }
-                    if close_level == level && self.peek() == Some(']') {
+                    if close_level == level && self.peek() == Some(b']') {
                         lexeme.push(self.advance().unwrap());
                         return Token::new_string(lexeme, value, line, col);
                     }
                     // 不是结束符，继续添加
-                    value.push(']');
-                    for _ in 0..close_level {
-                        value.push('=');
-                    }
+                    value.push(b']');
+                    value.extend(std::iter::repeat_n(b'=', close_level as usize));
                 }
                 Some(c) if Self::is_newline(c) => {
-                    lexeme.push_str(&self.consume_newline());
-                    value.push('\n');
+                    lexeme.extend_from_slice(&self.consume_newline());
+                    value.push(b'\n');
                 }
                 Some(c) => {
                     self.advance();
@@ -613,15 +617,20 @@ impl<'source> Lexer<'source> {
 
     // ── 标识符/关键字扫描 ────────────────────────────────────────
 
-    fn scan_identifier(&mut self, first: char, line: i32, col: i32) -> Token {
-        let mut lexeme = String::from(first);
+    fn scan_identifier(&mut self, first: u8, line: i32, col: i32) -> Token {
+        let mut lexeme = vec![first];
 
-        while self.peek().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
             lexeme.push(self.advance().unwrap());
         }
 
         // 检查是否为关键字
-        if let Some(kw_type) = lookup_keyword(&lexeme) {
+        let identifier =
+            std::str::from_utf8(&lexeme).expect("lexer invariant: identifier bytes are ASCII");
+        if let Some(kw_type) = lookup_keyword(identifier) {
             // 特殊处理 true/false/nil
             let value = match kw_type {
                 TokenType::True => TokenValue::None, // 在 Lua 中 true 是关键词，不是字面量
@@ -644,16 +653,16 @@ impl<'source> Lexer<'source> {
         let (line, col) = (self.line, self.column);
 
         // 检查是否为长注释 --[[ 或 --[=[ ... ]=]
-        if self.peek() == Some('[') {
+        if self.peek() == Some(b'[') {
             self.advance(); // consume '['
 
             let mut level = 0i32;
-            while self.peek() == Some('=') {
+            while self.peek() == Some(b'=') {
                 self.advance();
                 level += 1;
             }
 
-            if self.peek() == Some('[') {
+            if self.peek() == Some(b'[') {
                 self.advance(); // consume second '['
                 return self.skip_long_comment(level, line, col);
             }
@@ -669,7 +678,7 @@ impl<'source> Lexer<'source> {
 
     fn skip_line_comment(&mut self) {
         while let Some(c) = self.peek() {
-            if c == '\n' || c == '\r' {
+            if c == b'\n' || c == b'\r' {
                 break;
             }
             self.advance();
@@ -691,14 +700,14 @@ impl<'source> Lexer<'source> {
                         start_col,
                     ));
                 }
-                Some(']') => {
+                Some(b']') => {
                     self.advance();
                     let mut close_level = 0i32;
-                    while close_level < level && self.peek() == Some('=') {
+                    while close_level < level && self.peek() == Some(b'=') {
                         self.advance();
                         close_level += 1;
                     }
-                    if close_level == level && self.peek() == Some(']') {
+                    if close_level == level && self.peek() == Some(b']') {
                         self.advance();
                         return None; // 成功闭合
                     }
@@ -718,20 +727,20 @@ impl<'source> Lexer<'source> {
     fn make_token(
         &self,
         token_type: TokenType,
-        lexeme: impl Into<String>,
+        lexeme: impl AsRef<[u8]>,
         line: i32,
         column: i32,
     ) -> Token {
-        Token::new(token_type, lexeme.into(), line, column)
+        Token::new(token_type, lexeme, line, column)
     }
 
     fn make_eos(&self) -> Token {
         Token::eos(self.line, self.column)
     }
 
-    /// 前瞻 N 个字符
-    fn peek_ahead(&self, n: usize) -> Option<char> {
-        self.rest.chars().nth(n)
+    /// 前瞻 N 个字节
+    fn peek_ahead(&self, n: usize) -> Option<u8> {
+        self.rest.get(n).copied()
     }
 }
 
@@ -740,29 +749,29 @@ impl<'source> Lexer<'source> {
 // =====================================================================
 
 impl TokenType {
-    /// 从单字符获取 TokenType
-    fn from_char(c: char) -> Option<TokenType> {
+    /// 从单字节获取 TokenType
+    fn from_byte(c: u8) -> Option<TokenType> {
         match c {
-            '+' => Some(TokenType::Plus),
-            '-' => Some(TokenType::Minus),
-            '*' => Some(TokenType::Star),
-            '/' => Some(TokenType::Slash),
-            '^' => Some(TokenType::Caret),
-            '%' => Some(TokenType::Percent),
-            '=' => Some(TokenType::Assign),
-            '<' => Some(TokenType::Lt),
-            '>' => Some(TokenType::Gt),
-            '(' => Some(TokenType::LParen),
-            ')' => Some(TokenType::RParen),
-            '{' => Some(TokenType::LBrace),
-            '}' => Some(TokenType::RBrace),
-            '[' => Some(TokenType::LBracket),
-            ']' => Some(TokenType::RBracket),
-            ';' => Some(TokenType::Semicolon),
-            ',' => Some(TokenType::Comma),
-            '.' => Some(TokenType::Dot),
-            '#' => Some(TokenType::Len),
-            ':' => Some(TokenType::Colon),
+            b'+' => Some(TokenType::Plus),
+            b'-' => Some(TokenType::Minus),
+            b'*' => Some(TokenType::Star),
+            b'/' => Some(TokenType::Slash),
+            b'^' => Some(TokenType::Caret),
+            b'%' => Some(TokenType::Percent),
+            b'=' => Some(TokenType::Assign),
+            b'<' => Some(TokenType::Lt),
+            b'>' => Some(TokenType::Gt),
+            b'(' => Some(TokenType::LParen),
+            b')' => Some(TokenType::RParen),
+            b'{' => Some(TokenType::LBrace),
+            b'}' => Some(TokenType::RBrace),
+            b'[' => Some(TokenType::LBracket),
+            b']' => Some(TokenType::RBracket),
+            b';' => Some(TokenType::Semicolon),
+            b',' => Some(TokenType::Comma),
+            b'.' => Some(TokenType::Dot),
+            b'#' => Some(TokenType::Len),
+            b':' => Some(TokenType::Colon),
             _ => None,
         }
     }
@@ -774,6 +783,8 @@ impl TokenType {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::approx_constant)]
+
     use super::*;
 
     /// 辅助函数：扫描所有 Token 并返回 Vec
@@ -810,7 +821,7 @@ mod tests {
             let tokens = scan_non_eos(kw);
             assert_eq!(tokens.len(), 1, "Failed for keyword: {}", kw);
             assert!(tokens[0].is_keyword(), "Not a keyword: {}", kw);
-            assert_eq!(tokens[0].lexeme, kw);
+            assert_eq!(tokens[0].lexeme.as_bytes(), kw.as_bytes());
         }
     }
 
@@ -828,7 +839,7 @@ mod tests {
         assert_eq!(tokens.len(), 4);
         for (i, name) in ["foo", "bar_123", "_private", "X1"].iter().enumerate() {
             assert_eq!(tokens[i].token_type, TokenType::Name);
-            assert_eq!(tokens[i].lexeme, *name);
+            assert_eq!(tokens[i].lexeme.as_bytes(), name.as_bytes());
         }
     }
 
@@ -896,8 +907,8 @@ mod tests {
         assert_eq!(tokens.len(), 2);
         assert!(tokens[0].is_string());
         assert!(tokens[1].is_string());
-        assert!(matches!(&tokens[0].value, TokenValue::String(s) if s == "hello"));
-        assert!(matches!(&tokens[1].value, TokenValue::String(s) if s == "world"));
+        assert!(matches!(&tokens[0].value, TokenValue::String(s) if s.as_bytes() == b"hello"));
+        assert!(matches!(&tokens[1].value, TokenValue::String(s) if s.as_bytes() == b"world"));
     }
 
     #[test]
@@ -905,7 +916,9 @@ mod tests {
         let source = r#""a\nb\tc\\d\"e""#;
         let tokens = scan_non_eos(source);
         assert_eq!(tokens.len(), 1);
-        assert!(matches!(&tokens[0].value, TokenValue::String(s) if s == "a\nb\tc\\d\"e"));
+        assert!(
+            matches!(&tokens[0].value, TokenValue::String(s) if s.as_bytes() == b"a\nb\tc\\d\"e")
+        );
     }
 
     #[test]
@@ -913,7 +926,7 @@ mod tests {
         for source in ["\"\\\n\"", "\"\\\r\"", "\"\\\r\n\"", "\"\\\n\r\""] {
             let tokens = scan_non_eos(source);
             assert_eq!(tokens.len(), 1);
-            assert!(matches!(&tokens[0].value, TokenValue::String(s) if s == "\n"));
+            assert!(matches!(&tokens[0].value, TokenValue::String(s) if s.as_bytes() == b"\n"));
         }
     }
 
@@ -933,7 +946,9 @@ mod tests {
         let tokens = scan_non_eos(source);
         assert_eq!(tokens.len(), 1);
         assert!(tokens[0].is_string());
-        assert!(matches!(&tokens[0].value, TokenValue::String(s) if s == "hello\nworld"));
+        assert!(
+            matches!(&tokens[0].value, TokenValue::String(s) if s.as_bytes() == b"hello\nworld")
+        );
     }
 
     #[test]
@@ -942,7 +957,9 @@ mod tests {
         let tokens = scan_non_eos(source);
         assert_eq!(tokens.len(), 1);
         assert!(tokens[0].is_string());
-        assert!(matches!(&tokens[0].value, TokenValue::String(s) if s == "hello [world] foo"));
+        assert!(
+            matches!(&tokens[0].value, TokenValue::String(s) if s.as_bytes() == b"hello [world] foo")
+        );
     }
 
     #[test]
@@ -1036,7 +1053,7 @@ mod tests {
         assert_eq!(tokens.len(), 6);
         assert_eq!(tokens[0].token_type, TokenType::Local);
         assert_eq!(tokens[1].token_type, TokenType::Name);
-        assert_eq!(tokens[1].lexeme, "x");
+        assert_eq!(tokens[1].lexeme.as_bytes(), b"x");
         assert_eq!(tokens[2].token_type, TokenType::Assign);
         assert!(tokens[3].is_number());
         assert_eq!(tokens[4].token_type, TokenType::Plus);
@@ -1085,7 +1102,7 @@ mod tests {
     fn test_column_tracking() {
         let source = "  x";
         let tokens = scan_non_eos(source);
-        assert_eq!(tokens[0].lexeme, "x");
+        assert_eq!(tokens[0].lexeme.as_bytes(), b"x");
         assert_eq!(tokens[0].column, 3); // after two spaces
     }
 

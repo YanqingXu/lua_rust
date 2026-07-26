@@ -23,29 +23,40 @@ impl GarbageCollector {
     pub fn clear_weak_table_entries(&mut self) {
         // 克隆列表以避免在清理期间修改时出现借用冲突。兼容路径可能在
         // 多次轻量 collect 后清空注册列表，所以同时从对象链补扫弱表位。
-        let mut weak_tables: Vec<*mut GcObjectHeader> = self.weak_tables.clone();
+        let mut weak_tables = self.weak_tables.clone();
         let mut current = self.all_objects;
         while !current.is_null() {
-            // SAFETY: current walks the GC intrusive object list.
-            unsafe {
-                if (*current).gc_type() == crate::types::GcObjectType::Table
-                    && ((*current).marked() & bits::WEAKBITS) != 0
-                    && !weak_tables.contains(&current)
-                {
-                    weak_tables.push(current);
-                }
-                current = (*current).next();
+            if !self.contains_object(current) {
+                self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
+                break;
             }
+            // SAFETY: address membership proves `current` is a registered
+            // intrusive-list node before its link is read.
+            let next = unsafe { (*current).next() };
+            if let Some(table_ref) = self.registered_ref_from_ptr(current.cast::<Table>())
+                && self.validate_ref(table_ref).is_ok_and(|pointer| {
+                    let header = pointer.as_ptr().cast::<GcObjectHeader>();
+                    // SAFETY: pointer, identity, and Table tag were validated.
+                    unsafe { ((*header).marked() & bits::WEAKBITS) != 0 }
+                })
+                && !weak_tables.contains(&table_ref)
+            {
+                weak_tables.push(table_ref);
+            }
+            current = next;
         }
 
-        for &table_header in &weak_tables {
-            if table_header.is_null() {
+        for table_ref in weak_tables {
+            let Ok(table_pointer) = self.validate_ref(table_ref) else {
+                self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
                 continue;
-            }
+            };
+            let table_header = table_pointer.as_ptr().cast::<GcObjectHeader>();
 
             // 读取弱模式标志位
             let (weak_keys, weak_values) = {
-                // SAFETY: table_header is valid and not dead
+                // SAFETY: the side table matched address, identity, and Table
+                // tag before this header read.
                 let marked = unsafe { (*table_header).marked() };
                 let wk = (marked & bits::WEAKKEY) != 0;
                 let wv = (marked & bits::WEAKVALUE) != 0;
@@ -56,10 +67,10 @@ impl GarbageCollector {
                 continue;
             }
 
-            // 清理弱表中的死亡条目
-            // SAFETY: table_header points to a valid Table
+            // SAFETY: table identity and concrete tag were validated above;
+            // mutable collector access prevents destruction during cleanup.
             unsafe {
-                let table = &mut *(table_header as *mut Table);
+                let table = &mut *table_pointer.as_ptr();
                 Self::remove_weak_entries_from_table(table, self, weak_keys, weak_values);
             }
         }
@@ -85,17 +96,17 @@ impl GarbageCollector {
             let key_pending_finalizer = matches!(
                 &k,
                 Value::Userdata(userdata)
-                    if gc
-                        .pending_finalizers
-                        .contains(&(userdata.as_ptr() as *mut GcObjectHeader))
+                    if gc.pending_finalizers.contains(userdata)
             );
             let key_finalized_userdata = matches!(
                 &k,
                 Value::Userdata(userdata) if {
-                    let header = userdata.as_ptr() as *mut GcObjectHeader;
-                    // SAFETY: userdata is a GC reference stored in the table
-                    // key; weak cleanup runs before sweep frees the header.
-                    unsafe { (*header).is_finalized() }
+                    gc.validate_ref(*userdata).is_ok_and(|pointer| {
+                        let header = pointer.as_ptr().cast::<GcObjectHeader>();
+                        // SAFETY: validation matched allocation identity and
+                        // the Userdata tag before this header read.
+                        unsafe { (*header).is_finalized() }
+                    })
                 } && !key_pending_finalizer
             );
             if weak_keys
@@ -158,7 +169,7 @@ mod tests {
     #[test]
     fn test_is_object_dead_null() {
         let gc = GarbageCollector::new();
-        assert!(!gc.is_object_dead(std::ptr::null_mut()));
+        assert!(gc.is_object_dead(crate::gc::gc_ref::GcRef::<Table>::null()));
     }
 
     #[test]
@@ -172,8 +183,10 @@ mod tests {
     #[test]
     fn test_is_value_dead_string_always_alive() {
         let mut gc = GarbageCollector::new();
-        let s = gc.create(GcString::new("alive"));
+        let s = gc.create(GcString::from_bytes(b"alive"));
         // 字符串即使白色也被视为存活
+        // SAFETY: `s` is a live registered object, and `GcObject` guarantees
+        // that its header is the first field.
         unsafe {
             let h = s.as_ptr() as *mut GcObjectHeader;
             (*h).set_color(crate::types::GcColor::White);
@@ -187,6 +200,8 @@ mod tests {
         let t = gc.create(Table::new());
 
         // 白色 → 死
+        // SAFETY: `t` remains live and registered with `gc` throughout these
+        // mark-bit checks.
         unsafe {
             let h = t.as_ptr() as *mut GcObjectHeader;
             (*h).set_color(crate::types::GcColor::White);
@@ -194,6 +209,7 @@ mod tests {
         assert!(gc.is_value_dead(&Value::Table(t)));
 
         // 黑色 → 活
+        // SAFETY: `t` has not been swept or relocated since the prior access.
         unsafe {
             let h = t.as_ptr() as *mut GcObjectHeader;
             (*h).set_color(crate::types::GcColor::Black);
@@ -209,16 +225,19 @@ mod tests {
         let table = gc.create_root(Table::new());
         let table_header = table.as_ptr() as *mut GcObjectHeader;
 
+        // SAFETY: `table_header` comes from the live rooted table and points
+        // to its leading `GcObjectHeader`.
         unsafe {
             (*table_header).set_marked((*table_header).marked() | bits::WEAKVALUE);
         }
-        gc.weak_tables.push(table_header);
+        gc.weak_tables.push(table);
 
         // Insert a child Table reference
         let child = gc.create(Table::new());
         let child_header = child.as_ptr() as *mut GcObjectHeader;
 
         // Make child white (dead)
+        // SAFETY: `child_header` comes from a live table registered with `gc`.
         unsafe {
             (*child_header).set_color(crate::types::GcColor::White);
         }
@@ -227,13 +246,14 @@ mod tests {
         assert!(gc.is_weak_value_dead(&Value::Table(child)));
 
         // Verify: dead white object is detected
-        assert!(gc.is_object_dead(child_header));
+        assert!(gc.is_object_dead(child));
 
         // Verify: alive (black) object is not dead
+        // SAFETY: no sweep occurs between creation and this header mutation.
         unsafe {
             (*child_header).set_color(crate::types::GcColor::Black);
         }
-        assert!(!gc.is_object_dead(child_header));
+        assert!(!gc.is_object_dead(child));
         assert!(!gc.is_weak_value_dead(&Value::Table(child)));
     }
 }

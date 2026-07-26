@@ -32,7 +32,7 @@ fn reg(
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::new(name));
+    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
     let func_obj = gc.create(Function::new_c(func));
     // SAFETY: table points to the library table created and rooted by open_library.
     unsafe {
@@ -49,7 +49,7 @@ fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
             if let Value::String(key_ref) = key
                 // SAFETY: key is held by the rooted global table.
                 && let Some(key_str) = unsafe { key_ref.as_ref() }
-                && key_str.data() == name
+                && key_str.as_bytes() == name.as_bytes()
                 && let Value::Table(t) = val
             {
                 return *t;
@@ -71,12 +71,19 @@ unsafe extern "C" fn lua_coroutine_create(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     let func = l.at(1).cloned().unwrap_or(Value::Nil);
     if !matches!(func, Value::Function(_)) {
-        return push_error(l, "bad argument #1 to 'create' (function expected)");
+        return push_error(l, b"bad argument #1 to 'create' (function expected)");
     }
 
-    let thread_ref = create_thread(l, gc, func);
-    l.push_value(Value::Thread(thread_ref));
-    1
+    match create_thread(l, gc, func) {
+        Ok(thread_ref) => {
+            l.push_value(Value::Thread(thread_ref));
+            1
+        }
+        Err(error) => {
+            l.push_value(error);
+            -1
+        }
+    }
 }
 
 unsafe extern "C" fn lua_coroutine_resume(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -92,12 +99,12 @@ unsafe extern "C" fn lua_coroutine_resume(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     let Value::Thread(thread_ref) = l.at(1).cloned().unwrap_or(Value::Nil) else {
         l.push_boolean(false);
-        push_lua_string(l, gc, "bad argument #1 to 'resume' (coroutine expected)");
+        push_lua_bytes(l, gc, b"bad argument #1 to 'resume' (coroutine expected)");
         return 2;
     };
     let args = args_from(l, 2);
 
-    match resume_thread(thread_ref, gc, &args) {
+    match resume_thread(l, thread_ref, gc, &args) {
         Ok(values) => {
             let count = 1 + values.len();
             l.push_boolean(true);
@@ -130,8 +137,8 @@ unsafe extern "C" fn lua_coroutine_status(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     let status = with_thread(thread_ref, |thread| thread.status())
         .map(status_name)
-        .unwrap_or("dead");
-    push_lua_string(l, gc, status);
+        .unwrap_or(b"dead");
+    push_lua_bytes(l, gc, status);
     1
 }
 
@@ -158,10 +165,16 @@ unsafe extern "C" fn lua_coroutine_wrap(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     let func = l.at(1).cloned().unwrap_or(Value::Nil);
     if !matches!(func, Value::Function(_)) {
-        return push_error(l, "bad argument #1 to 'wrap' (function expected)");
+        return push_error(l, b"bad argument #1 to 'wrap' (function expected)");
     }
 
-    let thread_ref = create_thread(l, gc, func);
+    let thread_ref = match create_thread(l, gc, func) {
+        Ok(thread_ref) => thread_ref,
+        Err(error) => {
+            l.push_value(error);
+            return -1;
+        }
+    };
     let upvalue_ref = gc.create(Upvalue::new_closed(Value::Thread(thread_ref)));
     let mut wrapper = Function::new_c(lua_coroutine_wrap_runner);
     wrapper.add_upvalue(upvalue_ref);
@@ -181,11 +194,11 @@ unsafe extern "C" fn lua_coroutine_wrap_runner(l_ptr: *mut std::ffi::c_void) -> 
     let gc = unsafe { &mut *gc_ptr };
 
     let Some(Value::Thread(thread_ref)) = current_upvalue(l, 0) else {
-        return push_error(l, "coroutine wrapper is missing its thread");
+        return push_error(l, b"coroutine wrapper is missing its thread");
     };
     let args = args_from(l, 1);
 
-    match resume_thread(thread_ref, gc, &args) {
+    match resume_thread(l, thread_ref, gc, &args) {
         Ok(values) => {
             let count = values.len();
             for value in values {
@@ -208,7 +221,11 @@ unsafe extern "C" fn lua_coroutine_yield(l_ptr: *mut std::ffi::c_void) -> i32 {
     0
 }
 
-fn create_thread(l: &LuaState, gc: &mut GarbageCollector, entry: Value) -> GcRef<Thread> {
+fn create_thread(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    entry: Value,
+) -> Result<GcRef<Thread>, Value> {
     let mut co_state = if let Some(global) = l.global_table {
         LuaState::with_global_table(global)
     } else {
@@ -223,59 +240,85 @@ fn create_thread(l: &LuaState, gc: &mut GarbageCollector, entry: Value) -> GcRef
     co_state.number_metatable = l.number_metatable;
     co_state.push_value(entry);
 
+    let handle = l
+        .insert_coroutine_state(co_state)
+        .map_err(|err| diagnostic_string_value(gc, &format!("invalid coroutine state: {err}")))?;
     let mut thread = Thread::new();
-    let state_ptr = Box::into_raw(Box::new(co_state)) as *mut std::ffi::c_void;
-    thread.set_lua_state(state_ptr);
+    thread.set_state_handle(handle);
     let thread_ref = gc.create(thread);
-    // SAFETY: state_ptr was created from Box<LuaState> above and is owned by the Thread.
-    unsafe { (*(state_ptr as *mut LuaState)).current_thread = Some(thread_ref) };
-    thread_ref
+    l.with_resolved_state_mut(handle, |state| {
+        state.current_thread = Some(thread_ref);
+    })
+    .map_err(|err| diagnostic_string_value(gc, &format!("invalid coroutine state: {err}")))?;
+    Ok(thread_ref)
 }
 
 fn resume_thread(
+    current: &mut LuaState,
     thread_ref: GcRef<Thread>,
     gc: &mut GarbageCollector,
     args: &[Value],
 ) -> Result<Vec<Value>, Value> {
-    let thread = thread_mut(thread_ref).ok_or_else(|| lua_string_value(gc, "invalid coroutine"))?;
-    if thread.is_dead() {
-        return Err(lua_string_value(gc, "cannot resume dead coroutine"));
+    let (status, first_resume, handle) = with_thread(thread_ref, |thread| {
+        (
+            thread.status(),
+            thread.is_first_resume(),
+            thread.state_handle(),
+        )
+    })
+    .ok_or_else(|| lua_ascii_value(gc, b"invalid coroutine"))?;
+    if status == CoroutineStatus::Dead {
+        return Err(lua_ascii_value(gc, b"cannot resume dead coroutine"));
     }
-    if thread.is_running() {
-        return Err(lua_string_value(gc, "cannot resume running coroutine"));
+    if status == CoroutineStatus::Running {
+        return Err(lua_ascii_value(gc, b"cannot resume running coroutine"));
     }
+    let handle = handle.ok_or_else(|| lua_ascii_value(gc, b"invalid coroutine"))?;
 
-    let co_state = thread_state_mut(thread)?;
-    co_state.gc = Some(gc as *mut GarbageCollector);
+    current
+        .with_resolved_state_mut(handle, |co_state| {
+            co_state.gc = Some(gc as *mut GarbageCollector);
 
-    if thread.is_first_resume() {
-        install_initial_args(co_state, args);
-        start_lua_call_at_stack(co_state, gc, 0, args.len(), None)
-            .map_err(|err| runtime_error_value(gc, err))?;
-        thread.mark_resumed();
-    } else {
-        install_resume_args(co_state, args);
-    }
+            if first_resume {
+                install_initial_args(co_state, args);
+                start_lua_call_at_stack(co_state, gc, 0, args.len(), None)
+                    .map_err(|err| runtime_error_value(gc, err))?;
+                with_thread_mut(thread_ref, Thread::mark_resumed)
+                    .ok_or_else(|| lua_ascii_value(gc, b"invalid coroutine"))?;
+            } else {
+                install_resume_args(co_state, args);
+            }
 
-    thread.set_status(CoroutineStatus::Running);
-    match resume_lua_thread(co_state, gc) {
-        Ok(ExecResult::Yielded) => {
-            thread.set_status(CoroutineStatus::Suspended);
-            co_state.last_error = None;
-            Ok(co_state.yielded_values.clone())
-        }
-        Ok(ExecResult::Returned) => {
-            thread.set_status(CoroutineStatus::Dead);
-            co_state.last_error = None;
-            Ok(stack_values(co_state))
-        }
-        Err(err) => {
-            thread.set_status(CoroutineStatus::Dead);
-            let error = runtime_error_value(gc, err);
-            co_state.last_error = Some(error.clone());
-            Err(error)
-        }
-    }
+            with_thread_mut(thread_ref, |thread| {
+                thread.set_status(CoroutineStatus::Running);
+            })
+            .ok_or_else(|| lua_ascii_value(gc, b"invalid coroutine"))?;
+            match resume_lua_thread(co_state, gc) {
+                Ok(ExecResult::Yielded) => {
+                    with_thread_mut(thread_ref, |thread| {
+                        thread.set_status(CoroutineStatus::Suspended);
+                    });
+                    co_state.last_error = None;
+                    Ok(co_state.yielded_values.clone())
+                }
+                Ok(ExecResult::Returned) => {
+                    with_thread_mut(thread_ref, |thread| {
+                        thread.set_status(CoroutineStatus::Dead);
+                    });
+                    co_state.last_error = None;
+                    Ok(stack_values(co_state))
+                }
+                Err(err) => {
+                    with_thread_mut(thread_ref, |thread| {
+                        thread.set_status(CoroutineStatus::Dead);
+                    });
+                    let error = runtime_error_value(gc, err);
+                    co_state.last_error = Some(error.clone());
+                    Err(error)
+                }
+            }
+        })
+        .map_err(|err| diagnostic_string_value(gc, &format!("invalid coroutine state: {err}")))?
 }
 
 fn install_initial_args(l: &mut LuaState, args: &[Value]) {
@@ -339,59 +382,109 @@ fn current_upvalue(l: &LuaState, index: usize) -> Option<Value> {
     Some(upvalue.get_closed_value().clone())
 }
 
-fn with_thread<T>(thread_ref: GcRef<Thread>, f: impl FnOnce(&Thread) -> T) -> Option<T> {
+fn with_thread<T>(
+    thread_ref: GcRef<Thread>,
+    f: impl for<'thread> FnOnce(&'thread Thread) -> T,
+) -> Option<T> {
     // SAFETY: the thread value is held on a Lua stack or in a closure upvalue.
     let thread = unsafe { thread_ref.as_ref() }?;
     Some(f(thread))
 }
 
-fn thread_mut(thread_ref: GcRef<Thread>) -> Option<&'static mut Thread> {
+fn with_thread_mut<T>(
+    thread_ref: GcRef<Thread>,
+    f: impl for<'thread> FnOnce(&'thread mut Thread) -> T,
+) -> Option<T> {
     if thread_ref.is_null() {
         return None;
     }
-    // SAFETY: coroutine functions serialize access through a single Lua VM thread.
-    Some(unsafe { &mut *(thread_ref.as_ptr() as *mut Thread) })
+    // SAFETY: the thread is held by a live Lua value and coroutine mutations
+    // are serialized by the single-threaded VM. The HRTB closure prevents the
+    // mutable reference from escaping this call.
+    Some(f(unsafe { &mut *(thread_ref.as_ptr() as *mut Thread) }))
 }
 
-fn thread_state_mut(thread: &mut Thread) -> Result<&'static mut LuaState, Value> {
-    let ptr = thread.lua_state() as *mut LuaState;
-    if ptr.is_null() {
-        return Err(Value::Nil);
-    }
-    // SAFETY: create_thread installs a Box<LuaState> pointer into the Thread.
-    Ok(unsafe { &mut *ptr })
-}
-
-fn status_name(status: CoroutineStatus) -> &'static str {
+fn status_name(status: CoroutineStatus) -> &'static [u8] {
     match status {
-        CoroutineStatus::Suspended => "suspended",
-        CoroutineStatus::Running => "running",
-        CoroutineStatus::Normal => "normal",
-        CoroutineStatus::Dead => "dead",
+        CoroutineStatus::Suspended => b"suspended",
+        CoroutineStatus::Running => b"running",
+        CoroutineStatus::Normal => b"normal",
+        CoroutineStatus::Dead => b"dead",
     }
 }
 
-fn push_lua_string(l: &mut LuaState, gc: &mut GarbageCollector, text: &str) {
-    let s = gc.create(GcString::new(text));
+fn push_lua_bytes(l: &mut LuaState, gc: &mut GarbageCollector, bytes: &[u8]) {
+    let s = gc.create(GcString::from_bytes(bytes));
     l.push_value(Value::String(s));
 }
 
-fn lua_string_value(gc: &mut GarbageCollector, text: &str) -> Value {
-    Value::String(gc.create(GcString::new(text)))
+fn lua_ascii_value(gc: &mut GarbageCollector, bytes: &'static [u8]) -> Value {
+    debug_assert!(bytes.is_ascii());
+    Value::String(gc.create(GcString::from_bytes(bytes)))
+}
+
+/// Convert host diagnostic text at the explicit UTF-8 boundary.
+fn diagnostic_string_value(gc: &mut GarbageCollector, text: &str) -> Value {
+    Value::String(gc.create(GcString::from_utf8_text(text)))
 }
 
 fn runtime_error_value(gc: &mut GarbageCollector, err: lua_vm::RuntimeError) -> Value {
     err.error_value()
-        .unwrap_or_else(|| lua_string_value(gc, &err.message))
+        .unwrap_or_else(|| diagnostic_string_value(gc, &err.message))
 }
 
-fn push_error(l: &mut LuaState, message: &str) -> i32 {
+fn push_error(l: &mut LuaState, message: &'static [u8]) -> i32 {
     if let Some(gc_ptr) = l.gc {
         // SAFETY: LuaState::gc is installed by the VM before calling C functions.
         let gc = unsafe { &mut *gc_ptr };
-        push_lua_string(l, gc, message);
+        push_lua_bytes(l, gc, message);
     } else {
         l.push_nil();
     }
     -1
+}
+
+#[cfg(test)]
+mod byte_string_tests {
+    use super::*;
+
+    #[test]
+    fn library_lookup_requires_the_exact_ascii_key_bytes() {
+        let mut gc = GarbageCollector::new();
+        let target = gc.create(Table::new());
+        let decoy = gc.create(Table::new());
+        let exact_key = gc.create(GcString::from_bytes(b"coroutine"));
+        let invalid_prefix_key = gc.create(GcString::from_bytes(b"coroutine\0\xff"));
+        let mut global = Table::new();
+        global.set(&Value::String(invalid_prefix_key), &Value::Table(decoy));
+        global.set(&Value::String(exact_key), &Value::Table(target));
+        let global_ref = gc.create(global);
+        let state = LuaState::with_global_table(global_ref);
+
+        assert_eq!(find_lib_table(&state, "coroutine"), target);
+        assert_ne!(find_lib_table(&state, "coroutine"), decoy);
+    }
+
+    #[test]
+    fn status_protocol_values_are_ascii_bytes() {
+        assert_eq!(status_name(CoroutineStatus::Suspended), b"suspended");
+        assert_eq!(status_name(CoroutineStatus::Running), b"running");
+        assert_eq!(status_name(CoroutineStatus::Normal), b"normal");
+        assert_eq!(status_name(CoroutineStatus::Dead), b"dead");
+    }
+
+    #[test]
+    fn lua_byte_results_preserve_nul_and_invalid_utf8() {
+        let mut gc = GarbageCollector::new();
+        let mut state = LuaState::new();
+        let bytes = [0, 0xff, 0x80, b'x'];
+
+        push_lua_bytes(&mut state, &mut gc, &bytes);
+        let Value::String(string_ref) = state.at(-1).expect("result is pushed") else {
+            panic!("expected Lua string result");
+        };
+        // SAFETY: the collector remains alive and no collection runs.
+        let string = unsafe { string_ref.as_ref() }.expect("test string is live");
+        assert_eq!(string.as_bytes(), bytes);
+    }
 }

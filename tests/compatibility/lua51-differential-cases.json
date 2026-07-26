@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "normalization": {
+    "stdout": ["crlf-to-lf"],
+    "stderr": ["crlf-to-lf"]
+  },
+  "expectedDifferences": [
+    {
+      "id": "official-version-project-identity",
+      "lane": "official-lua51",
+      "probe": "_VERSION",
+      "fields": ["stdout"],
+      "referenceUtf8": "Lua 5.1\n",
+      "candidateUtf8": "Lua 5.1 (C core prototype)\n",
+      "deviation": "NOTE-001"
+    }
+  ],
+  "cases": [
+    {
+      "id": "value-types",
+      "script": "tests/lua/differential/value-types.lua",
+      "evidence": ["stdout", "stderr", "exitStatus", "returnValueTypes"]
+    },
+    {
+      "id": "error-category",
+      "script": "tests/lua/differential/error-category.lua",
+      "evidence": ["stdout", "stderr", "exitStatus", "errorCategory"]
+    },
+    {
+      "id": "gc-weak-value",
+      "script": "tests/lua/differential/gc-weak-value.lua",
+      "evidence": ["stdout", "stderr", "exitStatus", "gcObservableSideEffect"]
+    },
+    {
+      "id": "stderr",
+      "script": "tests/lua/differential/stderr.lua",
+      "evidence": ["stdout", "stderr", "exitStatus"]
+    }
+  ]
+}

@@ -10,7 +10,7 @@ use crate::codegen::CodeGenerator;
 use crate::codegen::types::{NO_JUMP, PatchList};
 use crate::opcode::{self, MAXARG_SBX, NO_REG, OpCode};
 
-impl CodeGenerator {
+impl CodeGenerator<'_> {
     // ── 跳转发射 ──────────────────────────────────────────────────
 
     /// 发射无条件跳转，返回跳转 PC

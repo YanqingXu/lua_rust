@@ -1,100 +1,122 @@
-//! GC 引用安全包装器
+//! Copyable identities for collector-managed objects.
 //!
-//! `GcRef<T>` 是 GC 管理对象的安全引用句柄。它包装一个裸指针，
-//! 对外部 safe 代码隐藏指针细节，由 GC 系统保证指针有效性。
-//!
+//! A pointer address alone cannot distinguish a live allocation from a stale
+//! handle after allocator address reuse. `GcRef<T>` therefore carries the
+//! process-unique `ObjectId` assigned when the object was registered.
 
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
-/// GC 管理的对象的引用句柄
+use crate::gc::gc_object::GcObject;
+use crate::gc::header::GcObjectHeader;
+use crate::gc::object_id::ObjectId;
+use crate::types::GcObjectType;
+
+/// A typed handle to one collector-managed allocation.
 ///
-/// `GcRef<T>` 是一个轻量级的 Copy 类型（单个指针大小），
-/// 表示对 GC 管理对象的引用。只要 GC 未回收该对象，
-/// `GcRef<T>` 就保持有效。
-///
-/// # Safety
-///
-/// - `GcRef<T>` 必须始终指向一个有效的 GC 对象（或为 null）
-/// - GC 回收对象后，所有指向该对象的 `GcRef<T>` 变为悬空
-/// - `GcRef<T>` 不实现 `Send` 或 `Sync`（单线程 Lua VM）
-///
-// Manual Clone/Copy impls avoid requiring T: Clone / T: Copy bounds.
-// GcRef is always bitwise-copyable (it's just a pointer wrapper).
+/// This remains `Copy`, but it is no longer pointer-sized. Safe liveness
+/// checks require an owning `GarbageCollector`, whose side table validates
+/// both the address and `ObjectId` before any object memory is read.
 pub struct GcRef<T> {
     ptr: Option<NonNull<T>>,
+    object_id: ObjectId,
     _marker: PhantomData<T>,
 }
 
 impl<T> GcRef<T> {
-    /// 从裸指针创建 GcRef
+    /// Construct a handle for a collector-registered allocation.
+    ///
+    /// This is intentionally crate-private: arbitrary host pointers are light
+    /// userdata, not GC references.
     ///
     /// # Safety
-    /// `ptr` 必须为 null 或指向一个有效的、未被回收的 GC 对象。
+    ///
+    /// `ptr` must identify the live allocation to which `object_id` was
+    /// assigned by the collector, and the allocation must have layout `T`.
     #[inline]
-    pub unsafe fn from_ptr(ptr: *const T) -> Self {
-        Self {
-            ptr: NonNull::new(ptr as *mut T),
-            _marker: PhantomData,
-        }
-    }
-
-    /// 从 NonNull 创建 GcRef
-    #[inline]
-    pub fn from_nonnull(ptr: NonNull<T>) -> Self {
+    pub(crate) unsafe fn from_registered(ptr: NonNull<T>, object_id: ObjectId) -> Self {
+        debug_assert!(!object_id.is_null());
         Self {
             ptr: Some(ptr),
+            object_id,
             _marker: PhantomData,
         }
     }
 
-    /// 创建空引用（null）
+    /// Construct a null GC handle.
     #[inline]
-    pub fn null() -> Self {
+    pub const fn null() -> Self {
         Self {
             ptr: None,
+            object_id: ObjectId::NULL,
             _marker: PhantomData,
         }
     }
 
-    /// 检查是否为空（null）
+    /// Whether this handle is null.
     #[inline]
-    pub fn is_null(&self) -> bool {
+    pub fn is_null(self) -> bool {
         self.ptr.is_none()
     }
 
-    /// 获取底层裸指针
+    /// Return the allocation's process-unique identity.
     #[inline]
-    pub fn as_ptr(&self) -> *const T {
-        match self.ptr {
-            Some(p) => p.as_ptr(),
-            None => std::ptr::null(),
-        }
+    pub const fn object_id(self) -> ObjectId {
+        self.object_id
     }
 
-    /// 获取 NonNull 指针（如果非空）
+    /// Return the candidate object pointer without validating liveness.
     #[inline]
-    pub fn as_nonnull(&self) -> Option<NonNull<T>> {
+    pub fn as_ptr(self) -> *const T {
+        self.ptr
+            .map_or(std::ptr::null(), |pointer| pointer.as_ptr().cast_const())
+    }
+
+    /// Return the candidate object pointer without validating liveness.
+    #[inline]
+    pub fn as_nonnull(self) -> Option<NonNull<T>> {
         self.ptr
     }
 
-    /// 将 GcRef 转换为引用
+    /// Borrow the candidate allocation without a collector-side liveness
+    /// check.
+    ///
+    /// Prefer `GarbageCollector::with_ref`. This escape hatch remains only for
+    /// transitional VM paths that independently prove the object is rooted
+    /// and that no sweep can occur for the duration of the borrow.
     ///
     /// # Safety
-    /// 调用者必须保证 GC 在此期间不会回收该对象。
-    /// 在 Rust 的借用规则下，只要持有该对象的不可变引用，
-    /// GC 就不能运行（GC 需要 `&mut GarbageCollector`）。
+    ///
+    /// The caller must prove that `(ptr, object_id)` is still registered as
+    /// `T` in its owning collector and cannot be destroyed during the borrow.
     #[inline]
     pub unsafe fn as_ref(&self) -> Option<&T> {
-        // SAFETY: caller guarantees the pointer is valid for the borrow duration
-        self.ptr.map(|p| unsafe { &*p.as_ptr() })
+        // SAFETY: the caller establishes liveness, layout, and borrow duration.
+        self.ptr.map(|pointer| unsafe { pointer.as_ref() })
+    }
+
+    #[inline]
+    pub(crate) fn erase(self) -> ErasedGcRef
+    where
+        T: GcObject,
+    {
+        ErasedGcRef {
+            ptr: self
+                .ptr
+                .map_or(std::ptr::null_mut(), |pointer| pointer.as_ptr().cast()),
+            object_id: self.object_id,
+            object_type: T::expected_gc_type(),
+        }
     }
 }
 
 impl<T> fmt::Debug for GcRef<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GcRef({:p})", self.as_ptr())
+        f.debug_struct("GcRef")
+            .field("ptr", &format_args!("{:p}", self.as_ptr()))
+            .field("object_id", &self.object_id)
+            .finish()
     }
 }
 
@@ -104,20 +126,17 @@ impl<T> fmt::Pointer for GcRef<T> {
     }
 }
 
-// Manual Clone: bitwise copy, no T: Clone bound needed
 impl<T> Clone for GcRef<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-// Manual Copy: always safe since GcRef is just a NonNull + PhantomData
 impl<T> Copy for GcRef<T> {}
 
-// GcRef<T> 的比较基于指针相等性。
 impl<T> PartialEq for GcRef<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.as_ptr() == other.as_ptr()
+        self.ptr == other.ptr && self.object_id == other.object_id
     }
 }
 
@@ -125,48 +144,68 @@ impl<T> Eq for GcRef<T> {}
 
 impl<T> std::hash::Hash for GcRef<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_ptr().hash(state);
+        self.ptr.hash(state);
+        self.object_id.hash(state);
     }
 }
 
-// Safety: 已有 `from_ptr` 作为 unsafe 构造器
+/// Type-erased identity retained by collector queues and root storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ErasedGcRef {
+    ptr: *mut GcObjectHeader,
+    object_id: ObjectId,
+    object_type: GcObjectType,
+}
+
+impl ErasedGcRef {
+    pub(crate) const fn ptr(self) -> *mut GcObjectHeader {
+        self.ptr
+    }
+
+    pub(crate) const fn object_id(self) -> ObjectId {
+        self.object_id
+    }
+
+    pub(crate) const fn object_type(self) -> GcObjectType {
+        self.object_type
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_null_ref() {
-        let r: GcRef<()> = GcRef::null();
-        assert!(r.is_null());
-        assert_eq!(r.as_ptr(), std::ptr::null());
+    fn null_ref_has_reserved_identity() {
+        let reference: GcRef<()> = GcRef::null();
+        assert!(reference.is_null());
+        assert_eq!(reference.as_ptr(), std::ptr::null());
+        assert_eq!(reference.object_id(), ObjectId::NULL);
     }
 
     #[test]
-    fn test_from_ptr() {
-        let x = 42u8;
-        let r: GcRef<u8> = unsafe { GcRef::from_ptr(&x) };
-        assert!(!r.is_null());
-        assert_eq!(r.as_ptr(), &x as *const u8);
+    fn allocation_identity_participates_in_equality_and_hash() {
+        let mut value = 42_u8;
+        let pointer = NonNull::from(&mut value);
+        let first_id = ObjectId::from_raw_for_test(7);
+        let second_id = ObjectId::from_raw_for_test(8);
+        // SAFETY: this unit test never dereferences either synthetic handle.
+        let first = unsafe { GcRef::from_registered(pointer, first_id) };
+        // SAFETY: this unit test never dereferences either synthetic handle.
+        let same = unsafe { GcRef::from_registered(pointer, first_id) };
+        // SAFETY: this unit test never dereferences either synthetic handle.
+        let reused_address = unsafe { GcRef::from_registered(pointer, second_id) };
+
+        assert_eq!(first, same);
+        assert_ne!(first, reused_address);
     }
 
     #[test]
-    fn test_pointer_equality() {
-        let x = 1u8;
-        let y = 2u8;
-        let rx: GcRef<u8> = unsafe { GcRef::from_ptr(&x) };
-        let rx2: GcRef<u8> = unsafe { GcRef::from_ptr(&x) };
-        let ry: GcRef<u8> = unsafe { GcRef::from_ptr(&y) };
-        assert_eq!(rx, rx2);
-        assert_ne!(rx, ry);
-    }
-
-    #[test]
-    fn test_gc_ref_size() {
-        // GcRef<T> should be exactly one pointer wide
+    fn gc_ref_size_debt_is_explicit() {
         assert_eq!(
             std::mem::size_of::<GcRef<u8>>(),
-            std::mem::size_of::<*const u8>()
+            2 * std::mem::size_of::<usize>(),
+            "M1 provenance intentionally makes GcRef two words"
         );
     }
 }

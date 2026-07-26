@@ -6,14 +6,20 @@
 //! ## Module Guide
 //! - `state`: Lua 栈、调用帧和线程状态。
 //! - `execute`: opcode dispatch、调用/返回、元方法、闭包和 coroutine 执行。
+//! - `runtime`: pinned runtime services and transitional main-state ownership.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod execute;
+pub mod runtime;
 pub mod state;
 
 pub use execute::{
     ExecResult, RuntimeError, execute_proto, resume_lua_thread, start_lua_call_at_stack,
+};
+pub use runtime::{
+    Runtime, RuntimeAccessError, RuntimeCloseReport, RuntimeId, RuntimePartsMut, RuntimePhase,
+    StateArena, StateHandle, StateResolveError,
 };
 pub use state::{CallInfo, LUA_MULTRET, LuaState, Stack, ThreadStatus};

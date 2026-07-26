@@ -2,9 +2,12 @@
 //!
 //! 验证 Rust `Value` 实现的 Lua 5.1 值语义。
 
+#![allow(clippy::approx_constant)]
+
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
+use lua_core::light_userdata::LightUserdataRef;
 use lua_core::types::{Function, Table, Thread, Userdata, ValueType};
 use lua_core::value::Value;
 use std::mem;
@@ -18,7 +21,7 @@ fn test_value_discriminant_order() {
     assert_eq!(Value::Nil.value_type(), ValueType::Nil);
     assert_eq!(Value::Boolean(true).value_type(), ValueType::Boolean);
     assert_eq!(
-        Value::LightUserdata(GcRef::null()).value_type(),
+        Value::LightUserdata(LightUserdataRef::null()).value_type(),
         ValueType::LightUserdata
     );
     assert_eq!(Value::Number(0.0).value_type(), ValueType::Number);
@@ -52,7 +55,7 @@ fn test_value_nil_default() {
 fn test_value_boolean_roundtrip() {
     let v = Value::Boolean(true);
     assert!(v.is_boolean());
-    assert_eq!(v.as_boolean(), true);
+    assert!(v.as_boolean());
 }
 
 #[test]
@@ -79,7 +82,12 @@ fn test_value_integer_truncation() {
 
 #[test]
 fn test_value_light_userdata_roundtrip() {
-    let p = unsafe { GcRef::from_ptr(0xDEAD_BEEF_usize as *const std::ffi::c_void) };
+    let storage = 0_u8;
+    let p = LightUserdataRef::from_ptr(
+        (&storage as *const u8)
+            .cast_mut()
+            .cast::<std::ffi::c_void>(),
+    );
     let v = Value::LightUserdata(p);
     assert!(v.is_light_userdata());
     assert_eq!(v.as_light_userdata(), p);
@@ -87,7 +95,8 @@ fn test_value_light_userdata_roundtrip() {
 
 #[test]
 fn test_value_string_type_check() {
-    let p = unsafe { GcRef::<GcString>::from_ptr(0x1000 as *const _) };
+    let mut gc = GarbageCollector::new();
+    let p = gc.create(GcString::from_bytes(b"type-check"));
     let v = Value::String(p);
     assert!(v.is_string());
     assert!(!v.is_nil());
@@ -95,25 +104,32 @@ fn test_value_string_type_check() {
 
 #[test]
 fn test_value_table_type_check() {
-    let p = unsafe { GcRef::<Table>::from_ptr(0x2000 as *const _) };
+    let mut gc = GarbageCollector::new();
+    let p = gc.create(Table::new());
     assert!(Value::Table(p).is_table());
 }
 
 #[test]
 fn test_value_function_type_check() {
-    let p = unsafe { GcRef::<Function>::from_ptr(0x3000 as *const _) };
+    use lua_core::proto::Proto;
+
+    let mut gc = GarbageCollector::new();
+    let proto = gc.create(Proto::new());
+    let p = gc.create(Function::new_lua(proto));
     assert!(Value::Function(p).is_function());
 }
 
 #[test]
 fn test_value_userdata_type_check() {
-    let p = unsafe { GcRef::<Userdata>::from_ptr(0x4000 as *const _) };
+    let mut gc = GarbageCollector::new();
+    let p = gc.create(Userdata::new(0));
     assert!(Value::Userdata(p).is_userdata());
 }
 
 #[test]
 fn test_value_thread_type_check() {
-    let p = unsafe { GcRef::<Thread>::from_ptr(0x5000 as *const _) };
+    let mut gc = GarbageCollector::new();
+    let p = gc.create(Thread::new());
     assert!(Value::Thread(p).is_thread());
 }
 
@@ -163,7 +179,7 @@ fn test_lua_truthiness_gc_string_is_truthy() {
 
 #[test]
 fn test_lua_truthiness_light_userdata_null_is_truthy() {
-    assert!(Value::LightUserdata(GcRef::null()).is_true());
+    assert!(Value::LightUserdata(LightUserdataRef::null()).is_true());
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -197,9 +213,9 @@ fn test_value_equality_different_type() {
 #[test]
 fn test_value_equality_string_content() {
     let mut gc = GarbageCollector::new();
-    let p1 = gc.create(GcString::new("same"));
-    let p2 = gc.create(GcString::new("same"));
-    let p3 = gc.create(GcString::new("different"));
+    let p1 = gc.create(GcString::from_bytes(b"same"));
+    let p2 = gc.create(GcString::from_bytes(b"same"));
+    let p3 = gc.create(GcString::from_bytes(b"different"));
 
     assert_ne!(p1, p2);
     assert_eq!(Value::String(p1), Value::String(p2));
@@ -208,8 +224,18 @@ fn test_value_equality_string_content() {
 
 #[test]
 fn test_value_equality_light_userdata() {
-    let p1 = unsafe { GcRef::from_ptr(0xAAAA as *const std::ffi::c_void) };
-    let p2 = unsafe { GcRef::from_ptr(0xBBBB as *const std::ffi::c_void) };
+    let storage1 = 0_u8;
+    let storage2 = 0_u8;
+    let p1 = LightUserdataRef::from_ptr(
+        (&storage1 as *const u8)
+            .cast_mut()
+            .cast::<std::ffi::c_void>(),
+    );
+    let p2 = LightUserdataRef::from_ptr(
+        (&storage2 as *const u8)
+            .cast_mut()
+            .cast::<std::ffi::c_void>(),
+    );
     assert_eq!(Value::LightUserdata(p1), Value::LightUserdata(p1));
     assert_ne!(Value::LightUserdata(p1), Value::LightUserdata(p2));
 }
@@ -245,38 +271,39 @@ fn test_display_number() {
 
 #[test]
 fn test_display_light_userdata() {
-    let p = unsafe { GcRef::<std::ffi::c_void>::from_ptr(0xDEAD_BEEF_usize as *const _) };
+    let storage = 0_u8;
+    let p = LightUserdataRef::from_ptr(
+        (&storage as *const u8)
+            .cast_mut()
+            .cast::<std::ffi::c_void>(),
+    );
     let output = format!("{}", Value::LightUserdata(p));
     assert!(output.starts_with("lightuserdata: 0x"), "Got '{}'", output);
 }
 
 #[test]
 fn test_display_gc_types() {
-    let p = unsafe { GcRef::<GcString>::from_ptr(0x1000 as *const _) };
-    assert!(format!("{}", Value::String(p)).starts_with("string: 0x"));
+    use lua_core::proto::Proto;
 
-    let p = unsafe { GcRef::<Table>::from_ptr(0x2000 as *const _) };
-    assert!(format!("{}", Value::Table(p)).starts_with("table: 0x"));
+    let mut gc = GarbageCollector::new();
+    let string = gc.create(GcString::from_bytes(b"display"));
+    assert!(format!("{}", Value::String(string)).starts_with("string: 0x"));
 
-    // Function Display requires a valid GcRef to distinguish C/Lua functions,
-    // so use a real object for testing.
-    {
-        use lua_core::function::Function;
-        use lua_core::gc::collector::GarbageCollector;
-        use lua_core::proto::Proto;
+    let table = gc.create(Table::new());
+    assert!(format!("{}", Value::Table(table)).starts_with("table: 0x"));
 
-        let mut gc = GarbageCollector::new();
-        let proto = gc.create(Proto::new());
-        let func = gc.create(Function::new_lua(proto));
-        let output = format!("{}", Value::Function(func));
-        assert!(output.starts_with("Lua function: 0x"), "Got '{}'", output);
-    }
+    // Safe Display reports identity only; it has no collector context in
+    // which object memory could be validated.
+    let proto = gc.create(Proto::new());
+    let func = gc.create(Function::new_lua(proto));
+    let output = format!("{}", Value::Function(func));
+    assert!(output.starts_with("function: 0x"), "Got '{}'", output);
 
-    let p = unsafe { GcRef::<Userdata>::from_ptr(0x4000 as *const _) };
-    assert!(format!("{}", Value::Userdata(p)).starts_with("userdata: 0x"));
+    let userdata = gc.create(Userdata::new(0));
+    assert!(format!("{}", Value::Userdata(userdata)).starts_with("userdata: 0x"));
 
-    let p = unsafe { GcRef::<Thread>::from_ptr(0x5000 as *const _) };
-    assert!(format!("{}", Value::Thread(p)).starts_with("thread: 0x"));
+    let thread = gc.create(Thread::new());
+    assert!(format!("{}", Value::Thread(thread)).starts_with("thread: 0x"));
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -308,7 +335,10 @@ fn test_try_as_integer() {
 #[test]
 fn test_value_size_constraint() {
     let size = mem::size_of::<Value>();
-    assert!(size <= 16, "Value size {} exceeds 16 bytes", size);
+    assert_eq!(
+        size, 24,
+        "M1 ObjectId provenance intentionally makes Value 24 bytes"
+    );
 }
 
 #[test]

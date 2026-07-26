@@ -9,6 +9,8 @@ pub mod gc_object;
 pub mod gc_ref;
 pub mod header;
 pub mod mark;
+pub mod object_id;
+pub mod publication;
 pub mod strategy;
 pub mod sweep;
 pub mod weak;

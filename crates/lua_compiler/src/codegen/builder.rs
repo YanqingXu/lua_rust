@@ -22,28 +22,12 @@ use crate::opcode::{self, OpCode};
 pub struct BytecodeBuilder {
     /// 当前绑定的 Proto
     proto: Proto,
-    /// 字符串驻留池（用于字符串驻留；mut 因为 intern() 需要 &mut）
-    string_pool: Option<*mut StringPool>,
 }
-
-// SAFETY: string_pool raw pointer is only accessed during compilation,
-// which is single-threaded. The original StringPool outlives the builder.
-unsafe impl Send for BytecodeBuilder {}
-// SAFETY: See Send impl.
-unsafe impl Sync for BytecodeBuilder {}
 
 impl BytecodeBuilder {
     /// 创建新的 BytecodeBuilder
     pub fn new(proto: Proto) -> Self {
-        Self {
-            proto,
-            string_pool: None,
-        }
-    }
-
-    /// 绑定 StringPool（用于字符串驻留）
-    pub fn bind_pool(&mut self, pool: &mut StringPool) {
-        self.string_pool = Some(pool as *mut StringPool);
+        Self { proto }
     }
 
     /// 获取 Proto 的可变引用
@@ -154,24 +138,35 @@ impl BytecodeBuilder {
 
     /// 添加字符串常量，返回常量索引
     ///
-    /// 如果 StringPool 已绑定，则优先从驻留池获取已有字符串（保证相同内容的
+    /// 如果提供 StringPool，则优先从驻留池获取已有字符串（保证相同内容的
     /// 字符串获得相同的 GcRef，从而使指针比较在表查找中直接生效）。
-    /// 如果池中不存在，则创建新 GcString 并注册到驻留池。
+    /// 如果未提供池，则直接由 GC 分配字符串。
     pub fn add_string_constant(
         &mut self,
         gc: &mut lua_core::gc::collector::GarbageCollector,
+        string_pool: Option<&mut StringPool>,
         value: &str,
     ) -> Option<i32> {
-        // Try StringPool interning first (for pointer-identical GcRef across
-        // compiler and stdlib).
-        let gc_str = if let Some(pool_ptr) = self.string_pool {
-            // SAFETY: pool_ptr was set from a valid &mut StringPool that outlives
-            // the builder. Compilation is single-threaded.
-            let pool: &mut StringPool = unsafe { &mut *pool_ptr };
-            pool.intern(gc, value)
+        self.add_byte_string_constant(gc, string_pool, value.as_bytes())
+    }
+
+    /// 添加任意字节的 Lua 字符串常量。
+    ///
+    /// 这是字符串字面量的规范入口；`add_string_constant` 仅作为 UTF-8
+    /// 文本（标识符、调试名）的兼容包装。
+    pub fn add_byte_string_constant(
+        &mut self,
+        gc: &mut lua_core::gc::collector::GarbageCollector,
+        string_pool: Option<&mut StringPool>,
+        value: &[u8],
+    ) -> Option<i32> {
+        // The pool is an explicit short-lived borrow. The builder never retains
+        // allocator services beyond this call.
+        let gc_str = if let Some(pool) = string_pool {
+            pool.intern_bytes(gc, value)
         } else {
             // No pool available — fall back to direct GC allocation
-            gc.create(GcString::new(value))
+            gc.create(GcString::from_bytes(value))
         };
         let idx = self.proto.add_constant(Value::String(gc_str)) as i32;
         Some(idx)

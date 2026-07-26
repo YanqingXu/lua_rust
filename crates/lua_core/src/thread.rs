@@ -1,23 +1,23 @@
 //! Lua 协程/线程对象
 //!
-//! `Thread` 是 GC 管理的协程对象，每个 Thread 持有一个独立的 LuaState
-//!（独立栈 + 调用栈，共享 GlobalState）。
+//! `Thread` 是 GC 管理的协程对象。每个 Thread 保存一个由 VM Runtime
+//! 验证的 generational `StateHandle`，而不拥有或暴露 LuaState 指针。
 //!
 //! ## 核心设计
 //! - 所有执行现场保存在 LuaState/CallInfo 中（不依赖宿主栈帧）
 //! - VM 通过 `ExecResult::Yielded` 退出执行循环
 //! - `resume`/`yield` 通过显式的值搬运 + VM 重入实现
 //!
-//! ## Phase 1.4 限制
-//! LuaState 在 Phase 3 才实现，当前 `state_` 和 `callerState_` 使用不透明
-//! 指针占位。`mark_children` 仅标记 `caller` 线程；栈内容的标记将在
-//! Phase 3 通过 `gc.markState()` 启用。
+//! ## M1.5 限制
+//! `mark_children` 仍仅标记 `caller` 线程。StateArena 中协程栈的 root
+//! tracing 与 Thread sweep 时的 slot 回收属于 M1.7。
 //!
 
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_object::GcObject;
 use crate::gc::gc_ref::GcRef;
 use crate::gc::header::GcObjectHeader;
+use crate::state_handle::StateHandle;
 use crate::types::GcObjectType;
 
 // =====================================================================
@@ -56,31 +56,23 @@ impl std::fmt::Display for CoroutineStatus {
 
 /// Lua 线程/协程对象
 ///
-/// Thread 是 GC 管理的协程对象，持有独立的执行状态。
+/// Thread 是 GC 管理的协程对象，通过 handle 引用独立执行状态。
 ///
 /// 内存布局（`#[repr(C)]`，header 在开头）：
 /// - header: GcObjectHeader (16 bytes)
-/// - state: *mut c_void (8 bytes) — Phase 3 具体化为 `*mut LuaState`
+/// - state_handle: `Option<StateHandle>`
 /// - co_status: CoroutineStatus (1 byte)
 /// - first_resume: bool (1 byte)
-/// - padding: (6 bytes)
-/// - caller: Option<GcRef<Thread>> (8 bytes)
-/// - caller_state: *mut c_void (8 bytes) — Phase 3 具体化为 `*mut LuaState`
+/// - caller: `Option<GcRef<Thread>>`
 /// - saved_nexeccalls: i32 (4 bytes)
-/// - padding: (4 bytes)
-///   总计约 56+ bytes
 ///
 #[repr(C)]
 pub struct Thread {
     /// GC 对象头部（必须在结构体开头）
     header: GcObjectHeader,
 
-    /// LuaState 指针
-    ///
-    /// Phase 1.4: 不透明占位（`*mut c_void`）。
-    /// Phase 3: 具体化为 `*mut LuaState`。
-    ///
-    state: *mut std::ffi::c_void,
+    /// Runtime-owned LuaState slot.
+    state_handle: Option<StateHandle>,
 
     /// 协程状态
     ///
@@ -94,13 +86,6 @@ pub struct Thread {
     ///
     caller: Option<GcRef<Thread>>,
 
-    /// Resume 链：调用者的 LuaState
-    ///
-    /// Phase 1.4: 不透明占位。
-    /// Phase 3: 具体化为 `*mut LuaState`。
-    ///
-    caller_state: *mut std::ffi::c_void,
-
     /// VM 重入保护：保存的嵌套执行计数
     ///
     saved_nexeccalls: i32,
@@ -109,16 +94,15 @@ pub struct Thread {
 impl Thread {
     /// 创建新的协程
     ///
-    /// 初始状态为 `Suspended`，LuaState 指针为空（Phase 3 初始化）。
+    /// 初始状态为 `Suspended`，state handle 尚未安装。
     ///
     pub fn new() -> Self {
         Self {
             header: GcObjectHeader::new(GcObjectType::Thread),
-            state: std::ptr::null_mut(),
+            state_handle: None,
             co_status: CoroutineStatus::Suspended,
             first_resume: true,
             caller: None,
-            caller_state: std::ptr::null_mut(),
             saved_nexeccalls: 1,
         }
     }
@@ -155,24 +139,18 @@ impl Thread {
         self.co_status == CoroutineStatus::Running
     }
 
-    // ── LuaState 访问（占位）──────────────────────────────────────
+    // ── LuaState handle ───────────────────────────────────────────
 
-    /// 获取 LuaState 指针（不透明）
-    ///
-    /// Phase 1.4: 返回不透明指针。
-    /// Phase 3: 具体化为 `*mut LuaState`。
-    ///
+    /// Return the runtime-owned LuaState handle.
     #[inline]
-    pub fn lua_state(&self) -> *mut std::ffi::c_void {
-        self.state
+    pub fn state_handle(&self) -> Option<StateHandle> {
+        self.state_handle
     }
 
-    /// 设置 LuaState 指针
-    ///
-    /// Phase 3 在创建 Thread 时调用，关联新创建的 LuaState。
+    /// Associate this Thread with a runtime-owned LuaState slot.
     #[inline]
-    pub fn set_lua_state(&mut self, state: *mut std::ffi::c_void) {
-        self.state = state;
+    pub fn set_state_handle(&mut self, handle: StateHandle) {
+        self.state_handle = Some(handle);
     }
 
     // ── Resume 链管理 ─────────────────────────────────────────────
@@ -189,21 +167,6 @@ impl Thread {
     pub fn set_caller(&mut self, caller: Option<GcRef<Thread>>) {
         // TODO Phase 1.3+: write barrier — gc->writeBarrier(this, caller)
         self.caller = caller;
-    }
-
-    /// 获取调用者的 LuaState（不透明）
-    ///
-    /// Phase 1.4: 返回不透明指针。
-    /// Phase 3: 具体化为 `*mut LuaState`。
-    #[inline]
-    pub fn caller_state(&self) -> *mut std::ffi::c_void {
-        self.caller_state
-    }
-
-    /// 设置调用者的 LuaState
-    #[inline]
-    pub fn set_caller_state(&mut self, state: *mut std::ffi::c_void) {
-        self.caller_state = state;
     }
 
     // ── 首次 Resume 标志 ──────────────────────────────────────────
@@ -265,13 +228,9 @@ unsafe impl GcObject for Thread {
     unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
         // 标记 caller 协程
         if let Some(caller_ref) = self.caller {
-            // SAFETY: caller_ref is a valid GcRef<Thread> held by this Thread;
-            // collector is valid during mark phase.
-            unsafe {
-                collector.mark_object(caller_ref.as_ptr() as *mut GcObjectHeader);
-            }
+            collector.mark_registered(caller_ref);
         }
-        // Phase 3: gc.markState(state_) 和 gc.markState(callerState_)
+        // M1.7: trace the StateArena slot identified by state_handle.
     }
 
     fn get_size(&self) -> usize {
@@ -290,6 +249,7 @@ impl std::fmt::Debug for Thread {
         f.debug_struct("Thread")
             .field("status", &self.co_status)
             .field("first_resume", &self.first_resume)
+            .field("state_handle", &self.state_handle)
             .field("has_caller", &self.caller.is_some())
             .finish()
     }
@@ -317,9 +277,8 @@ mod tests {
         assert!(!t.is_running());
         assert!(t.is_first_resume());
         assert_eq!(t.saved_nexeccalls(), 1);
-        assert!(t.lua_state().is_null());
+        assert!(t.state_handle().is_none());
         assert!(t.caller().is_none());
-        assert!(t.caller_state().is_null());
     }
 
     #[test]
@@ -375,16 +334,16 @@ mod tests {
         assert_eq!(t.saved_nexeccalls(), 5);
     }
 
-    // ── LuaState 占位 ─────────────────────────────────────────────
+    // ── LuaState handle ───────────────────────────────────────────
 
     #[test]
-    fn test_lua_state_placeholder() {
+    fn test_lua_state_handle() {
         let mut t = Thread::new();
-        assert!(t.lua_state().is_null());
+        assert!(t.state_handle().is_none());
 
-        let dummy: *mut std::ffi::c_void = 0x1000 as *mut _;
-        t.set_lua_state(dummy);
-        assert_eq!(t.lua_state(), dummy);
+        let handle = StateHandle::new(crate::state_handle::RuntimeId::new(7), 3, 2);
+        t.set_state_handle(handle);
+        assert_eq!(t.state_handle(), Some(handle));
     }
 
     // ── Caller 链管理 ─────────────────────────────────────────────
@@ -402,16 +361,6 @@ mod tests {
 
         callee.set_caller(None);
         assert!(callee.caller().is_none());
-    }
-
-    #[test]
-    fn test_caller_state_placeholder() {
-        let mut t = Thread::new();
-        assert!(t.caller_state().is_null());
-
-        let dummy: *mut std::ffi::c_void = 0x2000 as *mut _;
-        t.set_caller_state(dummy);
-        assert_eq!(t.caller_state(), dummy);
     }
 
     // ── GC 类型测试 ───────────────────────────────────────────────
@@ -446,12 +395,16 @@ mod tests {
         gc.reset_marks();
 
         // 标记 callee → 应标记 caller
+        // SAFETY: `callee_ref` is live in `gc`, and that same collector is
+        // exclusively borrowed while the caller reference is traversed.
         unsafe {
             let t_ptr = callee_ref.as_ptr();
             (*t_ptr).mark_children(&mut gc);
         }
 
         let caller_header = caller.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: `caller` remains registered with `gc`; marking does not free
+        // or relocate it, and its header is at offset 0.
         unsafe {
             assert!(
                 !(*caller_header).is_white(),
@@ -469,6 +422,8 @@ mod tests {
         gc.reset_marks();
 
         // 无 caller — mark_children 不应 panic
+        // SAFETY: `t_ref` is a live registered thread and `gc` is exclusively
+        // borrowed for the call.
         unsafe {
             let t_ptr = t_ref.as_ptr();
             (*t_ptr).mark_children(&mut gc);

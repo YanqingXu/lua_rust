@@ -11,11 +11,39 @@
 
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_object::GcObject;
+use crate::gc::gc_ref::GcRef;
 use crate::gc::header::GcObjectHeader;
 use crate::gc::header::bits;
+use crate::state_handle::StateHandle;
 use crate::table::Table;
 use crate::types::{GcColor, GcObjectType};
 use crate::value::Value;
+
+/// Result of seeding the collector's explicit roots for a mark-only traversal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MarkRootSeedReport {
+    /// Explicit and temporary root handles that still named registered
+    /// objects.
+    pub seeded: usize,
+    /// Null, stale, foreign, or otherwise unregistered explicit or temporary
+    /// root handles.
+    pub rejected: usize,
+    /// Successfully seeded lexical publication roots.
+    pub temporary_seeded: usize,
+    /// Rejected lexical publication roots.
+    pub temporary_rejected: usize,
+}
+
+/// One concrete-object propagation step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkTraceStep {
+    /// Concrete object layout that was traced.
+    pub object_type: GcObjectType,
+    /// State edge carried by a reachable `Thread`, if present.
+    pub thread_state_handle: Option<StateHandle>,
+    /// Whether the reachable `Thread` also published a caller edge.
+    pub traced_thread_caller: bool,
+}
 
 impl GarbageCollector {
     /// 执行标记阶段
@@ -26,6 +54,17 @@ impl GarbageCollector {
     /// 4. 传播标记
     ///
     pub fn mark(&mut self) {
+        self.begin_mark_only();
+        self.propagate_marks();
+    }
+
+    /// Reset mark state and seed registered explicit roots without sweeping.
+    ///
+    /// This is the collector half of Runtime-owned live-set diagnostics. It
+    /// never calls `sweep`, `collect`, `clear_all`, finalizers, or object
+    /// destruction. State roots are deliberately not accepted here: the
+    /// Runtime owns and validates those through its `StateArena`.
+    pub fn begin_mark_only(&mut self) -> MarkRootSeedReport {
         // 1. 重置所有对象为白色（保留 FIXED 和 FINALIZED）
         let mut current = self.all_objects;
         while !current.is_null() {
@@ -42,20 +81,41 @@ impl GarbageCollector {
         self.gray_list.clear();
         self.weak_tables.clear();
         self.external_marked.clear();
+        self.rejected_mark_edges = 0;
 
-        // 3. 标记所有根对象为灰色
-        let roots: Vec<*mut GcObjectHeader> = self.roots.clone();
-        for &root in &roots {
-            if !root.is_null() {
-                // SAFETY: root is a valid GC-managed object
-                unsafe {
-                    self.mark_object(root);
+        // 3. 标记所有仍属于本 collector 的显式根对象为灰色
+        let mut report = MarkRootSeedReport::default();
+        let roots = self.roots.clone();
+        for root in roots {
+            match self.validate_erased(root) {
+                Ok(pointer) => {
+                    self.mark_live_object(pointer.as_ptr());
+                    report.seeded += 1;
+                }
+                Err(_) => {
+                    report.rejected += 1;
+                    self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
                 }
             }
         }
 
-        // 4. 传播标记
-        self.propagate_marks();
+        let temporary_roots: Vec<_> = self.temporary_roots.values().copied().collect();
+        for root in temporary_roots {
+            match self.validate_erased(root) {
+                Ok(pointer) => {
+                    self.mark_live_object(pointer.as_ptr());
+                    report.seeded += 1;
+                    report.temporary_seeded += 1;
+                }
+                Err(_) => {
+                    report.rejected += 1;
+                    report.temporary_rejected += 1;
+                    self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
+                }
+            }
+        }
+
+        report
     }
 
     /// 传播标记：处理灰色列表中的所有对象
@@ -64,23 +124,47 @@ impl GarbageCollector {
     /// `mark_children()` 方法报告引用关系。
     ///
     pub fn propagate_marks(&mut self) {
-        while let Some(obj) = self.gray_list.pop() {
-            // SAFETY: obj is from gray_list, which only contains valid GC objects
-            unsafe {
-                // 标记为黑色
-                (*obj).set_color(GcColor::Black);
+        while self.propagate_one_marked_object().is_some() {}
+    }
 
-                // 如果是表，使用弱表感知的标记路径
-                if (*obj).gc_type() == GcObjectType::Table {
-                    self.mark_table(obj);
-                } else {
-                    // 调用对象的 mark_children 方法
-                    // 需要通过 trait 对象调用，但 GcObject trait 的
-                    // mark_children 是 unsafe 方法。
-                    // 使用类型分发：透传 header 指针。
-                    self.mark_object_children(obj);
-                }
+    /// Trace one gray object and return any state edge it publishes.
+    ///
+    /// Runtime's canonical mark-only tracer uses this single-step API to
+    /// alternate between the collector gray queue and its validated
+    /// `StateHandle` queue until both reach a fixed point.
+    pub fn propagate_one_marked_object(&mut self) -> Option<MarkTraceStep> {
+        let obj = self.gray_list.pop()?;
+
+        let Some(live) = self.live_allocations.get(&(obj as usize)).copied() else {
+            self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
+            return None;
+        };
+
+        // SAFETY: gray_list contains only live headers registered through
+        // `create` or validated by `mark_registered`; membership was checked
+        // again before dereference.
+        unsafe {
+            (*obj).set_color(GcColor::Black);
+            let object_type = live.object_type;
+            let (thread_state_handle, traced_thread_caller) = if object_type == GcObjectType::Thread
+            {
+                let thread = &*(obj as *const crate::thread::Thread);
+                (thread.state_handle(), thread.caller().is_some())
+            } else {
+                (None, false)
+            };
+
+            if object_type == GcObjectType::Table {
+                self.mark_table(obj);
+            } else {
+                self.mark_object_children(obj, object_type);
             }
+
+            Some(MarkTraceStep {
+                object_type,
+                thread_state_handle,
+                traced_thread_caller,
+            })
         }
     }
 
@@ -88,10 +172,14 @@ impl GarbageCollector {
     ///
     /// # Safety
     /// `header_ptr` 必须指向有效的 GC 对象。
-    unsafe fn mark_object_children(&mut self, header_ptr: *mut GcObjectHeader) {
+    unsafe fn mark_object_children(
+        &mut self,
+        header_ptr: *mut GcObjectHeader,
+        object_type: GcObjectType,
+    ) {
         // SAFETY: caller guarantees header_ptr is valid
         unsafe {
-            match (*header_ptr).gc_type() {
+            match object_type {
                 GcObjectType::String => {
                     // GcString 的 mark_children 为空操作
                 }
@@ -130,16 +218,22 @@ impl GarbageCollector {
     /// 检查表的元表 `__mode` 字段以确定弱键/弱值模式，
     /// 并将弱表注册到 `weak_tables` 列表中。
     ///
-    pub fn mark_table(&mut self, table_header: *mut GcObjectHeader) {
-        if table_header.is_null() {
+    fn mark_table(&mut self, table_header: *mut GcObjectHeader) {
+        let Some(table_ref) = self.registered_ref_from_ptr(table_header.cast::<Table>()) else {
+            self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
             return;
-        }
+        };
+        let Ok(table_pointer) = self.validate_ref(table_ref) else {
+            self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
+            return;
+        };
+        let table_header = table_pointer.as_ptr().cast::<GcObjectHeader>();
 
         // 检测弱表模式
         let (weak_keys, weak_values) = self.detect_weak_mode(table_header);
 
         // 设置弱表标记位
-        // SAFETY: table_header is valid
+        // SAFETY: the side table matched pointer, ObjectId, and Table tag.
         unsafe {
             let marked = (*table_header).marked() & !bits::WEAKBITS;
             let new_marked = if weak_keys {
@@ -156,14 +250,15 @@ impl GarbageCollector {
         }
 
         // 如果是弱表，注册到弱表列表
-        if weak_keys || weak_values {
-            self.weak_tables.push(table_header);
+        if (weak_keys || weak_values) && !self.weak_tables.contains(&table_ref) {
+            self.weak_tables.push(table_ref);
         }
 
         // 标记表内容（含弱键/弱值策略）
-        // SAFETY: table_header is valid
+        // SAFETY: the validated allocation remains live while `&mut self`
+        // prevents collector destruction.
         unsafe {
-            let table = &*(table_header as *const Table);
+            let table = table_pointer.as_ref();
             self.mark_table_contents(table, weak_keys, weak_values);
         }
     }
@@ -189,8 +284,11 @@ impl GarbageCollector {
             None => return (false, false),
         };
 
-        // SAFETY: metatable is valid
-        let mt = unsafe { &*metatable.as_ptr() };
+        let Ok(mt_pointer) = self.validate_ref(metatable) else {
+            return (false, false);
+        };
+        // SAFETY: validation matched address, identity, and Table tag.
+        let mt = unsafe { mt_pointer.as_ref() };
 
         // 在元表中查找 "__mode" 键
         // 遍历哈希表查找匹配的字符串键
@@ -200,10 +298,13 @@ impl GarbageCollector {
 
         match mode_value {
             Some(Value::String(s)) => {
-                // SAFETY: s is a valid GcRef
-                let mode_str = unsafe { &*s.as_ptr() }.data();
-                let weak_keys = mode_str.contains('k');
-                let weak_values = mode_str.contains('v');
+                let Ok(pointer) = self.validate_ref(s) else {
+                    return (false, false);
+                };
+                // SAFETY: validation matched address, identity, and String tag.
+                let mode = unsafe { pointer.as_ref() }.as_bytes();
+                let weak_keys = mode.contains(&b'k');
+                let weak_values = mode.contains(&b'v');
                 (weak_keys, weak_values)
             }
             _ => (false, false),
@@ -219,9 +320,13 @@ impl GarbageCollector {
         let mut key = Value::Nil;
         while let Some((next_key, next_value)) = table.next(&key) {
             if let Value::String(s) = &next_key {
-                // SAFETY: s is valid
-                let key_data = unsafe { &*s.as_ptr() }.data();
-                if key_data == name {
+                let Ok(pointer) = self.validate_ref(*s) else {
+                    key = next_key;
+                    continue;
+                };
+                // SAFETY: validation matched address, identity, and String tag.
+                let key_bytes = unsafe { pointer.as_ref() }.as_bytes();
+                if key_bytes == name.as_bytes() {
                     return Some(next_value);
                 }
             }
@@ -239,22 +344,18 @@ impl GarbageCollector {
         while let Some((k, v)) = table.next(&key) {
             // 标记键（弱键模式下跳过非字符串键）
             if !weak_keys || k.is_string() {
-                self.mark_value(&k);
+                self.mark_registered_value(&k);
             }
             // 标记值（弱值模式下只标记字符串值）
             if !weak_values || v.is_string() {
-                self.mark_value(&v);
+                self.mark_registered_value(&v);
             }
             key = k;
         }
 
         // 标记元表（始终强引用）
         if let Some(mt) = table.metatable() {
-            let header_ptr = mt.as_ptr() as *mut GcObjectHeader;
-            // SAFETY: mt is a valid GC reference
-            unsafe {
-                self.mark_object(header_ptr);
-            }
+            self.mark_registered(mt);
         }
     }
 
@@ -264,44 +365,38 @@ impl GarbageCollector {
     /// Userdata、Thread），则标记该对象。
     ///
     pub fn mark_value(&mut self, value: &Value) {
+        self.mark_registered_value(value);
+    }
+
+    /// Mark a typed reference only if it belongs to this collector and its
+    /// concrete tag matches `T`.
+    ///
+    /// The candidate pointer is compared, not dereferenced, until membership
+    /// in the collector's live intrusive list has been established.
+    pub fn mark_registered<T: GcObject>(&mut self, value: GcRef<T>) -> bool {
+        match self.validate_ref(value) {
+            Ok(pointer) => {
+                self.mark_live_object(pointer.as_ptr().cast::<GcObjectHeader>());
+                true
+            }
+            Err(_) => {
+                self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
+                false
+            }
+        }
+    }
+
+    /// Checked mark operation for the collectable edge in a `Value`.
+    ///
+    /// Non-collectable values have no edge and therefore return `true`.
+    pub fn mark_registered_value(&mut self, value: &Value) -> bool {
         match value {
-            Value::String(s) => {
-                let ptr = s.as_ptr() as *mut GcObjectHeader;
-                // SAFETY: s is a valid GC reference; ptr is a valid GcObjectHeader
-                unsafe {
-                    self.mark_object(ptr);
-                }
-            }
-            Value::Table(t) => {
-                let ptr = t.as_ptr() as *mut GcObjectHeader;
-                // SAFETY: t is a valid GC reference
-                unsafe {
-                    self.mark_object(ptr);
-                }
-            }
-            Value::Function(f) => {
-                let ptr = f.as_ptr() as *mut GcObjectHeader;
-                // SAFETY: f is a valid GC reference
-                unsafe {
-                    self.mark_object(ptr);
-                }
-            }
-            Value::Userdata(u) => {
-                let ptr = u.as_ptr() as *mut GcObjectHeader;
-                // SAFETY: u is a valid GC reference
-                unsafe {
-                    self.mark_object(ptr);
-                }
-            }
-            Value::Thread(t) => {
-                let ptr = t.as_ptr() as *mut GcObjectHeader;
-                // SAFETY: t is a valid GC reference
-                unsafe {
-                    self.mark_object(ptr);
-                }
-            }
-            // Nil, Boolean, Number, LightUserdata 不包含 GC 对象
-            _ => {}
+            Value::String(value) => self.mark_registered(*value),
+            Value::Table(value) => self.mark_registered(*value),
+            Value::Function(value) => self.mark_registered(*value),
+            Value::Userdata(value) => self.mark_registered(*value),
+            Value::Thread(value) => self.mark_registered(*value),
+            _ => true,
         }
     }
 
@@ -312,68 +407,62 @@ impl GarbageCollector {
     /// 当黑色对象开始引用白色子对象时，立即标记该子对象并传播标记图。
     /// 防止同轮 sweep 回收新可达对象。
     ///
-    pub fn write_barrier(&mut self, owner: *mut GcObjectHeader, child: *mut GcObjectHeader) {
-        if owner.is_null() || child.is_null() {
-            return;
-        }
+    pub fn write_barrier<O: GcObject, C: GcObject>(
+        &mut self,
+        owner: GcRef<O>,
+        child: GcRef<C>,
+    ) -> bool {
+        let (Ok(owner), Ok(child)) = (self.validate_ref(owner), self.validate_ref(child)) else {
+            self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
+            return false;
+        };
+        let owner = owner.as_ptr().cast::<GcObjectHeader>();
+        let child = child.as_ptr().cast::<GcObjectHeader>();
 
-        // SAFETY: owner and child are valid GC object pointers
+        // SAFETY: both handles matched collector, allocation identity, and
+        // concrete type before either header is read.
         unsafe {
-            // 仅当 owner 是黑色且 child 是白色时才需要屏障
             if !(*owner).is_black() || !(*child).is_white() {
-                return;
+                return true;
             }
         }
 
-        // SAFETY: child is valid
-        unsafe {
-            self.mark_object(child);
-        }
+        self.mark_live_object(child);
         self.propagate_marks();
+        true
     }
 
     /// Value 版本的写屏障
     ///
-    pub fn write_barrier_value(&mut self, owner: *mut GcObjectHeader, value: &Value) {
+    pub fn write_barrier_value<O: GcObject>(&mut self, owner: GcRef<O>, value: &Value) -> bool {
         match value {
-            Value::String(s) => {
-                self.write_barrier(owner, s.as_ptr() as *mut GcObjectHeader);
-            }
-            Value::Table(t) => {
-                self.write_barrier(owner, t.as_ptr() as *mut GcObjectHeader);
-            }
-            Value::Function(f) => {
-                self.write_barrier(owner, f.as_ptr() as *mut GcObjectHeader);
-            }
-            Value::Userdata(u) => {
-                self.write_barrier(owner, u.as_ptr() as *mut GcObjectHeader);
-            }
-            Value::Thread(t) => {
-                self.write_barrier(owner, t.as_ptr() as *mut GcObjectHeader);
-            }
-            _ => {} // 非 GC 对象不需要屏障
+            Value::String(child) => self.write_barrier(owner, *child),
+            Value::Table(child) => self.write_barrier(owner, *child),
+            Value::Function(child) => self.write_barrier(owner, *child),
+            Value::Userdata(child) => self.write_barrier(owner, *child),
+            Value::Thread(child) => self.write_barrier(owner, *child),
+            _ => self.contains_registered(owner),
         }
     }
 
     /// 非 GC 根的写屏障（如 GlobalState 侧表）
     ///
-    pub fn write_root_barrier(&mut self, child: *mut GcObjectHeader) {
-        if child.is_null() {
-            return;
-        }
-
-        // SAFETY: child is valid
+    pub fn write_root_barrier<C: GcObject>(&mut self, child: GcRef<C>) -> bool {
+        let Ok(child) = self.validate_ref(child) else {
+            self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
+            return false;
+        };
+        let child = child.as_ptr().cast::<GcObjectHeader>();
+        // SAFETY: validation matched address, identity, and concrete tag.
         unsafe {
             if !(*child).is_white() {
-                return;
+                return true;
             }
         }
 
-        // SAFETY: child is valid
-        unsafe {
-            self.mark_object(child);
-        }
+        self.mark_live_object(child);
         self.propagate_marks();
+        true
     }
 }
 
@@ -381,55 +470,11 @@ impl GarbageCollector {
 mod tests {
     use super::*;
     use crate::gc::collector::GarbageCollector;
-    use crate::gc::gc_object::GcObject;
     use crate::gc::header::GcObjectHeader;
     use crate::string_pool::StringPool;
     use crate::table::Table;
-    use crate::types::{GcColor, GcObjectType};
-
-    /// 测试用 GC 对象（包含对其他对象的引用）
-    /// `#[repr(C)]` 确保 header 在偏移 0，可以安全转换为 `*mut GcObjectHeader`。
-    #[repr(C)]
-    struct TestObjectWithRef {
-        header: GcObjectHeader,
-        refs: Vec<*mut GcObjectHeader>,
-    }
-
-    impl TestObjectWithRef {
-        fn new(refs: Vec<*mut GcObjectHeader>) -> Self {
-            Self {
-                // Use Thread type to avoid routing into type-specific mark/sweep logic
-                // (Thread is the only remaining unimplemented GC type in Phase 1.4)
-                header: GcObjectHeader::new(GcObjectType::Thread),
-                refs,
-            }
-        }
-    }
-
-    unsafe impl GcObject for TestObjectWithRef {
-        fn gc_header(&self) -> &GcObjectHeader {
-            &self.header
-        }
-
-        fn gc_header_mut(&mut self) -> &mut GcObjectHeader {
-            &mut self.header
-        }
-
-        unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
-            for &r in &self.refs {
-                if !r.is_null() {
-                    // SAFETY: refs contain valid GC object pointers
-                    unsafe {
-                        collector.mark_object(r);
-                    }
-                }
-            }
-        }
-
-        fn get_size(&self) -> usize {
-            std::mem::size_of::<Self>()
-        }
-    }
+    use crate::thread::Thread;
+    use crate::types::GcColor;
 
     #[test]
     fn test_mark_and_sweep_basic() {
@@ -452,6 +497,8 @@ mod tests {
         assert_eq!(gc.object_count(), 1);
 
         // 验证根对象仍为白色（sweep 后重置）
+        // SAFETY: `root_obj` is a registered root, so collection preserved it;
+        // GC objects are not relocated.
         unsafe {
             assert!((*root_header).is_white());
         }
@@ -492,6 +539,8 @@ mod tests {
 
         // 重置所有标记
         gc.reset_marks();
+        // SAFETY: `table_ref` is still owned by `gc`; resetting marks neither
+        // frees nor relocates it.
         unsafe {
             assert!((*table_header).is_white());
         }
@@ -501,36 +550,112 @@ mod tests {
         gc.mark_value(&table_value);
 
         // 应该变为灰色（在 gray_list 中）
+        // SAFETY: marking retains the registered table and only updates its
+        // header bits.
         unsafe {
             assert!(!(*table_header).is_white());
         }
     }
 
     #[test]
-    fn test_write_barrier() {
+    fn mark_only_seed_rejects_unregistered_explicit_root_without_dereference() {
+        let mut gc = GarbageCollector::new();
+        let live = gc.create_root(Table::new());
+        // SAFETY: synthetic handle is never dereferenced; it exercises the
+        // fail-closed test injection path only.
+        let unregistered = unsafe {
+            GcRef::<Table>::from_registered(
+                std::ptr::NonNull::<Table>::dangling(),
+                crate::gc::object_id::ObjectId::from_raw_for_test(u64::MAX),
+            )
+        };
+        gc.roots.push(unregistered.erase());
+
+        let report = gc.begin_mark_only();
+
+        assert_eq!(report.seeded, 1);
+        assert_eq!(report.rejected, 1);
+        let live_header = live.as_ptr() as *const GcObjectHeader;
+        // SAFETY: `live` remains registered and mark-only never destroys it.
+        assert!(!unsafe { (*live_header).is_white() });
+    }
+
+    #[test]
+    fn child_tracing_rejects_foreign_identity_before_header_read() {
+        let mut owner_gc = GarbageCollector::new();
+        let mut foreign_gc = GarbageCollector::new();
+        let parent = owner_gc.create_root(Table::new());
+        let foreign_child = foreign_gc.create(Table::new());
+
+        owner_gc
+            .with_mut(parent, |table| {
+                table.set(&Value::Number(1.0), &Value::Table(foreign_child));
+            })
+            .unwrap();
+
+        let report = owner_gc.begin_mark_only();
+        owner_gc.propagate_marks();
+
+        assert_eq!(report.seeded, 1);
+        assert_eq!(owner_gc.marked_object_count(), 1);
+        assert_eq!(owner_gc.rejected_mark_edge_count(), 1);
+    }
+
+    #[test]
+    fn barriers_reject_foreign_and_stale_handles_fail_closed() {
+        let mut gc = GarbageCollector::new();
+        let mut foreign_gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let owner = gc.create(Thread::new());
+        let stale_child = gc.create(Thread::new());
+        let foreign_child = foreign_gc.create(Thread::new());
+        let owner_header = owner.as_ptr() as *mut GcObjectHeader;
+
+        // SAFETY: owner is registered and kept black so it survives sweep;
+        // stale_child remains white and is reclaimed.
+        unsafe {
+            (*owner_header).set_color(GcColor::Black);
+        }
+        assert!(!gc.write_barrier(owner, foreign_child));
+        assert!(!gc.write_root_barrier(foreign_child));
+
+        assert_eq!(gc.sweep(&mut pool), 1);
+        assert!(gc.contains_registered(owner));
+        assert!(!gc.contains_registered(stale_child));
+        assert!(!gc.write_barrier(owner, stale_child));
+        assert!(!gc.write_root_barrier(stale_child));
+    }
+
+    #[test]
+    fn two_million_registered_barrier_dispatches_remain_stable() {
         let mut gc = GarbageCollector::new();
 
-        let owner_ref = gc.create(TestObjectWithRef::new(Vec::new()));
-        let child_ref = gc.create(TestObjectWithRef::new(Vec::new()));
+        // Use real Thread layouts so propagation exercises the same concrete
+        // dispatch that production objects use. The previous fake Thread tag
+        // made this test invoke undefined behavior.
+        let owner_ref = gc.create(Thread::new());
+        let child_ref = gc.create(Thread::new());
 
         let owner = owner_ref.as_ptr() as *mut GcObjectHeader;
         let child = child_ref.as_ptr() as *mut GcObjectHeader;
 
-        // 设置 owner 为黑色
-        unsafe {
-            (*owner).set_color(GcColor::Black);
-        }
-        // child 为白色
-        unsafe {
-            (*child).set_color(GcColor::White);
-        }
+        // Repeated dispatch is an in-process regression stress test for the
+        // formerly intermittent misaligned-pointer failure.
+        for _ in 0..2_000_000 {
+            // SAFETY: both pointers are live registered Thread headers. No
+            // collection or relocation occurs during this loop.
+            unsafe {
+                (*owner).set_color(GcColor::Black);
+                (*child).set_color(GcColor::White);
+            }
 
-        // 写屏障：黑色 owner 引用白色 child → 应标记 child
-        gc.write_barrier(owner, child);
+            // 写屏障：黑色 owner 引用白色 child → 应标记 child
+            assert!(gc.write_barrier(owner_ref, child_ref));
 
-        // child 现在应该被标记（非白色）
-        unsafe {
-            assert!(!(*child).is_white());
+            // SAFETY: the barrier marks and traces `child` without freeing it.
+            unsafe {
+                assert!((*child).is_black());
+            }
         }
     }
 
@@ -538,10 +663,11 @@ mod tests {
     fn test_mark_clears_previous_marks() {
         let mut gc = GarbageCollector::new();
 
-        let obj = gc.create(TestObjectWithRef::new(Vec::new()));
+        let obj = gc.create(Thread::new());
         let header = obj.as_ptr() as *mut GcObjectHeader;
 
         // 设置为黑色
+        // SAFETY: `header` is derived from the live registered object `obj`.
         unsafe {
             (*header).set_color(GcColor::Black);
         }
@@ -550,6 +676,7 @@ mod tests {
         gc.mark();
 
         // 非根对象 → 白色
+        // SAFETY: `mark` does not sweep; `obj` therefore remains allocated.
         unsafe {
             assert!((*header).is_white());
         }

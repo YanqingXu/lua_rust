@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "purpose": "M1 raw-byte differential evidence",
+  "normalization": {
+    "stdout": ["crlf-to-lf"],
+    "stderr": ["crlf-to-lf"]
+  },
+  "expectedDifferences": [
+    {
+      "id": "official-version-project-identity",
+      "lane": "official-lua51",
+      "probe": "_VERSION",
+      "fields": ["stdout"],
+      "referenceUtf8": "Lua 5.1\n",
+      "candidateUtf8": "Lua 5.1 (C core prototype)\n",
+      "deviation": "NOTE-001"
+    },
+    {
+      "id": "official-chunk-name-nul-c-string-boundary",
+      "lane": "official-lua51",
+      "case": "m1-byte-chunk-source",
+      "fields": ["stdout"],
+      "referenceSha256": "a5839ddd88e3f67eebf6ab94dd150298108e4b20b6c44144b6cbeed84b8dfa4d",
+      "candidateSha256": "614e04958ec66e39d03b53f4835599bf72b61a7166573724be566a578393c7cf",
+      "referenceBase64": "CXJlcXVlc3RlZAAFPYD/AFgGc291cmNlAAM9gP8Jc2hvcnQtc3JjAAKA/w==",
+      "candidateBase64": "CXJlcXVlc3RlZAAFPYD/AFgGc291cmNlAAU9gP8AWAlzaG9ydC1zcmMABID/AFg=",
+      "deviation": "NOTE-011",
+      "reason": "Official Lua 5.1 stores the load chunk name through a NUL-terminated C-string boundary and truncates source/short_src at the embedded NUL; lua_cpp and lua_rust preserve the full length-bearing Lua byte string."
+    }
+  ],
+  "cases": [
+    {
+      "id": "m1-byte-string",
+      "script": "tests/lua/differential/m1-byte-string.lua",
+      "evidence": [
+        "stdout-base64",
+        "stdout-sha256",
+        "stderr-base64",
+        "stderr-sha256",
+        "exitStatus"
+      ],
+      "assertions": [
+        "NUL-80-FF",
+        "string-reverse-sub-rep",
+        "tmpfile-binary-roundtrip",
+        "non-UTF8-package-preload-name",
+        "non-UTF8-package-module-name"
+      ],
+      "normalization": {
+        "stdout": [],
+        "stderr": []
+      }
+    },
+    {
+      "id": "m1-byte-chunk-source",
+      "script": "tests/lua/differential/m1-byte-chunk-source.lua",
+      "evidence": [
+        "stdout-base64",
+        "stdout-sha256",
+        "stderr-base64",
+        "stderr-sha256",
+        "exitStatus"
+      ],
+      "assertions": [
+        "invalid-byte-load-chunk-name",
+        "debug-getinfo-source",
+        "debug-getinfo-short-src"
+      ],
+      "normalization": {
+        "stdout": [],
+        "stderr": []
+      }
+    }
+  ]
+}

@@ -8,12 +8,12 @@ use lua_compiler::opcode::{self, OpCode};
 use lua_core::function::{CFunction, Function};
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
-use lua_core::gc::header::GcObjectHeader;
 use lua_core::gc_string::GcString;
 use lua_core::proto::{Proto, VARARG_NEEDSARG};
 use lua_core::table::Table;
 use lua_core::upvalue::Upvalue;
 use lua_core::value::Value;
+use std::cmp::Ordering;
 
 use crate::state::{LUA_MULTRET, LuaState, Stack, ThreadStatus};
 
@@ -43,7 +43,24 @@ const MAX_STRING_LENGTH: usize = 64 * 1024 * 1024;
 /// - `pc` — 程序计数器
 pub fn execute_proto(
     l: &mut LuaState,
-    proto: &Proto,
+    proto: GcRef<Proto>,
+    gc: &mut GarbageCollector,
+) -> Result<ExecResult, RuntimeError> {
+    let entry_ci = l.current_ci;
+    let result = execute_proto_inner(l, proto, gc);
+    if result.is_err() && entry_ci == 0 && l.current_ci == 0 {
+        let ci = l.current_call_info_mut();
+        if ci.proto == Some(proto) {
+            ci.proto = None;
+            ci.varargs.clear();
+        }
+    }
+    result
+}
+
+fn execute_proto_inner(
+    l: &mut LuaState,
+    proto: GcRef<Proto>,
     gc: &mut GarbageCollector,
 ) -> Result<ExecResult, RuntimeError> {
     if l.nccalls > MAX_CALLS {
@@ -53,12 +70,15 @@ pub fn execute_proto(
     }
     l.gc = Some(gc as *mut GarbageCollector);
 
-    let mut active_proto = proto;
+    let mut active_proto_ref = proto;
+    let initial_max_stack = gc
+        .with_ref(active_proto_ref, Proto::max_stack_size)
+        .map_err(invalid_proto_error)?;
     let _nresults = l.current_call_info().nresults;
     let resume_from_yield = l.status == ThreadStatus::Yield;
     let mut pc: usize = if resume_from_yield {
         l.status = ThreadStatus::Ok;
-        l.current_call_info_mut().proto = Some(active_proto as *const Proto);
+        l.current_call_info_mut().proto = Some(active_proto_ref);
         l.current_call_info()
             .savedpc
             .map(|savedpc| savedpc + 1)
@@ -66,13 +86,13 @@ pub fn execute_proto(
     } else {
         let ci = l.current_call_info_mut();
         ci.savedpc = Some(0); // start at PC 0
-        ci.proto = Some(active_proto as *const Proto);
+        ci.proto = Some(active_proto_ref);
         0
     };
 
     // Ensure stack has enough space for this function's registers.
     // Proto::max_stack_size() gives the number of register slots needed.
-    let stack_needed = l.current_call_info().base + active_proto.max_stack_size() as usize;
+    let stack_needed = l.current_call_info().base + initial_max_stack as usize;
     if l.stack.size() < stack_needed {
         l.stack.set_top(stack_needed);
     }
@@ -82,7 +102,14 @@ pub fn execute_proto(
 
     // 主解释循环
     loop {
-        l.current_proto = Some(active_proto as *const Proto);
+        let active_proto_ptr = gc
+            .validate_ref(active_proto_ref)
+            .map_err(invalid_proto_error)?;
+        // SAFETY: validate_ref checked address, ObjectId, and type against this
+        // collector immediately before the dereference. Destructive sweep is
+        // forbidden while the VM executes, so the allocation cannot disappear
+        // during this interpreter iteration.
+        let active_proto = unsafe { active_proto_ptr.as_ref() };
         let code = active_proto.code();
         if pc >= code.len() {
             break;
@@ -92,7 +119,7 @@ pub fn execute_proto(
         let op = opcode::get_opcode(inst);
         let base_idx = l.current_call_info().base;
         l.current_call_info_mut().savedpc = Some(pc);
-        run_debug_instruction_hooks(l, gc, active_proto, pc, op)?;
+        run_debug_instruction_hooks(l, gc, active_proto_ref, pc, op)?;
         run_auto_weak_gc(l, gc);
 
         match op {
@@ -443,60 +470,60 @@ pub fn execute_proto(
                     if let Some(func_obj) = unsafe { func_ref.as_ref() } {
                         if func_obj.is_lua_function() {
                             if let Some(callee_proto_ref) = func_obj.proto() {
-                                // SAFETY: callee_proto_ref is kept alive by the Function
-                                // GC object which is on the stack during execution
-                                let callee_proto = unsafe { callee_proto_ref.as_ref() };
-                                if let Some(callee_proto) = callee_proto {
-                                    // Setup new call frame
-                                    let new_base = base_idx + a + 1;
-                                    let varargs =
-                                        prepare_lua_varargs(l, gc, callee_proto, new_base, nargs);
-                                    let saved_ci = l.current_ci;
-                                    let ci = l.push_call_info();
-                                    ci.func = base_idx + a;
-                                    ci.base = new_base;
-                                    ci.top = new_base + callee_proto.max_stack_size() as usize;
-                                    ci.nresults = nresults;
-                                    ci.nargs = nargs;
-                                    ci.varargs = varargs;
-                                    ci.savedpc = None;
-                                    ci.proto = Some(callee_proto as *const Proto);
-                                    ci.tailcalls = 0;
+                                let callee_proto_ptr = gc
+                                    .validate_ref(callee_proto_ref)
+                                    .map_err(invalid_proto_error)?;
+                                // SAFETY: validated above; destructive sweep is disabled
+                                // throughout VM execution.
+                                let callee_proto = unsafe { callee_proto_ptr.as_ref() };
+                                // Setup new call frame
+                                let new_base = base_idx + a + 1;
+                                let varargs =
+                                    prepare_lua_varargs(l, gc, callee_proto, new_base, nargs);
+                                let saved_ci = l.current_ci;
+                                let ci = l.push_call_info();
+                                ci.func = base_idx + a;
+                                ci.base = new_base;
+                                ci.top = new_base + callee_proto.max_stack_size() as usize;
+                                ci.nresults = nresults;
+                                ci.nargs = nargs;
+                                ci.varargs = varargs;
+                                ci.savedpc = None;
+                                ci.proto = Some(callee_proto_ref);
+                                ci.tailcalls = 0;
 
-                                    if let Err(e) = fire_debug_hook(l, gc, "call", None) {
-                                        l.current_ci = saved_ci;
+                                if let Err(e) = fire_debug_hook(l, gc, "call", None) {
+                                    unwind_lua_frames_to(l, saved_ci);
+                                    return Err(e);
+                                }
+
+                                // Recursively execute the called function
+                                match execute_nested_proto_at(
+                                    l,
+                                    active_proto_ref,
+                                    pc,
+                                    callee_proto_ref,
+                                    gc,
+                                ) {
+                                    Ok(ExecResult::Returned) => {
+                                        // Results already placed by RETURN handler
+                                    }
+                                    Ok(ExecResult::Yielded) => {
+                                        return Ok(ExecResult::Yielded);
+                                    }
+                                    Err(e) => {
+                                        // Restore call frame and propagate error
+                                        unwind_lua_frames_to(l, saved_ci);
                                         return Err(e);
                                     }
-
-                                    // Recursively execute the called function
-                                    match execute_nested_proto_at(
-                                        l,
-                                        active_proto,
-                                        pc,
-                                        callee_proto,
-                                        gc,
-                                    ) {
-                                        Ok(ExecResult::Returned) => {
-                                            // Results already placed by RETURN handler
-                                        }
-                                        Ok(ExecResult::Yielded) => {
-                                            return Ok(ExecResult::Yielded);
-                                        }
-                                        Err(e) => {
-                                            // Restore call frame and propagate error
-                                            let close_base = l.current_call_info().base;
-                                            l.close_upvalues(close_base);
-                                            l.current_ci = saved_ci;
-                                            return Err(e);
-                                        }
-                                    }
-
-                                    if l.current_ci != saved_ci {
-                                        return Err(RuntimeError::new("VM: call frame imbalance"));
-                                    }
-                                    pc += 1;
-                                    continue;
                                 }
+
+                                if l.current_ci != saved_ci {
+                                    unwind_lua_frames_to(l, saved_ci);
+                                    return Err(RuntimeError::new("VM: call frame imbalance"));
+                                }
+                                pc += 1;
+                                continue;
                             }
                             return Err(RuntimeError::new("Lua function has no proto"));
                         } else if let Some(cfunc) = func_obj.c_function() {
@@ -607,6 +634,7 @@ pub fn execute_proto(
                         }
                     }
                     l.top = ci.func + available;
+                    l.pop_call_info();
                     return Ok(ExecResult::Returned);
                 }
 
@@ -615,11 +643,13 @@ pub fn execute_proto(
                     if let Some(func_obj) = unsafe { func_ref.as_ref() } {
                         if func_obj.is_lua_function() {
                             if let Some(tail_proto_ref) = func_obj.proto() {
-                                let tail_proto_ptr = tail_proto_ref.as_ptr();
-                                if !tail_proto_ptr.is_null() {
-                                    // SAFETY: tail_proto_ref is kept alive by the Function GC object,
-                                    // and GC does not run while the VM is executing this frame.
-                                    let tail_proto = unsafe { &*tail_proto_ptr };
+                                if !tail_proto_ref.is_null() {
+                                    let tail_proto_ptr = gc
+                                        .validate_ref(tail_proto_ref)
+                                        .map_err(invalid_proto_error)?;
+                                    // SAFETY: validated above; destructive sweep is disabled
+                                    // throughout VM execution.
+                                    let tail_proto = unsafe { tail_proto_ptr.as_ref() };
                                     let args: Vec<Value> = (0..actual_nargs)
                                         .map(|i| {
                                             l.stack
@@ -650,14 +680,14 @@ pub fn execute_proto(
                                     ci.nargs = tail_nargs;
                                     ci.varargs = varargs;
                                     ci.savedpc = Some(0);
-                                    ci.proto = Some(tail_proto as *const Proto);
+                                    ci.proto = Some(tail_proto_ref);
                                     ci.tailcalls += 1;
 
                                     if l.stack.size() < new_top {
                                         l.stack.set_top(new_top);
                                     }
                                     fire_debug_hook(l, gc, "call", None)?;
-                                    active_proto = tail_proto;
+                                    active_proto_ref = tail_proto_ref;
                                     pc = 0;
                                     continue;
                                 }
@@ -867,12 +897,12 @@ pub fn execute_proto(
                                     return Ok(ExecResult::Yielded);
                                 }
                             } else if let Some(iter_proto_ref) = func_obj.proto() {
-                                // SAFETY: iter_proto_ref is kept alive by the iterator closure
-                                // stored in the generic-for generator register.
-                                let iter_proto =
-                                    unsafe { iter_proto_ref.as_ref() }.ok_or_else(|| {
-                                        RuntimeError::new("generic for: Lua iterator has no proto")
-                                    })?;
+                                let iter_proto_ptr = gc
+                                    .validate_ref(iter_proto_ref)
+                                    .map_err(invalid_proto_error)?;
+                                // SAFETY: validated above; destructive sweep is disabled
+                                // throughout VM execution.
+                                let iter_proto = unsafe { iter_proto_ptr.as_ref() };
                                 let call_pos = base_idx + a + 3;
                                 ensure_stack_slot(l, call_pos + 2);
                                 if let Some(dst) = l.stack.at_mut(call_pos) {
@@ -896,21 +926,26 @@ pub fn execute_proto(
                                 ci.nargs = 2;
                                 ci.varargs = varargs;
                                 ci.savedpc = None;
-                                ci.proto = Some(iter_proto as *const Proto);
+                                ci.proto = Some(iter_proto_ref);
                                 ci.tailcalls = 0;
 
-                                match execute_nested_proto_at(l, active_proto, pc, iter_proto, gc) {
+                                match execute_nested_proto_at(
+                                    l,
+                                    active_proto_ref,
+                                    pc,
+                                    iter_proto_ref,
+                                    gc,
+                                ) {
                                     Ok(ExecResult::Returned) => {}
                                     Ok(ExecResult::Yielded) => return Ok(ExecResult::Yielded),
                                     Err(e) => {
-                                        let close_base = l.current_call_info().base;
-                                        l.close_upvalues(close_base);
-                                        l.current_ci = saved_ci;
+                                        unwind_lua_frames_to(l, saved_ci);
                                         return Err(e);
                                     }
                                 }
 
                                 if l.current_ci != saved_ci {
+                                    unwind_lua_frames_to(l, saved_ci);
                                     return Err(RuntimeError::new(
                                         "VM: generic-for call frame imbalance",
                                     ));
@@ -998,10 +1033,12 @@ pub fn execute_proto(
                 if !sub_proto_ref.is_null() {
                     let mut func = Function::new_lua(sub_proto_ref);
                     func.set_env(current_env(l));
-                    // SAFETY: sub_proto_ref is a live child proto owned by the
-                    // currently executing parent proto.
-                    let child_proto = unsafe { sub_proto_ref.as_ref() }
-                        .ok_or_else(|| RuntimeError::new("VM: CLOSURE invalid child proto"))?;
+                    let child_proto_ptr = gc
+                        .validate_ref(sub_proto_ref)
+                        .map_err(invalid_proto_error)?;
+                    // SAFETY: validated above; destructive sweep is disabled
+                    // throughout VM execution.
+                    let child_proto = unsafe { child_proto_ptr.as_ref() };
                     let mut next_pc = pc + 1;
                     for _ in 0..child_proto.num_upvalues() {
                         let pseudo = *code.get(next_pc).ok_or_else(|| {
@@ -1070,13 +1107,14 @@ pub fn execute_proto(
         pc += 1;
     }
 
+    l.pop_call_info();
     Ok(ExecResult::Returned)
 }
 
 fn run_debug_instruction_hooks(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    proto: &Proto,
+    proto: GcRef<Proto>,
     pc: usize,
     op: OpCode,
 ) -> Result<(), RuntimeError> {
@@ -1098,11 +1136,15 @@ fn run_debug_instruction_hooks(
     }
 
     if l.debug_hook_mask.contains('l') {
-        let line = proto.line(pc);
-        let should_skip_setup_line = l.debug_hook_skip_line == line
-            && l.debug_hook_skip_proto == Some(proto as *const Proto);
+        let line = gc
+            .with_ref(proto, |active| active.line(pc))
+            .map_err(invalid_proto_error)?;
+        let should_skip_setup_line =
+            l.debug_hook_skip_line == line && l.debug_hook_skip_proto == Some(proto);
         let repeated_line_from_jump = pc <= l.debug_hook_last_pc && line == l.debug_hook_last_line;
         if should_skip_setup_line {
+            l.debug_hook_skip_proto = None;
+            l.debug_hook_skip_line = -1;
             l.debug_hook_last_line = line;
             l.debug_hook_last_pc = pc;
         } else if line > 0 && (line != l.debug_hook_last_line || repeated_line_from_jump) {
@@ -1150,6 +1192,9 @@ fn mark_vm_roots_for_weak_cleanup(l: &LuaState, gc: &mut GarbageCollector) {
     if let Some(hook) = &l.debug_hook {
         gc.mark_value(hook);
     }
+    if let Some(skip_proto) = l.debug_hook_skip_proto {
+        gc.mark_registered(skip_proto);
+    }
     if let Some(error) = &l.last_error {
         gc.mark_value(error);
     }
@@ -1169,37 +1214,46 @@ fn mark_vm_roots_for_weak_cleanup(l: &LuaState, gc: &mut GarbageCollector) {
             gc.mark_value(value);
         }
 
-        let Some(proto_ptr) = frame_proto_for_gc(l, ci) else {
+        let Some(proto_ref) = frame_proto_for_gc(l, gc, ci) else {
             continue;
         };
-        // SAFETY: proto pointers are installed by the VM while their frames are live.
-        let proto = unsafe { &*proto_ptr };
+        gc.mark_registered(proto_ref);
         let pc = ci.savedpc.unwrap_or(0) as i32;
-        for idx in 0..proto.loc_var_count() {
-            let loc = proto.loc_var(idx);
-            if loc.startpc <= pc && pc < loc.endpc && loc.reg >= 0 {
-                let stack_index = ci.base + loc.reg as usize;
-                if let Some(value) = l.stack.at(stack_index) {
-                    gc.mark_value(value);
-                }
+        let local_slots = gc
+            .with_ref(proto_ref, |proto| {
+                (0..proto.loc_var_count())
+                    .filter_map(|idx| {
+                        let loc = proto.loc_var(idx);
+                        (loc.startpc <= pc && pc < loc.endpc && loc.reg >= 0)
+                            .then_some(ci.base + loc.reg as usize)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for stack_index in local_slots {
+            if let Some(value) = l.stack.at(stack_index) {
+                gc.mark_value(value);
             }
         }
     }
 }
 
-fn frame_proto_for_gc(l: &LuaState, ci: &crate::state::CallInfo) -> Option<*const Proto> {
+fn frame_proto_for_gc(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    ci: &crate::state::CallInfo,
+) -> Option<GcRef<Proto>> {
     if let Some(proto) = ci.proto {
         return Some(proto);
     }
     let Value::Function(func_ref) = l.stack.at(ci.func).cloned().unwrap_or(Value::Nil) else {
-        return l.current_proto;
-    };
-    // SAFETY: function refs read from active stack slots stay live during this call.
-    let func = unsafe { func_ref.as_ref() }?;
-    if !func.is_lua_function() {
         return None;
-    }
-    func.proto().map(|proto| proto.as_ptr())
+    };
+    gc.with_ref(func_ref, |func| {
+        func.is_lua_function().then(|| func.proto()).flatten()
+    })
+    .ok()
+    .flatten()
 }
 
 fn mark_open_upvalues(l: &LuaState, gc: &mut GarbageCollector) {
@@ -1209,10 +1263,7 @@ fn mark_open_upvalues(l: &LuaState, gc: &mut GarbageCollector) {
         let Some(upvalue) = (unsafe { upvalue_ref.as_ref() }) else {
             break;
         };
-        // SAFETY: upvalue_ref points to a GC-managed Upvalue object.
-        unsafe {
-            gc.mark_object(upvalue_ref.as_ptr() as *mut GcObjectHeader);
-        }
+        gc.mark_registered(upvalue_ref);
         if upvalue.is_open()
             && let Some(value) = l.stack.at(upvalue.stack_index())
         {
@@ -1241,7 +1292,7 @@ fn fire_debug_hook(
         return Ok(());
     }
 
-    let event_ref = gc.create(GcString::new(event));
+    let event_ref = gc.create(GcString::from_bytes(event.as_bytes()));
     let line_value = line.map_or(Value::Nil, |line| Value::Number(line as f64));
     let saved_top = l.top;
     let frame_top = l.current_call_info().top.max(saved_top);
@@ -1261,18 +1312,22 @@ fn fire_debug_hook(
 
 fn execute_nested_proto_at(
     l: &mut LuaState,
-    caller_proto: &Proto,
+    caller_proto: GcRef<Proto>,
     caller_pc: usize,
-    callee_proto: &Proto,
+    callee_proto: GcRef<Proto>,
     gc: &mut GarbageCollector,
 ) -> Result<ExecResult, RuntimeError> {
-    let overflow = stack_overflow_error(l, caller_proto, caller_pc);
+    let caller_proto_ptr = gc.validate_ref(caller_proto).map_err(invalid_proto_error)?;
+    // SAFETY: validated above; destructive sweep is disabled throughout VM
+    // execution.
+    let caller_proto = unsafe { caller_proto_ptr.as_ref() };
+    let overflow = stack_overflow_error(l, gc, caller_proto, caller_pc);
     execute_counted_proto(l, callee_proto, gc, overflow)
 }
 
 fn execute_counted_proto(
     l: &mut LuaState,
-    proto: &Proto,
+    proto: GcRef<Proto>,
     gc: &mut GarbageCollector,
     overflow: RuntimeError,
 ) -> Result<ExecResult, RuntimeError> {
@@ -1283,6 +1338,14 @@ fn execute_counted_proto(
     let result = execute_proto(l, proto, gc);
     l.nccalls -= 1;
     result
+}
+
+fn unwind_lua_frames_to(l: &mut LuaState, target_ci: usize) {
+    while l.current_ci > target_ci {
+        let base = l.current_call_info().base;
+        l.close_upvalues(base);
+        l.pop_call_info();
+    }
 }
 
 /// Call a Lua value from host/stdlib code and collect its results.
@@ -1315,7 +1378,7 @@ pub fn call_value(
     let result = call_value_at_stack(l, gc, call_pos, args.len(), wanted_results)
         .map(|()| collect_call_results(l, call_pos));
 
-    l.current_ci = saved_ci;
+    unwind_lua_frames_to(l, saved_ci);
     l.top = saved_top;
     result
 }
@@ -1344,10 +1407,12 @@ pub fn start_lua_call_at_stack(
     let Some(callee_proto_ref) = func_obj.proto() else {
         return Err(RuntimeError::new("coroutine entry must be a Lua function"));
     };
-    // SAFETY: the function on the stack keeps its Proto alive while it runs.
-    let Some(callee_proto) = (unsafe { callee_proto_ref.as_ref() }) else {
-        return Err(RuntimeError::new("Lua function has invalid proto"));
-    };
+    let callee_proto_ptr = gc
+        .validate_ref(callee_proto_ref)
+        .map_err(invalid_proto_error)?;
+    // SAFETY: validated above; destructive sweep is disabled throughout VM
+    // execution.
+    let callee_proto = unsafe { callee_proto_ptr.as_ref() };
 
     let new_base = func_pos + 1;
     let varargs = prepare_lua_varargs(l, gc, callee_proto, new_base, nargs as i32);
@@ -1359,7 +1424,7 @@ pub fn start_lua_call_at_stack(
     ci.nargs = nargs as i32;
     ci.varargs = varargs;
     ci.savedpc = None;
-    ci.proto = Some(callee_proto as *const Proto);
+    ci.proto = Some(callee_proto_ref);
     ci.tailcalls = 0;
 
     Ok(())
@@ -1376,15 +1441,22 @@ pub fn resume_lua_thread(
             return Ok(ExecResult::Returned);
         }
 
-        let proto_ref = current_lua_function(l)
-            .and_then(|function| function.proto())
+        let proto_ref = l
+            .current_call_info()
+            .proto
+            .or_else(|| current_lua_function(l).and_then(|function| function.proto()))
             .ok_or_else(|| RuntimeError::new("coroutine frame has no Lua proto"))?;
-        // SAFETY: the current frame's function slot keeps the proto alive.
-        let proto = unsafe { proto_ref.as_ref() }
-            .ok_or_else(|| RuntimeError::new("coroutine frame has invalid proto"))?;
+        gc.validate_ref(proto_ref).map_err(invalid_proto_error)?;
 
         l.status = ThreadStatus::Yield;
-        match execute_proto(l, proto, gc)? {
+        let result = match execute_proto(l, proto_ref, gc) {
+            Ok(result) => result,
+            Err(error) => {
+                unwind_lua_frames_to(l, 0);
+                return Err(error);
+            }
+        };
+        match result {
             ExecResult::Yielded => return Ok(ExecResult::Yielded),
             ExecResult::Returned => {
                 if l.current_ci == 0 {
@@ -1425,10 +1497,12 @@ fn call_value_at_stack(
     let Some(callee_proto_ref) = func_obj.proto() else {
         return Err(RuntimeError::new("Lua function has no proto"));
     };
-    // SAFETY: the function on the stack keeps its Proto alive while it runs.
-    let Some(callee_proto) = (unsafe { callee_proto_ref.as_ref() }) else {
-        return Err(RuntimeError::new("Lua function has invalid proto"));
-    };
+    let callee_proto_ptr = gc
+        .validate_ref(callee_proto_ref)
+        .map_err(invalid_proto_error)?;
+    // SAFETY: validated above; destructive sweep is disabled throughout VM
+    // execution.
+    let callee_proto = unsafe { callee_proto_ptr.as_ref() };
 
     let saved_ci = l.current_ci;
     let new_base = func_pos + 1;
@@ -1441,21 +1515,23 @@ fn call_value_at_stack(
     ci.nargs = nargs as i32;
     ci.varargs = varargs;
     ci.savedpc = None;
-    ci.proto = Some(callee_proto as *const Proto);
+    ci.proto = Some(callee_proto_ref);
     ci.tailcalls = 0;
 
-    match execute_counted_proto(l, callee_proto, gc, RuntimeError::new("stack overflow")) {
+    match execute_counted_proto(l, callee_proto_ref, gc, RuntimeError::new("stack overflow")) {
         Ok(ExecResult::Returned) => {}
-        Ok(ExecResult::Yielded) => return Err(RuntimeError::new("cannot yield across pcall")),
+        Ok(ExecResult::Yielded) => {
+            unwind_lua_frames_to(l, saved_ci);
+            return Err(RuntimeError::new("cannot yield across pcall"));
+        }
         Err(e) => {
-            let close_base = l.current_call_info().base;
-            l.close_upvalues(close_base);
-            l.current_ci = saved_ci;
+            unwind_lua_frames_to(l, saved_ci);
             return Err(e);
         }
     }
 
     if l.current_ci != saved_ci {
+        unwind_lua_frames_to(l, saved_ci);
         return Err(RuntimeError::new("VM: helper call frame imbalance"));
     }
     Ok(())
@@ -1493,7 +1569,7 @@ fn c_function_display_name(l: &LuaState, func_pos: usize) -> String {
             if let Some(name) = find_function_name_in_table(table, func_ref) {
                 // SAFETY: key is held by the global table.
                 let lib_name = unsafe { lib_name_ref.as_ref() }
-                    .map(|name| name.data().to_string())
+                    .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 return format!("{lib_name}.{name}");
             }
@@ -1508,7 +1584,7 @@ fn find_function_name_in_table(table: &Table, func_ref: GcRef<Function>) -> Opti
             && *value_ref == func_ref
         {
             // SAFETY: key is held by the table being inspected.
-            return unsafe { name_ref.as_ref() }.map(|name| name.data().to_string());
+            return unsafe { name_ref.as_ref() }.map(|name| name.to_string_lossy().into_owned());
         }
     }
     None
@@ -1533,20 +1609,25 @@ fn runtime_error_at(proto: &Proto, pc: usize, message: impl Into<String>) -> Run
         .source()
         .and_then(|source_ref| {
             // SAFETY: the active Proto keeps its source string alive.
-            unsafe { source_ref.as_ref() }.map(|source| source.data().to_string())
+            unsafe { source_ref.as_ref() }.map(|source| source.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "?".to_string());
     let line = proto.line(pc);
     RuntimeError::new(format!("{}:{}: {}", source, line, message.into()))
 }
 
-fn stack_overflow_error(l: &LuaState, caller_proto: &Proto, caller_pc: usize) -> RuntimeError {
+fn stack_overflow_error(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    caller_proto: &Proto,
+    caller_pc: usize,
+) -> RuntimeError {
     let recursive_line = caller_proto.line(caller_pc);
     let mut message = format!("?:{}: stack overflow", recursive_line);
     for _ in 0..20 {
         message.push_str(&format!("\n?:{}: in function 'y'", recursive_line));
     }
-    if let Some(line) = first_non_recursive_caller_line(l) {
+    if let Some(line) = first_non_recursive_caller_line(l, gc) {
         message.push_str(&format!("\n?:{}: in function 'g'", line));
     } else {
         let line = caller_proto.line(caller_pc);
@@ -1555,7 +1636,7 @@ fn stack_overflow_error(l: &LuaState, caller_proto: &Proto, caller_pc: usize) ->
     RuntimeError::new(message)
 }
 
-fn first_non_recursive_caller_line(l: &LuaState) -> Option<i32> {
+fn first_non_recursive_caller_line(l: &LuaState, gc: &GarbageCollector) -> Option<i32> {
     let mut top_func: Option<GcRef<Function>> = None;
     for ci in l.call_stack.iter().take(l.current_ci + 1).rev() {
         let Value::Function(func_ref) = l.stack.at(ci.func).cloned().unwrap_or(Value::Nil) else {
@@ -1568,12 +1649,10 @@ fn first_non_recursive_caller_line(l: &LuaState) -> Option<i32> {
         if Some(func_ref) == top_func {
             continue;
         }
-        // SAFETY: the function is held by a live call frame.
-        let func = unsafe { func_ref.as_ref() }?;
-        let proto_ref = func.proto()?;
-        // SAFETY: a Lua function keeps its proto alive.
-        let proto = unsafe { proto_ref.as_ref() }?;
-        return ci.savedpc.map(|pc| proto.line(pc));
+        let proto_ref = ci.proto?;
+        return ci
+            .savedpc
+            .and_then(|pc| gc.with_ref(proto_ref, |proto| proto.line(pc)).ok());
     }
     None
 }
@@ -1735,7 +1814,7 @@ fn describe_register_impl(
                 let upvalue = opcode::get_arg_b(inst) as usize;
                 return proto
                     .upvalue_name(upvalue)
-                    .and_then(gc_string_data)
+                    .and_then(gc_string_lossy)
                     .map(|name| format!("upvalue '{name}'"));
             }
             OpCode::GETGLOBAL => {
@@ -1829,7 +1908,7 @@ fn local_name_for_reg(proto: &Proto, reg: usize, pc: usize) -> Option<String> {
             && pc < loc.endpc
             && let Some(name_ref) = loc.varname
         {
-            return gc_string_data(name_ref);
+            return gc_string_lossy(name_ref);
         }
     }
     None
@@ -1845,14 +1924,14 @@ fn rk_string(constants: &[Value], rk: i32) -> Option<String> {
 
 fn constant_string(constants: &[Value], idx: usize) -> Option<String> {
     match constants.get(idx) {
-        Some(Value::String(name_ref)) => gc_string_data(*name_ref),
+        Some(Value::String(name_ref)) => gc_string_lossy(*name_ref),
         _ => None,
     }
 }
 
-fn gc_string_data(name_ref: GcRef<GcString>) -> Option<String> {
+fn gc_string_lossy(name_ref: GcRef<GcString>) -> Option<String> {
     // SAFETY: debug names/constants are owned by the active Proto while executing.
-    unsafe { name_ref.as_ref() }.map(|name| name.data().to_string())
+    unsafe { name_ref.as_ref() }.map(|name| name.to_string_lossy().into_owned())
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1921,7 +2000,7 @@ fn install_arg_table(l: &mut LuaState, gc: &mut GarbageCollector, slot: usize, v
     for (idx, value) in varargs.iter().enumerate() {
         table.set(&Value::Number((idx + 1) as f64), value);
     }
-    let n_key = gc.create(GcString::new("n"));
+    let n_key = gc.create(GcString::from_bytes(b"n"));
     table.set(&Value::String(n_key), &Value::Number(varargs.len() as f64));
 
     let table_ref = gc.create(table);
@@ -1959,7 +2038,7 @@ fn call_c_function(
     l.top = func_pos + 1 + nargs;
 
     if let Err(e) = fire_debug_hook(l, gc, "call", None) {
-        l.current_ci = saved_ci;
+        unwind_lua_frames_to(l, saved_ci);
         l.top = saved_top;
         return Err(e);
     }
@@ -1986,7 +2065,7 @@ fn call_c_function(
         } else {
             None
         };
-        l.current_ci = saved_ci;
+        unwind_lua_frames_to(l, saved_ci);
         l.top = saved_top;
         return Err(error_value
             .map(RuntimeError::with_value)
@@ -2001,7 +2080,11 @@ fn call_c_function(
     let nret_count = nret as usize;
     let first_result = l.top.saturating_sub(nret_count);
     let wanted_count = wanted_results.unwrap_or(nret_count);
-    fire_debug_hook(l, gc, "return", None)?;
+    if let Err(error) = fire_debug_hook(l, gc, "return", None) {
+        unwind_lua_frames_to(l, saved_ci);
+        l.top = saved_top;
+        return Err(error);
+    }
     if wanted_count > 0 {
         ensure_stack_slot(l, func_pos + wanted_count - 1);
     }
@@ -2221,7 +2304,7 @@ fn get_string_library_member(l: &LuaState, key: &Value) -> Value {
         let Some(name) = (unsafe { name_ref.as_ref() }) else {
             continue;
         };
-        if name.data() == "string"
+        if name.as_bytes() == b"string"
             && let Value::Table(string_table_ref) = global_value
             // SAFETY: string library table is reachable from the global table.
             && let Some(string_table) = unsafe { string_table_ref.as_ref() }
@@ -2410,7 +2493,7 @@ fn exec_concat(
     lhs: &Value,
     rhs: &Value,
 ) -> Result<Value, RuntimeError> {
-    if let (Some(left), Some(right)) = (to_concat_string(lhs), to_concat_string(rhs)) {
+    if let (Some(left), Some(right)) = (to_concat_bytes(lhs), to_concat_bytes(rhs)) {
         let len = left
             .len()
             .checked_add(right.len())
@@ -2418,7 +2501,10 @@ fn exec_concat(
         if len > MAX_STRING_LENGTH {
             return Err(RuntimeError::new("string length overflow"));
         }
-        return Ok(Value::String(gc.create(GcString::new(&(left + &right)))));
+        let mut bytes = Vec::with_capacity(len);
+        bytes.extend_from_slice(&left);
+        bytes.extend_from_slice(&right);
+        return Ok(Value::String(intern_vm_bytes(l, gc, &bytes)));
     }
     if let Some(metamethod) = find_metamethod(l, lhs, rhs, "__concat") {
         call_metamethod_value(l, gc, stack_limit, metamethod, &[lhs.clone(), rhs.clone()])
@@ -2427,6 +2513,15 @@ fn exec_concat(
             "attempt to concatenate a non-string value",
         ))
     }
+}
+
+fn intern_vm_bytes(l: &mut LuaState, gc: &mut GarbageCollector, bytes: &[u8]) -> GcRef<GcString> {
+    if let Some(pool) = l.string_pool {
+        // SAFETY: LuaState's runtime owns this pool and keeps it alive and
+        // exclusively available for the duration of VM execution.
+        return unsafe { &mut *pool }.intern_bytes(gc, bytes);
+    }
+    gc.create(GcString::from_bytes(bytes))
 }
 
 /// 取长度
@@ -2471,7 +2566,9 @@ fn exec_lt(
             // SAFETY: Same justification as above — GC is not running during execution.
             let b_str = unsafe { b_ref.as_ref() };
             match (a_str, b_str) {
-                (Some(a), Some(b)) => Ok(a.data() < b.data()),
+                (Some(a), Some(b)) => {
+                    Ok(compare_lua_string_bytes(a.as_bytes(), b.as_bytes()) == Ordering::Less)
+                }
                 _ => Ok(false),
             }
         }
@@ -2503,7 +2600,9 @@ fn exec_le(
             // SAFETY: Same justification — GC is not running during execution.
             let b_str = unsafe { b_ref.as_ref() };
             match (a_str, b_str) {
-                (Some(a), Some(b)) => Ok(a.data() <= b.data()),
+                (Some(a), Some(b)) => {
+                    Ok(compare_lua_string_bytes(a.as_bytes(), b.as_bytes()) != Ordering::Greater)
+                }
                 _ => Ok(false),
             }
         }
@@ -2519,6 +2618,49 @@ fn exec_le(
                 "attempt to compare non-comparable values",
             ))
         }
+    }
+}
+
+/// Compares Lua strings like the fixed C++ oracle's `luaStringCompare`.
+///
+/// The oracle calls `strcoll` separately for each NUL-delimited segment and
+/// then applies its explicit remaining-length rules. Under the default C
+/// locale, `strcoll` is unsigned-byte lexicographic ordering, which is what
+/// `segment.cmp` implements here. Locale-aware collation remains tracked by
+/// NOTE-006; this comparator deliberately does not use `ByteString::Ord`.
+pub fn compare_lua_string_bytes(mut left: &[u8], mut right: &[u8]) -> Ordering {
+    loop {
+        let left_segment_len = left
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(left.len());
+        let right_segment_len = right
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(right.len());
+        let segment_order = left[..left_segment_len].cmp(&right[..right_segment_len]);
+        if segment_order != Ordering::Equal {
+            return segment_order;
+        }
+
+        // Equal segments necessarily have the same length. Preserve the
+        // oracle's tail checks exactly, including the ordering of a terminal
+        // string against the same bytes followed by an embedded NUL.
+        let segment_len = left_segment_len;
+        if segment_len == right.len() {
+            return if segment_len == left.len() {
+                Ordering::Equal
+            } else {
+                Ordering::Greater
+            };
+        }
+        if segment_len == left.len() {
+            return Ordering::Less;
+        }
+
+        let next = segment_len + 1;
+        left = &left[next..];
+        right = &right[next..];
     }
 }
 
@@ -2618,19 +2760,19 @@ fn lookup_metamethod(metatable: GcRef<Table>, name: &str) -> Option<Value> {
     // SAFETY: metatable is held by a live value being compared.
     let metatable = unsafe { metatable.as_ref() }?;
     for (key, value) in metatable.hash_entries() {
-        if string_value_data(key).is_some_and(|key| key == name) && !value.is_nil() {
+        if string_value_bytes(key).is_some_and(|key| key == name.as_bytes()) && !value.is_nil() {
             return Some(value.clone());
         }
     }
     None
 }
 
-fn string_value_data(value: &Value) -> Option<&str> {
+fn string_value_bytes(value: &Value) -> Option<&[u8]> {
     let Value::String(string_ref) = value else {
         return None;
     };
     // SAFETY: string value is reachable during VM execution.
-    unsafe { string_ref.as_ref() }.map(|string| string.data())
+    unsafe { string_ref.as_ref() }.map(GcString::as_bytes)
 }
 
 fn to_arith_number(value: &Value) -> Option<f64> {
@@ -2638,24 +2780,35 @@ fn to_arith_number(value: &Value) -> Option<f64> {
         Value::Number(n) => Some(*n),
         Value::String(s) => {
             // SAFETY: string value is reachable during VM execution.
-            unsafe { s.as_ref() }.and_then(|string| string.data().trim().parse::<f64>().ok())
+            unsafe { s.as_ref() }.and_then(|string| parse_lua_number_bytes(string.as_bytes()))
         }
         _ => None,
     }
 }
 
-fn to_concat_string(value: &Value) -> Option<String> {
+fn parse_lua_number_bytes(mut bytes: &[u8]) -> Option<f64> {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()
+}
+
+fn to_concat_bytes(value: &Value) -> Option<Vec<u8>> {
     match value {
         Value::String(s) => {
             // SAFETY: string value is reachable during VM execution.
-            unsafe { s.as_ref() }.map(|string| string.data().to_string())
+            unsafe { s.as_ref() }.map(|string| string.as_bytes().to_vec())
         }
         Value::Number(n) => {
-            if n.fract() == 0.0 && n.is_finite() {
-                Some(format!("{n:.0}"))
+            let text = if n.fract() == 0.0 && n.is_finite() {
+                format!("{n:.0}")
             } else {
-                Some(n.to_string())
-            }
+                n.to_string()
+            };
+            Some(text.into_bytes())
         }
         _ => None,
     }
@@ -2675,7 +2828,7 @@ fn values_equal(lhs: &Value, rhs: &Value) -> bool {
             // SAFETY: Same justification — GC is not running during execution.
             let b_str = unsafe { b.as_ref() };
             match (a_str, b_str) {
-                (Some(a), Some(b)) => a.data() == b.data(),
+                (Some(a), Some(b)) => a.as_bytes() == b.as_bytes(),
                 _ => a.as_ptr() == b.as_ptr(),
             }
         }
@@ -2704,7 +2857,7 @@ fn as_number(val: &Value) -> f64 {
             // Try to parse string as number
             // SAFETY: GC does not run during VM execution; same justification as above.
             if let Some(gc_str) = unsafe { s.as_ref() } {
-                gc_str.data().trim().parse::<f64>().unwrap_or(0.0)
+                parse_lua_number_bytes(gc_str.as_bytes()).unwrap_or(0.0)
             } else {
                 0.0
             }
@@ -2730,7 +2883,7 @@ fn value_to_string(val: &Value) -> String {
             // SAFETY: GC does not run during VM execution; GcString is valid
             // because the string value is on the LuaState stack or in constants.
             if let Some(gc_str) = unsafe { s.as_ref() } {
-                gc_str.data().to_string()
+                gc_str.to_string_lossy().into_owned()
             } else {
                 String::new()
             }
@@ -2751,6 +2904,10 @@ fn value_to_string(val: &Value) -> String {
 pub struct RuntimeError {
     pub message: String,
     error_value: Option<Value>,
+}
+
+fn invalid_proto_error(error: lua_core::gc::collector::GcRefValidationError) -> RuntimeError {
+    RuntimeError::new(format!("VM: invalid Proto handle: {error}"))
 }
 
 impl RuntimeError {
@@ -2780,3 +2937,205 @@ impl std::fmt::Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+#[cfg(test)]
+mod byte_string_tests {
+    use super::*;
+    use lua_core::string_pool::StringPool;
+
+    fn byte_value(gc: &mut GarbageCollector, bytes: &[u8]) -> Value {
+        Value::String(gc.create(GcString::from_bytes(bytes)))
+    }
+
+    #[test]
+    fn raw_ff_is_not_equal_to_utf8_encoding_of_y_diaeresis() {
+        let mut gc = GarbageCollector::new();
+        let raw_ff = byte_value(&mut gc, &[0xff]);
+        let utf8_y_diaeresis = byte_value(&mut gc, &[0xc3, 0xbf]);
+
+        assert!(!values_equal(&raw_ff, &utf8_y_diaeresis));
+    }
+
+    #[test]
+    fn concat_preserves_high_bytes_and_uses_the_string_pool() {
+        let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let mut state = LuaState::new();
+        state.string_pool = Some(&mut pool);
+        let left = byte_value(&mut gc, &[0x00, 0x80, 0xff]);
+        let right = byte_value(&mut gc, &[0xfe, 0xc3, 0x00]);
+        let expected = [0x00, 0x80, 0xff, 0xfe, 0xc3, 0x00];
+
+        let result =
+            exec_concat(&mut state, &mut gc, 0, &left, &right).expect("byte concat succeeds");
+        let Value::String(result_ref) = result else {
+            panic!("concat must return a Lua string");
+        };
+        // SAFETY: result_ref was just allocated in gc and remains live.
+        let result_string = unsafe { result_ref.as_ref() }.expect("non-null string");
+
+        assert_eq!(result_string.as_bytes(), expected);
+        assert_eq!(pool.find_bytes(&expected), Some(result_ref));
+    }
+
+    #[test]
+    fn embedded_nul_participates_in_length_and_equality() {
+        let mut gc = GarbageCollector::new();
+        let first = byte_value(&mut gc, b"a\0b");
+        let same = byte_value(&mut gc, b"a\0b");
+        let different_tail = byte_value(&mut gc, b"a\0c");
+
+        assert_eq!(exec_len(&first), Value::Number(3.0));
+        assert!(values_equal(&first, &same));
+        assert!(!values_equal(&first, &different_tail));
+    }
+
+    #[test]
+    fn oracle_ordering_compares_each_embedded_nul_segment() {
+        assert_eq!(compare_lua_string_bytes(b"a\0b", b"a\0c"), Ordering::Less);
+        assert_eq!(compare_lua_string_bytes(b"a", b"a\0"), Ordering::Less);
+        assert_eq!(compare_lua_string_bytes(b"a\0", b"a"), Ordering::Greater);
+        assert_eq!(
+            compare_lua_string_bytes(&[0xff], &[0xc3, 0xbf]),
+            Ordering::Greater
+        );
+
+        let mut gc = GarbageCollector::new();
+        let mut state = LuaState::new();
+        let left = byte_value(&mut gc, b"a\0b");
+        let right = byte_value(&mut gc, b"a\0c");
+        assert!(exec_lt(&mut state, &mut gc, 0, &left, &right).expect("strings compare"));
+        assert!(exec_le(&mut state, &mut gc, 0, &left, &right).expect("strings compare"));
+    }
+
+    #[test]
+    fn invalid_utf8_numeric_string_fails_without_panicking() {
+        let mut gc = GarbageCollector::new();
+        let invalid = byte_value(&mut gc, &[b' ', 0xff, b'1', b' ']);
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| to_arith_number(&invalid)));
+        assert_eq!(result.expect("numeric conversion must not panic"), None);
+        assert_eq!(as_number(&invalid), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod proto_handle_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use lua_compiler::codegen::CodeGenerator;
+    use lua_compiler::parser::Parser;
+    use lua_core::string_pool::StringPool;
+
+    use super::*;
+
+    static LINE_HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_line_hook(_: *mut std::ffi::c_void) -> i32 {
+        LINE_HOOK_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
+        0
+    }
+
+    fn compile(gc: &mut GarbageCollector, source: &str) -> GcRef<Proto> {
+        let mut parser = Parser::new(source);
+        let chunk = parser.parse().expect("test source parses");
+        let proto = CodeGenerator::new(gc)
+            .generate(&chunk, "<proto-handle-test>")
+            .expect("test source compiles");
+        gc.create(proto)
+    }
+
+    #[test]
+    fn execute_rejects_stale_and_foreign_proto_handles() {
+        let mut stale_gc = GarbageCollector::new();
+        let stale = stale_gc.create(Proto::new());
+        stale_gc.destroy_all(&mut StringPool::new());
+
+        let mut state = LuaState::new();
+        let stale_error = execute_proto(&mut state, stale, &mut stale_gc)
+            .expect_err("destroyed Proto must be rejected");
+        assert!(stale_error.message.contains("not live"));
+
+        let mut foreign_gc = GarbageCollector::new();
+        let foreign = foreign_gc.create(Proto::new());
+        let mut local_gc = GarbageCollector::new();
+        let foreign_error = execute_proto(&mut state, foreign, &mut local_gc)
+            .expect_err("cross-collector Proto must be rejected");
+        assert!(foreign_error.message.contains("not live"));
+        assert!(state.call_stack.iter().all(|ci| ci.proto.is_none()));
+    }
+
+    #[test]
+    fn return_and_error_clear_inactive_proto_and_vararg_frames() {
+        let mut gc = GarbageCollector::new();
+        let mut returned = LuaState::new();
+        let return_proto = compile(
+            &mut gc,
+            "local function f(...) return 42 end return f(1, 2)",
+        );
+        assert!(matches!(
+            execute_proto(&mut returned, return_proto, &mut gc),
+            Ok(ExecResult::Returned)
+        ));
+        assert_eq!(returned.current_ci, 0);
+        assert!(
+            returned
+                .call_stack
+                .iter()
+                .all(|ci| ci.proto.is_none() && ci.varargs.is_empty()),
+            "{:?}",
+            returned.call_stack
+        );
+
+        let mut errored = LuaState::new();
+        let error_proto = compile(
+            &mut gc,
+            "local function f(...) return nil + 1 end return f(1, 2)",
+        );
+        execute_proto(&mut errored, error_proto, &mut gc)
+            .expect_err("nested arithmetic error must propagate");
+        assert_eq!(errored.current_ci, 0);
+        assert!(
+            errored
+                .call_stack
+                .iter()
+                .all(|ci| ci.proto.is_none() && ci.varargs.is_empty())
+        );
+    }
+
+    #[test]
+    fn debug_line_skip_is_one_shot_and_matches_full_object_identity() {
+        LINE_HOOK_CALLS.store(0, AtomicOrdering::SeqCst);
+        let mut gc = GarbageCollector::new();
+        let mut first = Proto::new();
+        first.add_line_info(17);
+        let first = gc.create(first);
+        let mut second = Proto::new();
+        second.add_line_info(17);
+        let second = gc.create(second);
+        assert_ne!(first.object_id(), second.object_id());
+
+        let hook = gc.create(Function::new_c(counting_line_hook));
+        let mut state = LuaState::new();
+        state.debug_hook = Some(Value::Function(hook));
+        state.debug_hook_mask = "l".to_string();
+        state.debug_hook_skip_proto = Some(first);
+        state.debug_hook_skip_line = 17;
+
+        run_debug_instruction_hooks(&mut state, &mut gc, second, 0, OpCode::MOVE)
+            .expect("different Proto identity runs the hook");
+        assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(state.debug_hook_skip_proto, Some(first));
+
+        run_debug_instruction_hooks(&mut state, &mut gc, first, 0, OpCode::MOVE)
+            .expect("matching Proto consumes the skip");
+        assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(state.debug_hook_skip_proto, None);
+        assert_eq!(state.debug_hook_skip_line, -1);
+
+        run_debug_instruction_hooks(&mut state, &mut gc, first, 0, OpCode::MOVE)
+            .expect("consumed skip no longer suppresses the line");
+        assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 2);
+    }
+}

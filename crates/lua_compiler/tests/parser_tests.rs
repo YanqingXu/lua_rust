@@ -46,7 +46,7 @@ fn test_parse_string() {
         Stmt::Return(r) => r,
         _ => panic!(),
     };
-    assert!(matches!(&*ret.values[0], Expr::String(s) if s.value == "hello"));
+    assert!(matches!(&*ret.values[0], Expr::String(s) if s.value.as_bytes() == b"hello"));
 }
 
 #[test]

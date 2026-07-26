@@ -12,6 +12,7 @@ use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_stdlib::catalog::open_all;
 use lua_vm::execute::call_value;
+use lua_vm::runtime::Runtime;
 use lua_vm::state::LuaState;
 
 use std::env;
@@ -185,30 +186,52 @@ fn print_usage(program: &str) {
 }
 
 fn run_app(args: &[String], options: &AppOptions) -> i32 {
-    let mut gc = GarbageCollector::new();
-    let mut string_pool = StringPool::new();
-    let global_table = gc.create_root(Table::new());
-    let mut state = LuaState::with_global_table(global_table);
-    state.string_pool = Some(&mut string_pool as *mut StringPool);
-    open_all(&mut state, &mut gc);
+    let mut runtime = Runtime::new();
+    let status = match runtime.parts_mut() {
+        Ok(mut parts) => {
+            let (state, gc, string_pool) = parts.split_mut();
+            run_app_with_parts(args, options, state, gc, string_pool)
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
 
-    if let Err(err) = execute_startup_actions(&mut state, &mut gc, &mut string_pool, options) {
+    if let Err(err) = runtime.close() {
+        eprintln!("{err}");
+        return 1;
+    }
+
+    status
+}
+
+fn run_app_with_parts(
+    args: &[String],
+    options: &AppOptions,
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    string_pool: &mut StringPool,
+) -> i32 {
+    open_all(state, gc);
+
+    if let Err(err) = execute_startup_actions(state, gc, string_pool, options) {
         eprintln!("{err}");
         return 1;
     }
 
     if let (Some(script), Some(script_index)) = (&options.script_file, options.script_index) {
-        install_arg_table(&mut state, &mut gc, args, script_index);
-        let script_args = lua_script_args(&mut gc, args, script_index);
+        install_arg_table(state, gc, args, script_index);
+        let script_args = lua_script_args(gc, args, script_index);
         let result = if script == "-" {
-            let mut source = String::new();
-            if let Err(err) = io::stdin().read_to_string(&mut source) {
+            let mut source = Vec::new();
+            if let Err(err) = io::stdin().read_to_end(&mut source) {
                 Err(err.to_string())
             } else {
                 execute_source(
-                    &mut state,
-                    &mut gc,
-                    &mut string_pool,
+                    state,
+                    gc,
+                    string_pool,
                     &source,
                     "=stdin",
                     &script_args,
@@ -217,7 +240,7 @@ fn run_app(args: &[String], options: &AppOptions) -> i32 {
                 .map(|_| ())
             }
         } else {
-            execute_file(&mut state, &mut gc, &mut string_pool, script, &script_args).map(|_| ())
+            execute_file(state, gc, string_pool, script, &script_args).map(|_| ())
         };
         if let Err(err) = result {
             eprintln!("{err}");
@@ -226,7 +249,7 @@ fn run_app(args: &[String], options: &AppOptions) -> i32 {
     }
 
     if (options.interactive || (options.mode == RunMode::Repl && options.script_file.is_none()))
-        && let Err(err) = run_quiet_interactive(&mut state, &mut gc, &mut string_pool)
+        && let Err(err) = run_quiet_interactive(state, gc, string_pool)
     {
         eprintln!("{err}");
         return 1;
@@ -248,7 +271,7 @@ fn execute_startup_actions(
                     state,
                     gc,
                     string_pool,
-                    &action.argument,
+                    action.argument.as_bytes(),
                     "=(command line)",
                     &[],
                     None,
@@ -263,7 +286,7 @@ fn execute_startup_actions(
                         state,
                         gc,
                         string_pool,
-                        &source,
+                        source.as_bytes(),
                         "=(command line)",
                         &[],
                         None,
@@ -283,13 +306,12 @@ fn execute_file(
     args: &[Value],
 ) -> Result<Vec<Value>, String> {
     let bytes = fs::read(filename).map_err(|err| format!("cannot open {filename}: {err}"))?;
-    let source = lua_source_from_bytes(&bytes);
     let chunk_name = format!("@{filename}");
     execute_source(
         state,
         gc,
         string_pool,
-        &source,
+        &bytes,
         &chunk_name,
         args,
         Some(filename),
@@ -300,7 +322,7 @@ fn execute_source(
     state: &mut LuaState,
     gc: &mut GarbageCollector,
     string_pool: &mut StringPool,
-    source: &str,
+    source: &[u8],
     chunk_name: &str,
     args: &[Value],
     script_path: Option<&str>,
@@ -317,22 +339,15 @@ fn compile_or_load_function(
     state: &mut LuaState,
     gc: &mut GarbageCollector,
     string_pool: &mut StringPool,
-    source: &str,
+    source: &[u8],
     chunk_name: &str,
 ) -> Result<GcRef<Function>, String> {
-    let load_source = skip_initial_hash_comment_line(source);
-    if let Some(result) = lua_stdlib::dump::undump_function(state, gc, load_source) {
-        return result;
-    }
-
-    let mut parser = Parser::new(source);
+    let mut parser = Parser::from_bytes(source);
     let chunk = parser
         .parse()
         .map_err(|err| format!("{chunk_name}:{}: {}", err.line, err.message))?;
 
-    let mut cg = CodeGenerator::new(gc);
-    cg.builder.bind_pool(string_pool);
-    let proto: Proto = cg
+    let proto: Proto = CodeGenerator::new_with_pool(gc, string_pool)
         .generate(&chunk, chunk_name)
         .map_err(|err| format!("{chunk_name}:{err}"))?;
     let proto_ref = gc.create(proto);
@@ -359,13 +374,13 @@ fn install_arg_table(
             text = "-e ".to_string();
         }
         let key = Value::Number(idx as f64 - script_index as f64);
-        let value = Value::String(gc.create(GcString::new(&text)));
+        let value = Value::String(gc.create(GcString::from_utf8_text(&text)));
         table.set(&key, &value);
     }
 
     let arg_ref = gc.create(table);
     if let Some(global_table) = state.global_table {
-        let name = gc.create(GcString::new("arg"));
+        let name = gc.create(GcString::from_bytes(b"arg"));
         let global_ptr = global_table.as_ptr() as *mut Table;
         // SAFETY: the global table is a GC root owned by this LuaState.
         unsafe {
@@ -377,7 +392,7 @@ fn install_arg_table(
 fn lua_script_args(gc: &mut GarbageCollector, args: &[String], script_index: usize) -> Vec<Value> {
     args.iter()
         .skip(script_index + 1)
-        .map(|arg| Value::String(gc.create(GcString::new(arg))))
+        .map(|arg| Value::String(gc.create(GcString::from_utf8_text(arg))))
         .collect()
 }
 
@@ -431,7 +446,15 @@ fn run_quiet_interactive(
             buffer.push_str(&input);
         }
 
-        match execute_source(state, gc, string_pool, &buffer, "=stdin", &[], None) {
+        match execute_source(
+            state,
+            gc,
+            string_pool,
+            buffer.as_bytes(),
+            "=stdin",
+            &[],
+            None,
+        ) {
             Ok(results) => {
                 if expression {
                     print_values(&results);
@@ -476,7 +499,7 @@ fn value_to_string(value: &Value) -> String {
         Value::String(value) => {
             // SAFETY: values being printed are returned on the live Lua stack.
             unsafe { value.as_ref() }
-                .map(|value| value.data().to_string())
+                .map(|value| value.to_string_lossy().into_owned())
                 .unwrap_or_default()
         }
         Value::Table(value) => format!("table: {:p}", value.as_ptr()),
@@ -495,11 +518,11 @@ fn global_string(state: &LuaState, name: &str) -> Option<String> {
         if let Value::String(key_ref) = key
             // SAFETY: the key is held by the global table.
             && let Some(key_string) = unsafe { key_ref.as_ref() }
-            && key_string.data() == name
+            && key_string.as_bytes() == name.as_bytes()
             && let Value::String(value_ref) = value
         {
             // SAFETY: the value is held by the global table.
-            return unsafe { value_ref.as_ref() }.map(|value| value.data().to_string());
+            return unsafe { value_ref.as_ref() }.map(|value| value.to_string_lossy().into_owned());
         }
     }
     None
@@ -522,20 +545,6 @@ fn is_pending_assignment(source: &str) -> bool {
     };
     (first.is_ascii_alphabetic() || first == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn lua_source_from_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| char::from(*byte)).collect()
-}
-
-fn skip_initial_hash_comment_line(source: &str) -> &str {
-    if !source.starts_with('#') {
-        return source;
-    }
-    let Some(newline) = source.find(['\r', '\n']) else {
-        return source;
-    };
-    source[newline..].trim_start_matches(['\r', '\n'])
 }
 
 fn lua_string_literal(text: &str) -> String {

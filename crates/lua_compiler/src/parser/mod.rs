@@ -117,8 +117,8 @@ struct TokenStream<'source> {
 }
 
 impl<'source> TokenStream<'source> {
-    fn new(source: &'source str) -> Self {
-        let mut lexer = Lexer::new(source);
+    fn from_bytes(source: &'source [u8]) -> Self {
+        let mut lexer = Lexer::from_bytes(source);
         let first = lexer.next_token();
         let prev = first.clone();
         Self {
@@ -316,8 +316,21 @@ impl<'source> Parser<'source> {
     }
 
     pub fn with_options(source: &'source str, options: ParserOptions) -> Self {
+        Self::with_options_bytes(source.as_bytes(), options)
+    }
+
+    /// 从任意 Lua 源码字节创建 Parser。
+    ///
+    /// 字符串字面量和长字符串保持原始字节；语法 token 只接受显式的
+    /// ASCII 词法范围。[`Parser::new`] 是保留的 UTF-8 文本包装入口。
+    pub fn from_bytes(source: &'source [u8]) -> Self {
+        Self::with_options_bytes(source, ParserOptions::default())
+    }
+
+    /// 从任意 Lua 源码字节和指定配置创建 Parser。
+    pub fn with_options_bytes(source: &'source [u8], options: ParserOptions) -> Self {
         let mut parser = Self {
-            token_stream: TokenStream::new(source),
+            token_stream: TokenStream::from_bytes(source),
             parse_state: ParseState::new(),
             function_scopes: Vec::new(),
             diagnostics: Vec::new(),
@@ -548,12 +561,21 @@ impl<'source> Parser<'source> {
 
     // ── Token 工具函数 ──────────────────────────────────────────────
 
-    /// 从 Token 中获取字符串值
-    fn token_string(token: &Token) -> &str {
+    /// 从字符串 Token 中获取 Lua 原始字节。
+    fn token_bytes(token: &Token) -> &[u8] {
         match &token.value {
-            TokenValue::String(s) => s.as_str(),
-            _ => token.lexeme.as_str(),
+            TokenValue::String(s) => s.as_bytes(),
+            _ => token.lexeme.as_bytes(),
         }
+    }
+
+    /// 从语法 Name Token 中获取文本。
+    ///
+    /// Lexer 仅生成 ASCII Name，因此失败代表内部不变量被破坏，而不是
+    /// 隐式替换非法源码字节。
+    fn token_name(token: &Token) -> &str {
+        std::str::from_utf8(token.lexeme.as_bytes())
+            .expect("lexer invariant: identifiers are ASCII")
     }
 }
 
@@ -568,7 +590,16 @@ fn get_token_text(token: &Token) -> String {
         return "<eof>".to_string();
     }
     if !token.lexeme.is_empty() {
-        return token.lexeme.clone();
+        return match token.lexeme.to_utf8() {
+            Ok(text) => text.to_owned(),
+            Err(_) => token
+                .lexeme
+                .as_bytes()
+                .iter()
+                .flat_map(|byte| std::ascii::escape_default(*byte))
+                .map(char::from)
+                .collect(),
+        };
     }
     token.token_type.to_string()
 }

@@ -16,7 +16,6 @@ pub mod base;
 pub mod catalog;
 pub mod coroutine;
 pub mod debug;
-pub mod dump;
 pub mod io;
 pub mod math;
 pub mod os;

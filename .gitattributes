@@ -1,0 +1,5 @@
+tests/lua/official/** text eol=lf
+tests/lua/differential/** text eol=lf
+tests/compatibility/*.json text eol=lf
+tests/compatibility/*.lua text eol=lf
+tests/compatibility/*.toml text eol=lf

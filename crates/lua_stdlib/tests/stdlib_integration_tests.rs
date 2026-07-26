@@ -1,43 +1,61 @@
 use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::parser::Parser;
-use lua_core::gc::collector::GarbageCollector;
-use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_stdlib::catalog::open_all;
+use lua_vm::Runtime;
 use lua_vm::execute::execute_proto;
-use lua_vm::state::LuaState;
 use std::path::{Path, PathBuf};
 
-fn compile_and_run(source: &str) -> (LuaState, GarbageCollector) {
-    let mut gc = GarbageCollector::new();
-    let global_table = gc.create_root(Table::new());
-    let mut state = LuaState::with_global_table(global_table);
+fn compile_and_run(source: &str) -> (Runtime, ()) {
+    let mut runtime = Runtime::new();
+    {
+        let mut parts = runtime.parts_mut().expect("runtime parts are available");
+        let (state, gc, _) = parts.split_mut();
+        open_all(state, gc);
 
-    open_all(&mut state, &mut gc);
+        let mut parser = Parser::new(source);
+        let chunk = parser.parse().expect("parse should succeed");
+        let cg = CodeGenerator::new(gc);
+        let proto = cg
+            .generate(&chunk, "<stdlib-test>")
+            .expect("codegen should succeed");
+        let proto = gc.create(proto);
 
-    let mut parser = Parser::new(source);
-    let chunk = parser.parse().expect("parse should succeed");
-    let cg = CodeGenerator::new(&mut gc);
-    let proto = cg
-        .generate(&chunk, "<stdlib-test>")
-        .expect("codegen should succeed");
-
-    execute_proto(&mut state, &proto, &mut gc).expect("VM should execute");
-    (state, gc)
+        execute_proto(state, proto, gc).expect("VM should execute");
+    }
+    (runtime, ())
 }
 
-fn return_value(state: &LuaState) -> Value {
-    state.stack.at(0).cloned().unwrap_or(Value::Nil)
+fn return_value(runtime: &Runtime) -> Value {
+    runtime
+        .main_state()
+        .and_then(|state| state.stack.at(0))
+        .cloned()
+        .unwrap_or(Value::Nil)
 }
 
-fn returned_string(state: &LuaState) -> String {
-    match return_value(state) {
+fn returned_string(runtime: &Runtime) -> String {
+    match return_value(runtime) {
         Value::String(s) => {
-            // SAFETY: the returned string is still owned by the live test GC.
+            // SAFETY: the returned string is owned by the live test Runtime.
             unsafe { s.as_ref() }
                 .expect("string ref should be valid")
-                .data()
+                .to_utf8()
+                .expect("returned test string should be UTF-8 text")
                 .to_string()
+        }
+        value => panic!("expected string, got {value:?}"),
+    }
+}
+
+fn returned_bytes(runtime: &Runtime) -> Vec<u8> {
+    match return_value(runtime) {
+        Value::String(s) => {
+            // SAFETY: the returned string is owned by the live test Runtime.
+            unsafe { s.as_ref() }
+                .expect("string ref should be valid")
+                .as_bytes()
+                .to_vec()
         }
         value => panic!("expected string, got {value:?}"),
     }
@@ -510,20 +528,32 @@ fn coroutine_wrap_yields_recursive_generator_values() {
         "local function gen(c, n) if n == 0 then coroutine.yield(c) else gen(c .. 'a', n - 1); gen(c .. 'b', n - 1) end end local out = '' for s in coroutine.wrap(function() gen('', 2) end) do out = out .. s .. ',' end return out",
     );
     assert_eq!(returned_string(&state), "aa,ab,ba,bb,");
+    assert_eq!(state.live_coroutine_state_count(), 1);
 }
 
 #[test]
-fn string_dump_round_trips_lua_functions_inside_this_vm() {
+fn string_dump_reports_stable_unsupported_error() {
     let (state, _gc) = compile_and_run(
-        "local dumped = string.dump(loadstring('x = 1; return x')); local i = 0; local f = assert(load(function() i = i + 1; return string.sub(dumped, i, i) end)); return f()",
+        "local ok, err = pcall(string.dump, function() return 1 end); if ok then return 'unexpected success' end return err",
+    );
+    assert_eq!(
+        returned_string(&state),
+        "string.dump is unsupported until Lua 5.1 binary chunk serialization is implemented"
+    );
+}
+
+#[test]
+fn legacy_pseudo_dump_is_not_accepted_by_load_or_loadstring() {
+    let (state, _gc) = compile_and_run(
+        "local legacy = string.char(27) .. 'LuaRustDump:999:72657475726e203432'; local f1, e1 = loadstring(legacy); local sent = false; local f2, e2 = load(function() if sent then return nil end sent = true return legacy end); if f1 == nil and type(e1) == 'string' and f2 == nil and type(e2) == 'string' then return 1 end return 0",
     );
     assert_eq!(return_value(&state), Value::Number(1.0));
 }
 
 #[test]
-fn debug_setupvalue_updates_dumped_function_upvalues() {
+fn debug_setupvalue_updates_lua_function_upvalues() {
     let (state, _gc) = compile_and_run(
-        "local a, b = 20, 30; local x = loadstring(string.dump(function(x) if x == 'set' then a = 10 + b; b = b + 1 else return a end end)); if x() ~= nil then return 0 end; if debug.setupvalue(x, 1, 'hi') ~= 'a' then return 0 end; if x() ~= 'hi' then return 0 end; if debug.setupvalue(x, 2, 13) ~= 'b' then return 0 end; if debug.setupvalue(x, 3, 10) ~= nil then return 0 end; x('set'); if x() ~= 23 then return 0 end; x('set'); return x()",
+        "local a, b = 20, 30; local x = function(arg) if arg == 'set' then a = 10 + b; b = b + 1 else return a end end; if x() ~= 20 then return 0 end; if debug.setupvalue(x, 1, 'hi') ~= 'a' then return 0 end; if x() ~= 'hi' then return 0 end; if debug.setupvalue(x, 2, 13) ~= 'b' then return 0 end; if debug.setupvalue(x, 3, 10) ~= nil then return 0 end; x('set'); if x() ~= 23 then return 0 end; x('set'); return x()",
     );
     assert_eq!(return_value(&state), Value::Number(24.0));
 }
@@ -606,6 +636,54 @@ fn package_require_loads_lua_files_and_caches_results() {
     assert_eq!(return_value(&state), Value::Number(11.0));
 
     std::fs::remove_file(module_path).ok();
+}
+
+#[test]
+fn package_require_preserves_non_utf8_module_source_bytes() {
+    let mut source = b"return string.byte(\"".to_vec();
+    source.push(0xe1);
+    source.extend_from_slice(b"\")");
+    let module_path = write_temp_lua_bytes("require_byte_module", &source);
+    let module_lit = lua_path_literal(&module_path);
+
+    let (state, _gc) = compile_and_run(&format!(
+        "package.path = {module_lit}; return require('byte_module')"
+    ));
+    assert_eq!(return_value(&state), Value::Number(225.0));
+
+    std::fs::remove_file(module_path).ok();
+}
+
+#[test]
+fn package_require_uses_non_utf8_preload_keys_before_the_filesystem_boundary() {
+    let (runtime, _gc) = compile_and_run(
+        "local name = string.char(255, 0, 128); \
+         package.preload[name] = function(argument) return argument end; \
+         local loaded = require(name); \
+         if loaded ~= name or package.loaded[name] ~= name then return 'bad' end; \
+         return loaded",
+    );
+
+    assert_eq!(returned_bytes(&runtime), [0xff, 0x00, 0x80]);
+}
+
+#[test]
+fn package_module_preserves_arbitrary_byte_names_and_nested_keys() {
+    let (runtime, _gc) = compile_and_run(
+        "local globals = _G; \
+         local loaded = package.loaded; \
+         local first = string.char(255); \
+         local leaf = string.char(0, 128); \
+         local name = first .. '.' .. leaf; \
+         module(name); \
+         local current = loaded[name]; \
+         if current ~= globals[first][leaf] then return 0 end; \
+         if current._NAME ~= name then return 0 end; \
+         if current._PACKAGE ~= first .. '.' then return 0 end; \
+         return 1",
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(1.0));
 }
 
 #[test]
@@ -982,6 +1060,51 @@ fn string_byte_and_char_use_lua_byte_semantics() {
         "local a = {string.byte('hi', 3, 4)}; if next(a) == nil and string.char() == '' then return 1 end return 0",
     );
     assert_eq!(return_value(&state), Value::Number(1.0));
+
+    let (state, _gc) = compile_and_run("return string.char(255)");
+    assert_eq!(returned_bytes(&state), [0xff]);
+
+    let (state, _gc) = compile_and_run("return string.char(0, 128, 255)");
+    assert_eq!(returned_bytes(&state), [0x00, 0x80, 0xff]);
+}
+
+#[test]
+fn string_transforms_preserve_embedded_nul_and_high_bytes() {
+    let (state, _gc) = compile_and_run("return string.reverse(string.char(0, 128, 255, 65))");
+    assert_eq!(returned_bytes(&state), [65, 0xff, 0x80, 0]);
+
+    let (state, _gc) = compile_and_run("return string.sub(string.char(0, 128, 255, 65), 2, 3)");
+    assert_eq!(returned_bytes(&state), [0x80, 0xff]);
+
+    let (state, _gc) = compile_and_run("return string.rep(string.char(0, 255), 2)");
+    assert_eq!(returned_bytes(&state), [0, 0xff, 0, 0xff]);
+
+    let (state, _gc) = compile_and_run("return string.upper(string.char(97, 0, 128, 122))");
+    assert_eq!(returned_bytes(&state), [b'A', 0, 0x80, b'Z']);
+}
+
+#[test]
+fn string_pattern_and_format_results_preserve_arbitrary_bytes() {
+    let (state, _gc) = compile_and_run(
+        "local s = string.char(0, 128, 255); local a, b = string.find(s, string.char(128), 1, true); if a == 2 and b == 2 then return string.match(s, string.char(40, 128, 41)) end return 'bad'",
+    );
+    assert_eq!(returned_bytes(&state), [0x80]);
+
+    let (state, _gc) = compile_and_run(
+        "return string.gsub(string.char(0, 128, 255), string.char(128), string.char(255, 0))",
+    );
+    assert_eq!(returned_bytes(&state), [0, 0xff, 0, 0xff]);
+
+    let (state, _gc) = compile_and_run(
+        "local iter, state, var = string.gmatch(string.char(255, 0), '.'); return iter(state, var)",
+    );
+    assert_eq!(returned_bytes(&state), [0xff]);
+
+    let (state, _gc) = compile_and_run("return string.format('%c%s', 255, string.char(0, 128))");
+    assert_eq!(returned_bytes(&state), [0xff, 0, 0x80]);
+
+    let (state, _gc) = compile_and_run("return string.format('%.2s', string.char(0, 128, 255))");
+    assert_eq!(returned_bytes(&state), [0, 0x80]);
 }
 
 #[test]

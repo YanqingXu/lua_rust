@@ -71,7 +71,7 @@ impl<'source> Parser<'source> {
 
             if next.token_type == TokenType::Assign {
                 // 命名键：`name = value`
-                let name = Self::token_string(self.current()).to_string();
+                let name = self.current().lexeme.clone();
                 let name_line = self.current().line;
                 let name_col = self.current().column;
                 self.advance(); // consume name

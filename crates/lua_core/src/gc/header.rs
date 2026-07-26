@@ -262,6 +262,8 @@ mod tests {
         let b = GcObjectHeader::new(GcObjectType::Table);
         a.set_next(&b as *const _ as *mut _);
         assert!(!a.next().is_null());
+        // SAFETY: `a.next()` was set to `b`, which remains live and immovable
+        // until after this dereference.
         assert_eq!(unsafe { (*a.next()).gc_type() }, GcObjectType::Table);
     }
 

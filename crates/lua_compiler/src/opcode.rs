@@ -96,7 +96,7 @@ pub enum OpCode {
     LOADNIL = 3,
 
     // ── 变量访问指令 ──────────────────────────────────────────────
-    /// R(A) := UpValue[B]
+    /// `R(A) := UpValue[B]`
     GETUPVAL = 4,
     /// R(A) := Gbl[K(Bx)]
     GETGLOBAL = 5,
@@ -106,7 +106,7 @@ pub enum OpCode {
     // ── 变量赋值指令 ──────────────────────────────────────────────
     /// Gbl[K(Bx)] := R(A)
     SETGLOBAL = 7,
-    /// UpValue[B] := R(A)
+    /// `UpValue[B] := R(A)`
     SETUPVAL = 8,
     /// R(A)[RK(B)] := RK(C)
     SETTABLE = 9,
@@ -180,7 +180,7 @@ pub enum OpCode {
     CLOSE = 35,
 
     // ── 闭包创建指令 ──────────────────────────────────────────────
-    /// R(A) := closure(KPROTO[Bx], R(A), ... ,R(A+n))
+    /// `R(A) := closure(KPROTO[Bx], R(A), ... ,R(A+n))`
     CLOSURE = 36,
 
     // ── 可变参数指令 ──────────────────────────────────────────────

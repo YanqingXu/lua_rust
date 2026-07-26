@@ -52,7 +52,8 @@ pub const VARARG_NEEDSARG: u8 = 4;
 /// 常量去重键，用于在编译期对常量进行哈希去重。
 ///
 /// 参考 Lua 5.1 的 `addk()` 实现。支持 nil、bool、number、string
-/// 四种常量类型。string 使用 `GcString` 的预计算哈希值。
+/// 四种常量类型。Production string constants must be interned; their
+/// allocation identity is therefore the canonical constant key.
 ///
 #[derive(Debug, Clone)]
 pub enum ConstantKey {
@@ -86,12 +87,7 @@ impl std::hash::Hash for ConstantKey {
             ConstantKey::Nil => 0_i32.hash(state),
             ConstantKey::Boolean(b) => b.hash(state),
             ConstantKey::Number(n) => n.to_bits().hash(state),
-            ConstantKey::String(s) => {
-                // SAFETY: GC single-threaded model ensures the GcString is alive;
-                // reading the precomputed hash is a pure read.
-                let h = unsafe { s.as_ref() }.map(|gs| gs.hash()).unwrap_or(0);
-                h.hash(state);
-            }
+            ConstantKey::String(s) => s.hash(state),
         }
     }
 }
@@ -171,14 +167,14 @@ impl Default for LocVar {
 ///
 /// 内存布局（`#[repr(C)]`，header 在开头）：
 /// - header: GcObjectHeader (16 bytes)
-/// - constants: Vec<Value> (24 bytes)
+/// - constants: `Vec<Value>` (24 bytes)
 /// - constant_map: HashMap<ConstantKey, usize> (~56 bytes)
-/// - code: Vec<Instruction> (24 bytes)
-/// - sub_protos: Vec<GcRef<Proto>> (24 bytes)
-/// - line_info: Vec<i32> (24 bytes)
-/// - locvars: Vec<LocVar> (24 bytes)
-/// - upvalue_names: Vec<GcRef<GcString>> (24 bytes)
-/// - source: Option<GcRef<GcString>> (8 bytes)
+/// - code: `Vec<Instruction>` (24 bytes)
+/// - sub_protos: `Vec<GcRef<Proto>>` (24 bytes)
+/// - line_info: `Vec<i32>` (24 bytes)
+/// - locvars: `Vec<LocVar>` (24 bytes)
+/// - upvalue_names: `Vec<GcRef<GcString>>` (24 bytes)
+/// - source: `Option<GcRef<GcString>>`
 /// - 元数据字段 (8 bytes + 4 bytes padding)
 ///
 #[repr(C)]
@@ -666,66 +662,29 @@ unsafe impl GcObject for Proto {
     unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
         // 1. 标记源文件名
         if let Some(source_ref) = self.source {
-            // SAFETY: source_ref is a valid GcRef held by this Proto;
-            // collector is valid during mark phase.
-            unsafe {
-                collector.mark_object(source_ref.as_ptr() as *mut GcObjectHeader);
-            }
+            collector.mark_registered(source_ref);
         }
 
         // 2. 标记常量表中的 GC 对象
         for val in &self.constants {
-            // SAFETY: all GcRef pointers in constants_ are valid;
-            // collector is valid during mark phase.
-            unsafe {
-                match val {
-                    Value::String(s) => {
-                        collector.mark_object(s.as_ptr() as *mut GcObjectHeader);
-                    }
-                    Value::Table(t) => {
-                        collector.mark_object(t.as_ptr() as *mut GcObjectHeader);
-                    }
-                    Value::Function(f) => {
-                        collector.mark_object(f.as_ptr() as *mut GcObjectHeader);
-                    }
-                    Value::Userdata(u) => {
-                        collector.mark_object(u.as_ptr() as *mut GcObjectHeader);
-                    }
-                    Value::Thread(t) => {
-                        collector.mark_object(t.as_ptr() as *mut GcObjectHeader);
-                    }
-                    _ => {}
-                }
-            }
+            collector.mark_registered_value(val);
         }
 
         // 3. 标记所有子函数原型
         for sub_proto in &self.sub_protos {
-            // SAFETY: sub_proto is a valid GcRef<Proto> held by this Proto;
-            // collector is valid during mark phase.
-            unsafe {
-                collector.mark_object(sub_proto.as_ptr() as *mut GcObjectHeader);
-            }
+            collector.mark_registered(*sub_proto);
         }
 
         // 4. 标记局部变量名称
         for locvar in &self.locvars {
             if let Some(name_ref) = locvar.varname {
-                // SAFETY: name_ref is a valid GcRef<GcString> held by this LocVar;
-                // collector is valid during mark phase.
-                unsafe {
-                    collector.mark_object(name_ref.as_ptr() as *mut GcObjectHeader);
-                }
+                collector.mark_registered(name_ref);
             }
         }
 
         // 5. 标记上值名称
         for name in &self.upvalue_names {
-            // SAFETY: name is a valid GcRef<GcString> held by this Proto;
-            // collector is valid during mark phase.
-            unsafe {
-                collector.mark_object(name.as_ptr() as *mut GcObjectHeader);
-            }
+            collector.mark_registered(*name);
         }
     }
 
@@ -769,6 +728,8 @@ impl std::fmt::Debug for Proto {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::approx_constant)]
+
     use super::*;
     use crate::gc::collector::GarbageCollector;
     use crate::gc::gc_ref::GcRef;
@@ -859,8 +820,8 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let s1 = pool.intern(&mut gc, "hello");
-        let s2 = pool.intern(&mut gc, "hello"); // 同一驻留字符串
+        let s1 = pool.intern_bytes(&mut gc, b"hello");
+        let s2 = pool.intern_bytes(&mut gc, b"hello"); // 同一驻留字符串
 
         let mut p = Proto::new();
         let idx1 = p.add_constant(Value::String(s1));
@@ -1020,8 +981,8 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let name1 = pool.intern(&mut gc, "x");
-        let name2 = pool.intern(&mut gc, "y");
+        let name1 = pool.intern_bytes(&mut gc, b"x");
+        let name2 = pool.intern_bytes(&mut gc, b"y");
 
         let mut p = Proto::new();
         let idx1 = p.add_loc_var(Some(name1), 0, 5, 0);
@@ -1047,8 +1008,8 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let name_x = pool.intern(&mut gc, "x");
-        let name_y = pool.intern(&mut gc, "y");
+        let name_x = pool.intern_bytes(&mut gc, b"x");
+        let name_y = pool.intern_bytes(&mut gc, b"y");
 
         let mut p = Proto::new();
         // x: PC 0..10, reg 0  (活跃范围最广)
@@ -1080,8 +1041,8 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let uv1 = pool.intern(&mut gc, "outer_var");
-        let uv2 = pool.intern(&mut gc, "counter");
+        let uv1 = pool.intern_bytes(&mut gc, b"outer_var");
+        let uv2 = pool.intern_bytes(&mut gc, b"counter");
 
         let mut p = Proto::new();
         let idx1 = p.add_upvalue_name(uv1);
@@ -1120,7 +1081,7 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let s_ref = pool.intern(&mut gc, "constant_string");
+        let s_ref = pool.intern_bytes(&mut gc, b"constant_string");
 
         let mut p = Proto::new();
         p.add_constant(Value::String(s_ref));
@@ -1129,6 +1090,8 @@ mod tests {
         gc.reset_marks();
 
         // 标记 proto
+        // SAFETY: `p_ref` is a live proto registered with `gc`, and the same
+        // collector is exclusively borrowed while its children are marked.
         unsafe {
             let p_ptr = p_ref.as_ptr();
             (*p_ptr).mark_children(&mut gc);
@@ -1136,6 +1099,8 @@ mod tests {
 
         // 字符串应被标记
         let s_header = s_ref.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: `s_ref` remains interned and registered with `gc`; marking
+        // updates its header without freeing or relocating it.
         unsafe {
             assert!(!(*s_header).is_white(), "String constant should be marked");
         }
@@ -1152,6 +1117,8 @@ mod tests {
 
         gc.reset_marks();
 
+        // SAFETY: `p_ref` is live in `gc`, which owns both the proto and all
+        // children traversed by `mark_children`.
         unsafe {
             let p_ptr = p_ref.as_ptr();
             (*p_ptr).mark_children(&mut gc);
@@ -1159,6 +1126,8 @@ mod tests {
 
         // 子 proto 应被标记
         let sub_header = sub.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: `sub` remains allocated in `gc`; the mark operation does not
+        // relocate or release registered objects.
         unsafe {
             assert!(!(*sub_header).is_white(), "Sub-proto should be marked");
         }
@@ -1169,7 +1138,7 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let name = pool.intern(&mut gc, "local_x");
+        let name = pool.intern_bytes(&mut gc, b"local_x");
 
         let mut p = Proto::new();
         p.add_loc_var(Some(name), 0, 10, 0);
@@ -1177,12 +1146,16 @@ mod tests {
 
         gc.reset_marks();
 
+        // SAFETY: `p_ref` is a live registered proto and `gc` is exclusively
+        // borrowed for the duration of child marking.
         unsafe {
             let p_ptr = p_ref.as_ptr();
             (*p_ptr).mark_children(&mut gc);
         }
 
         let name_header = name.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: the interned name remains live in `gc`; only mark bits were
+        // changed by the preceding traversal.
         unsafe {
             assert!(!(*name_header).is_white(), "LocVar name should be marked");
         }
@@ -1193,7 +1166,7 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let uv_name = pool.intern(&mut gc, "captured_var");
+        let uv_name = pool.intern_bytes(&mut gc, b"captured_var");
 
         let mut p = Proto::new();
         p.add_upvalue_name(uv_name);
@@ -1201,12 +1174,16 @@ mod tests {
 
         gc.reset_marks();
 
+        // SAFETY: `p_ref` points to a live proto owned by the same collector
+        // passed to `mark_children`.
         unsafe {
             let p_ptr = p_ref.as_ptr();
             (*p_ptr).mark_children(&mut gc);
         }
 
         let name_header = uv_name.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: `uv_name` remains interned and registered, and marking does
+        // not free or relocate it.
         unsafe {
             assert!(!(*name_header).is_white(), "Upvalue name should be marked");
         }
@@ -1217,7 +1194,7 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let source_name = pool.intern(&mut gc, "test.lua");
+        let source_name = pool.intern_bytes(&mut gc, b"test.lua");
 
         let mut p = Proto::new();
         p.set_source(Some(source_name));
@@ -1225,12 +1202,16 @@ mod tests {
 
         gc.reset_marks();
 
+        // SAFETY: `p_ref` is live and registered with the exclusively borrowed
+        // collector used to mark its children.
         unsafe {
             let p_ptr = p_ref.as_ptr();
             (*p_ptr).mark_children(&mut gc);
         }
 
         let src_header = source_name.as_ptr() as *mut GcObjectHeader;
+        // SAFETY: `source_name` remains registered with `gc`; the traversal
+        // changes only its mark state.
         unsafe {
             assert!(!(*src_header).is_white(), "Source should be marked");
         }
@@ -1285,7 +1266,7 @@ mod tests {
         for i in 0..100 {
             p.add_instruction(i as Instruction);
             p.add_constant(Value::Number(i as f64));
-            p.add_line_info(i as i32);
+            p.add_line_info(i);
         }
 
         let size_full = p.get_size();
@@ -1299,7 +1280,7 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let name = pool.intern(&mut gc, "local_x");
+        let name = pool.intern_bytes(&mut gc, b"local_x");
 
         let mut p = Proto::new();
         p.set_num_params(2);

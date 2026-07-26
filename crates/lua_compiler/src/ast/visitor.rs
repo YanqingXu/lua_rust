@@ -353,7 +353,7 @@ mod tests {
         // String
         v.visit_expr(&Expr::String(StringExpr {
             location: loc(0, 0),
-            value: String::new(),
+            value: lua_core::byte_string::ByteString::from_bytes(b""),
         }));
         // Vararg
         v.visit_expr(&Expr::Vararg(VarargExpr {

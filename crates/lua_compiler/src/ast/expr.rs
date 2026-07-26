@@ -4,6 +4,7 @@
 //!
 
 use crate::ast::stmt::Stmt;
+use lua_core::byte_string::ByteString;
 
 // =====================================================================
 // 源代码位置信息
@@ -105,7 +106,8 @@ pub struct NumberExpr {
 #[derive(Debug, Clone)]
 pub struct StringExpr {
     pub location: SourceLocation,
-    pub value: String,
+    /// Lua 字符串字面量的原始字节。
+    pub value: ByteString,
 }
 
 /// 变长参数 `...`
@@ -338,9 +340,9 @@ mod tests {
     fn test_string_expr() {
         let e = Expr::String(StringExpr {
             location: loc(1, 1),
-            value: "hello".to_string(),
+            value: ByteString::from_bytes(b"hello"),
         });
-        assert!(matches!(e, Expr::String(ref s) if s.value == "hello"));
+        assert!(matches!(e, Expr::String(ref s) if s.value.as_bytes() == b"hello"));
     }
 
     #[test]
@@ -425,7 +427,7 @@ mod tests {
         }));
         let arg = Box::new(Expr::String(StringExpr {
             location: loc(1, 7),
-            value: "hello".to_string(),
+            value: ByteString::from_bytes(b"hello"),
         }));
         let e = Expr::Call(CallExpr {
             location: loc(1, 1),
@@ -445,7 +447,7 @@ mod tests {
         }));
         let index = Box::new(Expr::String(StringExpr {
             location: loc(1, 3),
-            value: "key".to_string(),
+            value: ByteString::from_bytes(b"key"),
         }));
         let e = Expr::Index(IndexExpr {
             location: loc(1, 1),
@@ -512,7 +514,7 @@ mod tests {
         });
         let _ = Expr::String(StringExpr {
             location: loc(0, 0),
-            value: String::new(),
+            value: ByteString::from_bytes(b""),
         });
         let _ = Expr::Vararg(VarargExpr {
             location: loc(0, 0),

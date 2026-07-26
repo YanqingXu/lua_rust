@@ -11,15 +11,18 @@ use lua_compiler::parser::Parser;
 use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
-use lua_core::gc::header::GcObjectHeader;
 use lua_core::gc_string::GcString;
-use lua_core::proto::Proto;
 use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
 use lua_core::userdata::Userdata;
 use lua_core::value::Value;
 use lua_vm::execute::call_value;
 use lua_vm::state::LuaState;
+use std::io::Write;
+
+// Project compatibility follows the fixed lua_cpp oracle. This intentionally
+// differs from the stock Lua 5.1 `_VERSION` value (`"Lua 5.1"`).
+const LUA_VERSION: &str = "Lua 5.1 (C core prototype)";
 
 /// 打开基础库（注册到全局表 _G）
 pub fn open_base(l: &mut LuaState, gc: &mut GarbageCollector) {
@@ -27,6 +30,8 @@ pub fn open_base(l: &mut LuaState, gc: &mut GarbageCollector) {
         let table_ptr = global_table.as_ptr() as *mut Table;
 
         set_global_value(l, gc, table_ptr, "_G", &Value::Table(global_table));
+        let version = Value::String(intern_string(l, gc, LUA_VERSION));
+        set_global_value(l, gc, table_ptr, "_VERSION", &version);
 
         // Register core functions
         register(l, gc, table_ptr, "assert", lua_b_assert_raw);
@@ -88,13 +93,13 @@ fn register(
         // SAFETY: pool_ptr was set from a valid &mut StringPool
         let pool: &mut StringPool = unsafe { &mut *pool_ptr };
         // Check if already interned
-        if let Some(existing) = pool.find(name) {
+        if let Some(existing) = pool.find_bytes(name.as_bytes()) {
             existing
         } else {
-            pool.intern(gc, name)
+            pool.intern_bytes(gc, name.as_bytes())
         }
     } else {
-        gc.create(GcString::new(name))
+        gc.create(GcString::from_bytes(name.as_bytes()))
     };
     let func_obj = gc.create(Function::new_c(func));
     // SAFETY: table_ptr points to a valid GC-rooted table
@@ -107,9 +112,10 @@ fn intern_string(l: &mut LuaState, gc: &mut GarbageCollector, text: &str) -> GcR
     if let Some(pool_ptr) = l.string_pool {
         // SAFETY: pool_ptr was set from a valid &mut StringPool.
         let pool: &mut StringPool = unsafe { &mut *pool_ptr };
-        pool.find(text).unwrap_or_else(|| pool.intern(gc, text))
+        pool.find_bytes(text.as_bytes())
+            .unwrap_or_else(|| pool.intern_bytes(gc, text.as_bytes()))
     } else {
-        gc.create(GcString::new(text))
+        gc.create(GcString::from_bytes(text.as_bytes()))
     }
 }
 
@@ -121,40 +127,55 @@ unsafe extern "C" fn lua_b_print_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: _l_ptr is the LuaState pointer passed by the VM CALL handler
     let l: &mut LuaState = unsafe { &mut *(_l_ptr as *mut LuaState) };
     let n = l.get_top();
+    let mut output = Vec::new();
     for i in 1..=n {
         if i > 1 {
-            print!("\t");
+            output.push(b'\t');
         }
         if let Some(val) = l.at(i) {
-            print_value(val);
+            append_print_value(&mut output, val);
         }
     }
-    println!();
-    0 // Return 0 results
+    output.push(b'\n');
+
+    if std::io::stdout().lock().write_all(&output).is_ok() {
+        0
+    } else {
+        -1
+    }
 }
 
-fn print_value(v: &Value) {
+fn append_print_value(output: &mut Vec<u8>, v: &Value) {
     match v {
-        Value::Nil => print!("nil"),
-        Value::Boolean(b) => print!("{}", b),
+        Value::Nil => output.extend_from_slice(b"nil"),
+        Value::Boolean(b) => output.extend_from_slice(if *b { b"true" } else { b"false" }),
         Value::Number(n) => {
-            if n.fract() == 0.0 && n.is_finite() {
-                print!("{:.0}", n)
+            let text = if n.fract() == 0.0 && n.is_finite() {
+                format!("{n:.0}")
             } else {
-                print!("{}", n)
-            }
+                n.to_string()
+            };
+            output.extend_from_slice(text.as_bytes());
         }
         Value::String(s) => {
             // SAFETY: GC is not running; s is a valid GcRef
             if let Some(gc_str) = unsafe { s.as_ref() } {
-                print!("{}", gc_str.data());
+                output.extend_from_slice(gc_str.as_bytes());
             }
         }
-        Value::Table(t) => print!("table: {:p}", t.as_ptr()),
-        Value::Function(f) => print!("function: {:p}", f.as_ptr()),
-        Value::Userdata(u) => print!("userdata: {:p}", u.as_ptr()),
-        Value::Thread(t) => print!("thread: {:p}", t.as_ptr()),
-        Value::LightUserdata(p) => print!("lightuserdata: {:p}", p.as_ptr()),
+        Value::Table(t) => output.extend_from_slice(format!("table: {:p}", t.as_ptr()).as_bytes()),
+        Value::Function(f) => {
+            output.extend_from_slice(format!("function: {:p}", f.as_ptr()).as_bytes());
+        }
+        Value::Userdata(u) => {
+            output.extend_from_slice(format!("userdata: {:p}", u.as_ptr()).as_bytes());
+        }
+        Value::Thread(t) => {
+            output.extend_from_slice(format!("thread: {:p}", t.as_ptr()).as_bytes());
+        }
+        Value::LightUserdata(p) => {
+            output.extend_from_slice(format!("lightuserdata: {:p}", p.as_ptr()).as_bytes());
+        }
     }
 }
 
@@ -250,7 +271,7 @@ fn value_to_string_helper(v: &Value) -> String {
             // SAFETY: GC is not running during C function execution;
             // the GcString is alive as long as its on the Lua stack.
             if let Some(gc_str) = unsafe { s.as_ref() } {
-                gc_str.data().to_string()
+                gc_str.to_string_lossy().into_owned()
             } else {
                 String::new()
             }
@@ -264,7 +285,11 @@ fn value_to_string_helper(v: &Value) -> String {
 }
 
 fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
-    if let Some(s) = intern_lua_string(l, text) {
+    push_lua_bytes(l, text.as_bytes())
+}
+
+fn push_lua_bytes(l: &mut LuaState, bytes: &[u8]) -> bool {
+    if let Some(s) = intern_lua_bytes(l, bytes) {
         l.push_value(Value::String(s));
         true
     } else {
@@ -273,15 +298,22 @@ fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
 }
 
 fn intern_lua_string(l: &mut LuaState, text: &str) -> Option<GcRef<GcString>> {
+    intern_lua_bytes(l, text.as_bytes())
+}
+
+fn intern_lua_bytes(l: &mut LuaState, bytes: &[u8]) -> Option<GcRef<GcString>> {
     let gc_ptr = l.gc?;
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
     if let Some(pool_ptr) = l.string_pool {
         // SAFETY: string_pool is installed from a live StringPool owned by the host.
         let pool = unsafe { &mut *pool_ptr };
-        Some(pool.find(text).unwrap_or_else(|| pool.intern(gc, text)))
+        Some(
+            pool.find_bytes(bytes)
+                .unwrap_or_else(|| pool.intern_bytes(gc, bytes)),
+        )
     } else {
-        Some(gc.create(GcString::new(text)))
+        Some(gc.create(GcString::from_bytes(bytes)))
     }
 }
 
@@ -324,11 +356,13 @@ unsafe extern "C" fn lua_b_error_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
         && let Value::String(message_ref) = message
         && let Some(prefix) = error_location_prefix(l, level)
     {
+        let mut bytes = prefix.into_bytes();
+        bytes.extend_from_slice(b": ");
         // SAFETY: message is an active argument.
-        let text = unsafe { message_ref.as_ref() }
-            .map(|message| message.data().to_string())
-            .unwrap_or_default();
-        if !push_lua_string(l, &format!("{prefix}: {text}")) {
+        if let Some(message) = unsafe { message_ref.as_ref() } {
+            bytes.extend_from_slice(message.as_bytes());
+        }
+        if !push_lua_bytes(l, &bytes) {
             return -1;
         }
         return -1;
@@ -343,17 +377,17 @@ unsafe extern "C" fn lua_b_collectgarbage_raw(_l_ptr: *mut std::ffi::c_void) -> 
     let option = match l.at(1) {
         Some(Value::String(s)) => {
             // SAFETY: option string is on the active Lua stack.
-            unsafe { s.as_ref() }.map(|s| s.data().to_string())
+            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
         }
         _ => None,
     };
 
-    match option.as_deref().unwrap_or("collect") {
-        "count" => {
+    match option.as_deref().unwrap_or(b"collect") {
+        b"count" => {
             let kb = poll_gcinfo_kb(l);
             l.push_value(Value::Number(kb));
         }
-        "collect" => {
+        b"collect" => {
             if let Err(error) = run_gc_compat_cycle(l) {
                 l.push_value(error);
                 return -1;
@@ -361,7 +395,7 @@ unsafe extern "C" fn lua_b_collectgarbage_raw(_l_ptr: *mut std::ffi::c_void) -> 
             finish_gcinfo_cycle(l);
             l.push_value(Value::Number(0.0));
         }
-        "step" => {
+        b"step" => {
             let size = match l.at(2) {
                 Some(Value::Number(n)) => *n,
                 _ => 0.0,
@@ -375,16 +409,16 @@ unsafe extern "C" fn lua_b_collectgarbage_raw(_l_ptr: *mut std::ffi::c_void) -> 
             }
             l.push_value(Value::Boolean(done));
         }
-        "stop" => {
+        b"stop" => {
             l.gc_stopped = true;
             l.push_value(Value::Number(0.0));
         }
-        "restart" => {
+        b"restart" => {
             l.gc_stopped = false;
             l.gc_step_remaining = 0;
             l.push_value(Value::Number(0.0));
         }
-        "setpause" | "setstepmul" => {
+        b"setpause" | b"setstepmul" => {
             l.push_value(Value::Number(0.0));
         }
         _ => {
@@ -439,10 +473,13 @@ fn mark_lua_roots_for_weak_cleanup(l: &LuaState, gc: &mut GarbageCollector) {
     if let Some(hook) = &l.debug_hook {
         gc.mark_value(hook);
     }
+    if let Some(skip_proto) = l.debug_hook_skip_proto {
+        gc.mark_registered(skip_proto);
+    }
 
     mark_open_upvalues(l, gc);
 
-    for ci in &l.call_stack {
+    for ci in l.call_stack.iter().take(l.current_ci + 1) {
         if let Some(value) = l.stack.at(ci.func) {
             gc.mark_value(value);
         }
@@ -450,39 +487,25 @@ fn mark_lua_roots_for_weak_cleanup(l: &LuaState, gc: &mut GarbageCollector) {
             gc.mark_value(value);
         }
 
-        let proto_ptr: *const Proto = match l.stack.at(ci.func) {
-            Some(Value::Function(func_ref)) => {
-                // SAFETY: func_ref was read from a live call frame slot while
-                // the VM is marking reachable state.
-                let Some(func) = (unsafe { func_ref.as_ref() }) else {
-                    continue;
-                };
-                if !func.is_lua_function() {
-                    continue;
-                }
-                let Some(proto_ref) = func.proto() else {
-                    continue;
-                };
-                proto_ref.as_ptr()
-            }
-            _ => {
-                let Some(proto_ptr) = l.current_proto else {
-                    continue;
-                };
-                proto_ptr
-            }
+        let Some(proto_ref) = ci.proto else {
+            continue;
         };
-        // SAFETY: proto_ptr is either owned by a live Lua Function or refreshed
-        // by the VM loop for the currently executing top-level chunk.
-        let proto = unsafe { &*proto_ptr };
+        gc.mark_registered(proto_ref);
         let pc = ci.savedpc.unwrap_or(0) as i32;
-        for idx in 0..proto.loc_var_count() {
-            let loc = proto.loc_var(idx);
-            if loc.startpc <= pc && pc < loc.endpc && loc.reg >= 0 {
-                let stack_index = ci.base + loc.reg as usize;
-                if let Some(value) = l.stack.at(stack_index) {
-                    gc.mark_value(value);
-                }
+        let local_slots = gc
+            .with_ref(proto_ref, |proto| {
+                (0..proto.loc_var_count())
+                    .filter_map(|idx| {
+                        let loc = proto.loc_var(idx);
+                        (loc.startpc <= pc && pc < loc.endpc && loc.reg >= 0)
+                            .then_some(ci.base + loc.reg as usize)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for stack_index in local_slots {
+            if let Some(value) = l.stack.at(stack_index) {
+                gc.mark_value(value);
             }
         }
     }
@@ -495,10 +518,7 @@ fn mark_open_upvalues(l: &LuaState, gc: &mut GarbageCollector) {
         let Some(upvalue) = (unsafe { upvalue_ref.as_ref() }) else {
             break;
         };
-        // SAFETY: upvalue_ref points to a GC-managed Upvalue object.
-        unsafe {
-            gc.mark_object(upvalue_ref.as_ptr() as *mut GcObjectHeader);
-        }
+        gc.mark_registered(upvalue_ref);
         if upvalue.is_open()
             && let Some(value) = l.stack.at(upvalue.stack_index())
         {
@@ -526,7 +546,7 @@ fn run_userdata_finalizer(
         .map(|_| ())
         .map_err(|err| {
             err.error_value().unwrap_or_else(|| {
-                let message = gc.create(GcString::new(&err.message));
+                let message = gc.create(GcString::from_utf8_text(&err.message));
                 Value::String(message)
             })
         })
@@ -714,7 +734,7 @@ unsafe extern "C" fn lua_b_loadstring_raw(_l_ptr: *mut std::ffi::c_void) -> i32 
         let Some(source) = (unsafe { source_ref.as_ref() }) else {
             return push_load_error(l, "invalid source string");
         };
-        source.data().to_string()
+        source.as_bytes().to_vec()
     };
 
     let chunk_name = l
@@ -722,15 +742,11 @@ unsafe extern "C" fn lua_b_loadstring_raw(_l_ptr: *mut std::ffi::c_void) -> i32 
         .and_then(|value| match value {
             Value::String(name_ref) => {
                 // SAFETY: chunk name is an argument on the active Lua stack.
-                unsafe { name_ref.as_ref() }.map(|name| name.data().to_string())
+                unsafe { name_ref.as_ref() }.map(|name| name.as_bytes().to_vec())
             }
             _ => None,
         })
         .unwrap_or_else(|| default_loadstring_chunk_name(&source));
-
-    if let Some(nret) = try_push_dumped_function(l, &source) {
-        return nret;
-    }
 
     match compile_chunk_function(l, &source, &chunk_name) {
         Ok(func_ref) => {
@@ -750,17 +766,17 @@ unsafe extern "C" fn lua_b_load_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
         .and_then(|value| match value {
             Value::String(name_ref) => {
                 // SAFETY: chunk name is an argument on the active Lua stack.
-                unsafe { name_ref.as_ref() }.map(|name| name.data().to_string())
+                unsafe { name_ref.as_ref() }.map(|name| name.as_bytes().to_vec())
             }
             _ => None,
         })
-        .unwrap_or_else(|| "=(load)".to_string());
+        .unwrap_or_else(|| b"=(load)".to_vec());
 
     let source = match reader {
         Value::String(source_ref) => {
             // SAFETY: source string is an argument on the active Lua stack.
             match unsafe { source_ref.as_ref() } {
-                Some(source) => source.data().to_string(),
+                Some(source) => source.as_bytes().to_vec(),
                 None => return push_load_error(l, "invalid source string"),
             }
         }
@@ -775,10 +791,6 @@ unsafe extern "C" fn lua_b_load_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
         _ => return push_load_error(l, "bad argument #1 to 'load' (function expected)"),
     };
 
-    if let Some(nret) = try_push_dumped_function(l, &source) {
-        return nret;
-    }
-
     match compile_chunk_function(l, &source, &chunk_name) {
         Ok(func_ref) => {
             l.push_value(Value::Function(func_ref));
@@ -788,13 +800,13 @@ unsafe extern "C" fn lua_b_load_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     }
 }
 
-fn read_from_lua_reader(l: &mut LuaState, reader: Value) -> Result<String, Value> {
+fn read_from_lua_reader(l: &mut LuaState, reader: Value) -> Result<Vec<u8>, Value> {
     let Some(gc_ptr) = l.gc else {
         return Err(Value::Nil);
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
-    let mut source = String::new();
+    let mut source = Vec::new();
 
     loop {
         let results = call_value(l, gc, reader.clone(), &[], Some(1))
@@ -807,10 +819,10 @@ fn read_from_lua_reader(l: &mut LuaState, reader: Value) -> Result<String, Value
                 let Some(text) = (unsafe { s.as_ref() }) else {
                     return Err(Value::Nil);
                 };
-                if text.data().is_empty() {
+                if text.as_bytes().is_empty() {
                     break;
                 }
-                source.push_str(text.data());
+                source.extend_from_slice(text.as_bytes());
                 if source.len() >= 2
                     && let Some(message) = definite_syntax_error(&source)
                 {
@@ -833,16 +845,19 @@ fn read_from_lua_reader(l: &mut LuaState, reader: Value) -> Result<String, Value
     Ok(source)
 }
 
-fn definite_syntax_error(source: &str) -> Option<String> {
-    let first = source.trim_start().chars().next()?;
+fn definite_syntax_error(source: &[u8]) -> Option<String> {
+    let first = source
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())?;
     if !matches!(
         first,
-        '*' | '/' | '%' | '^' | ')' | ']' | '}' | ',' | '=' | '<' | '>'
+        b'*' | b'/' | b'%' | b'^' | b')' | b']' | b'}' | b',' | b'=' | b'<' | b'>'
     ) {
         return None;
     }
 
-    let mut parser = Parser::new(source);
+    let mut parser = Parser::from_bytes(source);
     match parser.parse() {
         Ok(_) => None,
         Err(err) if err.message.contains("<eof>") => None,
@@ -851,20 +866,6 @@ fn definite_syntax_error(source: &str) -> Option<String> {
             err.line, err.column, err.message
         )),
     }
-}
-
-fn try_push_dumped_function(l: &mut LuaState, source: &str) -> Option<i32> {
-    let gc_ptr = l.gc?;
-    // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
-    let gc = unsafe { &mut *gc_ptr };
-    let dumped = crate::dump::undump_function(l, gc, source)?;
-    Some(match dumped {
-        Ok(func_ref) => {
-            l.push_value(Value::Function(func_ref));
-            1
-        }
-        Err(message) => push_load_error(l, &message),
-    })
 }
 
 unsafe extern "C" fn lua_b_loadfile_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -878,7 +879,7 @@ unsafe extern "C" fn lua_b_loadfile_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
         Ok(source) => source,
         Err(err) => return push_load_error(l, &format!("cannot open {filename}: {err}")),
     };
-    let chunk_name = format!("@{filename}");
+    let chunk_name = format!("@{filename}").into_bytes();
 
     match compile_chunk_function(l, &source, &chunk_name) {
         Ok(func_ref) => {
@@ -908,7 +909,7 @@ unsafe extern "C" fn lua_b_dofile_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
             return -1;
         }
     };
-    let chunk_name = format!("@{filename}");
+    let chunk_name = format!("@{filename}").into_bytes();
 
     let func_ref = match compile_chunk_function(l, &source, &chunk_name) {
         Ok(func_ref) => func_ref,
@@ -952,43 +953,44 @@ fn push_load_error(l: &mut LuaState, message: &str) -> i32 {
     2
 }
 
-fn read_lua_source_file(filename: &str) -> std::io::Result<String> {
-    let bytes = std::fs::read(filename)?;
-    Ok(lua_source_from_bytes(&bytes))
+fn read_lua_source_file(filename: &str) -> std::io::Result<Vec<u8>> {
+    std::fs::read(filename)
 }
 
-fn lua_source_from_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| char::from(*byte)).collect()
-}
-
-fn default_loadstring_chunk_name(source: &str) -> String {
+fn default_loadstring_chunk_name(source: &[u8]) -> Vec<u8> {
     string_chunk_id(source)
 }
 
-fn string_chunk_id(source: &str) -> String {
+fn string_chunk_id(source: &[u8]) -> Vec<u8> {
     const LUA_IDSIZE: usize = 60;
-    let before_newline = source.split('\n').next().unwrap_or_default();
-    if before_newline.is_empty() && source.contains('\n') {
-        return "[string \"...\"]".to_string();
+    let before_newline = source
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    if before_newline.is_empty() && source.contains(&b'\n') {
+        return b"[string \"...\"]".to_vec();
     }
 
-    let mut preview = before_newline.to_string();
-    let needs_ellipsis =
-        source.contains('\n') || source.chars().count() > before_newline.chars().count();
+    let needs_ellipsis = source.contains(&b'\n') || source.len() > before_newline.len();
     let max_inner = LUA_IDSIZE.saturating_sub("[string \"...\"]".len());
-    if needs_ellipsis || preview.chars().count() > max_inner {
-        preview = preview.chars().take(max_inner).collect();
-        format!("[string \"{preview}...\"]")
-    } else {
-        format!("[string \"{preview}\"]")
+    let preview = &before_newline[..before_newline.len().min(max_inner)];
+    let mut chunk_id = Vec::with_capacity(LUA_IDSIZE);
+    chunk_id.extend_from_slice(b"[string \"");
+    chunk_id.extend_from_slice(preview);
+    if needs_ellipsis || before_newline.len() > max_inner {
+        chunk_id.extend_from_slice(b"...");
     }
+    chunk_id.extend_from_slice(b"\"]");
+    chunk_id
 }
 
 fn optional_filename_arg(l: &LuaState, idx: i32, _name: &str) -> Option<String> {
     match l.at(idx) {
         Some(Value::String(s)) => {
             // SAFETY: filename argument is on the active Lua stack.
-            unsafe { s.as_ref() }.map(|s| s.data().to_string())
+            unsafe { s.as_ref() }
+                .and_then(|string| string.to_utf8().ok())
+                .map(str::to_owned)
         }
         Some(Value::Nil) | None => None,
         _ => None,
@@ -997,8 +999,8 @@ fn optional_filename_arg(l: &LuaState, idx: i32, _name: &str) -> Option<String> 
 
 fn compile_chunk_function(
     l: &mut LuaState,
-    source: &str,
-    chunk_name: &str,
+    source: &[u8],
+    chunk_name: &[u8],
 ) -> Result<GcRef<Function>, String> {
     let Some(gc_ptr) = l.gc else {
         return Err("chunk compilation unavailable without an active GC".to_string());
@@ -1006,27 +1008,49 @@ fn compile_chunk_function(
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
 
-    let mut parser = Parser::new(source);
-    let chunk = parser
-        .parse()
-        .map_err(|err| format!("{chunk_name}:{}: {}", err.line, err.message))?;
+    let mut parser = Parser::from_bytes(source);
+    let chunk = parser.parse().map_err(|err| {
+        format!(
+            "{}:{}: {}",
+            chunk_name_for_diagnostic(chunk_name),
+            err.line,
+            err.message
+        )
+    })?;
 
-    let mut generator = CodeGenerator::new(gc);
-    if let Some(pool_ptr) = l.string_pool {
+    let generator = if let Some(pool_ptr) = l.string_pool {
         // SAFETY: LuaState::string_pool is installed from a live StringPool
         // owned by the host for the duration of this compilation.
-        generator.builder.bind_pool(unsafe { &mut *pool_ptr });
-    }
+        CodeGenerator::new_with_pool(gc, unsafe { &mut *pool_ptr })
+    } else {
+        CodeGenerator::new(gc)
+    };
     let proto = generator
-        .generate(&chunk, chunk_name)
-        .map_err(|err| format!("{chunk_name}:{err}"))?;
+        .generate_with_source_bytes(&chunk, chunk_name)
+        .map_err(|err| format!("{}:{err}", chunk_name_for_diagnostic(chunk_name)))?;
 
     let proto_ref = gc.create(proto);
     let mut function = Function::new_lua(proto_ref);
     function.set_env(l.thread_env.or(l.global_table));
-    let function_ref = gc.create(function);
-    crate::dump::remember_function_source(function_ref, source);
-    Ok(function_ref)
+    Ok(gc.create(function))
+}
+
+fn chunk_name_for_diagnostic(chunk_name: &[u8]) -> std::borrow::Cow<'_, str> {
+    match std::str::from_utf8(chunk_name) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => {
+            let mut escaped = String::with_capacity(chunk_name.len());
+            for &byte in chunk_name {
+                if byte.is_ascii_graphic() || byte == b' ' {
+                    escaped.push(char::from(byte));
+                } else {
+                    use std::fmt::Write as _;
+                    let _ = write!(escaped, "\\x{byte:02x}");
+                }
+            }
+            std::borrow::Cow::Owned(escaped)
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1078,7 +1102,7 @@ unsafe extern "C" fn lua_b_select_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
 
     let selector_is_count = matches!(l.at(1), Some(Value::String(s)) if {
         // SAFETY: selector string is an argument on the active Lua stack.
-        unsafe { s.as_ref() }.is_some_and(|gs| gs.data() == "#")
+        unsafe { s.as_ref() }.is_some_and(|gs| gs.as_bytes() == b"#")
     });
     if selector_is_count {
         l.push_value(Value::Number(extra as f64));
@@ -1140,7 +1164,9 @@ fn value_to_plain_string(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => {
             // SAFETY: GC is not running during C function execution.
-            unsafe { s.as_ref() }.map(|gs| gs.data().to_string())
+            unsafe { s.as_ref() }
+                .and_then(|string| string.to_utf8().ok())
+                .map(str::to_owned)
         }
         Value::Number(n) => Some(value_to_string_helper(&Value::Number(*n))),
         _ => None,
@@ -1395,7 +1421,7 @@ fn metatable_field(metatable: GcRef<Table>, name: &str) -> Option<Value> {
         if let Value::String(key_ref) = key
             // SAFETY: key is held by the metatable.
             && let Some(key_string) = unsafe { key_ref.as_ref() }
-            && key_string.data() == name
+            && key_string.as_bytes() == name.as_bytes()
         {
             return Some(value.clone());
         }
@@ -1410,12 +1436,12 @@ fn weak_mode(metatable: GcRef<Table>) -> Option<(bool, bool)> {
         if let Value::String(key_ref) = key
             // SAFETY: key is held by the metatable.
             && let Some(key_str) = unsafe { key_ref.as_ref() }
-            && key_str.data() == "__mode"
+            && key_str.as_bytes() == b"__mode"
             && let Value::String(mode_ref) = value
         {
             // SAFETY: mode string is held by the metatable.
-            let mode = unsafe { mode_ref.as_ref() }?.data();
-            return Some((mode.contains('k'), mode.contains('v')));
+            let mode = unsafe { mode_ref.as_ref() }?.as_bytes();
+            return Some((mode.contains(&b'k'), mode.contains(&b'v')));
         }
     }
     None
@@ -1449,11 +1475,15 @@ fn function_ref_at_level(l: &LuaState, level: usize) -> Option<GcRef<Function>> 
 
 fn error_location_prefix(l: &LuaState, level: usize) -> Option<String> {
     let func_ref = function_ref_at_level(l, level)?;
-    // SAFETY: function refs at a stack level are kept alive by the call frame.
-    let func = unsafe { func_ref.as_ref() }?;
-    let proto_ref = func.proto()?;
-    // SAFETY: a Lua function keeps its proto alive.
-    let proto = unsafe { proto_ref.as_ref() }?;
+    let gc_ptr = l.gc?;
+    // SAFETY: the VM installs the owning collector for the duration of the
+    // active base-library callback.
+    let gc = unsafe { &*gc_ptr };
+    let proto_ref = gc.with_ref(func_ref, Function::proto).ok().flatten()?;
+    let proto_ptr = gc.validate_ref(proto_ref).ok()?;
+    // SAFETY: validated above; destructive sweep is disabled during this
+    // base-library callback.
+    let proto = unsafe { proto_ptr.as_ref() };
     let ResolvedStackLevel::Real(frame_idx) = resolve_stack_level(l, level)? else {
         return None;
     };
@@ -1463,7 +1493,7 @@ fn error_location_prefix(l: &LuaState, level: usize) -> Option<String> {
         .source()
         .and_then(|source_ref| {
             // SAFETY: the proto keeps its source string alive.
-            unsafe { source_ref.as_ref() }.map(|source| source.data().to_string())
+            unsafe { source_ref.as_ref() }.map(|source| source.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "?".to_string());
     Some(format!("{}:{}", source, proto.line(pc)))
@@ -1528,9 +1558,9 @@ fn raw_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::String(a), Value::String(b)) => {
             // SAFETY: both strings are live Value operands during this C function call.
-            let a = unsafe { a.as_ref() }.map(|s| s.data());
+            let a = unsafe { a.as_ref() }.map(|s| s.as_bytes());
             // SAFETY: both strings are live Value operands during this C function call.
-            let b = unsafe { b.as_ref() }.map(|s| s.data());
+            let b = unsafe { b.as_ref() }.map(|s| s.as_bytes());
             a == b
         }
         _ => a == b,

@@ -12,9 +12,9 @@ use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_vm::state::LuaState;
 
-/// SAFETY helper: cast C function void pointer back to &mut LuaState
+/// SAFETY helper: cast a VM callback pointer back to its scoped LuaState borrow.
 #[inline]
-unsafe fn to_lua(l_ptr: *mut std::ffi::c_void) -> &'static mut LuaState {
+unsafe fn to_lua<'state>(l_ptr: *mut std::ffi::c_void) -> &'state mut LuaState {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler
     unsafe { &mut *(l_ptr as *mut LuaState) }
 }
@@ -70,7 +70,7 @@ fn reg(
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::new(name));
+    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
     let func_obj = gc.create(Function::new_c(func));
     // SAFETY: table points to a valid GC-rooted table; GC does not run here
     unsafe {
@@ -79,7 +79,7 @@ fn reg(
 }
 
 fn set_number(gc: &mut GarbageCollector, table: *mut Table, name: &str, value: f64) {
-    let name_str = gc.create(GcString::new(name));
+    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
     // SAFETY: table points to a valid GC-rooted table; GC does not run here.
     unsafe {
         (*table).set(&Value::String(name_str), &Value::Number(value));
@@ -95,7 +95,7 @@ fn find_lib_table(l: &LuaState, name: &str) -> lua_core::gc::gc_ref::GcRef<Table
                 if let Value::String(key_ref) = key {
                     // SAFETY: key is from the GC-rooted global table
                     if let Some(key_str) = unsafe { key_ref.as_ref() } {
-                        if key_str.data() == name {
+                        if key_str.as_bytes() == name.as_bytes() {
                             if let Value::Table(t) = val {
                                 return *t;
                             }
@@ -114,10 +114,20 @@ fn get_number(l: &LuaState, index: usize) -> Option<f64> {
         Value::Number(n) => Some(*n),
         Value::String(s) => {
             // SAFETY: string arguments are on the active Lua stack.
-            unsafe { s.as_ref() }.and_then(|s| s.data().trim().parse::<f64>().ok())
+            unsafe { s.as_ref() }.and_then(|s| parse_lua_number_bytes(s.as_bytes()))
         }
         _ => None,
     })
+}
+
+fn parse_lua_number_bytes(mut bytes: &[u8]) -> Option<f64> {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()
 }
 
 fn check_number(l: &mut LuaState, index: usize, func: &str) -> Result<f64, i32> {
@@ -139,7 +149,7 @@ fn push_error(l: &mut LuaState, message: &str) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let message = gc.create(GcString::new(message));
+    let message = gc.create(GcString::from_utf8_text(message));
     l.push_value(Value::String(message));
     -1
 }
@@ -583,4 +593,16 @@ unsafe extern "C" fn lua_math_tanh(l_ptr: *mut std::ffi::c_void) -> i32 {
     l.pop();
     l.push_value(Value::Number(x.tanh()));
     1
+}
+
+#[cfg(test)]
+mod byte_string_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_conversion_is_ascii_and_rejects_invalid_utf8() {
+        assert_eq!(parse_lua_number_bytes(b" \t42.5\r\n"), Some(42.5));
+        assert_eq!(parse_lua_number_bytes(&[0xff, b'1']), None);
+        assert_eq!(parse_lua_number_bytes(b"1\0"), None);
+    }
 }

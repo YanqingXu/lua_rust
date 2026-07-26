@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::gc::gc_ref::GcRef;
 use crate::gc_string::GcString;
+use crate::light_userdata::LightUserdataRef;
 use crate::types::{Function, LuaInteger, LuaNumber, Table, Thread, Userdata, ValueType};
 
 // =====================================================================
@@ -27,7 +28,7 @@ pub enum Value {
     /// Lua 布尔值 — discriminant 1
     Boolean(bool),
     /// 轻量用户数据（不受 GC 管理的 C 指针）— discriminant 2
-    LightUserdata(GcRef<std::ffi::c_void>),
+    LightUserdata(LightUserdataRef),
     /// Lua 数值（f64）— discriminant 3
     Number(LuaNumber),
     /// Lua 字符串（受 GC 管理）— discriminant 4
@@ -131,7 +132,7 @@ impl Value {
     }
 
     #[inline]
-    pub fn as_light_userdata(&self) -> GcRef<std::ffi::c_void> {
+    pub fn as_light_userdata(&self) -> LightUserdataRef {
         match self {
             Value::LightUserdata(p) => *p,
             _ => panic_value("LightUserdata", self),
@@ -199,7 +200,7 @@ impl Value {
         self.try_as_number().map(|n| n as LuaInteger)
     }
     #[inline]
-    pub fn try_as_light_userdata(&self) -> Option<GcRef<std::ffi::c_void>> {
+    pub fn try_as_light_userdata(&self) -> Option<LightUserdataRef> {
         match self {
             Value::LightUserdata(p) => Some(*p),
             _ => None,
@@ -283,7 +284,7 @@ impl PartialEq for Value {
             (Value::Nil, Value::Nil) => true,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Number(a), Value::Number(b)) => a.to_bits() == b.to_bits(),
-            // GcRef<T> 的 PartialEq 比较指针相等性
+            // Light userdata compares by exact host-pointer identity.
             (Value::LightUserdata(a), Value::LightUserdata(b)) => a == b,
             // Lua strings compare by byte content. Interning keeps this fast in
             // the common path, but equality must still be correct if a caller
@@ -293,9 +294,9 @@ impl PartialEq for Value {
                     true
                 } else {
                     // SAFETY: string Value operands are live while equality is evaluated.
-                    let a_data = unsafe { a.as_ref() }.map(|s| s.data());
+                    let a_data = unsafe { a.as_ref() }.map(|s| s.as_bytes());
                     // SAFETY: string Value operands are live while equality is evaluated.
-                    let b_data = unsafe { b.as_ref() }.map(|s| s.data());
+                    let b_data = unsafe { b.as_ref() }.map(|s| s.as_bytes());
                     a_data == b_data
                 }
             }
@@ -356,18 +357,9 @@ impl fmt::Display for Value {
             Value::String(p) => write!(f, "string: {:p}", p.as_ptr()),
             Value::Table(p) => write!(f, "table: {:p}", p.as_ptr()),
             Value::Function(p) => {
-                // SAFETY: Display takes &self, preventing concurrent GC mutation.
-                // The GcRef is valid as long as no GC sweep has freed the object.
-                // The single-threaded GC model guarantees this during Display.
-                if let Some(func) = unsafe { p.as_ref() } {
-                    if func.is_c_function() {
-                        write!(f, "C function: {:p}", p.as_ptr())
-                    } else {
-                        write!(f, "Lua function: {:p}", p.as_ptr())
-                    }
-                } else {
-                    write!(f, "function: {:p}", p.as_ptr())
-                }
+                // Safe formatting has no collector context and therefore must
+                // never inspect candidate object memory.
+                write!(f, "function: {:p}", p.as_ptr())
             }
             Value::Userdata(p) => write!(f, "userdata: {:p}", p.as_ptr()),
             Value::Thread(p) => write!(f, "thread: {:p}", p.as_ptr()),
@@ -382,8 +374,12 @@ impl fmt::Display for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::function::Function;
     use crate::gc::collector::GarbageCollector;
     use crate::gc_string::GcString;
+    use crate::string_pool::StringPool;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     use std::mem;
 
     #[test]
@@ -397,16 +393,52 @@ mod tests {
     #[test]
     fn test_value_size_constraint() {
         let size = mem::size_of::<Value>();
-        assert!(size <= 16, "Value size {} exceeds 16 bytes", size);
+        assert_eq!(
+            size, 24,
+            "M1 ObjectId provenance intentionally makes Value 24 bytes"
+        );
     }
 
     #[test]
     fn test_string_values_compare_by_content_without_interning() {
         let mut gc = GarbageCollector::new();
-        let left = gc.create(GcString::new("same"));
-        let right = gc.create(GcString::new("same"));
+        let left = gc.create(GcString::from_bytes(b"same"));
+        let right = gc.create(GcString::from_bytes(b"same"));
 
         assert_ne!(left, right);
         assert_eq!(Value::String(left), Value::String(right));
+    }
+
+    #[test]
+    fn string_value_equality_and_hash_use_the_same_exact_bytes() {
+        let mut gc = GarbageCollector::new();
+        let latin1 = Value::String(gc.create(GcString::from_bytes(&[0xe9])));
+        let latin1_duplicate = Value::String(gc.create(GcString::from_bytes(&[0xe9])));
+        let utf8 = Value::String(gc.create(GcString::from_utf8_text("é")));
+
+        assert_eq!(latin1, latin1_duplicate);
+        assert_ne!(latin1, utf8);
+
+        fn value_hash(value: &Value) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        assert_eq!(value_hash(&latin1), value_hash(&latin1_duplicate));
+    }
+
+    #[test]
+    fn display_of_stale_function_value_never_dereferences_candidate_memory() {
+        let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let proto = gc.create(crate::proto::Proto::new());
+        let function = gc.create(Function::new_lua(proto));
+        let stale = Value::Function(function);
+        let expected_pointer = format!("{:p}", function.as_ptr());
+
+        assert_eq!(gc.sweep(&mut pool), 2);
+        assert!(!gc.contains_registered(function));
+        assert_eq!(format!("{stale}"), format!("function: {expected_pointer}"));
     }
 }

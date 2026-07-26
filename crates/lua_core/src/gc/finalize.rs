@@ -41,26 +41,35 @@ impl GarbageCollector {
         let mut current = self.all_objects;
 
         while !current.is_null() {
-            // SAFETY: current walks the GC intrusive object list.
+            let Some(live) = self.live_allocations.get(&(current as usize)).copied() else {
+                self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
+                break;
+            };
+            // SAFETY: address membership was established in the authoritative
+            // table before reading this internal intrusive-list link.
             let next = unsafe { (*current).next() };
-            // SAFETY: current is a valid GC list node. The Userdata cast is
-            // guarded by the type tag before userdata_has_gc inspects it.
-            let should_finalize = unsafe {
-                (*current).gc_type() == GcObjectType::Userdata
+            // SAFETY: address membership and the side-table Userdata tag are
+            // checked before reading header mark bits.
+            let is_candidate = unsafe {
+                live.object_type == GcObjectType::Userdata
                     && (*current).is_white()
                     && !(*current).is_finalized()
-                    && userdata_has_gc(current as *const Userdata)
             };
+            let userdata = is_candidate
+                .then(|| self.registered_ref_from_ptr(current.cast::<Userdata>()))
+                .flatten();
+            let should_finalize = userdata.is_some_and(|userdata| userdata_has_gc(self, userdata));
 
             if should_finalize {
                 // SAFETY: current is a valid userdata object from the GC list.
                 unsafe {
                     (*current).mark_finalized();
-                    self.mark_object(current);
-                    pending.push(GcRef::from_ptr(current as *const Userdata));
                 }
-                if !self.pending_finalizers.contains(&current) {
-                    self.pending_finalizers.push(current);
+                self.mark_live_object(current);
+                let userdata = userdata.expect("validated finalizer candidate");
+                pending.push(userdata);
+                if !self.pending_finalizers.contains(&userdata) {
+                    self.pending_finalizers.push(userdata);
                 }
             }
 
@@ -92,29 +101,31 @@ impl GarbageCollector {
     }
 }
 
-unsafe fn userdata_has_gc(userdata_ptr: *const Userdata) -> bool {
-    // SAFETY: caller provides a valid userdata pointer from the GC object list.
-    let Some(metatable) = (unsafe { (*userdata_ptr).metatable() }) else {
+fn userdata_has_gc(gc: &GarbageCollector, userdata: GcRef<Userdata>) -> bool {
+    let Ok(metatable) = gc.with_ref(userdata, Userdata::metatable) else {
         return false;
     };
-    metatable_has_field(metatable, "__gc")
+    let Some(metatable) = metatable else {
+        return false;
+    };
+    metatable_has_field(gc, metatable, "__gc")
 }
 
-fn metatable_has_field(metatable: GcRef<Table>, name: &str) -> bool {
-    // SAFETY: metatable came from a live userdata object, and finalizer
-    // preparation runs before sweep frees unreachable GC objects.
-    let Some(table) = (unsafe { metatable.as_ref() }) else {
+fn metatable_has_field(gc: &GarbageCollector, metatable: GcRef<Table>, name: &str) -> bool {
+    let Ok(table) = gc.validate_ref(metatable) else {
         return false;
     };
+    // SAFETY: validation matched collector, identity, and Table tag.
+    let table = unsafe { table.as_ref() };
     table.hash_entries().any(|(key, value)| {
         !value.is_nil()
             && matches!(
                 key,
                 Value::String(key_ref) if {
-                    // SAFETY: string keys in this table remain allocated while
-                    // finalizer preparation runs before sweep.
-                    unsafe { key_ref.as_ref() }
-                        .is_some_and(|key_string: &GcString| key_string.data() == name)
+                    gc.with_ref(*key_ref, |key_string: &GcString| {
+                        key_string.as_bytes() == name.as_bytes()
+                    })
+                    .unwrap_or(false)
                 }
             )
     })

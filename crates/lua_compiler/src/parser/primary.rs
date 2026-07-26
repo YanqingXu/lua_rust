@@ -59,7 +59,8 @@ impl<'source> Parser<'source> {
 
         // 字符串
         if self.current().is_string() {
-            let value = Self::token_string(self.current()).to_string();
+            let value =
+                lua_core::byte_string::ByteString::from_bytes(Self::token_bytes(self.current()));
             let str_expr = StringExpr {
                 location: SourceLocation::new(line, column),
                 value,
@@ -100,7 +101,7 @@ impl<'source> Parser<'source> {
         // 标识符
         if crate::parser::is_name(self.current()) {
             let name_token = self.current().clone();
-            let name = Self::token_string(&name_token).to_string();
+            let name = Self::token_name(&name_token).to_string();
             self.note_name_use(&name, &name_token)?;
             self.advance();
 
@@ -165,7 +166,7 @@ impl<'source> Parser<'source> {
                     return Err(self.make_error("Expected member name after '.'"));
                 }
 
-                let member = Self::token_string(self.current()).to_string();
+                let member = Self::token_name(self.current()).to_string();
                 let loc = SourceLocation::new(line, column);
                 self.advance();
 
@@ -179,7 +180,7 @@ impl<'source> Parser<'source> {
                     return Err(self.make_error("Expected method name after ':'"));
                 }
 
-                let method_name = Self::token_string(self.current()).to_string();
+                let method_name = Self::token_name(self.current()).to_string();
                 self.advance();
 
                 let member_expr = MemberExpr {
@@ -214,7 +215,9 @@ impl<'source> Parser<'source> {
                             self.make_error("ambiguous syntax (function call x new statement)")
                         );
                     }
-                    let str_val = Self::token_string(self.current()).to_string();
+                    let str_val = lua_core::byte_string::ByteString::from_bytes(Self::token_bytes(
+                        self.current(),
+                    ));
                     let str_line = self.current().line;
                     let str_col = self.current().column;
                     self.advance();
@@ -239,7 +242,9 @@ impl<'source> Parser<'source> {
                 // 字符串参数调用：func"string" 或 func'string'
                 reject_ambiguous_newline(self, self.previous().line)?;
 
-                let str_val = Self::token_string(self.current()).to_string();
+                let str_val = lua_core::byte_string::ByteString::from_bytes(Self::token_bytes(
+                    self.current(),
+                ));
                 let str_line = self.current().line;
                 let str_col = self.current().column;
                 self.advance();

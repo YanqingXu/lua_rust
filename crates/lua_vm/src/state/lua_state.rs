@@ -4,11 +4,12 @@
 //! 全局表引用和线程状态。
 //!
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::proto::Proto;
+use lua_core::state_handle::StateHandle;
 use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
 use lua_core::thread::Thread;
@@ -17,6 +18,7 @@ use lua_core::value::Value;
 
 use super::call_info::CallInfo;
 use super::stack::Stack;
+use crate::runtime::StateArena;
 
 /// 线程执行状态
 ///
@@ -29,6 +31,26 @@ pub enum ThreadStatus {
     ErrSyntax = 3,
     ErrMem = 4,
     ErrErr = 5,
+}
+
+/// State-local work and debt observed during deterministic Runtime shutdown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LuaStateShutdownReport {
+    pub closed_open_upvalues: usize,
+    pub rejected_open_upvalue_edges: usize,
+    pub open_upvalue_cycles: usize,
+    pub open_upvalue_owner_mismatches: usize,
+    pub open_upvalue_stack_values_missing: usize,
+}
+
+impl LuaStateShutdownReport {
+    pub fn merge(&mut self, other: Self) {
+        self.closed_open_upvalues += other.closed_open_upvalues;
+        self.rejected_open_upvalue_edges += other.rejected_open_upvalue_edges;
+        self.open_upvalue_cycles += other.open_upvalue_cycles;
+        self.open_upvalue_owner_mismatches += other.open_upvalue_owner_mismatches;
+        self.open_upvalue_stack_values_missing += other.open_upvalue_stack_values_missing;
+    }
 }
 
 /// Lua 线程状态
@@ -57,6 +79,9 @@ pub struct LuaState {
     pub thread_env: Option<GcRef<Table>>,
     /// Environment for the currently executing top-level chunk pseudo-frame.
     pub chunk_env: Option<GcRef<Table>>,
+    /// Runtime registry table. The Runtime owns the canonical root; reachable
+    /// states retain the same handle for VM and library access.
+    pub registry: Option<GcRef<Table>>,
     /// Coroutine object that owns this state, if any.
     pub current_thread: Option<GcRef<Thread>>,
     /// Optional metatable for nil values, configured through debug.setmetatable.
@@ -69,9 +94,10 @@ pub struct LuaState {
     pub string_pool: Option<*mut StringPool>,
     /// 当前运行时 GC（供 C 函数创建返回字符串/表等 GC 对象）
     pub gc: Option<*mut GarbageCollector>,
-    /// Proto currently executing in the VM loop; used by C helpers called from a
-    /// top-level chunk that has no Function object in its call frame.
-    pub current_proto: Option<*const Proto>,
+    /// This state's runtime-scoped generational identity.
+    pub(crate) state_handle: Option<StateHandle>,
+    /// Stable transitional pointer to the Runtime-owned StateArena.
+    pub(crate) state_arena: Option<std::ptr::NonNull<StateArena>>,
     /// Active debug hook function configured through debug.sethook.
     pub debug_hook: Option<Value>,
     /// Debug hook event mask, e.g. "crl".
@@ -87,7 +113,7 @@ pub struct LuaState {
     /// Last program counter reported to a line hook.
     pub debug_hook_last_pc: usize,
     /// Caller Proto whose current source line should be skipped immediately after sethook.
-    pub debug_hook_skip_proto: Option<*const Proto>,
+    pub debug_hook_skip_proto: Option<GcRef<Proto>>,
     /// Caller source line to skip immediately after sethook.
     pub debug_hook_skip_line: i32,
     /// Cache for debug.getinfo(..., "n") call-site name lookups.
@@ -129,13 +155,15 @@ impl LuaState {
             global_table: None,
             thread_env: None,
             chunk_env: None,
+            registry: None,
             current_thread: None,
             nil_metatable: None,
             boolean_metatable: None,
             number_metatable: None,
             string_pool: None,
             gc: None,
-            current_proto: None,
+            state_handle: None,
+            state_arena: None,
             debug_hook: None,
             debug_hook_mask: String::new(),
             debug_hook_count: 0,
@@ -280,13 +308,24 @@ impl LuaState {
             self.call_stack.push(CallInfo::new());
         }
         self.current_ci += 1;
+        self.call_stack[self.current_ci].reset();
         &mut self.call_stack[self.current_ci]
     }
 
     /// 弹出当前 CallInfo（函数返回后）
     pub fn pop_call_info(&mut self) {
+        self.call_stack[self.current_ci].reset();
         if self.current_ci > 0 {
             self.current_ci -= 1;
+        }
+    }
+
+    /// 清理并弹出所有高于 `target_ci` 的活动调用帧。
+    ///
+    /// 错误展开必须通过此入口，避免复用帧继续保留 Proto/varargs 根。
+    pub fn unwind_call_info_to(&mut self, target_ci: usize) {
+        while self.current_ci > target_ci {
+            self.pop_call_info();
         }
     }
 
@@ -369,6 +408,88 @@ impl LuaState {
         }
     }
 
+    /// Close valid open Upvalues and detach every transitional Runtime
+    /// backpointer before this state allocation is dropped.
+    ///
+    /// Each Upvalue candidate is validated against the owning collector before
+    /// dereference. Invalid/cross-collector edges and cycles fail closed and
+    /// are reported as shutdown debt; the later heap teardown still releases
+    /// all collector-owned allocations without following those edges.
+    pub(crate) fn prepare_for_runtime_shutdown(
+        &mut self,
+        gc: &GarbageCollector,
+    ) -> LuaStateShutdownReport {
+        let mut report = LuaStateShutdownReport::default();
+        let mut visited = HashSet::new();
+        let owner_stack = std::ptr::from_mut(&mut self.stack).cast::<std::ffi::c_void>();
+
+        while let Some(upvalue_ref) = self.open_upvalues {
+            if !gc.contains_registered(upvalue_ref) {
+                report.rejected_open_upvalue_edges += 1;
+                self.open_upvalues = None;
+                break;
+            }
+
+            let upvalue_ptr = upvalue_ref.as_ptr() as *mut Upvalue;
+            if !visited.insert(upvalue_ptr) {
+                report.open_upvalue_cycles += 1;
+                self.open_upvalues = None;
+                break;
+            }
+
+            // SAFETY: contains_registered established a live Upvalue allocation
+            // in this Runtime collector. Shutdown has exclusive Runtime access
+            // and no execution guard is active.
+            let upvalue = unsafe { &mut *upvalue_ptr };
+            let next = upvalue.next();
+            let stack_index = upvalue.stack_index_any();
+            let owner_matches = upvalue.owner_stack() == owner_stack;
+            if !owner_matches {
+                report.open_upvalue_owner_mismatches += 1;
+            }
+            let stack_value = if owner_matches && stack_index < self.top {
+                match self.stack.at(stack_index).cloned() {
+                    Some(value) => value,
+                    None => {
+                        report.open_upvalue_stack_values_missing += 1;
+                        Value::Nil
+                    }
+                }
+            } else {
+                if owner_matches {
+                    report.open_upvalue_stack_values_missing += 1;
+                }
+                Value::Nil
+            };
+
+            if upvalue.is_open() {
+                upvalue.close(stack_value);
+                report.closed_open_upvalues += 1;
+            }
+            upvalue.set_next(None);
+            self.open_upvalues = next;
+        }
+
+        self.global_table = None;
+        self.thread_env = None;
+        self.chunk_env = None;
+        self.registry = None;
+        self.current_thread = None;
+        self.nil_metatable = None;
+        self.boolean_metatable = None;
+        self.number_metatable = None;
+        self.debug_hook = None;
+        self.yielded_values.clear();
+        self.last_error = None;
+        self.debug_hook_skip_proto = None;
+        self.gc = None;
+        self.string_pool = None;
+        self.state_handle = None;
+        self.state_arena = None;
+
+        report
+    }
+
     // ── 线程状态 ────────────────────────────────────────────────
 
     pub fn get_status(&self) -> ThreadStatus {
@@ -418,5 +539,36 @@ mod tests {
         assert_eq!(ls.current_call_info().func, 10);
         ls.pop_call_info();
         assert_eq!(ls.current_call_info().func, 0);
+    }
+
+    #[test]
+    fn popped_and_unwound_frames_release_proto_and_varargs() {
+        let mut gc = GarbageCollector::new();
+        let proto = gc.create(Proto::new());
+        let mut ls = LuaState::new();
+
+        let first = ls.push_call_info();
+        first.proto = Some(proto);
+        first.varargs.push(Value::Number(1.0));
+        ls.pop_call_info();
+        assert!(ls.call_stack[1].proto.is_none());
+        assert!(ls.call_stack[1].varargs.is_empty());
+
+        let reused = ls.push_call_info();
+        assert!(reused.proto.is_none());
+        assert!(reused.varargs.is_empty());
+        reused.proto = Some(proto);
+        reused.varargs.push(Value::Number(2.0));
+        let second = ls.push_call_info();
+        second.proto = Some(proto);
+        second.varargs.push(Value::Number(3.0));
+
+        ls.unwind_call_info_to(0);
+        assert_eq!(ls.current_ci, 0);
+        assert!(
+            ls.call_stack[1..]
+                .iter()
+                .all(|ci| ci.proto.is_none() && ci.varargs.is_empty())
+        );
     }
 }

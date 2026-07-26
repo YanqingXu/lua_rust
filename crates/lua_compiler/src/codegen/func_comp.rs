@@ -13,7 +13,7 @@ use crate::codegen::CodeGenerator;
 use crate::codegen::types::{CompiledFunction, ParentFunctionContext, UpvalueCapture};
 use crate::opcode::OpCode;
 
-impl CodeGenerator {
+impl CodeGenerator<'_> {
     // ═══════════════════════════════════════════════════════════════
     // 函数编译
     // ═══════════════════════════════════════════════════════════════
@@ -34,6 +34,7 @@ impl CodeGenerator {
         // 创建子 Proto
         let source = self.builder.proto().source();
         let mut sub_proto = Proto::new();
+        sub_proto.set_max_stack_size(2);
         let vararg_flags = if is_vararg {
             VARARG_ISVARARG | if needs_arg { VARARG_NEEDSARG } else { 0 }
         } else {
@@ -94,20 +95,24 @@ impl CodeGenerator {
         // 保存编译结果
         let upvalues = self.upvalues.clone();
         self.builder.set_num_upvalues(upvalues.len() as u8);
-        // SAFETY: self.gc is set during CodeGenerator::new() from a valid &mut
-        // GarbageCollector reference that outlives the compilation process.
-        let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
         for upvalue in &upvalues {
-            let name = gc.create(GcString::new(&upvalue.name));
+            let name = self
+                .gc
+                .create(GcString::from_bytes(upvalue.name.as_bytes()));
             self.builder.add_upvalue_name(name);
         }
-        let max_stack = (self.reg_alloc.max_used() + 2).max(self.active_var_count + 2);
+        let max_stack = self
+            .reg_alloc
+            .max_used()
+            .max(self.active_var_count)
+            .max(self.builder.max_stack_size() as i32)
+            .max(2);
         self.builder.set_max_stack_size(max_stack as u8);
 
         let child_builder = std::mem::replace(&mut self.builder, saved_builder);
         let child_proto = child_builder.into_proto();
 
-        let child_ref = gc.create(child_proto);
+        let child_ref = self.gc.create(child_proto);
         let proto_index = self.builder.add_sub_proto(child_ref);
 
         // 恢复状态

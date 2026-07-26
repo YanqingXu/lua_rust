@@ -93,10 +93,9 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
         return raise_string(l, "bad argument #1 to 'require' (string expected)");
     };
     // SAFETY: module_ref is the first argument on the active Lua stack.
-    let module_name = match unsafe { module_ref.as_ref() } {
-        Some(name) => name.data().to_string(),
-        None => return raise_string(l, "invalid module name"),
-    };
+    if unsafe { module_ref.as_ref() }.is_none() {
+        return raise_string(l, "invalid module name");
+    }
 
     let Some(gc_ptr) = l.gc else {
         return raise_string(l, "require unavailable without an active GC");
@@ -114,9 +113,18 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
         return 1;
     }
 
-    let loader = match preload_loader(l, gc, package, &module_name) {
+    let loader = match preload_loader(l, gc, package, &module_key) {
         Some(loader) => loader,
         None => {
+            // `package.loaded` and `package.preload` are Lua tables, so their
+            // keys remain arbitrary byte strings. UTF-8 is required only when
+            // the unresolved name crosses into the host filesystem.
+            // SAFETY: module_ref is still the first active argument.
+            let module_name =
+                match unsafe { module_ref.as_ref() }.and_then(|name| name.to_utf8().ok()) {
+                    Some(name) => name.to_owned(),
+                    None => return raise_string(l, "module name must be valid UTF-8"),
+                };
             let (path, source) = match find_module_source(package, &module_name) {
                 Ok(found) => found,
                 Err(message) => return raise_string(l, &message),
@@ -198,8 +206,9 @@ unsafe extern "C" fn lua_package_module(l_ptr: *mut std::ffi::c_void) -> i32 {
         return raise_string(l, "bad argument #1 to 'module' (string expected)");
     };
     // SAFETY: name_ref is the first argument on the active Lua stack.
-    let Some(module_name) = (unsafe { name_ref.as_ref() }).map(|s| s.data().to_string()) else {
-        return raise_string(l, "invalid module name");
+    let module_name = match unsafe { name_ref.as_ref() } {
+        Some(name) => name.as_bytes().to_vec(),
+        None => return raise_string(l, "invalid module name"),
     };
     let Some(gc_ptr) = l.gc else {
         return raise_string(l, "module unavailable without an active GC");
@@ -215,8 +224,12 @@ unsafe extern "C" fn lua_package_module(l_ptr: *mut std::ffi::c_void) -> i32 {
         Err(message) => return raise_string(l, &message),
     };
 
-    set_module_metadata(l, gc, module_ref, &module_name);
+    set_module_metadata(l, gc, module_ref, &module_name, &module_key);
     table_set(l, gc, loaded, &module_key, &Value::Table(module_ref));
+
+    if !set_caller_env(l, module_ref) {
+        return raise_string(l, "module has no caller environment");
+    }
 
     let options: Vec<Value> = (2..=l.get_top())
         .filter_map(|idx| l.at(idx).cloned())
@@ -231,17 +244,13 @@ unsafe extern "C" fn lua_package_module(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
     }
 
-    if !set_caller_env(l, module_ref) {
-        return raise_string(l, "module has no caller environment");
-    }
-
     0
 }
 
 fn find_module_source(
     package: GcRef<Table>,
     module_name: &str,
-) -> Result<(PathBuf, String), String> {
+) -> Result<(PathBuf, Vec<u8>), String> {
     let path = table_string_field(package, "path").unwrap_or_else(|| DEFAULT_PATH.to_string());
     let module_path = module_path_name(module_name);
     let mut attempted = Vec::new();
@@ -275,23 +284,28 @@ fn module_path_name(module_name: &str) -> String {
         .collect()
 }
 
-fn read_lua_source_file(path: &Path) -> std::io::Result<String> {
-    let bytes = std::fs::read(path)?;
-    Ok(bytes.iter().map(|byte| char::from(*byte)).collect())
+fn read_lua_source_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path)
 }
 
 fn compile_chunk_function(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    source: &str,
+    source: &[u8],
     chunk_name: &str,
 ) -> Result<GcRef<Function>, String> {
-    let mut parser = Parser::new(source);
+    let mut parser = Parser::from_bytes(source);
     let chunk = parser
         .parse()
         .map_err(|err| format!("{chunk_name}:{}:{}: {}", err.line, err.column, err.message))?;
 
-    let generator = CodeGenerator::new(gc);
+    let generator = if let Some(pool_ptr) = l.string_pool {
+        // SAFETY: LuaState::string_pool is a transitional runtime backpointer
+        // installed from the live host-owned pool for this VM call.
+        CodeGenerator::new_with_pool(gc, unsafe { &mut *pool_ptr })
+    } else {
+        CodeGenerator::new(gc)
+    };
     let proto = generator
         .generate(&chunk, chunk_name)
         .map_err(|err| format!("{chunk_name}:{err}"))?;
@@ -385,7 +399,7 @@ fn register_global(
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
     env: Option<GcRef<Table>>,
 ) {
-    let name_str = gc.create(GcString::new(name));
+    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
     let mut function = Function::new_c(func);
     function.set_env(env);
     let func_obj = gc.create(function);
@@ -401,7 +415,7 @@ fn register_package_function(
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::new(name));
+    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
     let func_obj = gc.create(Function::new_c(func));
     // SAFETY: package is rooted through the global table during library registration.
     unsafe {
@@ -414,11 +428,10 @@ fn preload_loader(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     package: GcRef<Table>,
-    module_name: &str,
+    module_key: &Value,
 ) -> Option<Value> {
     let preload = ensure_preload_table(l, gc, package);
-    let key = lua_string_value(l, gc, module_name);
-    match table_get(preload, &key) {
+    match table_get(preload, module_key) {
         loader @ Value::Function(_) => Some(loader),
         _ => None,
     }
@@ -428,7 +441,7 @@ fn module_table(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     loaded: GcRef<Table>,
-    module_name: &str,
+    module_name: &[u8],
     module_key: &Value,
 ) -> Result<GcRef<Table>, String> {
     if let Value::Table(module_ref) = table_get(loaded, module_key) {
@@ -443,118 +456,113 @@ fn module_table(
 fn ensure_global_module_path(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    module_name: &str,
+    module_name: &[u8],
     module_ref: GcRef<Table>,
 ) -> Result<(), String> {
-    let Some((parent, leaf)) = module_parent_table(l, gc, module_name)? else {
-        set_global_value(l, gc, module_name, &Value::Table(module_ref));
-        return Ok(());
+    let fields = module_name_fields(module_name)?;
+    let Some(global) = l.global_table else {
+        return Err("module has no global table".to_string());
     };
-    let key = lua_string_value(l, gc, &leaf);
-    table_set(l, gc, parent, &key, &Value::Table(module_ref));
+    let mut parent = global;
+    for (index, field) in fields.iter().enumerate() {
+        let key = lua_bytes_value(l, gc, field);
+        if index + 1 == fields.len() {
+            table_set(l, gc, parent, &key, &Value::Table(module_ref));
+            return Ok(());
+        }
+        match table_get(parent, &key) {
+            Value::Table(next) => parent = next,
+            Value::Nil => {
+                let next = gc.create(Table::new());
+                table_set(l, gc, parent, &key, &Value::Table(next));
+                parent = next;
+            }
+            _ => return Err(module_name_conflict(module_name)),
+        }
+    }
     Ok(())
 }
 
 fn ensure_global_module_table(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    module_name: &str,
+    module_name: &[u8],
 ) -> Result<GcRef<Table>, String> {
-    if let Some(value) = global_value(l, module_name) {
-        return match value {
-            Value::Table(module_ref) => Ok(module_ref),
-            Value::Nil => Ok(create_named_module_table(l, gc, module_name)?),
-            _ => Err(format!("name conflict for module '{module_name}'")),
-        };
-    }
-
     create_named_module_table(l, gc, module_name)
 }
 
 fn create_named_module_table(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    module_name: &str,
+    module_name: &[u8],
 ) -> Result<GcRef<Table>, String> {
-    let Some((parent, leaf)) = module_parent_table(l, gc, module_name)? else {
-        let module_ref = gc.create(Table::new());
-        set_global_value(l, gc, module_name, &Value::Table(module_ref));
-        return Ok(module_ref);
+    let fields = module_name_fields(module_name)?;
+    let Some(global) = l.global_table else {
+        return Err("module has no global table".to_string());
     };
-
-    let leaf_key = lua_string_value(l, gc, &leaf);
-    let existing = table_get(parent, &leaf_key);
-    match existing {
-        Value::Table(module_ref) => Ok(module_ref),
-        Value::Nil => {
-            let module_ref = gc.create(Table::new());
-            table_set(l, gc, parent, &leaf_key, &Value::Table(module_ref));
-            Ok(module_ref)
+    let mut parent = global;
+    for (index, field) in fields.iter().enumerate() {
+        let key = lua_bytes_value(l, gc, field);
+        let existing = table_get(parent, &key);
+        if index + 1 == fields.len() {
+            return match existing {
+                Value::Table(module_ref) => Ok(module_ref),
+                Value::Nil => {
+                    let module_ref = gc.create(Table::new());
+                    table_set(l, gc, parent, &key, &Value::Table(module_ref));
+                    Ok(module_ref)
+                }
+                _ => Err(module_name_conflict(module_name)),
+            };
         }
-        _ => Err(format!("name conflict for module '{module_name}'")),
-    }
-}
-
-fn module_parent_table(
-    l: &mut LuaState,
-    gc: &mut GarbageCollector,
-    module_name: &str,
-) -> Result<Option<(GcRef<Table>, String)>, String> {
-    let Some((first, rest)) = module_name.split_once('.') else {
-        return Ok(None);
-    };
-
-    let root = match global_value(l, first) {
-        Some(Value::Table(root)) => root,
-        Some(Value::Nil) | None => {
-            let root = gc.create(Table::new());
-            set_global_value(l, gc, first, &Value::Table(root));
-            root
-        }
-        Some(_) => return Err(format!("name conflict for module '{module_name}'")),
-    };
-
-    let mut current = root;
-    let mut parts = rest.split('.').peekable();
-    while let Some(part) = parts.next() {
-        if parts.peek().is_none() {
-            return Ok(Some((current, part.to_string())));
-        }
-
-        let key = lua_string_value(l, gc, part);
-        match table_get(current, &key) {
-            Value::Table(next) => current = next,
+        match existing {
+            Value::Table(next) => parent = next,
             Value::Nil => {
                 let next = gc.create(Table::new());
-                table_set(l, gc, current, &key, &Value::Table(next));
-                current = next;
+                table_set(l, gc, parent, &key, &Value::Table(next));
+                parent = next;
             }
-            _ => return Err(format!("name conflict for module '{module_name}'")),
+            _ => return Err(module_name_conflict(module_name)),
         }
     }
 
-    Ok(None)
+    Err(module_name_conflict(module_name))
 }
 
 fn set_module_metadata(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     module_ref: GcRef<Table>,
-    module_name: &str,
+    module_name: &[u8],
+    module_key: &Value,
 ) {
-    let name = lua_string_value(l, gc, module_name);
-    set_table_string(l, gc, module_ref, "_NAME", &name);
+    set_table_string(l, gc, module_ref, "_NAME", module_key);
     set_table_string(l, gc, module_ref, "_M", &Value::Table(module_ref));
     let package_name = module_package_name(module_name);
-    let package = lua_string_value(l, gc, &package_name);
+    let package = lua_bytes_value(l, gc, package_name);
     set_table_string(l, gc, module_ref, "_PACKAGE", &package);
 }
 
-fn module_package_name(module_name: &str) -> String {
+fn module_package_name(module_name: &[u8]) -> &[u8] {
     module_name
-        .rfind('.')
-        .map(|idx| module_name[..=idx].to_string())
-        .unwrap_or_default()
+        .iter()
+        .rposition(|&byte| byte == b'.')
+        .map_or(&[], |index| &module_name[..=index])
+}
+
+fn module_name_fields(module_name: &[u8]) -> Result<Vec<&[u8]>, String> {
+    let fields: Vec<_> = module_name.split(|&byte| byte == b'.').collect();
+    if fields.iter().any(|field| field.is_empty()) {
+        return Err(module_name_conflict(module_name));
+    }
+    Ok(fields)
+}
+
+fn module_name_conflict(module_name: &[u8]) -> String {
+    format!(
+        "name conflict for module '{}'",
+        String::from_utf8_lossy(module_name)
+    )
 }
 
 fn set_caller_env(l: &mut LuaState, module_ref: GcRef<Table>) -> bool {
@@ -599,11 +607,13 @@ fn table_string_field(table: GcRef<Table>, key: &str) -> Option<String> {
         if let Value::String(key_ref) = field_key
             // SAFETY: keys are held by the table being inspected.
             && let Some(key_str) = unsafe { key_ref.as_ref() }
-            && key_str.data() == key
+            && key_str.as_bytes() == key.as_bytes()
             && let Value::String(value_ref) = value
         {
             // SAFETY: values are held by the table being inspected.
-            return unsafe { value_ref.as_ref() }.map(|value| value.data().to_string());
+            return unsafe { value_ref.as_ref() }
+                .and_then(|value| value.to_utf8().ok())
+                .map(str::to_owned);
         }
     }
     None
@@ -655,7 +665,7 @@ fn global_value(l: &LuaState, name: &str) -> Option<Value> {
         if let Value::String(key_ref) = key
             // SAFETY: key is held by the rooted global table.
             && let Some(key_str) = unsafe { key_ref.as_ref() }
-            && key_str.data() == name
+            && key_str.as_bytes() == name.as_bytes()
         {
             return Some(value.clone());
         }
@@ -679,6 +689,10 @@ fn lua_string_value(l: &mut LuaState, gc: &mut GarbageCollector, text: &str) -> 
     Value::String(intern_string(l, gc, text))
 }
 
+fn lua_bytes_value(l: &mut LuaState, gc: &mut GarbageCollector, bytes: &[u8]) -> Value {
+    Value::String(intern_bytes(l, gc, bytes))
+}
+
 fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
     let Some(gc_ptr) = l.gc else {
         return false;
@@ -691,12 +705,16 @@ fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
 }
 
 fn intern_string(l: &mut LuaState, gc: &mut GarbageCollector, text: &str) -> GcRef<GcString> {
+    intern_bytes(l, gc, text.as_bytes())
+}
+
+fn intern_bytes(l: &mut LuaState, gc: &mut GarbageCollector, bytes: &[u8]) -> GcRef<GcString> {
     if let Some(pool_ptr) = l.string_pool {
         // SAFETY: string_pool is installed from a live StringPool owned by the host.
         let pool = unsafe { &mut *pool_ptr };
-        pool.find(text).unwrap_or_else(|| pool.intern(gc, text))
+        pool.intern_bytes(gc, bytes)
     } else {
-        gc.create(GcString::new(text))
+        gc.create(GcString::from_bytes(bytes))
     }
 }
 
@@ -714,7 +732,7 @@ fn value_to_string(value: Value) -> String {
         Value::String(s) => {
             // SAFETY: string value is an active argument while package.loadlib runs.
             unsafe { s.as_ref() }
-                .map(|s| s.data().to_string())
+                .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default()
         }
         Value::Table(t) => format!("table: {:p}", t.as_ptr()),

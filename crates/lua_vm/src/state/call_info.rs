@@ -25,6 +25,7 @@
 //! ```
 //!
 
+use lua_core::gc::gc_ref::GcRef;
 use lua_core::proto::Proto;
 use lua_core::value::Value;
 
@@ -46,7 +47,7 @@ pub struct CallInfo {
     /// 保存的程序计数器（Lua 函数指向当前指令，C 函数为 None）
     pub savedpc: Option<usize>,
     /// 当前 Lua 调用帧对应的函数原型。
-    pub proto: Option<*const Proto>,
+    pub proto: Option<GcRef<Proto>>,
     /// 期望返回值数量（-1 = LUA_MULTRET）
     pub nresults: i32,
     /// 实际传入参数数量

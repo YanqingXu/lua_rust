@@ -13,7 +13,7 @@ use crate::codegen::CodeGenerator;
 use crate::codegen::types::{AccessKind, LValueKind, NO_JUMP, SymbolKind, ValueResult};
 use crate::opcode::{MAXINDEXRK, OpCode, is_k, rk_ask};
 
-impl CodeGenerator {
+impl CodeGenerator<'_> {
     // ═══════════════════════════════════════════════════════════════
     // 公开入口 — 语句 / 语句块
     // ═══════════════════════════════════════════════════════════════
@@ -229,7 +229,8 @@ impl CodeGenerator {
     fn emit_call_stmt(&mut self, c: &CallStmt) -> Result<(), String> {
         self.current_line = c.location.line;
         if let Expr::Call(call) = c.call.as_ref() {
-            let _info = self.emit_call_expr(call, -1);
+            let mut info = self.emit_call_expr(call, -1);
+            self.set_wanted_results(&mut info, 0);
         }
         Ok(())
     }
@@ -495,11 +496,7 @@ impl CodeGenerator {
                     let k = if sym.kind == SymbolKind::Global {
                         sym.index
                     } else {
-                        // SAFETY: self.gc is set from a valid &mut GC during CodeGenerator::new()
-                        let gc: &mut lua_core::gc::collector::GarbageCollector =
-                            unsafe { &mut *self.gc };
-                        self.builder
-                            .add_string_constant(gc, &f.name)
+                        self.add_string_constant(&f.name)
                             .unwrap_or_else(|| self.builder.add_number_constant(0.0))
                     };
                     self.code_abx(OpCode::SETGLOBAL, reg, k, def_line);
@@ -518,11 +515,8 @@ impl CodeGenerator {
             };
 
             for path_name in f.table_path.iter().skip(1) {
-                // SAFETY: self.gc is set from a valid &mut GC during CodeGenerator::new()
-                let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
                 let key = self
-                    .builder
-                    .add_string_constant(gc, path_name)
+                    .add_string_constant(path_name)
                     .unwrap_or_else(|| self.builder.add_number_constant(0.0));
                 let rk_key = if key <= MAXINDEXRK {
                     rk_ask(key)
@@ -536,11 +530,8 @@ impl CodeGenerator {
 
             let reg = self.reg_alloc.alloc();
             self.emit_closure_to_reg(f, reg)?;
-            // SAFETY: self.gc is set from a valid &mut GC during CodeGenerator::new()
-            let gc: &mut lua_core::gc::collector::GarbageCollector = unsafe { &mut *self.gc };
             let key = self
-                .builder
-                .add_string_constant(gc, &f.name)
+                .add_string_constant(&f.name)
                 .unwrap_or_else(|| self.builder.add_number_constant(0.0));
             let rk_key = if key <= MAXINDEXRK {
                 rk_ask(key)
@@ -588,8 +579,34 @@ impl CodeGenerator {
             return;
         }
 
-        let first_reg = self.reg_alloc.current();
         let nresults = r.values.len() as i32;
+        let mut direct_local_base = None;
+        for (index, value) in r.values.iter().enumerate() {
+            let Expr::Name(name) = value.as_ref() else {
+                direct_local_base = None;
+                break;
+            };
+            let reg = self.find_local_var(&name.name);
+            if reg < 0 {
+                direct_local_base = None;
+                break;
+            }
+
+            match direct_local_base {
+                None if index == 0 => direct_local_base = Some(reg),
+                Some(first) if reg == first + index as i32 => {}
+                _ => {
+                    direct_local_base = None;
+                    break;
+                }
+            }
+        }
+        if let Some(base) = direct_local_base {
+            self.code_abc(OpCode::RETURN, base, nresults + 1, 0, self.current_line);
+            return;
+        }
+
+        let first_reg = self.reg_alloc.current();
 
         if r.values.len() == 1
             && let Expr::Call(call) = r.values[0].as_ref()

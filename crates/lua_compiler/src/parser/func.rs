@@ -30,7 +30,7 @@ impl<'source> Parser<'source> {
             return Err(self.make_error("Expected function name"));
         }
 
-        let mut name = Self::token_string(self.current()).to_string();
+        let mut name = Self::token_name(self.current()).to_string();
         self.advance();
 
         let mut table_path = Vec::new();
@@ -44,7 +44,7 @@ impl<'source> Parser<'source> {
                 if !crate::parser::is_name(self.current()) {
                     return Err(self.make_error("Expected field name after '.'"));
                 }
-                name = Self::token_string(self.current()).to_string();
+                name = Self::token_name(self.current()).to_string();
                 self.advance();
             } else if self.match_token(TokenType::Colon) {
                 table_path.push(std::mem::take(&mut name));
@@ -53,7 +53,7 @@ impl<'source> Parser<'source> {
                 if !crate::parser::is_name(self.current()) {
                     return Err(self.make_error("Expected method name after ':'"));
                 }
-                name = Self::token_string(self.current()).to_string();
+                name = Self::token_name(self.current()).to_string();
                 self.advance();
                 break;
             }
@@ -150,7 +150,7 @@ impl<'source> Parser<'source> {
 
         loop {
             if crate::parser::is_name(self.current()) {
-                params.push(Self::token_string(self.current()).to_string());
+                params.push(Self::token_name(self.current()).to_string());
                 self.advance();
             } else if self.match_token(TokenType::Dots) {
                 params.push("...".to_string());

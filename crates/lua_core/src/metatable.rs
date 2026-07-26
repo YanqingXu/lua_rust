@@ -173,9 +173,6 @@ pub fn metamethod_name(event: TMS) -> &'static str {
 /// - `pool`: 字符串驻留池，用于驻留元方法名称
 /// - `gc`: GC 实例，用于创建驻留字符串
 ///
-/// # Safety
-/// `metatable` 中的 `GcRef<Table>` 必须有效（未被 GC 回收）。
-///
 pub fn get_metamethod(
     metatable: Option<GcRef<Table>>,
     event: TMS,
@@ -187,12 +184,15 @@ pub fn get_metamethod(
         Some(mt) => mt,
         None => return Value::Nil,
     };
+    if gc.validate_ref(mt_ref).is_err() {
+        return Value::Nil;
+    }
 
     // 2. 对快速元方法，检查 flags 缓存
     if event.is_fast() {
-        // SAFETY: mt_ref is a valid GcRef, GC won't run during this call
-        // (we hold &mut GarbageCollector, preventing concurrent GC cycle)
-        let flags = unsafe { &*mt_ref.as_ptr() }.flags();
+        let Ok(flags) = gc.with_ref(mt_ref, Table::flags) else {
+            return Value::Nil;
+        };
         if flags & event.flag_bit() != 0 {
             // 标志位表示该元方法不存在，直接返回 nil
             return Value::Nil;
@@ -201,22 +201,18 @@ pub fn get_metamethod(
 
     // 3. 在元表中查找元方法名称对应的值
     let name = metamethod_name(event);
-    let name_str = pool.intern(gc, name);
+    let name_str = pool.intern_bytes(gc, name.as_bytes());
     let key = Value::String(name_str);
 
-    // SAFETY: mt_ref is valid, and we hold &mut GarbageCollector
-    // which prevents GC from running concurrently
-    let result = unsafe { &*mt_ref.as_ptr() }.get(&key);
+    let Ok(result) = gc.with_ref(mt_ref, |metatable| metatable.get(&key)) else {
+        return Value::Nil;
+    };
 
     // 4. 如果未找到且是快速元方法，更新 flags 标志位
     if result.is_nil() && event.is_fast() {
-        // SAFETY: mt_ref is valid, exclusive access guaranteed by &mut GC
-        // which prevents concurrent GC cycles.
-        unsafe {
-            let mt_ptr = mt_ref.as_ptr() as *mut Table;
-            let new_flags = (*mt_ptr).flags() | event.flag_bit();
-            (*mt_ptr).set_flags(new_flags);
-        }
+        let _ = gc.with_mut(mt_ref, |metatable| {
+            metatable.set_flags(metatable.flags() | event.flag_bit());
+        });
     }
 
     result
@@ -273,10 +269,10 @@ mod tests {
         pool: &mut StringPool,
         gc: &mut GarbageCollector,
     ) {
-        let key_str = pool.intern(gc, name);
+        let key_str = pool.intern_bytes(gc, name.as_bytes());
         let key = Value::String(key_str);
-        // SAFETY: metatable is valid
-        unsafe { &mut *(metatable.as_ptr() as *mut Table) }.set(&key, &value);
+        gc.with_mut(metatable, |table| table.set(&key, &value))
+            .expect("test metatable is registered");
     }
 
     // ── TMS 枚举测试 ────────────────────────────────────────────
@@ -379,6 +375,23 @@ mod tests {
 
         let result = get_metamethod(None, TMS::TM_INDEX, &mut pool, &mut gc);
         assert!(result.is_nil());
+    }
+
+    #[test]
+    fn safe_metamethod_lookup_rejects_foreign_and_stale_tables() {
+        let mut gc = GarbageCollector::new();
+        let mut foreign_gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let foreign = foreign_gc.create(Table::new());
+
+        assert!(get_metamethod(Some(foreign), TMS::TM_INDEX, &mut pool, &mut gc).is_nil());
+        assert!(pool.is_empty());
+
+        let stale = gc.create(Table::new());
+        let mut destroy_pool = StringPool::new();
+        assert_eq!(gc.sweep(&mut destroy_pool), 1);
+        assert!(get_metamethod(Some(stale), TMS::TM_INDEX, &mut pool, &mut gc).is_nil());
+        assert!(pool.is_empty());
     }
 
     #[test]
@@ -554,8 +567,8 @@ mod tests {
         let mut pool = StringPool::new();
 
         // 多次驻留同一元方法名称应返回相同指针
-        let s1 = pool.intern(&mut gc, "__index");
-        let s2 = pool.intern(&mut gc, "__index");
+        let s1 = pool.intern_bytes(&mut gc, b"__index");
+        let s2 = pool.intern_bytes(&mut gc, b"__index");
 
         assert_eq!(s1, s2);
         assert_eq!(pool.len(), 1); // 只驻留了一份 "__index"
@@ -566,9 +579,8 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        for i in 0..TMS::TM_N as usize {
-            let name = METAMETHOD_NAMES[i];
-            let s = pool.intern(&mut gc, name);
+        for name in METAMETHOD_NAMES.iter().take(TMS::TM_N as usize) {
+            let s = pool.intern_bytes(&mut gc, name.as_bytes());
             assert!(!s.is_null(), "Failed to intern '{}'", name);
         }
 

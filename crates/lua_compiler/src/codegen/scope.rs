@@ -9,7 +9,7 @@ use crate::codegen::types::{BlockInfo, LocalVar, PatchList, UpvalueCapture};
 use crate::opcode::OpCode;
 use lua_core::gc_string::GcString;
 
-impl CodeGenerator {
+impl CodeGenerator<'_> {
     // ── 局部变量 ──────────────────────────────────────────────────
 
     /// 添加局部变量，返回分配的寄存器槽位
@@ -224,9 +224,7 @@ impl CodeGenerator {
             } else {
                 self.builder.instruction_count() as i32
             };
-            // SAFETY: self.gc is set by CodeGenerator::new and lives for this codegen pass.
-            let gc = unsafe { &mut *self.gc };
-            let name = gc.create(GcString::new(&var.name));
+            let name = self.gc.create(GcString::from_bytes(var.name.as_bytes()));
             self.builder
                 .add_local_debug(Some(name), var.startpc, endpc, var.reg);
         }

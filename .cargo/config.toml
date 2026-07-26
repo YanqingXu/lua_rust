@@ -12,7 +12,7 @@ rustflags = ["-C", "link-args=/STACK:16777216"]
 
 [alias]
 # Convenience aliases for the migration workflow
-nextest = "nextest run"
+nt = "nextest run"
 gate = "run --package lua_app --"
 
 [term]

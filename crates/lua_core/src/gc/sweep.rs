@@ -8,7 +8,9 @@
 
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_object::GcObject;
+use crate::gc::gc_ref::GcRef;
 use crate::gc::header::GcObjectHeader;
+use crate::gc_string::GcString;
 use crate::string_pool::StringPool;
 use crate::types::GcObjectType;
 
@@ -26,7 +28,12 @@ impl GarbageCollector {
         let mut current = self.all_objects;
 
         while !current.is_null() {
-            // SAFETY: current is a node in the intrusive linked list
+            assert!(
+                self.contains_object(current),
+                "intrusive-list object lacks provenance entry"
+            );
+            // SAFETY: address membership was established before reading this
+            // internal list node.
             let next = unsafe { (*current).next() };
 
             let should_sweep = {
@@ -81,26 +88,39 @@ impl GarbageCollector {
             return;
         }
 
-        // 从内部列表中移除
-        self.roots.retain(|&r| r != obj);
-        self.gray_list.retain(|&r| r != obj);
-        self.external_marked.retain(|&r| r != obj);
+        // Remove authoritative provenance before any operation that could
+        // panic. From this point on every copied handle fails closed, even if
+        // unwinding leaks the detached allocation.
+        let live = self
+            .live_allocations
+            .remove(&(obj as usize))
+            .expect("destroyed GC object was not registered");
 
-        // SAFETY: obj is a valid GC object pointer
-        let (gc_type, obj_size) = unsafe { ((*obj).gc_type(), self.object_size_of(obj)) };
+        // 从内部列表中移除
+        self.roots.retain(|root| root.ptr() != obj);
+        self.temporary_roots
+            .retain(|_, reference| reference.ptr() != obj);
+        self.gray_list.retain(|&r| r != obj);
+        self.weak_tables
+            .retain(|reference| reference.as_ptr().cast::<GcObjectHeader>().cast_mut() != obj);
+        self.pending_finalizers
+            .retain(|reference| reference.as_ptr().cast::<GcObjectHeader>().cast_mut() != obj);
+        self.external_marked
+            .retain(|reference| reference.ptr() != obj);
+
+        // SAFETY: `obj` came from the intrusive list and its concrete layout
+        // is recorded in the authoritative side table entry just removed.
+        let obj_size = unsafe { self.object_size_of(obj, live.object_type) };
 
         // 如果是字符串，从 StringPool 中移除
-        if gc_type == GcObjectType::String {
-            use crate::gc::gc_ref::GcRef;
-            use crate::gc_string::GcString;
-            // SAFETY: obj is a valid GcString
-            let gc_ref: GcRef<GcString> = unsafe { GcRef::from_ptr(obj as *const GcString) };
+        if live.object_type == GcObjectType::String {
+            let pointer = std::ptr::NonNull::new(obj.cast::<GcString>())
+                .expect("intrusive-list nodes are non-null");
+            // SAFETY: the removed entry proves this exact allocation identity
+            // and String layout; memory remains allocated until dispatch below.
+            let gc_ref: GcRef<GcString> =
+                unsafe { GcRef::from_registered(pointer, live.object_id) };
             string_pool.remove(gc_ref);
-        }
-
-        // 从弱表列表中移除（如果是 Table）
-        if gc_type == GcObjectType::Table {
-            self.weak_tables.retain(|&t| t != obj);
         }
 
         // 更新统计信息
@@ -118,7 +138,7 @@ impl GarbageCollector {
         // 释放内存：通过裸指针重建 Box 并 drop
         // SAFETY: obj 通过 Box::into_raw 分配，现在回收所有权
         unsafe {
-            Self::free_gc_object(obj, gc_type);
+            Self::free_gc_object(obj, live.object_type);
         }
     }
 
@@ -126,10 +146,10 @@ impl GarbageCollector {
     ///
     /// # Safety
     /// `obj` 必须指向有效的 GC 对象。
-    unsafe fn object_size_of(&self, obj: *mut GcObjectHeader) -> usize {
+    unsafe fn object_size_of(&self, obj: *mut GcObjectHeader, object_type: GcObjectType) -> usize {
         // SAFETY: caller guarantees obj is valid
         unsafe {
-            match (*obj).gc_type() {
+            match object_type {
                 GcObjectType::String => {
                     use crate::gc_string::GcString;
                     let ptr = obj as *const GcString;
@@ -172,6 +192,14 @@ impl GarbageCollector {
     /// 释放 GC 对象内存
     ///
     /// 根据对象类型，将裸指针转回对应的 Box 类型并 drop。
+    ///
+    /// This concrete dispatch is sound only because `GcObject` is sealed and
+    /// `GarbageCollector::create` validates each allocation's leading header
+    /// and tag before registration.
+    ///
+    /// TODO(M1 GC metadata): move this drop function (and trace/size) into
+    /// type-erased per-allocation metadata before supporting extensible object
+    /// types or reclaiming objects from collector `Drop`.
     ///
     /// # Safety
     /// `obj` 必须是通过 `Box::into_raw` 分配的，且尚未被释放。
@@ -220,16 +248,19 @@ mod tests {
     use crate::string_pool::StringPool;
     use crate::table::Table;
     use crate::types::GcColor;
+    use crate::userdata::Userdata;
 
     #[test]
     fn test_sweep_removes_white_objects() {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let obj1 = gc.create(GcString::new("keep"));
-        let _obj2 = gc.create(GcString::new("sweep"));
+        let obj1 = gc.create(GcString::from_bytes(b"keep"));
+        let _obj2 = gc.create(GcString::from_bytes(b"sweep"));
 
         // obj1 标记为黑色（存活），obj2 保持白色（应被回收）
+        // SAFETY: `obj1` is a live object registered with `gc`, and the
+        // `GcObject` layout places its header at offset 0.
         unsafe {
             let h1 = obj1.as_ptr() as *mut GcObjectHeader;
             (*h1).set_color(GcColor::Black);
@@ -249,6 +280,8 @@ mod tests {
 
         let fixed_obj = gc.create(Table::new());
         // 标记为固定
+        // SAFETY: `fixed_obj` is live and registered with `gc`; its header is
+        // the first field by the `GcObject` contract.
         unsafe {
             let header = fixed_obj.as_ptr() as *mut GcObjectHeader;
             (*header).mark_fixed();
@@ -271,6 +304,8 @@ mod tests {
 
         let survivor = gc.create(Table::new());
         // 标记为黑色
+        // SAFETY: `survivor` is a live registered object and its header is at
+        // offset 0.
         unsafe {
             let header = survivor.as_ptr() as *mut GcObjectHeader;
             (*header).set_color(GcColor::Black);
@@ -279,6 +314,8 @@ mod tests {
         gc.sweep(&mut pool);
 
         // sweep 后存活对象应重置为白色
+        // SAFETY: the black object survived `sweep`, which does not relocate
+        // survivors, so `survivor` still points to a live table.
         unsafe {
             let header = survivor.as_ptr() as *mut GcObjectHeader;
             assert!((*header).is_white());
@@ -290,14 +327,14 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
-        let _s = pool.intern(&mut gc, "temporary_string");
-        assert!(pool.find("temporary_string").is_some());
+        let _s = pool.intern_bytes(&mut gc, b"temporary_string");
+        assert!(pool.find_bytes(b"temporary_string").is_some());
 
         // sweep（字符串为白色 → 应被回收）
         let _collected = gc.sweep(&mut pool);
 
         // 字符串应从池中移除
-        assert!(pool.find("temporary_string").is_none());
+        assert!(pool.find_bytes(b"temporary_string").is_none());
     }
 
     #[test]
@@ -307,5 +344,31 @@ mod tests {
 
         let collected = gc.sweep(&mut pool);
         assert_eq!(collected, 0);
+    }
+
+    #[test]
+    fn panicking_drop_unregisters_provenance_before_unwind() {
+        unsafe fn panic_destructor(_: *mut u8) {
+            panic!("injected userdata destructor panic");
+        }
+
+        let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let mut userdata = Userdata::new(0);
+        // SAFETY: the injected callback does not inspect or retain its
+        // payload; it exists only to exercise destruction unwinding.
+        unsafe {
+            userdata.set_destructor(panic_destructor);
+        }
+        let stale = gc.create(userdata);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.sweep(&mut pool);
+        }));
+
+        assert!(result.is_err());
+        assert!(!gc.contains_registered(stale));
+        assert_eq!(gc.object_count(), 0);
+        assert_eq!(gc.total_memory(), 0);
     }
 }

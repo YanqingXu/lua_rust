@@ -12,12 +12,20 @@ use lua_core::userdata::Userdata;
 use lua_core::value::Value;
 use lua_vm::state::LuaState;
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 
 const DIRECT_WRITE_THRESHOLD: usize = 256 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StandardStream {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
 struct IoFileData {
     direct_handle: Option<std::fs::File>,
+    standard_stream: Option<StandardStream>,
 }
 
 pub fn open_io(l: &mut LuaState, gc: &mut GarbageCollector) {
@@ -27,9 +35,9 @@ pub fn open_io(l: &mut LuaState, gc: &mut GarbageCollector) {
     }
 
     let table_ptr = io_table.as_ptr() as *mut Table;
-    let stdout = create_memory_file(gc, None, "w", true);
-    let stdin = create_memory_file(gc, None, "r", false);
-    let stderr = create_memory_file(gc, None, "w", true);
+    let stdout = create_standard_file(gc, b"w", true, StandardStream::Stdout);
+    let stdin = create_standard_file(gc, b"r", false, StandardStream::Stdin);
+    let stderr = create_standard_file(gc, b"w", true, StandardStream::Stderr);
     set_table_value(table_ptr, gc, "stdout", &Value::Userdata(stdout));
     set_table_value(table_ptr, gc, "stdin", &Value::Userdata(stdin));
     set_table_value(table_ptr, gc, "stderr", &Value::Userdata(stderr));
@@ -53,7 +61,7 @@ fn reg(
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::new(name));
+    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
     let func_obj = gc.create(Function::new_c(func));
     // SAFETY: table points to a library or file-handle table kept alive by GC roots/stack.
     unsafe {
@@ -70,7 +78,7 @@ fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
             if let Value::String(key_ref) = key
                 // SAFETY: key is held by the rooted global table.
                 && let Some(key_str) = unsafe { key_ref.as_ref() }
-                && key_str.data() == name
+                && key_str.as_bytes() == name.as_bytes()
                 && let Value::Table(t) = val
             {
                 return *t;
@@ -83,25 +91,43 @@ fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
 fn create_memory_file(
     gc: &mut GarbageCollector,
     path: Option<String>,
-    mode: &str,
+    mode: &[u8],
     writable: bool,
 ) -> GcRef<Userdata> {
+    create_file(gc, path, mode, writable, None)
+}
+
+fn create_standard_file(
+    gc: &mut GarbageCollector,
+    mode: &[u8],
+    writable: bool,
+    standard_stream: StandardStream,
+) -> GcRef<Userdata> {
+    create_file(gc, None, mode, writable, Some(standard_stream))
+}
+
+fn create_file(
+    gc: &mut GarbageCollector,
+    path: Option<String>,
+    mode: &[u8],
+    writable: bool,
+    standard_stream: Option<StandardStream>,
+) -> GcRef<Userdata> {
     let mut state = Table::new();
-    let initial = if mode.contains('a') || (mode.starts_with('r') && !mode.starts_with('w')) {
+    let initial = if mode.contains(&b'a') || (mode.starts_with(b"r") && !mode.starts_with(b"w")) {
         path.as_deref()
             .and_then(|path| std::fs::read(path).ok())
-            .map(bytes_to_string)
             .unwrap_or_default()
     } else {
-        String::new()
+        Vec::new()
     };
-    let initial_len = initial.chars().count();
-    set_string_field(&mut state, gc, "__content", &initial);
+    let initial_len = initial.len();
+    set_bytes_field(&mut state, gc, "__content", &initial);
     set_number_field(
         &mut state,
         gc,
         "__pos",
-        if mode.contains('a') {
+        if mode.contains(&b'a') {
             initial_len as f64
         } else {
             0.0
@@ -113,14 +139,15 @@ fn create_memory_file(
         &mut state,
         gc,
         "__readable",
-        mode.starts_with('r') || mode.contains('+'),
+        mode.starts_with(b"r") || mode.contains(&b'+'),
     );
-    set_string_field(&mut state, gc, "__mode", mode);
-    set_string_field(&mut state, gc, "__buffer", "full");
+    set_bytes_field(&mut state, gc, "__mode", mode);
+    set_bytes_field(&mut state, gc, "__buffer", b"full");
     set_bool_field(&mut state, gc, "__buffer_explicit", false);
     set_bool_field(&mut state, gc, "__direct", false);
+    set_bool_field(&mut state, gc, "__stdin_eof", false);
     if let Some(path) = path {
-        set_string_field(&mut state, gc, "__path", &path);
+        set_bytes_field(&mut state, gc, "__path", path.as_bytes());
     }
 
     let file_ptr = &mut state as *mut Table;
@@ -133,7 +160,7 @@ fn create_memory_file(
     reg(gc, file_ptr, "flush", lua_io_file_flush);
     reg(gc, file_ptr, "__gc", lua_io_file_gc);
     reg(gc, file_ptr, "__tostring", lua_io_file_tostring);
-    let index_key = gc.create(GcString::new("__index"));
+    let index_key = gc.create(GcString::from_bytes(b"__index"));
     let state_ref = gc.create(state);
     // SAFETY: state_ref points to the freshly allocated metatable.
     unsafe {
@@ -147,6 +174,7 @@ fn create_memory_file(
     unsafe {
         userdata.write_typed(IoFileData {
             direct_handle: None,
+            standard_stream,
         });
     }
     userdata.set_metatable(Some(state_ref));
@@ -154,7 +182,7 @@ fn create_memory_file(
 }
 
 fn set_table_value(table: *mut Table, gc: &mut GarbageCollector, key: &str, value: &Value) {
-    let key = gc.create(GcString::new(key));
+    let key = gc.create(GcString::from_bytes(key.as_bytes()));
     // SAFETY: table points to a live library/file table during registration.
     unsafe {
         (*table).set(&Value::String(key), value);
@@ -170,7 +198,7 @@ fn set_table_ref_string(
     if table_ref.is_null() {
         return;
     }
-    let key = gc.create(GcString::new(key));
+    let key = gc.create(GcString::from_bytes(key.as_bytes()));
     // SAFETY: table_ref is reachable from globals while IO functions execute.
     unsafe {
         let table = &mut *(table_ref.as_ptr() as *mut Table);
@@ -221,42 +249,49 @@ fn table_to_file_userdata(_table_ref: GcRef<Table>) -> Option<GcRef<Userdata>> {
     None
 }
 
-fn file_state(file_ref: GcRef<Userdata>) -> Option<&'static Table> {
-    // SAFETY: file_ref is held by the active stack/table/function environment while
-    // stdlib code is executing, and the userdata metatable stores the file state.
+fn with_file_state<R>(
+    file_ref: GcRef<Userdata>,
+    access: impl for<'state> FnOnce(&'state Table) -> R,
+) -> Option<R> {
+    // SAFETY: file_ref is rooted by the active stack/table/function environment for
+    // this call. The HRTB callback keeps the metatable borrow inside this function.
     let userdata = unsafe { file_ref.as_ref() }?;
     let metatable = userdata.metatable()?;
-    if metatable.is_null() {
-        None
-    } else {
-        // SAFETY: the metatable is kept alive by the userdata.
-        Some(unsafe { &*metatable.as_ptr() })
-    }
+    // SAFETY: the userdata keeps its metatable alive for the callback's duration.
+    let state = unsafe { metatable.as_ptr().as_ref() }?;
+    Some(access(state))
 }
 
-fn file_state_mut(file_ref: GcRef<Userdata>) -> Option<&'static mut Table> {
-    // SAFETY: file_ref is held by the active stack/table/function environment while
-    // stdlib code is executing. The VM is single-threaded, so this mutable access is
-    // scoped to the current C-library operation.
+fn with_file_state_mut<R>(
+    file_ref: GcRef<Userdata>,
+    access: impl for<'state> FnOnce(&'state mut Table) -> R,
+) -> Option<R> {
+    // SAFETY: file_ref is rooted for this call and IO operations are serialized on
+    // the VM thread. The HRTB callback prevents the mutable reference from escaping.
     let userdata = unsafe { file_ref.as_ref() }?;
     let metatable = userdata.metatable()?;
-    // SAFETY: the metatable is kept alive by the userdata and stores mutable state.
-    unsafe { (metatable.as_ptr() as *mut Table).as_mut() }
+    // SAFETY: the userdata keeps its metatable alive, and access is scoped to the
+    // callback so no mutable table reference is returned to the caller.
+    let state = unsafe { (metatable.as_ptr() as *mut Table).as_mut() }?;
+    Some(access(state))
 }
 
 fn open_file_handle(
     gc: &mut GarbageCollector,
     path: &str,
-    mode: &str,
+    mode: &[u8],
 ) -> std::io::Result<GcRef<Userdata>> {
-    let read_mode = mode.starts_with('r');
-    let append_mode = mode.starts_with('a');
-    let write_mode = mode.starts_with('w') || append_mode || mode.contains('+');
-    let binary_mode = mode.contains('b');
+    let read_mode = mode.starts_with(b"r");
+    let append_mode = mode.starts_with(b"a");
+    let write_mode = mode.starts_with(b"w") || append_mode || mode.contains(&b'+');
+    let binary_mode = mode.contains(&b'b');
     let normalized_mode = if binary_mode {
-        mode.replace('b', "")
+        mode.iter()
+            .copied()
+            .filter(|byte| *byte != b'b')
+            .collect::<Vec<_>>()
     } else {
-        mode.to_string()
+        mode.to_vec()
     };
 
     if read_mode && !std::path::Path::new(path).is_file() {
@@ -275,13 +310,13 @@ fn open_file_handle(
         }
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true);
-        if normalized_mode.starts_with('w') {
+        if normalized_mode.starts_with(b"w") {
             options.truncate(true);
         }
         if append_mode {
             options.append(true);
         }
-        if normalized_mode.contains('+') {
+        if normalized_mode.contains(&b'+') {
             options.read(true);
         }
         options.open(path)?;
@@ -305,7 +340,7 @@ unsafe extern "C" fn lua_io_tmpfile(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
 
-    let file_ref = create_memory_file(gc, None, "w+", true);
+    let file_ref = create_memory_file(gc, None, b"w+", true);
     l.push_value(Value::Userdata(file_ref));
     1
 }
@@ -332,10 +367,11 @@ unsafe extern "C" fn lua_io_input(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
         Value::String(path_ref) => {
             // SAFETY: path argument is on the active stack.
-            let path = unsafe { path_ref.as_ref() }
-                .map(|path| path.data().to_string())
-                .unwrap_or_default();
-            match open_file_handle(gc, &path, "r") {
+            let path = match gc_string_utf8(path_ref) {
+                Ok(path) => path,
+                Err(message) => return push_io_error_tuple(l, gc, message, 0),
+            };
+            match open_file_handle(gc, &path, b"r") {
                 Ok(file_ref) => {
                     set_table_ref_string(io_table, gc, "__input", &Value::Userdata(file_ref));
                     l.push_value(Value::Userdata(file_ref));
@@ -364,17 +400,24 @@ unsafe extern "C" fn lua_io_input(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_open(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(path) = string_arg(l, 1) else {
-        l.push_nil();
-        return 1;
-    };
-    let mode = string_arg(l, 2).unwrap_or_else(|| "r".to_string());
     let Some(gc_ptr) = l.gc else {
         l.push_nil();
         return 1;
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
+    let path = match utf8_string_arg(l, 1) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            l.push_nil();
+            return 1;
+        }
+        Err(message) => return push_io_error_tuple(l, gc, message, 0),
+    };
+    let mode = bytes_arg(l, 2).unwrap_or_else(|| b"r".to_vec());
+    if !mode.is_ascii() {
+        return push_io_error_tuple(l, gc, "invalid file mode", 0);
+    }
     match open_file_handle(gc, &path, &mode) {
         Ok(file_ref) => {
             l.push_value(Value::Userdata(file_ref));
@@ -410,11 +453,12 @@ unsafe extern "C" fn lua_io_type(l_ptr: *mut std::ffi::c_void) -> i32 {
     let gc = unsafe { &mut *gc_ptr };
     match l.at(1).cloned().unwrap_or(Value::Nil) {
         Value::Userdata(file_ref) => {
-            let Some(state) = file_state(file_ref) else {
+            let Some(closed) = with_file_state(file_ref, |state| get_bool_field(state, "__closed"))
+            else {
                 l.push_nil();
                 return 1;
             };
-            if get_bool_field(state, "__closed") {
+            if closed {
                 push_lua_string(l, gc, "closed file");
             } else {
                 push_lua_string(l, gc, "file");
@@ -459,10 +503,11 @@ unsafe extern "C" fn lua_io_lines(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
         Value::String(path_ref) => {
             // SAFETY: path argument is on the active stack.
-            let path = unsafe { path_ref.as_ref() }
-                .map(|path| path.data().to_string())
-                .unwrap_or_default();
-            match open_file_handle(gc, &path, "r") {
+            let path = match gc_string_utf8(path_ref) {
+                Ok(path) => path,
+                Err(message) => return push_io_error_tuple(l, gc, message, 0),
+            };
+            match open_file_handle(gc, &path, b"r") {
                 Ok(file_ref) => push_lines_iterator(l, gc, file_ref, true),
                 Err(err) => {
                     l.push_nil();
@@ -502,10 +547,11 @@ unsafe extern "C" fn lua_io_output(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
         Value::String(path_ref) => {
             // SAFETY: path argument is on the active stack.
-            let path = unsafe { path_ref.as_ref() }
-                .map(|path| path.data().to_string())
-                .unwrap_or_default();
-            match open_file_handle(gc, &path, "w") {
+            let path = match gc_string_utf8(path_ref) {
+                Ok(path) => path,
+                Err(message) => return push_io_error_tuple(l, gc, message, 0),
+            };
+            match open_file_handle(gc, &path, b"w") {
                 Ok(file_ref) => {
                     set_current_output(gc, io_table, file_ref);
                     l.push_value(Value::Userdata(file_ref));
@@ -579,18 +625,37 @@ fn write_to_file(
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
 
-    let mut appended = String::new();
+    let mut appended = Vec::new();
     for idx in first_arg..=l.get_top() {
         let value = l.at(idx).cloned().unwrap_or(Value::Nil);
-        appended.push_str(&value_to_write_string(&value));
+        appended.extend_from_slice(&value_to_write_bytes(&value));
     }
 
-    let Some(file) = file_state_mut(file_ref) else {
+    let Some((closed, writable, pos, content, direct_write, buffer_mode)) =
+        with_file_state(file_ref, |file| {
+            let already_direct = get_bool_field(file, "__direct");
+            let pos = get_number_field(file, "__pos").max(0.0) as usize;
+            let content = if already_direct {
+                Vec::new()
+            } else {
+                get_bytes_field(file, "__content")
+            };
+            let direct_write = should_write_direct(file, already_direct, &content, pos, &appended);
+            (
+                get_bool_field(file, "__closed"),
+                get_bool_field(file, "__writable"),
+                pos,
+                content,
+                direct_write,
+                get_bytes_field(file, "__buffer"),
+            )
+        })
+    else {
         l.push_nil();
         return 1;
     };
 
-    if get_bool_field(file, "__closed") {
+    if closed {
         if throw_on_error {
             return push_error(l, gc, "attempt to use a closed file");
         }
@@ -600,24 +665,40 @@ fn write_to_file(
         return 3;
     }
 
-    if !get_bool_field(file, "__writable") {
+    if !writable {
         l.push_nil();
         push_lua_string(l, gc, "file is not open for writing");
         l.push_value(Value::Number(0.0));
         return 3;
     }
 
-    let pos = get_number_field(file, "__pos").max(0.0) as usize;
-    let already_direct = get_bool_field(file, "__direct");
-    let content = if already_direct {
-        String::new()
-    } else {
-        get_string_field(file, "__content")
-    };
-    if should_write_direct(file, already_direct, &content, pos, &appended) {
-        match write_direct(gc, file_ref, file, &content, pos, &appended) {
+    if let Some(stream) = file_standard_stream(file_ref) {
+        match write_standard_stream(stream, &appended) {
+            Ok(()) => {
+                let _ = with_file_state_mut(file_ref, |file| {
+                    set_number_field(file, gc, "__pos", (pos + appended.len()) as f64);
+                });
+                l.push_value(Value::Userdata(file_ref));
+                return 1;
+            }
+            Err(err) => {
+                if throw_on_error {
+                    return push_error(l, gc, &err.to_string());
+                }
+                l.push_nil();
+                push_lua_string(l, gc, &err.to_string());
+                l.push_value(Value::Number(err.raw_os_error().unwrap_or(0) as f64));
+                return 3;
+            }
+        }
+    }
+
+    if direct_write {
+        match write_direct(gc, file_ref, &content, pos, &appended) {
             Ok(new_pos) => {
-                set_number_field(file, gc, "__pos", new_pos as f64);
+                let _ = with_file_state_mut(file_ref, |file| {
+                    set_number_field(file, gc, "__pos", new_pos as f64);
+                });
                 l.push_value(Value::Userdata(file_ref));
                 return 1;
             }
@@ -631,17 +712,37 @@ fn write_to_file(
     }
 
     let new_content = write_at(&content, pos, &appended);
-    let new_pos = pos + appended.chars().count();
-    set_string_field(file, gc, "__content", &new_content);
-    set_number_field(file, gc, "__pos", new_pos as f64);
+    let new_pos = pos + appended.len();
+    let _ = with_file_state_mut(file_ref, |file| {
+        set_bytes_field(file, gc, "__content", &new_content);
+        set_number_field(file, gc, "__pos", new_pos as f64);
+    });
 
-    let buffer_mode = get_string_field(file, "__buffer");
-    if buffer_mode == "no" || (buffer_mode == "line" && appended.contains('\n')) {
+    if buffer_mode == b"no" || (buffer_mode == b"line" && appended.contains(&b'\n')) {
         let _ = flush_file_to_disk(file_ref);
     }
 
     l.push_value(Value::Userdata(file_ref));
     1
+}
+
+fn write_standard_stream(stream: StandardStream, bytes: &[u8]) -> std::io::Result<()> {
+    match stream {
+        StandardStream::Stdout => {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(bytes)?;
+            stdout.flush()
+        }
+        StandardStream::Stderr => {
+            let mut stderr = std::io::stderr().lock();
+            stderr.write_all(bytes)?;
+            stderr.flush()
+        }
+        StandardStream::Stdin => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "standard input is not writable",
+        )),
+    }
 }
 
 unsafe extern "C" fn lua_io_file_read(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -668,27 +769,33 @@ unsafe extern "C" fn lua_io_file_seek(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
 
-    let whence = string_arg(l, 2).unwrap_or_else(|| "cur".to_string());
+    let whence = bytes_arg(l, 2).unwrap_or_else(|| b"cur".to_vec());
     let offset = number_arg(l, 3).unwrap_or(0.0) as isize;
-    let Some(file) = file_state_mut(file_ref) else {
+    let Some((direct, buffered_len, current)) = with_file_state(file_ref, |file| {
+        (
+            get_bool_field(file, "__direct"),
+            get_bytes_field(file, "__content").len(),
+            get_number_field(file, "__pos") as isize,
+        )
+    }) else {
         l.push_nil();
         return 1;
     };
 
-    let content_len = if get_bool_field(file, "__direct") {
-        direct_file_len(file_ref)
-            .unwrap_or_else(|| get_string_field(file, "__content").chars().count()) as isize
+    let content_len = if direct {
+        direct_file_len(file_ref).unwrap_or(buffered_len) as isize
     } else {
-        get_string_field(file, "__content").chars().count() as isize
+        buffered_len as isize
     };
-    let current = get_number_field(file, "__pos") as isize;
-    let base = match whence.as_str() {
-        "set" => 0,
-        "end" => content_len,
+    let base = match whence.as_slice() {
+        b"set" => 0,
+        b"end" => content_len,
         _ => current,
     };
     let new_pos = (base + offset).clamp(0, content_len) as usize;
-    set_number_field(file, gc, "__pos", new_pos as f64);
+    let _ = with_file_state_mut(file_ref, |file| {
+        set_number_field(file, gc, "__pos", new_pos as f64);
+    });
     l.push_value(Value::Number(new_pos as f64));
     1
 }
@@ -737,7 +844,7 @@ unsafe extern "C" fn lua_io_file_setvbuf(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_value(Value::Boolean(false));
         return 1;
     };
-    let Some(mode) = string_arg(l, 2) else {
+    let Some(mode) = bytes_arg(l, 2) else {
         l.push_value(Value::Boolean(false));
         return 1;
     };
@@ -747,22 +854,17 @@ unsafe extern "C" fn lua_io_file_setvbuf(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let Some(file) = file_state_mut(file_ref) else {
-        l.push_value(Value::Boolean(false));
-        return 1;
-    };
-    match mode.as_str() {
-        "no" | "full" | "line" => {
-            set_string_field(file, gc, "__buffer", &mode);
+    let updated = with_file_state_mut(file_ref, |file| match mode.as_slice() {
+        b"no" | b"full" | b"line" => {
+            set_bytes_field(file, gc, "__buffer", &mode);
             set_bool_field(file, gc, "__buffer_explicit", true);
-            l.push_value(Value::Boolean(true));
-            1
+            true
         }
-        _ => {
-            l.push_value(Value::Boolean(false));
-            1
-        }
-    }
+        _ => false,
+    })
+    .unwrap_or(false);
+    l.push_value(Value::Boolean(updated));
+    1
 }
 
 unsafe extern "C" fn lua_io_file_tostring(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -774,9 +876,11 @@ unsafe extern "C" fn lua_io_file_tostring(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let text = match file_arg(l).and_then(file_state) {
-        Some(file) if get_bool_field(file, "__closed") => "file (closed)".to_string(),
-        Some(_) => "file".to_string(),
+    let text = match file_arg(l)
+        .and_then(|file_ref| with_file_state(file_ref, |file| get_bool_field(file, "__closed")))
+    {
+        Some(true) => "file (closed)".to_string(),
+        Some(false) => "file".to_string(),
         None => "file (closed)".to_string(),
     };
     push_lua_string(l, gc, &text);
@@ -831,7 +935,7 @@ unsafe extern "C" fn lua_io_lines_iter(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     match read_line_from_file(l, gc, file_ref) {
         Ok(Some(line)) => {
-            push_lua_string(l, gc, &line);
+            push_lua_bytes(l, gc, &line);
             1
         }
         Ok(None) => {
@@ -854,12 +958,12 @@ fn close_file_handle(l: &mut LuaState, file_ref: GcRef<Userdata>) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let Some(file) = file_state_mut(file_ref) else {
+    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(file, "__closed")) else {
         l.push_value(Value::Boolean(false));
         return 1;
     };
 
-    if get_bool_field(file, "__closed") {
+    if closed {
         return push_error(l, gc, "attempt to close a closed file");
     }
 
@@ -869,21 +973,27 @@ fn close_file_handle(l: &mut LuaState, file_ref: GcRef<Userdata>) -> i32 {
     }
 
     close_direct_handle(file_ref);
-    set_bool_field(file, gc, "__closed", true);
+    let _ = with_file_state_mut(file_ref, |file| {
+        set_bool_field(file, gc, "__closed", true);
+    });
     l.push_value(Value::Boolean(true));
     1
 }
 
 fn close_file_silent(gc: &mut GarbageCollector, file_ref: GcRef<Userdata>) -> Result<(), String> {
-    let Some(file) = file_state_mut(file_ref) else {
+    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(file, "__closed")) else {
         return Err("invalid file".to_string());
     };
-    if get_bool_field(file, "__closed") {
+    if closed {
         return Err("attempt to close a closed file".to_string());
     }
     flush_file_to_disk(file_ref).map_err(|err| err.to_string())?;
     close_direct_handle(file_ref);
-    set_bool_field(file, gc, "__closed", true);
+    let Some(()) = with_file_state_mut(file_ref, |file| {
+        set_bool_field(file, gc, "__closed", true);
+    }) else {
+        return Err("invalid file".to_string());
+    };
     Ok(())
 }
 
@@ -897,7 +1007,7 @@ enum ReadFormat {
 
 enum ReadValue {
     Nil,
-    String(String),
+    Bytes(Vec<u8>),
     Number(f64),
 }
 
@@ -918,19 +1028,27 @@ fn read_from_file(l: &mut LuaState, file_ref: GcRef<Userdata>, first_arg: i32) -
         Err(message) => return push_error(l, gc, &message),
     };
 
-    let Some(file) = file_state(file_ref) else {
+    let Some((readable, mut pos)) = with_file_state(file_ref, |file| {
+        (
+            get_bool_field(file, "__readable"),
+            get_number_field(file, "__pos").max(0.0) as usize,
+        )
+    }) else {
         l.push_nil();
         return 1;
     };
-    if !get_bool_field(file, "__readable") {
+    if !readable {
         l.push_nil();
         return 1;
     }
 
-    let content = get_string_field(file, "__content");
-    let mut pos = get_number_field(file, "__pos").max(0.0) as usize;
     let mut values = Vec::new();
     for format in formats {
+        if let Err(message) = prepare_standard_input(gc, file_ref, pos, &format) {
+            return push_error(l, gc, &message);
+        }
+        let content = with_file_state(file_ref, |file| get_bytes_field(file, "__content"))
+            .unwrap_or_default();
         let value = read_one(&content, pos, &format);
         pos = value.1;
         let result = value.0;
@@ -941,15 +1059,15 @@ fn read_from_file(l: &mut LuaState, file_ref: GcRef<Userdata>, first_arg: i32) -
         }
     }
 
-    if let Some(file) = file_state_mut(file_ref) {
+    let _ = with_file_state_mut(file_ref, |file| {
         set_number_field(file, gc, "__pos", pos as f64);
-    }
+    });
 
     let count = values.len();
     for value in values {
         match value {
             ReadValue::Nil => l.push_nil(),
-            ReadValue::String(text) => push_lua_string(l, gc, &text),
+            ReadValue::Bytes(bytes) => push_lua_bytes(l, gc, &bytes),
             ReadValue::Number(number) => l.push_value(Value::Number(number)),
         }
     }
@@ -960,21 +1078,28 @@ fn read_line_from_file(
     _l: &mut LuaState,
     gc: &mut GarbageCollector,
     file_ref: GcRef<Userdata>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<Vec<u8>>, String> {
     ensure_file_readable(gc, file_ref)?;
-    let Some(file) = file_state(file_ref) else {
+    let Some((readable, pos)) = with_file_state(file_ref, |file| {
+        (
+            get_bool_field(file, "__readable"),
+            get_number_field(file, "__pos").max(0.0) as usize,
+        )
+    }) else {
         return Err("invalid file".to_string());
     };
-    if !get_bool_field(file, "__readable") {
+    if !readable {
         return Ok(None);
     }
-    let content = get_string_field(file, "__content");
-    let pos = get_number_field(file, "__pos").max(0.0) as usize;
+    prepare_standard_input(gc, file_ref, pos, &ReadFormat::Line)?;
+    let Some(content) = with_file_state(file_ref, |file| get_bytes_field(file, "__content")) else {
+        return Err("invalid file".to_string());
+    };
     match read_one(&content, pos, &ReadFormat::Line) {
-        (ReadValue::String(line), new_pos) => {
-            if let Some(file) = file_state_mut(file_ref) {
+        (ReadValue::Bytes(line), new_pos) => {
+            let _ = with_file_state_mut(file_ref, |file| {
                 set_number_field(file, gc, "__pos", new_pos as f64);
-            }
+            });
             Ok(Some(line))
         }
         (ReadValue::Nil, _) => Ok(None),
@@ -986,13 +1111,95 @@ fn ensure_file_readable(
     gc: &mut GarbageCollector,
     file_ref: GcRef<Userdata>,
 ) -> Result<(), String> {
-    let Some(file) = file_state(file_ref) else {
+    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(file, "__closed")) else {
         return Err("invalid file".to_string());
     };
-    if get_bool_field(file, "__closed") {
+    if closed {
         return Err("attempt to use a closed file".to_string());
     }
     refresh_file_from_disk(gc, file_ref);
+    Ok(())
+}
+
+fn prepare_standard_input(
+    gc: &mut GarbageCollector,
+    file_ref: GcRef<Userdata>,
+    pos: usize,
+    format: &ReadFormat,
+) -> Result<(), String> {
+    if file_standard_stream(file_ref) != Some(StandardStream::Stdin) {
+        return Ok(());
+    }
+
+    let Some((stdin_eof, content)) = with_file_state(file_ref, |file| {
+        (
+            get_bool_field(file, "__stdin_eof"),
+            get_bytes_field(file, "__content"),
+        )
+    }) else {
+        return Err("invalid file".to_string());
+    };
+    if stdin_eof {
+        return Ok(());
+    }
+    let available = content.len().saturating_sub(pos);
+    let suffix = &content[pos.min(content.len())..];
+
+    let mut bytes = Vec::new();
+    let reached_eof = match format {
+        ReadFormat::Line | ReadFormat::Number => {
+            if suffix.contains(&b'\n') {
+                return Ok(());
+            }
+            let read = std::io::stdin()
+                .lock()
+                .read_until(b'\n', &mut bytes)
+                .map_err(|err| err.to_string())?;
+            read == 0
+        }
+        ReadFormat::All => {
+            std::io::stdin()
+                .lock()
+                .read_to_end(&mut bytes)
+                .map_err(|err| err.to_string())?;
+            true
+        }
+        ReadFormat::Bytes(count) => {
+            let required = if *count == 0 { 1 } else { *count };
+            if available >= required {
+                return Ok(());
+            }
+
+            let mut remaining = required - available;
+            let mut stdin = std::io::stdin().lock();
+            let mut eof = false;
+            while remaining > 0 {
+                let mut chunk = vec![0; remaining.min(8192)];
+                let read = stdin.read(&mut chunk).map_err(|err| err.to_string())?;
+                if read == 0 {
+                    eof = true;
+                    break;
+                }
+                chunk.truncate(read);
+                bytes.extend_from_slice(&chunk);
+                remaining = remaining.saturating_sub(read);
+            }
+            eof
+        }
+    };
+
+    let Some(()) = with_file_state_mut(file_ref, |file| {
+        if !bytes.is_empty() {
+            let mut updated = get_bytes_field(file, "__content");
+            updated.extend_from_slice(&bytes);
+            set_bytes_field(file, gc, "__content", &updated);
+        }
+        if reached_eof {
+            set_bool_field(file, gc, "__stdin_eof", true);
+        }
+    }) else {
+        return Err("invalid file".to_string());
+    };
     Ok(())
 }
 
@@ -1007,13 +1214,13 @@ fn read_formats_from_args(l: &LuaState, first_arg: i32) -> Result<Vec<ReadFormat
             Value::Number(n) if n >= 0.0 => formats.push(ReadFormat::Bytes(n as usize)),
             Value::String(s) => {
                 // SAFETY: argument strings are kept alive on the active Lua stack.
-                let text = unsafe { s.as_ref() }
-                    .map(|s| s.data().to_string())
+                let option = unsafe { s.as_ref() }
+                    .map(|s| s.as_bytes())
                     .unwrap_or_default();
-                match text.as_str() {
-                    "*l" | "*line" => formats.push(ReadFormat::Line),
-                    "*a" | "*all" => formats.push(ReadFormat::All),
-                    "*n" | "*number" => formats.push(ReadFormat::Number),
+                match option {
+                    b"*l" | b"*line" => formats.push(ReadFormat::Line),
+                    b"*a" | b"*all" => formats.push(ReadFormat::All),
+                    b"*n" | b"*number" => formats.push(ReadFormat::Number),
                     _ => return Err("invalid read option".to_string()),
                 }
             }
@@ -1023,71 +1230,70 @@ fn read_formats_from_args(l: &LuaState, first_arg: i32) -> Result<Vec<ReadFormat
     Ok(formats)
 }
 
-fn read_one(content: &str, pos: usize, format: &ReadFormat) -> (ReadValue, usize) {
-    let chars: Vec<char> = content.chars().collect();
-    let pos = pos.min(chars.len());
+fn read_one(content: &[u8], pos: usize, format: &ReadFormat) -> (ReadValue, usize) {
+    let pos = pos.min(content.len());
     match format {
-        ReadFormat::Line => read_line_chars(&chars, pos),
+        ReadFormat::Line => read_line_bytes(content, pos),
         ReadFormat::All => {
-            let text: String = chars[pos..].iter().collect();
-            (ReadValue::String(text), chars.len())
+            let bytes = content[pos..].to_vec();
+            (ReadValue::Bytes(bytes), content.len())
         }
-        ReadFormat::Number => read_number_chars(&chars, pos),
+        ReadFormat::Number => read_number_bytes(content, pos),
         ReadFormat::Bytes(count) => {
             if *count == 0 {
-                if pos < chars.len() {
-                    (ReadValue::String(String::new()), pos)
+                if pos < content.len() {
+                    (ReadValue::Bytes(Vec::new()), pos)
                 } else {
                     (ReadValue::Nil, pos)
                 }
-            } else if pos >= chars.len() {
+            } else if pos >= content.len() {
                 (ReadValue::Nil, pos)
             } else {
-                let end = (pos + *count).min(chars.len());
-                let text: String = chars[pos..end].iter().collect();
-                (ReadValue::String(text), end)
+                let end = pos.saturating_add(*count).min(content.len());
+                let bytes = content[pos..end].to_vec();
+                (ReadValue::Bytes(bytes), end)
             }
         }
     }
 }
 
-fn read_line_chars(chars: &[char], pos: usize) -> (ReadValue, usize) {
-    if pos >= chars.len() {
+fn read_line_bytes(content: &[u8], pos: usize) -> (ReadValue, usize) {
+    if pos >= content.len() {
         return (ReadValue::Nil, pos);
     }
     let mut end = pos;
-    while end < chars.len() && chars[end] != '\n' {
+    while end < content.len() && content[end] != b'\n' {
         end += 1;
     }
     let mut line_end = end;
-    if line_end > pos && chars[line_end - 1] == '\r' {
+    if line_end > pos && content[line_end - 1] == b'\r' {
         line_end -= 1;
     }
-    let text: String = chars[pos..line_end].iter().collect();
-    let new_pos = if end < chars.len() { end + 1 } else { end };
-    (ReadValue::String(text), new_pos)
+    let bytes = content[pos..line_end].to_vec();
+    let new_pos = if end < content.len() { end + 1 } else { end };
+    (ReadValue::Bytes(bytes), new_pos)
 }
 
-fn read_number_chars(chars: &[char], pos: usize) -> (ReadValue, usize) {
+fn read_number_bytes(content: &[u8], pos: usize) -> (ReadValue, usize) {
     let mut idx = pos;
-    while idx < chars.len() && chars[idx].is_whitespace() {
+    while idx < content.len() && content[idx].is_ascii_whitespace() {
         idx += 1;
     }
     let start = idx;
-    if idx < chars.len() && matches!(chars[idx], '+' | '-') {
+    if idx < content.len() && matches!(content[idx], b'+' | b'-') {
         idx += 1;
     }
 
     let mut digits_before_dot = 0;
-    while idx < chars.len() && chars[idx].is_ascii_digit() {
+    while idx < content.len() && content[idx].is_ascii_digit() {
         digits_before_dot += 1;
         idx += 1;
     }
 
     let mut digits_after_dot = 0;
-    if idx < chars.len() && chars[idx] == '.' {
+    if idx < content.len() && content[idx] == b'.' {
         idx += 1;
-        while idx < chars.len() && chars[idx].is_ascii_digit() {
+        while idx < content.len() && content[idx].is_ascii_digit() {
             digits_after_dot += 1;
             idx += 1;
         }
@@ -1098,14 +1304,14 @@ fn read_number_chars(chars: &[char], pos: usize) -> (ReadValue, usize) {
     }
 
     let mantissa_end = idx;
-    if idx < chars.len() && matches!(chars[idx], 'e' | 'E') {
+    if idx < content.len() && matches!(content[idx], b'e' | b'E') {
         let exp_start = idx;
         idx += 1;
-        if idx < chars.len() && matches!(chars[idx], '+' | '-') {
+        if idx < content.len() && matches!(content[idx], b'+' | b'-') {
             idx += 1;
         }
         let exp_digits_start = idx;
-        while idx < chars.len() && chars[idx].is_ascii_digit() {
+        while idx < content.len() && content[idx].is_ascii_digit() {
             idx += 1;
         }
         if exp_digits_start == idx {
@@ -1114,7 +1320,8 @@ fn read_number_chars(chars: &[char], pos: usize) -> (ReadValue, usize) {
     }
 
     let token_end = idx.max(mantissa_end);
-    let token: String = chars[start..token_end].iter().collect();
+    let token = std::str::from_utf8(&content[start..token_end])
+        .expect("numeric token contains only ASCII bytes");
     match token.parse::<f64>() {
         Ok(number) => (ReadValue::Number(number), token_end),
         Err(_) => (ReadValue::Nil, pos),
@@ -1122,54 +1329,77 @@ fn read_number_chars(chars: &[char], pos: usize) -> (ReadValue, usize) {
 }
 
 fn refresh_file_from_disk(gc: &mut GarbageCollector, file_ref: GcRef<Userdata>) {
-    let Some(file) = file_state_mut(file_ref) else {
+    let Some((writable, path, old_pos)) = with_file_state(file_ref, |file| {
+        (
+            get_bool_field(file, "__writable"),
+            get_utf8_field(file, "__path"),
+            get_number_field(file, "__pos").max(0.0) as usize,
+        )
+    }) else {
         return;
     };
-    if get_bool_field(file, "__writable") {
+    if writable {
         return;
     }
-    let path = get_string_field(file, "__path");
-    if path.is_empty() {
+    let Ok(Some(path)) = path else {
         return;
-    }
+    };
     if let Ok(bytes) = std::fs::read(&path) {
-        let old_pos = get_number_field(file, "__pos").max(0.0) as usize;
-        let content = bytes_to_string(bytes);
-        let len = content.chars().count();
-        set_string_field(file, gc, "__content", &content);
-        set_number_field(file, gc, "__pos", old_pos.min(len) as f64);
+        let len = bytes.len();
+        let _ = with_file_state_mut(file_ref, |file| {
+            set_bytes_field(file, gc, "__content", &bytes);
+            set_number_field(file, gc, "__pos", old_pos.min(len) as f64);
+        });
     }
 }
 
 fn flush_file_to_disk(file_ref: GcRef<Userdata>) -> std::io::Result<()> {
-    let Some(file) = file_state(file_ref) else {
+    let Some((closed, writable, direct, path, content)) = with_file_state(file_ref, |file| {
+        (
+            get_bool_field(file, "__closed"),
+            get_bool_field(file, "__writable"),
+            get_bool_field(file, "__direct"),
+            get_utf8_field(file, "__path"),
+            get_bytes_field(file, "__content"),
+        )
+    }) else {
         return Ok(());
     };
-    if get_bool_field(file, "__closed") || !get_bool_field(file, "__writable") {
+    if closed || !writable {
         return Ok(());
     }
-    if get_bool_field(file, "__direct") {
-        if let Some(data) = file_data_mut(file_ref)
-            && let Some(handle) = data.direct_handle.as_mut()
-        {
-            handle.flush()?;
-        }
-        return Ok(());
+    if let Some(stream) = file_standard_stream(file_ref) {
+        return flush_standard_stream(stream);
     }
-    let path = get_string_field(file, "__path");
-    if path.is_empty() {
-        return Ok(());
+    if direct {
+        return with_file_data_mut(file_ref, |data| {
+            if let Some(handle) = data.direct_handle.as_mut() {
+                handle.flush()?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap_or(Ok(()));
     }
-    let content = get_string_field(file, "__content");
-    std::fs::write(path, lua_bytes_from_str(&content))
+    let Some(path) = path? else {
+        return Ok(());
+    };
+    std::fs::write(path, content)
+}
+
+fn flush_standard_stream(stream: StandardStream) -> std::io::Result<()> {
+    match stream {
+        StandardStream::Stdout => std::io::stdout().lock().flush(),
+        StandardStream::Stderr => std::io::stderr().lock().flush(),
+        StandardStream::Stdin => Ok(()),
+    }
 }
 
 fn should_write_direct(
     file: &Table,
     already_direct: bool,
-    content: &str,
+    content: &[u8],
     pos: usize,
-    appended: &str,
+    appended: &[u8],
 ) -> bool {
     if get_bool_field(file, "__buffer_explicit") || get_bool_field(file, "__closed") {
         return false;
@@ -1177,7 +1407,7 @@ fn should_write_direct(
     if !get_bool_field(file, "__writable") {
         return false;
     }
-    let path = get_string_field(file, "__path");
+    let path = get_bytes_field(file, "__path");
     if path.is_empty() {
         return false;
     }
@@ -1192,18 +1422,40 @@ fn should_write_direct(
 fn write_direct(
     gc: &mut GarbageCollector,
     file_ref: GcRef<Userdata>,
-    file: &mut Table,
-    content: &str,
+    content: &[u8],
     pos: usize,
-    appended: &str,
+    appended: &[u8],
 ) -> std::io::Result<usize> {
-    let path = get_string_field(file, "__path");
-    if !get_bool_field(file, "__direct") {
-        std::fs::write(&path, lua_bytes_from_str(content))?;
-        set_bool_field(file, gc, "__direct", true);
+    let Some((path, direct)) = with_file_state(file_ref, |file| {
+        (
+            get_utf8_field(file, "__path"),
+            get_bool_field(file, "__direct"),
+        )
+    }) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file state is missing",
+        ));
+    };
+    let Some(path) = path? else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file path is missing",
+        ));
+    };
+    if !direct {
+        std::fs::write(&path, content)?;
+        let Some(()) = with_file_state_mut(file_ref, |file| {
+            set_bool_field(file, gc, "__direct", true);
+        }) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file state is missing",
+            ));
+        };
     }
 
-    if let Some(data) = file_data_mut(file_ref) {
+    if let Some(result) = with_file_data_mut(file_ref, |data| -> std::io::Result<()> {
         if data.direct_handle.is_none() {
             data.direct_handle = Some(
                 std::fs::OpenOptions::new()
@@ -1216,7 +1468,10 @@ fn write_direct(
         }
         let handle = data.direct_handle.as_mut().expect("direct handle was set");
         handle.seek(SeekFrom::Start(pos as u64))?;
-        handle.write_all(&lua_bytes_from_str(appended))?;
+        handle.write_all(appended)?;
+        Ok(())
+    }) {
+        result?;
     } else {
         let mut handle = std::fs::OpenOptions::new()
             .create(true)
@@ -1225,39 +1480,62 @@ fn write_direct(
             .truncate(false)
             .open(&path)?;
         handle.seek(SeekFrom::Start(pos as u64))?;
-        handle.write_all(&lua_bytes_from_str(appended))?;
+        handle.write_all(appended)?;
     }
-    Ok(pos + appended.chars().count())
+    Ok(pos + appended.len())
 }
 
-fn file_data_mut(file_ref: GcRef<Userdata>) -> Option<&'static mut IoFileData> {
-    // SAFETY: file_ref points to a live full userdata while stdlib code is running.
+fn with_file_data<R>(
+    file_ref: GcRef<Userdata>,
+    access: impl for<'data> FnOnce(&'data IoFileData) -> R,
+) -> Option<R> {
+    // SAFETY: file_ref is rooted for this call. The HRTB callback prevents a
+    // reference into the userdata payload from escaping.
+    let userdata = unsafe { file_ref.as_ref() }?;
+    // SAFETY: create_file constructs every IO userdata with IoFileData.
+    let data = unsafe { userdata.data_as::<IoFileData>() }?;
+    Some(access(data))
+}
+
+fn with_file_data_mut<R>(
+    file_ref: GcRef<Userdata>,
+    access: impl for<'data> FnOnce(&'data mut IoFileData) -> R,
+) -> Option<R> {
+    // SAFETY: file_ref is rooted for this call and IO operations are serialized on
+    // the VM thread. The HRTB callback prevents mutable payload access from escaping.
     let userdata = unsafe { (file_ref.as_ptr() as *mut Userdata).as_mut() }?;
-    // SAFETY: create_memory_file constructs every file userdata with IoFileData.
-    unsafe { userdata.data_as_mut::<IoFileData>() }
+    // SAFETY: create_file constructs every IO userdata with IoFileData.
+    let data = unsafe { userdata.data_as_mut::<IoFileData>() }?;
+    Some(access(data))
+}
+
+fn file_standard_stream(file_ref: GcRef<Userdata>) -> Option<StandardStream> {
+    with_file_data(file_ref, |data| data.standard_stream).flatten()
 }
 
 fn close_direct_handle(file_ref: GcRef<Userdata>) {
-    if let Some(data) = file_data_mut(file_ref) {
+    let _ = with_file_data_mut(file_ref, |data| {
         data.direct_handle.take();
-    }
+    });
 }
 
 fn direct_file_len(file_ref: GcRef<Userdata>) -> Option<usize> {
-    if let Some(data) = file_data_mut(file_ref)
-        && let Some(handle) = data.direct_handle.as_mut()
-    {
+    if let Some(length) = with_file_data_mut(file_ref, |data| {
+        let handle = data.direct_handle.as_mut()?;
         let current = handle.stream_position().ok()?;
         let end = handle.seek(SeekFrom::End(0)).ok()?;
         let _ = handle.seek(SeekFrom::Start(current));
-        return Some(end as usize);
+        Some(end as usize)
+    })
+    .flatten()
+    {
+        return Some(length);
     }
 
-    let file = file_state(file_ref)?;
-    let path = get_string_field(file, "__path");
-    if path.is_empty() {
+    let path = with_file_state(file_ref, |file| get_utf8_field(file, "__path"))?;
+    let Ok(Some(path)) = path else {
         return None;
-    }
+    };
     std::fs::metadata(path)
         .ok()
         .map(|metadata| metadata.len() as usize)
@@ -1270,7 +1548,7 @@ fn push_lines_iterator(
     auto_close: bool,
 ) -> i32 {
     let mut env = Table::new();
-    set_string_field(&mut env, gc, "__kind", "io.lines");
+    set_bytes_field(&mut env, gc, "__kind", b"io.lines");
     set_bool_field(&mut env, gc, "__auto_close", auto_close);
     set_bool_field(&mut env, gc, "__dead", false);
     let env_ptr = &mut env as *mut Table;
@@ -1307,14 +1585,32 @@ fn file_arg(l: &LuaState) -> Option<GcRef<Userdata>> {
     }
 }
 
-fn string_arg(l: &LuaState, idx: i32) -> Option<String> {
+fn bytes_arg(l: &LuaState, idx: i32) -> Option<Vec<u8>> {
     match l.at(idx) {
         Some(Value::String(s)) => {
             // SAFETY: argument strings are kept alive on the active Lua stack.
-            unsafe { s.as_ref() }.map(|s| s.data().to_string())
+            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
         }
         _ => None,
     }
+}
+
+fn utf8_string_arg(l: &LuaState, idx: i32) -> Result<Option<String>, &'static str> {
+    match l.at(idx) {
+        Some(Value::String(s)) => gc_string_utf8(*s).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn gc_string_utf8(value: GcRef<GcString>) -> Result<String, &'static str> {
+    // SAFETY: callers only pass strings rooted by the active Lua stack/table.
+    let Some(value) = (unsafe { value.as_ref() }) else {
+        return Ok(String::new());
+    };
+    value
+        .to_utf8()
+        .map(str::to_owned)
+        .map_err(|_| "file path must be valid UTF-8")
 }
 
 fn number_arg(l: &LuaState, idx: i32) -> Option<f64> {
@@ -1322,7 +1618,10 @@ fn number_arg(l: &LuaState, idx: i32) -> Option<f64> {
         Some(Value::Number(n)) => Some(*n),
         Some(Value::String(s)) => {
             // SAFETY: argument strings are kept alive on the active Lua stack.
-            unsafe { s.as_ref() }.and_then(|s| s.data().trim().parse::<f64>().ok())
+            unsafe { s.as_ref() }.and_then(|s| {
+                let bytes = trim_ascii_whitespace(s.as_bytes());
+                std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()
+            })
         }
         _ => None,
     }
@@ -1333,7 +1632,7 @@ fn get_field(table: &Table, name: &str) -> Value {
         if let Value::String(key_ref) = key
             // SAFETY: keys are owned by this live table.
             && let Some(key_str) = unsafe { key_ref.as_ref() }
-            && key_str.data() == name
+            && key_str.as_bytes() == name.as_bytes()
         {
             return value.clone();
         }
@@ -1341,16 +1640,29 @@ fn get_field(table: &Table, name: &str) -> Value {
     Value::Nil
 }
 
-fn get_string_field(table: &Table, name: &str) -> String {
+fn get_bytes_field(table: &Table, name: &str) -> Vec<u8> {
     match get_field(table, name) {
         Value::String(s) => {
             // SAFETY: string value is owned by this live table.
             unsafe { s.as_ref() }
-                .map(|s| s.data().to_string())
+                .map(|s| s.as_bytes().to_vec())
                 .unwrap_or_default()
         }
-        _ => String::new(),
+        _ => Vec::new(),
     }
+}
+
+fn get_utf8_field(table: &Table, name: &str) -> std::io::Result<Option<String>> {
+    let bytes = get_bytes_field(table, name);
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    String::from_utf8(bytes).map(Some).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file path must be valid UTF-8",
+        )
+    })
 }
 
 fn get_number_field(table: &Table, name: &str) -> f64 {
@@ -1367,73 +1679,89 @@ fn get_bool_field(table: &Table, name: &str) -> bool {
     }
 }
 
-fn set_string_field(table: &mut Table, gc: &mut GarbageCollector, name: &str, value: &str) {
-    let key = gc.create(GcString::new(name));
-    let text = gc.create(GcString::new(value));
+fn set_bytes_field(table: &mut Table, gc: &mut GarbageCollector, name: &str, value: &[u8]) {
+    let key = gc.create(GcString::from_bytes(name.as_bytes()));
+    let text = gc.create(GcString::from_bytes(value));
     table.set(&Value::String(key), &Value::String(text));
 }
 
 fn set_number_field(table: &mut Table, gc: &mut GarbageCollector, name: &str, value: f64) {
-    let key = gc.create(GcString::new(name));
+    let key = gc.create(GcString::from_bytes(name.as_bytes()));
     table.set(&Value::String(key), &Value::Number(value));
 }
 
 fn set_bool_field(table: &mut Table, gc: &mut GarbageCollector, name: &str, value: bool) {
-    let key = gc.create(GcString::new(name));
+    let key = gc.create(GcString::from_bytes(name.as_bytes()));
     table.set(&Value::String(key), &Value::Boolean(value));
 }
 
 fn push_lua_string(l: &mut LuaState, gc: &mut GarbageCollector, text: &str) {
-    let s = gc.create(GcString::new(text));
+    let s = gc.create(GcString::from_utf8_text(text));
     l.push_value(Value::String(s));
 }
 
-fn bytes_to_string(bytes: Vec<u8>) -> String {
-    bytes.into_iter().map(char::from).collect()
+fn push_lua_bytes(l: &mut LuaState, gc: &mut GarbageCollector, bytes: &[u8]) {
+    let s = gc.create(GcString::from_bytes(bytes));
+    l.push_value(Value::String(s));
 }
 
-fn lua_bytes_from_str(text: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(text.len());
-    for ch in text.chars() {
-        let code = ch as u32;
-        if code <= 0xff {
-            bytes.push(code as u8);
-        } else {
-            let mut buf = [0; 4];
-            bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-        }
+fn push_io_error_tuple(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    message: &str,
+    error_code: i32,
+) -> i32 {
+    l.push_nil();
+    push_lua_string(l, gc, message);
+    l.push_value(Value::Number(f64::from(error_code)));
+    3
+}
+
+fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = bytes.split_first()
+        && first.is_ascii_whitespace()
+    {
+        bytes = rest;
+    }
+    while let Some((last, rest)) = bytes.split_last()
+        && last.is_ascii_whitespace()
+    {
+        bytes = rest;
     }
     bytes
 }
 
-fn write_at(content: &str, pos: usize, appended: &str) -> String {
-    let chars: Vec<char> = content.chars().collect();
-    let start = pos.min(chars.len());
-    let replace_end = (start + appended.chars().count()).min(chars.len());
+fn write_at(content: &[u8], pos: usize, appended: &[u8]) -> Vec<u8> {
+    let start = pos.min(content.len());
+    let replace_end = start.saturating_add(appended.len()).min(content.len());
 
-    let mut result = String::new();
-    result.extend(chars[..start].iter());
-    result.push_str(appended);
-    result.extend(chars[replace_end..].iter());
+    let mut result = Vec::with_capacity(
+        start
+            .saturating_add(appended.len())
+            .saturating_add(content.len().saturating_sub(replace_end)),
+    );
+    result.extend_from_slice(&content[..start]);
+    result.extend_from_slice(appended);
+    result.extend_from_slice(&content[replace_end..]);
     result
 }
 
-fn value_to_write_string(value: &Value) -> String {
+fn value_to_write_bytes(value: &Value) -> Vec<u8> {
     match value {
-        Value::Nil => "nil".to_string(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Number(n) => number_to_lua_string(*n),
+        Value::Nil => b"nil".to_vec(),
+        Value::Boolean(b) => b.to_string().into_bytes(),
+        Value::Number(n) => number_to_lua_string(*n).into_bytes(),
         Value::String(s) => {
             // SAFETY: string arguments are kept alive on the active Lua stack.
             unsafe { s.as_ref() }
-                .map(|s| s.data().to_string())
+                .map(|s| s.as_bytes().to_vec())
                 .unwrap_or_default()
         }
-        Value::Table(t) => format!("table: {:p}", t.as_ptr()),
-        Value::Function(f) => format!("function: {:p}", f.as_ptr()),
-        Value::Userdata(u) => format!("userdata: {:p}", u.as_ptr()),
-        Value::Thread(t) => format!("thread: {:p}", t.as_ptr()),
-        Value::LightUserdata(p) => format!("userdata: {p:p}"),
+        Value::Table(t) => format!("table: {:p}", t.as_ptr()).into_bytes(),
+        Value::Function(f) => format!("function: {:p}", f.as_ptr()).into_bytes(),
+        Value::Userdata(u) => format!("userdata: {:p}", u.as_ptr()).into_bytes(),
+        Value::Thread(t) => format!("thread: {:p}", t.as_ptr()).into_bytes(),
+        Value::LightUserdata(p) => format!("userdata: {p:p}").into_bytes(),
     }
 }
 
@@ -1442,5 +1770,30 @@ fn number_to_lua_string(n: f64) -> String {
         format!("{n:.0}")
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn userdata_payload_meets_io_file_data_alignment() {
+        let mut userdata = Userdata::new(std::mem::size_of::<IoFileData>());
+        assert_eq!(
+            userdata.as_ptr() as usize % std::mem::align_of::<IoFileData>(),
+            0
+        );
+
+        // SAFETY: the allocation has the asserted alignment and exact minimum
+        // size, and no payload was previously constructed.
+        unsafe {
+            userdata.write_typed(IoFileData {
+                direct_handle: None,
+                standard_stream: None,
+            });
+        }
+        // SAFETY: the preceding call constructed IoFileData in this payload.
+        assert!(unsafe { userdata.data_as::<IoFileData>() }.is_some());
     }
 }

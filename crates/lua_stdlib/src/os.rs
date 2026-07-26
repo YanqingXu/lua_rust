@@ -43,7 +43,7 @@ fn reg(
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::new(name));
+    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
     let func_obj = gc.create(Function::new_c(func));
     // SAFETY: table points to the library table created and rooted by open_library.
     unsafe {
@@ -60,7 +60,7 @@ fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
             if let Value::String(key_ref) = key
                 // SAFETY: key is held by the rooted global table.
                 && let Some(key_str) = unsafe { key_ref.as_ref() }
-                && key_str.data() == name
+                && key_str.as_bytes() == name.as_bytes()
                 && let Value::Table(t) = val
             {
                 return *t;
@@ -134,9 +134,15 @@ unsafe extern "C" fn lua_os_execute(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
         Value::String(s) => {
             // SAFETY: command string is held by the active Lua stack.
-            unsafe { s.as_ref() }
-                .map(|s| s.data().to_string())
-                .unwrap_or_default()
+            let Some(command) = (unsafe { s.as_ref() })
+                .and_then(|s| s.to_utf8().ok())
+                .map(str::to_owned)
+            else {
+                l.push_nil();
+                let _ = push_lua_string(l, "os.execute command must be valid UTF-8");
+                return 2;
+            };
+            command
         }
         _ => {
             l.push_nil();
@@ -176,7 +182,25 @@ unsafe extern "C" fn lua_os_execute(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_os_date(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let format = string_arg(l, 1).unwrap_or_else(|| "%c".to_string());
+    let format = match l.at(1) {
+        None | Some(Value::Nil) => "%c".to_string(),
+        Some(Value::String(string_ref)) => {
+            // SAFETY: the format argument is kept alive on the active stack.
+            let Some(format) = (unsafe { string_ref.as_ref() })
+                .and_then(|string| string.to_utf8().ok())
+                .map(str::to_owned)
+            else {
+                l.push_nil();
+                let _ = push_lua_string(l, "os.date format must be valid UTF-8");
+                return 2;
+            };
+            format
+        }
+        Some(_) => {
+            l.push_nil();
+            return 1;
+        }
+    };
     let timestamp = number_arg(l, 2).unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -220,7 +244,7 @@ unsafe extern "C" fn lua_os_setlocale(l_ptr: *mut std::ffi::c_void) -> i32 {
         Value::String(s) => {
             // SAFETY: argument strings are kept alive on the active Lua stack.
             unsafe { s.as_ref() }
-                .map(|s| s.data().to_string())
+                .map(|string| string.as_bytes().to_vec())
                 .unwrap_or_default()
         }
         _ => {
@@ -229,8 +253,8 @@ unsafe extern "C" fn lua_os_setlocale(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
     };
 
-    match locale.as_str() {
-        "" | "C" => push_lua_string(l, "C"),
+    match locale.as_slice() {
+        b"" | b"C" => push_lua_string(l, "C"),
         _ => {
             l.push_nil();
             1
@@ -241,7 +265,7 @@ unsafe extern "C" fn lua_os_setlocale(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_os_remove(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(path) = string_arg(l, 1) else {
+    let Some(path) = string_arg_text(l, 1) else {
         l.push_nil();
         return 1;
     };
@@ -261,11 +285,11 @@ unsafe extern "C" fn lua_os_remove(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_os_rename(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(from) = string_arg(l, 1) else {
+    let Some(from) = string_arg_text(l, 1) else {
         l.push_nil();
         return 1;
     };
-    let Some(to) = string_arg(l, 2) else {
+    let Some(to) = string_arg_text(l, 2) else {
         l.push_nil();
         return 1;
     };
@@ -300,11 +324,15 @@ unsafe extern "C" fn lua_os_tmpname(l_ptr: *mut std::ffi::c_void) -> i32 {
     push_lua_string(l, &path.to_string_lossy())
 }
 
-fn string_arg(l: &LuaState, idx: i32) -> Option<String> {
+fn string_arg_text(l: &LuaState, idx: i32) -> Option<String> {
     match l.at(idx) {
         Some(Value::String(s)) => {
             // SAFETY: string arguments are kept alive on the active Lua stack.
-            unsafe { s.as_ref() }.map(|s| s.data().to_string())
+            // Host OS APIs accept text paths/commands, so this boundary rejects
+            // arbitrary Lua bytes instead of silently re-encoding them.
+            unsafe { s.as_ref() }
+                .and_then(|s| s.to_utf8().ok())
+                .map(str::to_owned)
         }
         _ => None,
     }
@@ -315,7 +343,7 @@ fn number_arg(l: &LuaState, idx: i32) -> Option<f64> {
         Some(Value::Number(n)) => Some(*n),
         Some(Value::String(s)) => {
             // SAFETY: string arguments are kept alive on the active Lua stack.
-            unsafe { s.as_ref() }.and_then(|s| s.data().trim().parse::<f64>().ok())
+            unsafe { s.as_ref() }.and_then(|s| parse_lua_number_bytes(s.as_bytes()))
         }
         _ => None,
     }
@@ -326,7 +354,7 @@ fn table_number_field(table: &Table, name: &str) -> Option<f64> {
         Value::Number(n) => Some(n),
         Value::String(s) => {
             // SAFETY: string value is owned by this live table.
-            unsafe { s.as_ref() }.and_then(|s| s.data().trim().parse::<f64>().ok())
+            unsafe { s.as_ref() }.and_then(|s| parse_lua_number_bytes(s.as_bytes()))
         }
         _ => None,
     }
@@ -337,7 +365,7 @@ fn table_field(table: &Table, name: &str) -> Value {
         if let Value::String(key_ref) = key
             // SAFETY: keys are owned by this live table.
             && let Some(key_str) = unsafe { key_ref.as_ref() }
-            && key_str.data() == name
+            && key_str.as_bytes() == name.as_bytes()
         {
             return value.clone();
         }
@@ -346,12 +374,12 @@ fn table_field(table: &Table, name: &str) -> Value {
 }
 
 fn set_number_field(table: &mut Table, gc: &mut GarbageCollector, name: &str, value: f64) {
-    let key = gc.create(GcString::new(name));
+    let key = gc.create(GcString::from_bytes(name.as_bytes()));
     table.set(&Value::String(key), &Value::Number(value));
 }
 
 fn set_bool_field(table: &mut Table, gc: &mut GarbageCollector, name: &str, value: bool) {
-    let key = gc.create(GcString::new(name));
+    let key = gc.create(GcString::from_bytes(name.as_bytes()));
     table.set(&Value::String(key), &Value::Boolean(value));
 }
 
@@ -441,6 +469,16 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+fn parse_lua_number_bytes(mut bytes: &[u8]) -> Option<f64> {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()
+}
+
 fn push_lua_string(l: &mut LuaState, text: &str) -> i32 {
     let Some(gc_ptr) = l.gc else {
         l.push_nil();
@@ -448,7 +486,19 @@ fn push_lua_string(l: &mut LuaState, text: &str) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let s = gc.create(GcString::new(text));
+    let s = gc.create(GcString::from_utf8_text(text));
     l.push_value(Value::String(s));
     1
+}
+
+#[cfg(test)]
+mod byte_string_tests {
+    use super::*;
+
+    #[test]
+    fn number_parser_rejects_non_text_lua_bytes() {
+        assert_eq!(parse_lua_number_bytes(b" 123.5 "), Some(123.5));
+        assert_eq!(parse_lua_number_bytes(&[b'1', 0xff]), None);
+        assert_eq!(parse_lua_number_bytes(b"12\0"), None);
+    }
 }

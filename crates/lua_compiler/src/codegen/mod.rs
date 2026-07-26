@@ -35,6 +35,7 @@ pub use types::{
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc_string::GcString;
 use lua_core::proto::Proto;
+use lua_core::string_pool::StringPool;
 
 use crate::ast::stmt::Chunk;
 use crate::opcode::OpCode;
@@ -84,7 +85,7 @@ impl From<ParseError> for CodegenError {
 /// 将 AST 编译为可执行的 Proto 对象。
 /// 实现完整的表达式/语句 lowering 和函数编译管线。
 ///
-pub struct CodeGenerator {
+pub struct CodeGenerator<'services> {
     pub builder: BytecodeBuilder,
     pub reg_alloc: RegisterAllocator,
     pub current_line: i32,
@@ -103,17 +104,31 @@ pub struct CodeGenerator {
     // ── 代码块栈 ──────────────────────────────────────────────
     pub blocks: Vec<BlockInfo>,
 
-    /// GC 引用（用于创建字符串常量等 GC 对象）
-    pub gc: *mut GarbageCollector,
+    /// 编译期间借用的 GC。生命周期保证服务不会先于编译器失效。
+    gc: &'services mut GarbageCollector,
+
+    /// 可选的字符串驻留池，与 GC 一样只在本次编译期间安全借用。
+    string_pool: Option<&'services mut StringPool>,
 }
 
-// SAFETY: CodeGenerator is used on the stack during compilation;
-// the GC pointer is valid for the duration of the compilation.
-unsafe impl Send for CodeGenerator {}
+impl<'services> CodeGenerator<'services> {
+    pub fn new(gc: &'services mut GarbageCollector) -> Self {
+        Self::from_services(gc, None)
+    }
 
-impl CodeGenerator {
-    pub fn new(gc: &mut GarbageCollector) -> Self {
-        let proto = Proto::new();
+    pub fn new_with_pool(
+        gc: &'services mut GarbageCollector,
+        string_pool: &'services mut StringPool,
+    ) -> Self {
+        Self::from_services(gc, Some(string_pool))
+    }
+
+    fn from_services(
+        gc: &'services mut GarbageCollector,
+        string_pool: Option<&'services mut StringPool>,
+    ) -> Self {
+        let mut proto = Proto::new();
+        proto.set_max_stack_size(2);
         Self {
             builder: BytecodeBuilder::new(proto),
             reg_alloc: RegisterAllocator::new(0),
@@ -124,16 +139,27 @@ impl CodeGenerator {
             upvalues: Vec::new(),
             parent_functions: Vec::new(),
             blocks: Vec::new(),
-            gc: gc as *mut GarbageCollector,
+            gc,
+            string_pool,
         }
     }
 
-    /// 生成字节码（完整入口）
-    pub fn generate(mut self, chunk: &Chunk, source_name: &str) -> Result<Proto, CodegenError> {
-        // SAFETY: self.gc is set during CodeGenerator::new() from a valid &mut GC.
-        let gc: &mut GarbageCollector = unsafe { &mut *self.gc };
-        self.builder
-            .set_source(Some(gc.create(GcString::new(source_name))));
+    /// 从宿主 UTF-8 文本源名生成字节码。
+    ///
+    /// Lua 提供的 chunk name 应使用 [`Self::generate_with_source_bytes`]，
+    /// 以免任意字节在文本边界被重编码。
+    pub fn generate(self, chunk: &Chunk, source_name: &str) -> Result<Proto, CodegenError> {
+        self.generate_with_source_bytes(chunk, source_name.as_bytes())
+    }
+
+    /// 从任意 Lua 字节序列源名生成字节码。
+    pub fn generate_with_source_bytes(
+        mut self,
+        chunk: &Chunk,
+        source_name: &[u8],
+    ) -> Result<Proto, CodegenError> {
+        let source = self.gc.create(GcString::from_bytes(source_name));
+        self.builder.set_source(Some(source));
         self.builder.set_vararg(true);
 
         self.emit_block(&chunk.statements)
@@ -142,12 +168,31 @@ impl CodeGenerator {
         let final_line = chunk.statements.last().map(|s| s.end_line()).unwrap_or(1);
         self.code_abc(OpCode::RETURN, 0, 1, 0, final_line);
 
-        // Compute max stack size from register allocator usage
-        let max_stack = self.reg_alloc.max_used() + 2; // +2 for safety margin
+        // Lua 5.1 keeps a two-slot minimum, then records the exact highest
+        // register boundary reached during lowering.
+        let max_stack = self
+            .reg_alloc
+            .max_used()
+            .max(self.active_var_count)
+            .max(self.builder.max_stack_size() as i32)
+            .max(2);
         self.builder.set_max_stack_size(max_stack as u8);
         self.attach_local_debug();
 
         Ok(self.builder.into_proto())
+    }
+
+    pub(crate) fn add_string_constant(&mut self, value: &str) -> Option<i32> {
+        let gc = &mut *self.gc;
+        let string_pool = self.string_pool.as_deref_mut();
+        self.builder.add_string_constant(gc, string_pool, value)
+    }
+
+    pub(crate) fn add_byte_string_constant(&mut self, value: &[u8]) -> Option<i32> {
+        let gc = &mut *self.gc;
+        let string_pool = self.string_pool.as_deref_mut();
+        self.builder
+            .add_byte_string_constant(gc, string_pool, value)
     }
 
     // ── 指令生成便捷方法 ──────────────────────────────────────────
@@ -165,4 +210,5 @@ impl CodeGenerator {
     }
 }
 
-// Default removed: CodeGenerator now requires &mut GarbageCollector for string constants
+// Default is intentionally unavailable: every compiler is tied to explicit
+// allocation services for the complete code-generation pass.

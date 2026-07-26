@@ -9,8 +9,9 @@ use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_vm::RuntimeError;
-use lua_vm::execute::call_value;
+use lua_vm::execute::{call_value, compare_lua_string_bytes};
 use lua_vm::state::LuaState;
+use std::cmp::Ordering;
 
 pub fn open_table(l: &mut LuaState, gc: &mut GarbageCollector) {
     let table_lib = find_lib_table(l, "table");
@@ -35,7 +36,7 @@ fn reg(
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::new(name));
+    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
     let func_obj = gc.create(Function::new_c(func));
     // SAFETY: table points to the library table created and rooted by open_library.
     unsafe {
@@ -52,7 +53,7 @@ fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
             if let Value::String(key_ref) = key
                 // SAFETY: key is held by the rooted global table.
                 && let Some(key_str) = unsafe { key_ref.as_ref() }
-                && key_str.data() == name
+                && key_str.as_bytes() == name.as_bytes()
                 && let Value::Table(t) = val
             {
                 return *t;
@@ -60,11 +61,6 @@ fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
         }
     }
     GcRef::null()
-}
-
-unsafe fn to_lua(l_ptr: *mut std::ffi::c_void) -> &'static mut LuaState {
-    // SAFETY: l_ptr is passed by the VM CALL handler and points to the active LuaState.
-    unsafe { &mut *(l_ptr as *mut LuaState) }
 }
 
 fn table_arg(l: &LuaState, idx: i32) -> Option<GcRef<Table>> {
@@ -81,13 +77,13 @@ fn number_arg(l: &LuaState, idx: i32) -> Option<f64> {
     }
 }
 
-fn string_arg(l: &LuaState, idx: i32) -> Option<String> {
+fn string_arg_bytes(l: &LuaState, idx: i32) -> Option<Vec<u8>> {
     match l.at(idx) {
         Some(Value::String(s)) => {
             // SAFETY: string argument is on the active Lua stack.
-            unsafe { s.as_ref() }.map(|s| s.data().to_string())
+            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
         }
-        Some(Value::Number(n)) => Some(number_to_lua_string(*n)),
+        Some(Value::Number(n)) => Some(number_to_lua_string(*n).into_bytes()),
         Some(Value::Nil) | None => None,
         _ => None,
     }
@@ -101,18 +97,25 @@ fn number_to_lua_string(n: f64) -> String {
     }
 }
 
-fn value_to_concat_string(value: &Value) -> Option<String> {
+fn value_to_concat_bytes(value: &Value) -> Option<Vec<u8>> {
     match value {
         Value::String(s) => {
             // SAFETY: table value is reachable while the table is on the Lua stack.
-            unsafe { s.as_ref() }.map(|s| s.data().to_string())
+            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
         }
-        Value::Number(n) => Some(number_to_lua_string(*n)),
+        Value::Number(n) => Some(number_to_lua_string(*n).into_bytes()),
         _ => None,
     }
 }
 
-fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
+fn append_concat_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ()> {
+    output.len().checked_add(bytes.len()).ok_or(())?;
+    output.try_reserve(bytes.len()).map_err(|_| ())?;
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn push_lua_bytes(l: &mut LuaState, bytes: &[u8]) -> bool {
     let Some(gc_ptr) = l.gc else {
         return false;
     };
@@ -121,12 +124,16 @@ fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
     let string_ref = if let Some(pool_ptr) = l.string_pool {
         // SAFETY: string_pool is installed from a live StringPool owned by the host.
         let pool = unsafe { &mut *pool_ptr };
-        pool.find(text).unwrap_or_else(|| pool.intern(gc, text))
+        pool.intern_bytes(gc, bytes)
     } else {
-        gc.create(GcString::new(text))
+        gc.create(GcString::from_bytes(bytes))
     };
     l.push_value(Value::String(string_ref));
     true
+}
+
+fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
+    push_lua_bytes(l, text.as_bytes())
 }
 
 #[derive(Debug)]
@@ -167,7 +174,7 @@ fn table_foreachi_limit(table: &Table) -> usize {
         if let Value::String(key_ref) = key
             // SAFETY: key is held by the table being inspected.
             && let Some(key_string) = unsafe { key_ref.as_ref() }
-            && key_string.data() == "n"
+            && key_string.as_bytes() == b"n"
             && let Value::Number(n) = value
             && *n >= 0.0
         {
@@ -177,13 +184,13 @@ fn table_foreachi_limit(table: &Table) -> usize {
     table.length()
 }
 
-fn string_data(value: &Value) -> Option<&str> {
+fn string_bytes(value: &Value) -> Option<&[u8]> {
     let Value::String(string_ref) = value else {
         return None;
     };
     // SAFETY: the string value is reachable through the active Lua stack, a
     // table, or a temporary sort buffer whose source table remains reachable.
-    unsafe { string_ref.as_ref() }.map(|string| string.data())
+    unsafe { string_ref.as_ref() }.map(GcString::as_bytes)
 }
 
 fn value_metatable(value: &Value) -> Option<GcRef<Table>> {
@@ -204,7 +211,7 @@ fn lookup_metamethod(metatable: GcRef<Table>, name: &str) -> Option<Value> {
     // SAFETY: metatable references are held by values being compared.
     let metatable = unsafe { metatable.as_ref() }?;
     for (key, value) in metatable.hash_entries() {
-        if string_data(key).is_some_and(|key| key == name) && !value.is_nil() {
+        if string_bytes(key).is_some_and(|key| key == name.as_bytes()) && !value.is_nil() {
             return Some(value.clone());
         }
     }
@@ -244,9 +251,9 @@ fn default_less(
     match (lhs, rhs) {
         (Value::Number(a), Value::Number(b)) => Ok(a < b),
         (Value::String(_), Value::String(_)) => {
-            let lhs = string_data(lhs).unwrap_or_default();
-            let rhs = string_data(rhs).unwrap_or_default();
-            Ok(lhs < rhs)
+            let lhs = string_bytes(lhs).unwrap_or_default();
+            let rhs = string_bytes(rhs).unwrap_or_default();
+            Ok(compare_lua_string_bytes(lhs, rhs) == Ordering::Less)
         }
         _ => {
             if let Some(metamethod) = find_less_metamethod(lhs, rhs) {
@@ -322,7 +329,7 @@ fn merge_sort_values(
 
 unsafe extern "C" fn lua_table_getn(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    let l = unsafe { &mut *(l_ptr as *mut LuaState) };
     let Some(table_ref) = table_arg(l, 1) else {
         return -1;
     };
@@ -336,7 +343,7 @@ unsafe extern "C" fn lua_table_getn(l_ptr: *mut std::ffi::c_void) -> i32 {
 
 unsafe extern "C" fn lua_table_foreach(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    let l = unsafe { &mut *(l_ptr as *mut LuaState) };
     let Some(table_ref) = table_arg(l, 1) else {
         return table_error(l, "bad argument #1 to 'foreach' (table expected)");
     };
@@ -384,7 +391,7 @@ unsafe extern "C" fn lua_table_foreach(l_ptr: *mut std::ffi::c_void) -> i32 {
 
 unsafe extern "C" fn lua_table_foreachi(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    let l = unsafe { &mut *(l_ptr as *mut LuaState) };
     let Some(table_ref) = table_arg(l, 1) else {
         return table_error(l, "bad argument #1 to 'foreachi' (table expected)");
     };
@@ -436,7 +443,7 @@ unsafe extern "C" fn lua_table_foreachi(l_ptr: *mut std::ffi::c_void) -> i32 {
 
 unsafe extern "C" fn lua_table_maxn(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    let l = unsafe { &mut *(l_ptr as *mut LuaState) };
     let Some(table_ref) = table_arg(l, 1) else {
         return -1;
     };
@@ -467,7 +474,7 @@ unsafe extern "C" fn lua_table_maxn(l_ptr: *mut std::ffi::c_void) -> i32 {
 
 unsafe extern "C" fn lua_table_insert(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    let l = unsafe { &mut *(l_ptr as *mut LuaState) };
     let nargs = l.get_top();
     let Some(table_ref) = table_arg(l, 1) else {
         return -1;
@@ -506,7 +513,7 @@ unsafe extern "C" fn lua_table_insert(l_ptr: *mut std::ffi::c_void) -> i32 {
 
 unsafe extern "C" fn lua_table_remove(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    let l = unsafe { &mut *(l_ptr as *mut LuaState) };
     let nargs = l.get_top();
     let Some(table_ref) = table_arg(l, 1) else {
         return -1;
@@ -541,7 +548,7 @@ unsafe extern "C" fn lua_table_remove(l_ptr: *mut std::ffi::c_void) -> i32 {
 
 unsafe extern "C" fn lua_table_concat(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    let l = unsafe { &mut *(l_ptr as *mut LuaState) };
     let nargs = l.get_top();
     let Some(table_ref) = table_arg(l, 1) else {
         return -1;
@@ -552,9 +559,9 @@ unsafe extern "C" fn lua_table_concat(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
 
     let sep = if nargs >= 2 {
-        string_arg(l, 2).unwrap_or_default()
+        string_arg_bytes(l, 2).unwrap_or_default()
     } else {
-        String::new()
+        Vec::new()
     };
     let start = if nargs >= 3 {
         number_arg(l, 3).unwrap_or(1.0) as i32
@@ -567,21 +574,25 @@ unsafe extern "C" fn lua_table_concat(l_ptr: *mut std::ffi::c_void) -> i32 {
         table.length() as i32
     };
 
-    let mut pieces = Vec::new();
+    let mut result = Vec::new();
     for idx in start..=end {
+        if idx > start && append_concat_bytes(&mut result, &sep).is_err() {
+            return table_error(l, "table.concat: result length overflow");
+        }
         let value = table.get(&Value::Number(idx as f64));
-        let Some(piece) = value_to_concat_string(&value) else {
+        let Some(piece) = value_to_concat_bytes(&value) else {
             return -1;
         };
-        pieces.push(piece);
+        if append_concat_bytes(&mut result, &piece).is_err() {
+            return table_error(l, "table.concat: result length overflow");
+        }
     }
-    let result = pieces.join(&sep);
-    if push_lua_string(l, &result) { 1 } else { -1 }
+    if push_lua_bytes(l, &result) { 1 } else { -1 }
 }
 
 unsafe extern "C" fn lua_table_sort(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler.
-    let l = unsafe { to_lua(l_ptr) };
+    let l = unsafe { &mut *(l_ptr as *mut LuaState) };
     let nargs = l.get_top();
     let Some(table_ref) = table_arg(l, 1) else {
         return table_error(l, "bad argument #1 to 'table.sort' (table expected)");
@@ -628,4 +639,30 @@ unsafe extern "C" fn lua_table_sort(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod byte_string_tests {
+    use super::*;
+
+    #[test]
+    fn concat_value_preserves_nul_and_invalid_utf8() {
+        let mut gc = GarbageCollector::new();
+        let value = Value::String(gc.create(GcString::from_bytes(&[0, 0x80, 0xff])));
+
+        assert_eq!(value_to_concat_bytes(&value), Some(vec![0x00, 0x80, 0xff]));
+    }
+
+    #[test]
+    fn default_string_order_uses_vm_nul_segment_rule() {
+        let mut gc = GarbageCollector::new();
+        let mut state = LuaState::new();
+        let left = Value::String(gc.create(GcString::from_bytes(b"a\0b")));
+        let right = Value::String(gc.create(GcString::from_bytes(b"a\0c")));
+
+        assert!(matches!(
+            default_less(&mut state, &mut gc, &left, &right),
+            Ok(true)
+        ));
+    }
 }
