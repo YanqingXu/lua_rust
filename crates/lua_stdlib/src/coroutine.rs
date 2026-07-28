@@ -6,8 +6,8 @@ use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::thread::{CoroutineStatus, Thread};
-use lua_core::upvalue::Upvalue;
 use lua_core::value::Value;
+use lua_vm::runtime::PendingStateError;
 use lua_vm::state::{LuaState, ThreadStatus};
 
 pub fn open_coroutine(l: &mut LuaState, gc: &mut GarbageCollector) {
@@ -92,11 +92,8 @@ unsafe extern "C" fn lua_coroutine_create(l_ptr: *mut std::ffi::c_void) -> i32 {
         return push_error(l, b"bad argument #1 to 'create' (function expected)");
     }
 
-    match create_thread(l, gc, func) {
-        Ok(thread_ref) => {
-            l.push_value(Value::Thread(thread_ref));
-            1
-        }
+    match publish_thread_to_stack(l, gc, func) {
+        Ok(()) => 1,
         Err(error) => {
             l.push_value(error);
             -1
@@ -151,19 +148,13 @@ unsafe extern "C" fn lua_coroutine_wrap(l_ptr: *mut std::ffi::c_void) -> i32 {
         return push_error(l, b"bad argument #1 to 'wrap' (function expected)");
     }
 
-    let thread_ref = match create_thread(l, gc, func) {
-        Ok(thread_ref) => thread_ref,
+    match publish_wrapper_to_stack(l, gc, func) {
+        Ok(()) => 1,
         Err(error) => {
             l.push_value(error);
-            return -1;
+            -1
         }
-    };
-    let upvalue_ref = gc.create(Upvalue::new_closed(Value::Thread(thread_ref)));
-    let mut wrapper = Function::new_runtime_native(RuntimeNativeFunction::CoroutineWrapRunner);
-    wrapper.add_upvalue(upvalue_ref);
-    let wrapper_ref = gc.create(wrapper);
-    l.push_value(Value::Function(wrapper_ref));
-    1
+    }
 }
 
 unsafe extern "C" fn lua_coroutine_yield(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -174,39 +165,64 @@ unsafe extern "C" fn lua_coroutine_yield(l_ptr: *mut std::ffi::c_void) -> i32 {
     0
 }
 
-fn create_thread(
-    l: &mut LuaState,
-    gc: &mut GarbageCollector,
-    entry: Value,
-) -> Result<GcRef<Thread>, Value> {
-    let mut co_state = if let Some(global) = l.global_table {
+fn coroutine_state(l: &LuaState, gc: &mut GarbageCollector, entry: Value) -> LuaState {
+    let mut state = if let Some(global) = l.global_table {
         LuaState::with_global_table(global)
     } else {
         LuaState::new()
     };
-    co_state.string_pool = l.string_pool;
-    co_state.gc = Some(gc as *mut GarbageCollector);
-    co_state.thread_env = l.thread_env.or(l.global_table);
-    co_state.chunk_env = l.chunk_env.or(l.thread_env).or(l.global_table);
-    co_state.nil_metatable = l.nil_metatable;
-    co_state.boolean_metatable = l.boolean_metatable;
-    co_state.number_metatable = l.number_metatable;
-    co_state.push_value(entry);
+    state.string_pool = l.string_pool;
+    state.gc = Some(gc as *mut GarbageCollector);
+    state.thread_env = l.thread_env.or(l.global_table);
+    state.chunk_env = l.chunk_env.or(l.thread_env).or(l.global_table);
+    state.nil_metatable = l.nil_metatable;
+    state.boolean_metatable = l.boolean_metatable;
+    state.number_metatable = l.number_metatable;
+    state.push_value(entry);
+    state
+}
 
-    // Publish the owning Thread into the not-yet-inserted state before the
-    // arena makes that state addressable. This avoids borrowing a second
-    // LuaState merely to complete the State -> Thread edge after insertion.
-    // The reverse Thread -> StateHandle edge is installed before the Thread
-    // value is exposed to Lua. A future PendingState transaction will make
-    // allocation failure rollback and temporary-root tracing explicit.
-    let thread_ref = gc.create(Thread::new());
-    co_state.current_thread = Some(thread_ref);
-    let handle = l
-        .insert_coroutine_state(co_state)
-        .map_err(|err| diagnostic_string_value(gc, &format!("invalid coroutine state: {err}")))?;
-    with_thread_mut(thread_ref, |thread| thread.set_state_handle(handle))
-        .ok_or_else(|| lua_ascii_value(gc, b"invalid coroutine"))?;
-    Ok(thread_ref)
+fn publish_thread_to_stack(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    entry: Value,
+) -> Result<(), Value> {
+    let state = coroutine_state(l, gc, entry);
+    let published: Result<(), PendingStateError> = gc.with_publication(|transaction| {
+        let thread = transaction.alloc(Thread::new());
+        l.with_pending_coroutine_state(state, |pending, publisher| {
+            pending.bind_thread(transaction, thread)?;
+            pending.publish_thread_to_stack(publisher)?;
+            Ok(())
+        })?
+    });
+    published.map_err(|error| {
+        diagnostic_string_value(gc, &format!("invalid coroutine publication: {error}"))
+    })
+}
+
+fn publish_wrapper_to_stack(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    entry: Value,
+) -> Result<(), Value> {
+    let state = coroutine_state(l, gc, entry);
+    let published: Result<(), PendingStateError> = gc.with_publication(|transaction| {
+        let thread = transaction.alloc(Thread::new());
+        l.with_pending_coroutine_state(state, |pending, publisher| {
+            let upvalue = transaction.alloc_closed_thread_upvalue(&thread)?;
+            let wrapper = transaction.alloc_runtime_native_with_upvalue(
+                RuntimeNativeFunction::CoroutineWrapRunner,
+                &upvalue,
+            )?;
+            pending.bind_thread(transaction, thread)?;
+            pending.publish_wrapper_to_stack(transaction, wrapper, publisher)?;
+            Ok(())
+        })?
+    });
+    published.map_err(|error| {
+        diagnostic_string_value(gc, &format!("invalid coroutine publication: {error}"))
+    })
 }
 
 fn args_from(l: &LuaState, first: i32) -> Vec<Value> {
@@ -228,19 +244,6 @@ fn with_thread<T>(
     Some(f(thread))
 }
 
-fn with_thread_mut<T>(
-    thread_ref: GcRef<Thread>,
-    f: impl for<'thread> FnOnce(&'thread mut Thread) -> T,
-) -> Option<T> {
-    if thread_ref.is_null() {
-        return None;
-    }
-    // SAFETY: the thread is held by a live Lua value and coroutine mutations
-    // are serialized by the single-threaded VM. The HRTB closure prevents the
-    // mutable reference from escaping this call.
-    Some(f(unsafe { &mut *(thread_ref.as_ptr() as *mut Thread) }))
-}
-
 fn status_name(status: CoroutineStatus) -> &'static [u8] {
     match status {
         CoroutineStatus::Suspended => b"suspended",
@@ -253,11 +256,6 @@ fn status_name(status: CoroutineStatus) -> &'static [u8] {
 fn push_lua_bytes(l: &mut LuaState, gc: &mut GarbageCollector, bytes: &[u8]) {
     let s = gc.create(GcString::from_bytes(bytes));
     l.push_value(Value::String(s));
-}
-
-fn lua_ascii_value(gc: &mut GarbageCollector, bytes: &'static [u8]) -> Value {
-    debug_assert!(bytes.is_ascii());
-    Value::String(gc.create(GcString::from_bytes(bytes)))
 }
 
 /// Convert host diagnostic text at the explicit UTF-8 boundary.

@@ -53,8 +53,9 @@ is not closed:
   serializer exists, and source loaders no longer recognize the private
   pseudo-dump prefix;
 - `Runtime::trace_roots_mark_only` now provides the canonical object/state
-  fixed-point root callback, but temporary state roots, pending finalizers,
-  fixed strings, and several production publication paths remain incomplete;
+  fixed-point root callback; temporary state roots are implemented, while
+  pending finalizers, fixed strings, and several production publication paths
+  remain incomplete;
 - the two VM-side weak-cleanup scanners at
   `crates/lua_vm/src/execute.rs:1137-1188` and
   `crates/lua_stdlib/src/base.rs:432-495` disagree and are not safe sweep root
@@ -606,8 +607,8 @@ workspace total from 733 to 737.
 
 Coroutine creation also now installs `State -> Thread` before inserting the
 state, then binds `Thread -> StateHandle` before exposing the Thread value.
-This removes its former initialization-only second-state borrow. It does not
-replace the still-missing `PendingState` rollback/root transaction.
+The later PendingState slice replaces this transitional sequence with an
+exact-id rollback/root transaction; see D.3.
 
 This substrate is now the ownership foundation used by the production
 coroutine trampoline described below.
@@ -761,7 +762,7 @@ destruction. Existing weak-maintenance scanners now use managed Proto roots
 and checked metadata reads, but have not yet been replaced by this Runtime-only
 safe-point API. Destructive sweep remains blocked on scoped VM borrows,
 unreachable-state integration, finalizer roots, production publication
-migration, temporary state roots, and complete finalizer/shutdown semantics.
+migration, and complete finalizer/shutdown semantics.
 
 #### D.2 Implemented temporary-object root foundation (partial)
 
@@ -776,15 +777,50 @@ installs an explicit collector root before releasing the temporary identity.
 Nested transactions retain outer roots. Normal Drop and panic unwind remove
 only the exact IDs owned by the transaction. `begin_mark_only` validates and
 seeds these roots and reports temporary seeded/rejected counts. Focused tests
-cover nested panic, foreign/stale rejection, explicit-root promotion, mark
-seeding, and 1,000 scopes returning the registry to zero.
+cover nested panic, foreign/stale rejection, explicit-root promotion, typed
+Thread/Upvalue/runtime-native Function graph construction, checked value
+publication, mark seeding, and 1,000 scopes returning the registry to zero.
 
 This is an API/registry foundation, not completion of publication safety.
-Compiler Proto trees, IO graphs, library registration, VM temporaries,
-coroutine `State -> Thread`, app arguments, and returned `Vec<Value>` paths
-still use unprotected production allocation. A separate
-`TEMPORARY_STATE_ROOTS` inventory entry is therefore `missing`, and
-allocation-triggered collection remains disabled.
+Compiler Proto trees, IO graphs, library registration, VM temporaries, app
+arguments, and returned `Vec<Value>` paths still use unprotected production
+allocation. Coroutine create/wrap is the first migrated production graph:
+Thread, closed Upvalue, and wrapper Function remain branded roots until the
+State↔Thread graph is bound and its exported value is on a traced stack.
+Allocation-triggered collection remains disabled.
+
+#### D.3 Implemented temporary-state root transaction (local-complete slice)
+
+`StateArena::insert_pending_owned` installs a detached coroutine state and an
+exact nonzero temporary-root identity in the same slot mutation.
+`LuaState::with_pending_coroutine_state` exposes only a higher-ranked
+`PendingState<'scope>` guard; safe production code cannot obtain its
+`StateHandle` or clear its root directly.
+
+`PendingState::bind_thread` validates the protected Thread, installs
+State→Thread and Thread→StateHandle, and remembers the exact object identity.
+The only commit paths publish that Thread, or a checked runtime-native wrapper
+whose closed Upvalue reaches it, directly into the destination stack while
+the graph remains retained by a branded object root or the PendingState root.
+The temporary state root is released after the stack write. Returning or
+unwinding before commit rolls the slot back, drops the state, and advances its
+generation exactly once; generation `u64::MAX` permanently retires the slot.
+
+The canonical mark-only tracer snapshots these checked handles separately
+from ordinary arena membership and labels the edges
+`TEMPORARY_STATE_ROOTS`. Focused failure injection covers Thread allocation,
+arena insertion, bidirectional binding, and successful stack publication.
+Additional tests prove root-only reachability before any Thread exists,
+exact-id mismatch rejection, panic cleanup of both object and state roots,
+and one-time MAX-generation retirement. Runtime close reports both remaining
+temporary state roots and rejected releases; normal close and 1,000-cycle
+shutdown leave both at zero.
+
+This closes the inventory entry for coroutine state publication, not the
+broader production publication program. Proto→Function/compiler builders,
+library/package and IO graphs, VM temporaries, app arguments/results, unique
+Heap ownership, fixed strings, and finalizer roots remain blockers for live
+destructive collection.
 
 ### E. Shutdown substrate — M1.8
 

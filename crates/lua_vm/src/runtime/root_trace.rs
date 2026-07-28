@@ -59,6 +59,8 @@ pub enum RuntimeRootKind {
     LastError,
     /// Runtime-owned deferred coroutine requests, snapshots, and responses.
     CoroutineActivationBuffer,
+    /// Lexical PendingState handles not yet reachable through a Thread.
+    TemporaryStateRoots,
 }
 
 impl RuntimeRootKind {
@@ -84,6 +86,7 @@ impl RuntimeRootKind {
             Self::YieldedValues => "YIELDED_VALUES",
             Self::LastError => "LAST_ERROR",
             Self::CoroutineActivationBuffer => "COROUTINE_ACTIVATION_BUFFER",
+            Self::TemporaryStateRoots => "TEMPORARY_STATE_ROOTS",
         }
     }
 }
@@ -301,7 +304,14 @@ impl Runtime {
             &mut unresolved_object_edges,
         );
 
+        let temporary_state_roots = heap.state_arena.temporary_state_roots();
+        increment(
+            &mut root_counts,
+            RuntimeRootKind::TemporaryStateRoots,
+            temporary_state_roots.len(),
+        );
         let mut state_queue = VecDeque::from([main_handle]);
+        state_queue.extend(temporary_state_roots);
         increment(&mut root_counts, RuntimeRootKind::MainStateEntry, 1);
         let mut attempted_states = HashSet::new();
         let mut traced_states = Vec::new();
@@ -754,6 +764,7 @@ mod tests {
             RuntimeRootKind::DebugHook,
             RuntimeRootKind::YieldedValues,
             RuntimeRootKind::LastError,
+            RuntimeRootKind::TemporaryStateRoots,
         ] {
             assert_eq!(
                 absent.root_edge_count(kind),
@@ -782,6 +793,50 @@ mod tests {
         assert_white(fixtures.last_error);
         assert_white(fixtures.retired_stack);
         assert_white(fixtures.inactive_vararg);
+    }
+
+    #[test]
+    fn pending_state_is_traced_before_any_thread_edge_exists() {
+        let mut runtime = Runtime::new();
+        let main_handle = runtime.main_state_handle.expect("main state handle");
+
+        let (pending_handle, temporary_root_id, payload) = {
+            // SAFETY: RuntimeHeap is pinned and no execution guard is live.
+            let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
+            let payload = heap.gc.create(Table::new());
+            let mut pending = LuaState::new();
+            pending.push_value(Value::Table(payload));
+            let (handle, root_id) = heap
+                .state_arena
+                .insert_pending_owned(Box::new(pending))
+                .expect("detached state enters the pending root set");
+            (handle, root_id, payload)
+        };
+
+        let report = runtime
+            .trace_roots_mark_only()
+            .expect("temporary state root is a traceable handle");
+
+        assert_eq!(
+            report.traced_states,
+            sorted_handles([main_handle, pending_handle])
+        );
+        assert_eq!(
+            report.root_edge_count(RuntimeRootKind::TemporaryStateRoots),
+            1
+        );
+        assert!(report.failed_state_handles.is_empty());
+        assert!(report.unresolved_object_edges.is_empty());
+        assert_marked(payload);
+
+        // SAFETY: the exact pending root remains live in this pinned arena and
+        // no state or execution borrow is active.
+        let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
+        heap.state_arena
+            .rollback_pending(pending_handle, temporary_root_id)
+            .expect("exact pending root rolls back");
+        assert_eq!(heap.state_arena.temporary_state_root_count(), 0);
+        assert_eq!(heap.state_arena.live_owned_state_count(), 0);
     }
 
     #[test]

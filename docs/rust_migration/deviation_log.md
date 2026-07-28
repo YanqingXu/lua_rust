@@ -217,12 +217,15 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   Runtime upvalue transfer turns 顺序访问 owner/requester，reachable Upvalue
   会向 canonical tracer 发布 owner handle，arena drain 在 generation
   advance/retirement 前完成关闭。
+  coroutine create/wrap 现由 exact-id `PendingState` 事务持有未发布 arena
+  slot；Thread/closed Upvalue/wrapper Function 同时保留对象临时根，完成
+  State↔Thread 双向绑定并直接压入 caller stack 后才提交。提前返回或 panic
+  会删除 slot 并推进/退休 generation，canonical tracer 也可在尚无 Thread
+  边时从 `TEMPORARY_STATE_ROOTS` 独立到达该状态。
   但 main state 仍是 external arena slot，LuaState 仍保存 transitional
   GC/StringPool backpointer，debug/protected-helper 跨 state open-Upvalue
   访问尚未纳入同一调度协议；Lua `__gc`、IO/module service drain 与
-  allocator live-byte 合同也未闭环。coroutine 创建已先建立
-  State→Thread、再插入 arena 并绑定 Thread→StateHandle，去掉了初始化时的
-  第二个 state borrow，但仍缺少可回滚、可追踪的 `PendingState`。
+  allocator live-byte 合同也未闭环，其余生产对象 publication 路径仍待迁移。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
   close、coroutine lifecycle 和 allocator live-byte 合同。
 - **测试与任务：** 1000 轮 state/coroutine create-close、fixed/ordinary
@@ -232,16 +235,18 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   stock Lua 拒绝 `Normal` 祖先的差异；Rust process regression 已逐字节
   对齐该 C++ 行为。另有 suspended-coroutine closure 远端读写、
   Upvalue→owner-state root fixed point、集合去重/排序与
-  close-before-generation-invalidation 回归。
+  close-before-generation-invalidation 回归；PendingState 故障注入还覆盖
+  Thread 分配、slot 插入、双向绑定、压栈提交、exact-id mismatch、panic
+  cleanup 与 MAX-generation 单次退休。
   allocator live/peak、真实 finalizer/service close、Miri/ASan 等仍在
   M1.4、M1.5、M1.7、M1.8、M1.13。
 - **影响：** 已移除 resume/wrap 递归跨 state 借用和 raw open-Upvalue
   owner 风险，并能声称当前 Rust-owned 对象的 deterministic shutdown
   substrate；剩余 service/backpointer 与未迁移 publication 路径仍不允许
   声称完整 Lua close 或 live collection。
-- **处置状态：** `open`。唯一 Heap/service owner、temporary state
-  publication、debug/protected-helper 跨 state、Lua-visible close 与
-  lifecycle 验收全部完成前保持开放。
+- **处置状态：** `open`。temporary state publication 子项已关闭；唯一
+  Heap/service owner、其余生产 publication、debug/protected-helper 跨
+  state、Lua-visible close 与 lifecycle 验收全部完成前保持开放。
 
 ### NOTE-010: Lua 字符串 intern hash 选择固定 C++ 的前向采样
 

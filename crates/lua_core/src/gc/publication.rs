@@ -10,12 +10,16 @@
 use std::fmt;
 use std::marker::PhantomData;
 
+use crate::function::{Function, RuntimeNativeFunction};
 use crate::gc::collector::{GarbageCollector, GcRefValidationError};
 use crate::gc::gc_object::GcObject;
 use crate::gc::gc_ref::GcRef;
 #[cfg(test)]
 use crate::gc::mark::MarkRootSeedReport;
 use crate::gc::object_id::ObjectId;
+use crate::thread::Thread;
+use crate::upvalue::Upvalue;
+use crate::value::Value;
 
 /// A collector-managed object protected for one publication transaction.
 ///
@@ -154,6 +158,118 @@ impl<'scope> PublicationTxn<'scope> {
         self.collector.add_root(rooted.reference);
         self.release_owned_root(rooted.temporary_root_id);
         Ok(rooted.reference)
+    }
+
+    /// Build a protected closed Upvalue that owns a protected Thread value.
+    ///
+    /// Both nodes remain temporary roots until their transaction-owned
+    /// handles are either published or the transaction ends.
+    pub fn alloc_closed_thread_upvalue(
+        &mut self,
+        thread: &Rooted<'scope, Thread>,
+    ) -> Result<Rooted<'scope, Upvalue>, GcRefValidationError> {
+        self.validate_protection(thread)?;
+        Ok(self.alloc(Upvalue::new_closed(Value::Thread(thread.reference))))
+    }
+
+    /// Build a protected Runtime-native closure around a protected Upvalue.
+    pub fn alloc_runtime_native_with_upvalue(
+        &mut self,
+        operation: RuntimeNativeFunction,
+        upvalue: &Rooted<'scope, Upvalue>,
+    ) -> Result<Rooted<'scope, Function>, GcRefValidationError> {
+        self.validate_protection(upvalue)?;
+        let mut function = Function::new_runtime_native(operation);
+        function.add_upvalue(upvalue.reference);
+        Ok(self.alloc(function))
+    }
+
+    /// Check that a protected Function retains a protected Thread through one
+    /// of its closed Upvalues.
+    pub fn function_reaches_thread(
+        &self,
+        function: &Rooted<'scope, Function>,
+        thread: &Rooted<'scope, Thread>,
+    ) -> Result<bool, GcRefValidationError> {
+        self.validate_protection(function)?;
+        self.validate_protection(thread)?;
+        self.function_reaches_thread_object_id(function, thread.object_id())
+    }
+
+    /// Check that a protected Function retains the live Thread with an exact
+    /// object identity through one of its closed Upvalues.
+    ///
+    /// This variant supports the handoff from an object temporary root to a
+    /// PendingState root without re-exposing the Thread's raw `GcRef`.
+    pub fn function_reaches_thread_object_id(
+        &self,
+        function: &Rooted<'scope, Function>,
+        thread_id: ObjectId,
+    ) -> Result<bool, GcRefValidationError> {
+        self.validate_protection(function)?;
+        let upvalues = self.collector.with_ref(function.reference, |function| {
+            (0..function.upvalue_count())
+                .filter_map(|index| function.upvalue(index))
+                .collect::<Vec<_>>()
+        })?;
+        for upvalue in upvalues {
+            let reaches = self.collector.with_ref(upvalue, |upvalue| {
+                upvalue.is_closed()
+                    && matches!(
+                        upvalue.get_closed_value(),
+                        Value::Thread(candidate) if candidate.object_id() == thread_id
+                    )
+            })?;
+            if reaches {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Publish a protected Thread value while its temporary root remains
+    /// installed for the entire callback.
+    ///
+    /// If the callback unwinds, transaction Drop retains responsibility for
+    /// removing the temporary root. On normal return the callback must have
+    /// installed the supplied value into a traced owner before this method
+    /// releases the temporary identity.
+    ///
+    /// # Safety
+    ///
+    /// On normal return, `publish` must either install the supplied Value in
+    /// an independently traced owner or consume it synchronously. It must not
+    /// let the embedded `GcRef` escape only through an unrooted local or
+    /// return value.
+    pub unsafe fn publish_thread_value<R>(
+        &mut self,
+        rooted: Rooted<'scope, Thread>,
+        publish: impl FnOnce(Value) -> R,
+    ) -> Result<R, GcRefValidationError> {
+        self.validate_protection(&rooted)?;
+        let result = publish(Value::Thread(rooted.reference));
+        self.release_owned_root(rooted.temporary_root_id);
+        Ok(result)
+    }
+
+    /// Publish a protected Function value while its temporary root remains
+    /// installed for the entire callback.
+    ///
+    /// # Safety
+    ///
+    /// On normal return, `publish` must either install the supplied Value in
+    /// an independently traced owner or consume it synchronously. It must not
+    /// let the embedded `GcRef` escape only through an unrooted local or
+    /// return value.
+    pub unsafe fn publish_function_value<R>(
+        &mut self,
+        rooted: Rooted<'scope, Function>,
+        publish: impl FnOnce(Value) -> R,
+    ) -> Result<R, GcRefValidationError> {
+        self.validate_protection(&rooted)?;
+        let result = publish(Value::Function(rooted.reference));
+        self.release_owned_root(rooted.temporary_root_id);
+        Ok(result)
     }
 
     /// Run a nested publication transaction while retaining all outer roots.
@@ -339,6 +455,75 @@ mod tests {
         assert_eq!(collector.temporary_root_count(), 0);
         assert!(collector.is_root(published));
         assert!(collector.contains_registered(published));
+    }
+
+    #[test]
+    fn typed_coroutine_wrapper_graph_stays_rooted_through_publication() {
+        let mut collector = GarbageCollector::new();
+        let mut published_function_seen = false;
+
+        collector.with_publication(|transaction| {
+            let thread = transaction.alloc(Thread::new());
+            let upvalue = transaction
+                .alloc_closed_thread_upvalue(&thread)
+                .expect("protected Thread builds a protected Upvalue");
+            let wrapper = transaction
+                .alloc_runtime_native_with_upvalue(
+                    RuntimeNativeFunction::CoroutineWrapRunner,
+                    &upvalue,
+                )
+                .expect("protected Upvalue builds a protected wrapper");
+
+            assert_eq!(transaction.active_temporary_root_count(), 3);
+            assert!(
+                transaction
+                    .function_reaches_thread(&wrapper, &thread)
+                    .expect("the protected wrapper graph validates")
+            );
+            // SAFETY: the callback inspects the Value synchronously and does
+            // not let its embedded GcRef escape.
+            unsafe {
+                transaction.publish_function_value(wrapper, |value| {
+                    assert_eq!(transaction_root_kind(&value), "function");
+                    published_function_seen = true;
+                })
+            }
+            .expect("wrapper publication remains checked");
+            assert_eq!(transaction.active_temporary_root_count(), 2);
+        });
+
+        assert!(published_function_seen);
+        assert_eq!(collector.temporary_root_count(), 0);
+        assert_eq!(collector.rejected_temporary_root_release_count(), 0);
+    }
+
+    #[test]
+    fn typed_value_publication_panic_releases_exact_root() {
+        let mut collector = GarbageCollector::new();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            collector.with_publication(|transaction| {
+                let thread = transaction.alloc(Thread::new());
+                // SAFETY: the callback never returns normally, so transaction
+                // Drop retains and then removes the exact root.
+                unsafe {
+                    transaction.publish_thread_value(thread, |_| {
+                        panic!("injected stack publication failure");
+                    })
+                }
+                .expect("panic occurs inside the publication callback");
+            });
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(collector.temporary_root_count(), 0);
+        assert_eq!(collector.rejected_temporary_root_release_count(), 0);
+    }
+
+    fn transaction_root_kind(value: &Value) -> &'static str {
+        match value {
+            Value::Function(_) => "function",
+            _ => "other",
+        }
     }
 
     #[test]

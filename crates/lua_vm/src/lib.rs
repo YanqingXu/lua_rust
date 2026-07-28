@@ -21,7 +21,8 @@ pub use execute::{
 };
 pub use native::{NativeRequestId, UpvalueAccessOperation, UpvalueAccessRequest};
 pub use runtime::{
-    Runtime, RuntimeAccessError, RuntimeCloseReport, RuntimeExecutionError, RuntimeId,
-    RuntimeIdExhausted, RuntimePartsMut, RuntimePhase, StateArena, StateHandle, StateResolveError,
+    PendingState, PendingStateError, Runtime, RuntimeAccessError, RuntimeCloseReport,
+    RuntimeExecutionError, RuntimeId, RuntimeIdExhausted, RuntimePartsMut, RuntimePhase,
+    StateArena, StateHandle, StateResolveError,
 };
 pub use state::{CallInfo, LUA_MULTRET, LuaState, Stack, ThreadStatus};

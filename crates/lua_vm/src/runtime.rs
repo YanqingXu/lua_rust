@@ -28,6 +28,7 @@
 //! `collect`, `sweep`, or the legacy fixed-preserving `clear_all`, and live-VM
 //! destructive collection remains disabled.
 
+use std::collections::HashSet;
 use std::marker::{PhantomData, PhantomPinned};
 use std::num::NonZeroU64;
 use std::pin::Pin;
@@ -35,8 +36,11 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::thread::{self, ThreadId};
 
-use lua_core::gc::collector::GarbageCollector;
+use lua_core::function::Function;
+use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::gc::object_id::ObjectId;
+use lua_core::gc::publication::{PublicationTxn, Rooted};
 use lua_core::proto::Proto;
 use lua_core::state_handle::StateHandleIssuer;
 pub use lua_core::state_handle::{RuntimeId, RuntimeIdExhausted, StateHandle};
@@ -262,6 +266,10 @@ pub struct RuntimeCloseReport {
     pub remaining_estimated_bytes: usize,
     /// Coroutine states still retained after close.
     pub remaining_coroutine_states: usize,
+    /// PendingState roots still retained after close.
+    pub remaining_temporary_state_roots: usize,
+    /// Exact-id PendingState root releases rejected by the arena.
+    pub rejected_temporary_state_root_releases: usize,
     /// Transient gray/weak/finalizer/external collector queue entries.
     pub remaining_collector_queue_entries: usize,
     /// Coroutine states drained and generation-invalidated by the first close.
@@ -388,12 +396,42 @@ pub enum StateResolveError {
     },
 }
 
+/// Failure while publishing one Runtime-owned coroutine state.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum PendingStateError {
+    /// The arena rejected the pending state's checked handle.
+    #[error(transparent)]
+    State(#[from] StateResolveError),
+    /// The collector rejected a Thread or Function publication edge.
+    #[error(transparent)]
+    Object(#[from] GcRefValidationError),
+    /// The pending root identity no longer names this state.
+    #[error("pending state root no longer names its arena slot")]
+    RootMismatch,
+    /// A pending state was bound to a different Thread.
+    #[error("pending state is already bound to a different Thread")]
+    ThreadMismatch,
+    /// Publication was attempted before both State→Thread and Thread→State
+    /// edges were installed.
+    #[error("pending state has not completed its checked Thread binding")]
+    ThreadNotBound,
+    /// A wrapper publication did not retain the bound Thread through its
+    /// closed Upvalue graph.
+    #[error("published coroutine wrapper does not retain the pending Thread")]
+    WrapperThreadMismatch,
+    /// Stack publication targeted a different LuaState than the transaction
+    /// that created this PendingState.
+    #[error("pending state publication targeted a different LuaState")]
+    PublisherMismatch,
+}
+
 struct StateSlot {
     generation: u64,
     state: Option<NonNull<LuaState>>,
     owned: bool,
     borrowed: bool,
     retired: bool,
+    temporary_root_id: Option<u64>,
 }
 
 /// Runtime-owned generational arena for Lua coroutine states.
@@ -407,6 +445,8 @@ pub struct StateArena {
     slots: Vec<StateSlot>,
     free_slots: Vec<usize>,
     live_owned_states: usize,
+    next_temporary_root_id: u64,
+    rejected_temporary_root_releases: usize,
     turn_borrow: Option<StateHandle>,
     #[cfg(test)]
     turn_borrow_events: Vec<TurnBorrowEvent>,
@@ -434,6 +474,8 @@ impl StateArena {
             slots: Vec::new(),
             free_slots: Vec::new(),
             live_owned_states: 0,
+            next_temporary_root_id: 1,
+            rejected_temporary_root_releases: 0,
             turn_borrow: None,
             #[cfg(test)]
             turn_borrow_events: Vec::new(),
@@ -451,7 +493,11 @@ impl StateArena {
             match self.free_slots.pop() {
                 Some(slot_index)
                     if self.slots.get(slot_index).is_some_and(|slot| {
-                        !slot.retired && slot.state.is_none() && !slot.owned && !slot.borrowed
+                        !slot.retired
+                            && slot.state.is_none()
+                            && !slot.owned
+                            && !slot.borrowed
+                            && slot.temporary_root_id.is_none()
                     }) =>
                 {
                     break slot_index;
@@ -468,6 +514,7 @@ impl StateArena {
                         owned: false,
                         borrowed: false,
                         retired: false,
+                        temporary_root_id: None,
                     });
                     break self.slots.len() - 1;
                 }
@@ -490,7 +537,39 @@ impl StateArena {
         handle
     }
 
-    fn insert_owned(&mut self, mut state: Box<LuaState>) -> StateHandle {
+    #[cfg(test)]
+    fn insert_owned(&mut self, state: Box<LuaState>) -> StateHandle {
+        self.insert_owned_with_temporary_root(state, None)
+    }
+
+    fn insert_pending_owned(
+        &mut self,
+        state: Box<LuaState>,
+    ) -> Result<(StateHandle, u64), StateResolveError> {
+        if state.state_handle.is_some()
+            || state.state_arena.is_some()
+            || !state.open_upvalues.is_empty()
+        {
+            return Err(StateResolveError::ArenaInvariant {
+                reason: "pending state must be detached and have no open Upvalues",
+            });
+        }
+        let temporary_root_id = self.next_temporary_root_id;
+        self.next_temporary_root_id =
+            temporary_root_id
+                .checked_add(1)
+                .ok_or(StateResolveError::ArenaInvariant {
+                    reason: "temporary state-root identity space exhausted",
+                })?;
+        let handle = self.insert_owned_with_temporary_root(state, Some(temporary_root_id));
+        Ok((handle, temporary_root_id))
+    }
+
+    fn insert_owned_with_temporary_root(
+        &mut self,
+        mut state: Box<LuaState>,
+        temporary_root_id: Option<u64>,
+    ) -> StateHandle {
         let next_live_owned_states = self
             .live_owned_states
             .checked_add(1)
@@ -504,8 +583,115 @@ impl StateArena {
         let slot = &mut self.slots[handle.slot()];
         slot.state = Some(state);
         slot.owned = true;
+        slot.temporary_root_id = temporary_root_id;
         self.live_owned_states = next_live_owned_states;
         handle
+    }
+
+    fn validate_pending(
+        &self,
+        handle: StateHandle,
+        temporary_root_id: u64,
+    ) -> Result<(usize, NonNull<LuaState>), PendingStateError> {
+        let (slot_index, state) = self.validate(handle)?;
+        let slot = &self.slots[slot_index];
+        if !slot.owned || slot.temporary_root_id != Some(temporary_root_id) {
+            return Err(PendingStateError::RootMismatch);
+        }
+        Ok((slot_index, state))
+    }
+
+    fn bind_pending_thread(
+        &mut self,
+        handle: StateHandle,
+        temporary_root_id: u64,
+        thread: GcRef<Thread>,
+    ) -> Result<(), PendingStateError> {
+        let (_, mut state) = self.validate_pending(handle, temporary_root_id)?;
+        // SAFETY: the pending root exclusively owns this unpublished child;
+        // it is not borrowable through a Thread until the reverse edge below
+        // is installed, and Runtime execution is single-threaded.
+        let state = unsafe { state.as_mut() };
+        if state
+            .current_thread
+            .is_some_and(|current| current != thread)
+        {
+            return Err(PendingStateError::ThreadMismatch);
+        }
+        state.current_thread = Some(thread);
+        Ok(())
+    }
+
+    fn pending_thread(
+        &self,
+        handle: StateHandle,
+        temporary_root_id: u64,
+        thread_id: ObjectId,
+    ) -> Result<GcRef<Thread>, PendingStateError> {
+        let (_, state) = self.validate_pending(handle, temporary_root_id)?;
+        // SAFETY: validation proved this is the occupied pending slot. This
+        // immutable identity read cannot escape the PendingState operation.
+        let state = unsafe { state.as_ref() };
+        let thread = state
+            .current_thread
+            .ok_or(PendingStateError::ThreadNotBound)?;
+        if thread.object_id() != thread_id {
+            return Err(PendingStateError::ThreadMismatch);
+        }
+        Ok(thread)
+    }
+
+    fn commit_pending(
+        &mut self,
+        handle: StateHandle,
+        temporary_root_id: u64,
+    ) -> Result<(), PendingStateError> {
+        let (slot_index, _) = self.validate_pending(handle, temporary_root_id)?;
+        self.slots[slot_index].temporary_root_id = None;
+        Ok(())
+    }
+
+    fn rollback_pending(
+        &mut self,
+        handle: StateHandle,
+        temporary_root_id: u64,
+    ) -> Result<(), PendingStateError> {
+        let (slot_index, state) = self.validate_pending(handle, temporary_root_id)?;
+        if self.slots[slot_index].borrowed {
+            return Err(StateResolveError::AlreadyBorrowed {
+                slot: slot_index,
+                generation: handle.generation(),
+            }
+            .into());
+        }
+        let next_live_owned_states = self
+            .live_owned_states
+            .checked_sub(1)
+            .expect("pending owned slot requires a positive live count");
+        self.vacate_slot(slot_index);
+        self.live_owned_states = next_live_owned_states;
+        // SAFETY: pending slots originate from one Box::into_raw and have just
+        // been made vacant without ever transferring ownership elsewhere.
+        unsafe {
+            drop(Box::from_raw(state.as_ptr()));
+        }
+        Ok(())
+    }
+
+    fn temporary_state_roots(&self) -> Vec<StateHandle> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.temporary_root_id.is_some() && slot.state.is_some())
+            .map(|(slot_index, _)| self.issue_handle(slot_index))
+            .collect()
+    }
+
+    fn temporary_state_root_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.temporary_root_id.is_some())
+            .count()
     }
 
     fn validate(
@@ -848,6 +1034,7 @@ impl StateArena {
     }
 
     fn validate_internal_invariants(&self) -> Result<(), StateResolveError> {
+        let mut temporary_root_ids = HashSet::new();
         for &slot_index in &self.free_slots {
             if slot_index >= self.slots.len() {
                 return Err(StateResolveError::ArenaInvariant {
@@ -879,6 +1066,7 @@ impl StateArena {
                 if slot.state.is_some()
                     || slot.owned
                     || slot.borrowed
+                    || slot.temporary_root_id.is_some()
                     || free_entries != 0
                     || slot.generation != u64::MAX
                 {
@@ -903,9 +1091,25 @@ impl StateArena {
                             },
                         )?;
                     }
+                    if let Some(temporary_root_id) = slot.temporary_root_id {
+                        if !slot.owned {
+                            return Err(StateResolveError::ArenaInvariant {
+                                reason: "temporary state root names an external slot",
+                            });
+                        }
+                        if temporary_root_id == 0 || !temporary_root_ids.insert(temporary_root_id) {
+                            return Err(StateResolveError::ArenaInvariant {
+                                reason: "temporary state-root identity is zero or duplicated",
+                            });
+                        }
+                    }
                 }
                 None => {
-                    if slot.owned || slot.borrowed || free_entries != 1 {
+                    if slot.owned
+                        || slot.borrowed
+                        || slot.temporary_root_id.is_some()
+                        || free_entries != 1
+                    {
                         return Err(StateResolveError::ArenaInvariant {
                             reason: "vacant reusable slot has invalid flags or free-list count",
                         });
@@ -968,6 +1172,7 @@ impl StateArena {
         slot.state = None;
         slot.owned = false;
         slot.borrowed = false;
+        slot.temporary_root_id = None;
         if retires {
             slot.retired = true;
         } else {
@@ -999,8 +1204,152 @@ impl Drop for StateArena {
                 }
             }
             slot.borrowed = false;
+            slot.temporary_root_id = None;
         }
         self.live_owned_states = 0;
+    }
+}
+
+/// Branded owner of one not-yet-published coroutine state.
+///
+/// The state is a canonical temporary root while this guard is live. Dropping
+/// an uncommitted guard removes the arena slot, advances or retires its
+/// generation exactly once, and drops the unpublished state allocation.
+pub struct PendingState<'scope> {
+    arena: NonNull<StateArena>,
+    publisher: NonNull<LuaState>,
+    handle: StateHandle,
+    temporary_root_id: u64,
+    bound_thread: Option<ObjectId>,
+    committed: bool,
+    _scope: PhantomData<&'scope mut ()>,
+}
+
+impl PendingState<'_> {
+    /// Install and validate the bidirectional State↔Thread edge while the
+    /// Thread remains protected by its object-publication transaction.
+    pub fn bind_thread<'publication>(
+        &mut self,
+        transaction: &mut PublicationTxn<'publication>,
+        thread: Rooted<'publication, Thread>,
+    ) -> Result<(), PendingStateError> {
+        let thread_id = thread.object_id();
+        transaction.with_mut(&thread, |thread| {
+            thread.set_state_handle(self.handle);
+        })?;
+        let mut arena = self.arena;
+        // SAFETY: the callback installs the Thread in a canonical pending
+        // state root before the object temporary root is released.
+        unsafe {
+            transaction.publish_thread_value(thread, |value| {
+                let Value::Thread(thread_ref) = value else {
+                    unreachable!("typed Thread publication produced another Value kind");
+                };
+                // SAFETY: PendingState is created only from this pinned arena
+                // and remains the unique owner of the unpublished slot.
+                arena
+                    .as_mut()
+                    .bind_pending_thread(self.handle, self.temporary_root_id, thread_ref)
+            })
+        }??;
+        self.bound_thread = Some(thread_id);
+        Ok(())
+    }
+
+    /// Publish the bound Thread directly into a Lua stack and atomically
+    /// release the temporary state root.
+    pub fn publish_thread_to_stack(
+        &mut self,
+        publisher: &mut LuaState,
+    ) -> Result<StateHandle, PendingStateError> {
+        self.validate_publisher(publisher)?;
+        let thread_id = self.bound_thread.ok_or(PendingStateError::ThreadNotBound)?;
+        let arena = self.arena;
+        // SAFETY: the branded guard's pinned arena is live for this callback.
+        let thread = unsafe { arena.as_ref() }.pending_thread(
+            self.handle,
+            self.temporary_root_id,
+            thread_id,
+        )?;
+        let original_top = publisher.top;
+        publisher.push_value(Value::Thread(thread));
+        let commit = self.commit();
+        if commit.is_err() {
+            publisher.stack.set_top(original_top);
+            publisher.top = original_top;
+        }
+        commit
+    }
+
+    /// Publish a protected wrapper Function that retains the bound Thread
+    /// through a closed Upvalue, then atomically release the temporary state
+    /// root.
+    pub fn publish_wrapper_to_stack<'publication>(
+        &mut self,
+        transaction: &mut PublicationTxn<'publication>,
+        wrapper: Rooted<'publication, Function>,
+        publisher: &mut LuaState,
+    ) -> Result<StateHandle, PendingStateError> {
+        self.validate_publisher(publisher)?;
+        let thread_id = self.bound_thread.ok_or(PendingStateError::ThreadNotBound)?;
+        let arena = self.arena;
+        // SAFETY: the branded guard's pinned arena is live for this callback.
+        unsafe { arena.as_ref() }.pending_thread(self.handle, self.temporary_root_id, thread_id)?;
+        if !transaction.function_reaches_thread_object_id(&wrapper, thread_id)? {
+            return Err(PendingStateError::WrapperThreadMismatch);
+        }
+        let original_top = publisher.top;
+        // SAFETY: the exact publisher stack is a canonical Runtime root. The
+        // callback writes the Function before committing the state root.
+        let commit = unsafe {
+            transaction.publish_function_value(wrapper, |value| {
+                publisher.push_value(value);
+                self.commit()
+            })
+        }?;
+        if commit.is_err() {
+            publisher.stack.set_top(original_top);
+            publisher.top = original_top;
+        }
+        commit
+    }
+
+    fn validate_publisher(&self, publisher: &mut LuaState) -> Result<(), PendingStateError> {
+        if NonNull::from(publisher) != self.publisher {
+            return Err(PendingStateError::PublisherMismatch);
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<StateHandle, PendingStateError> {
+        let mut arena = self.arena;
+        // SAFETY: the lexical guard is the only capability that can commit
+        // this exact temporary-root identity.
+        unsafe { arena.as_mut() }.commit_pending(self.handle, self.temporary_root_id)?;
+        self.committed = true;
+        Ok(self.handle)
+    }
+}
+
+impl Drop for PendingState<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut arena = self.arena;
+        // SAFETY: PendingState cannot outlive the Runtime-owned pinned arena;
+        // an uncommitted guard still uniquely owns this unpublished slot.
+        if unsafe { arena.as_mut() }
+            .rollback_pending(self.handle, self.temporary_root_id)
+            .is_err()
+        {
+            // Fail closed: never guess another slot/root identity during
+            // unwind. Shutdown will still drain any retained owned state.
+            // SAFETY: same pinned-arena lifetime as above.
+            let arena = unsafe { arena.as_mut() };
+            arena.rejected_temporary_root_releases =
+                arena.rejected_temporary_root_releases.saturating_add(1);
+        }
     }
 }
 
@@ -1055,7 +1404,8 @@ impl LuaState {
     ///
     /// Standalone `LuaState` values are intentionally rejected: coroutine
     /// states require a Runtime owner so their allocation cannot leak.
-    pub fn insert_coroutine_state(
+    #[cfg(test)]
+    pub(crate) fn insert_coroutine_state(
         &mut self,
         state: LuaState,
     ) -> Result<StateHandle, StateResolveError> {
@@ -1066,6 +1416,56 @@ impl LuaState {
         // The current LuaState is alive for this call, so the Runtime and arena
         // cannot be dropped while the child Box is transferred.
         Ok(unsafe { arena.as_mut() }.insert_owned(Box::new(state)))
+    }
+
+    /// Execute one branded coroutine-state publication transaction.
+    ///
+    /// The inserted child is independently traced through
+    /// `TEMPORARY_STATE_ROOTS` until the callback publishes a checked
+    /// State↔Thread graph and commits it. Returning or unwinding without a
+    /// commit rolls the arena slot back.
+    pub fn with_pending_coroutine_state<R>(
+        &mut self,
+        state: LuaState,
+        publish: impl for<'scope> FnOnce(&mut PendingState<'scope>, &mut LuaState) -> R,
+    ) -> Result<R, StateResolveError> {
+        let mut arena = self
+            .state_arena
+            .ok_or(StateResolveError::ArenaUnavailable)?;
+        // SAFETY: Runtime installs only its pinned StateArena pointer. The
+        // branded guard is dropped before this method returns or unwinds.
+        let (handle, temporary_root_id) =
+            unsafe { arena.as_mut() }.insert_pending_owned(Box::new(state))?;
+        let mut pending = PendingState {
+            arena,
+            publisher: NonNull::from(&mut *self),
+            handle,
+            temporary_root_id,
+            bound_thread: None,
+            committed: false,
+            _scope: PhantomData,
+        };
+        Ok(publish(&mut pending, self))
+    }
+
+    /// Number of lexical temporary state roots in this Runtime arena.
+    pub fn temporary_state_root_count(&self) -> usize {
+        let Some(arena) = self.state_arena else {
+            return 0;
+        };
+        // SAFETY: StateArena is pinned and this shared diagnostic does not
+        // create a LuaState reference or mutate arena state.
+        unsafe { arena.as_ref() }.temporary_state_root_count()
+    }
+
+    /// Number of temporary state-root release mismatches observed by this
+    /// Runtime arena.
+    pub fn rejected_temporary_state_root_release_count(&self) -> usize {
+        let Some(arena) = self.state_arena else {
+            return 0;
+        };
+        // SAFETY: same pinned shared diagnostic invariant as above.
+        unsafe { arena.as_ref() }.rejected_temporary_root_releases
     }
 
     /// Resolve another state and confine its mutable reference to `f`.
@@ -1233,6 +1633,24 @@ impl Runtime {
             .get_ref()
             .state_arena
             .live_owned_state_count()
+    }
+
+    /// Return active lexical temporary state roots.
+    pub fn temporary_state_root_count(&self) -> usize {
+        self.heap
+            .as_ref()
+            .get_ref()
+            .state_arena
+            .temporary_state_root_count()
+    }
+
+    /// Return rejected exact-id temporary state-root releases.
+    pub fn rejected_temporary_state_root_release_count(&self) -> usize {
+        self.heap
+            .as_ref()
+            .get_ref()
+            .state_arena
+            .rejected_temporary_root_releases
     }
 
     /// Verify that the caller is executing on the owning thread.
@@ -1810,6 +2228,7 @@ impl Runtime {
         let heap = self.heap.as_ref().get_ref();
         let remaining_objects = heap.gc.object_count();
         let remaining_coroutine_states = heap.state_arena.live_owned_state_count();
+        let remaining_temporary_state_roots = heap.state_arena.temporary_state_root_count();
         let remaining_collector_queue_entries = heap.gc.transient_queue_entry_count();
         let summary = self.shutdown_summary.unwrap_or_default();
         RuntimeCloseReport {
@@ -1819,12 +2238,17 @@ impl Runtime {
                 || heap.gc.root_count() != 0
                 || !heap.string_pool.is_empty()
                 || remaining_coroutine_states != 0
+                || remaining_temporary_state_roots != 0
                 || remaining_collector_queue_entries != 0,
             remaining_objects,
             remaining_roots: heap.gc.root_count(),
             remaining_interned_strings: heap.string_pool.len(),
             remaining_estimated_bytes: heap.gc.total_memory(),
             remaining_coroutine_states,
+            remaining_temporary_state_roots,
+            rejected_temporary_state_root_releases: heap
+                .state_arena
+                .rejected_temporary_root_releases,
             remaining_collector_queue_entries,
             drained_coroutine_states: summary.drained_coroutine_states,
             closed_open_upvalues: summary.state_shutdown.closed_open_upvalues,
@@ -2418,6 +2842,166 @@ mod tests {
     }
 
     #[test]
+    fn pending_state_rolls_back_or_publishes_atomically() {
+        let mut runtime = Runtime::new();
+        let baseline_states = runtime.live_coroutine_state_count();
+
+        let allocation_unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (_, gc, _) = parts.split_mut();
+            gc.with_publication(|transaction| {
+                let _thread = transaction.alloc(Thread::new());
+                assert_eq!(transaction.active_temporary_root_count(), 1);
+                panic!("injected failure after Thread allocation");
+            });
+        }));
+        assert!(allocation_unwind.is_err());
+        assert_eq!(runtime.heap.as_ref().get_ref().gc.temporary_root_count(), 0);
+        assert_eq!(runtime.live_coroutine_state_count(), baseline_states);
+
+        let mut inserted_handle = None;
+        let insertion_unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (main, _, _) = parts.split_mut();
+            main.with_pending_coroutine_state(LuaState::new(), |pending, publisher| {
+                inserted_handle = Some(pending.handle);
+                assert_eq!(publisher.temporary_state_root_count(), 1);
+                panic!("injected failure after pending-state insertion");
+            })
+            .expect("pending state can be inserted");
+        }));
+        assert!(insertion_unwind.is_err());
+        let inserted_handle = inserted_handle.expect("pending handle was observed");
+        assert_eq!(runtime.temporary_state_root_count(), 0);
+        assert_eq!(runtime.live_coroutine_state_count(), baseline_states);
+        assert!(matches!(
+            runtime
+                .heap
+                .as_ref()
+                .get_ref()
+                .state_arena
+                .validate(inserted_handle),
+            Err(StateResolveError::StaleGeneration { .. })
+        ));
+
+        let mut wrong_publisher = LuaState::new();
+        {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (main, _, _) = parts.split_mut();
+            let rejected = main
+                .with_pending_coroutine_state(LuaState::new(), |pending, _| {
+                    pending.publish_thread_to_stack(&mut wrong_publisher)
+                })
+                .expect("pending state can be inserted");
+            assert!(matches!(
+                rejected,
+                Err(PendingStateError::PublisherMismatch)
+            ));
+        }
+        assert_eq!(runtime.temporary_state_root_count(), 0);
+        assert_eq!(runtime.live_coroutine_state_count(), baseline_states);
+
+        let mut bound_handle = None;
+        let binding_unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (main, gc, _) = parts.split_mut();
+            gc.with_publication(|transaction| {
+                let thread = transaction.alloc(Thread::new());
+                main.with_pending_coroutine_state(LuaState::new(), |pending, publisher| {
+                    pending
+                        .bind_thread(transaction, thread)
+                        .expect("both State↔Thread edges bind");
+                    bound_handle = Some(pending.handle);
+                    assert_eq!(publisher.temporary_state_root_count(), 1);
+                    assert_eq!(transaction.active_temporary_root_count(), 0);
+                    // SAFETY: this test is inside the branded PendingState
+                    // callback, so its pinned arena and exact slot remain live.
+                    let (_, state) = unsafe { pending.arena.as_ref() }
+                        .validate_pending(pending.handle, pending.temporary_root_id)
+                        .expect("pending slot remains exact");
+                    // SAFETY: the pending root owns this unpublished state for
+                    // the lexical callback.
+                    let thread_ref = unsafe { state.as_ref() }
+                        .current_thread
+                        .expect("State→Thread edge is installed");
+                    assert_eq!(Some(thread_ref.object_id()), pending.bound_thread);
+                    let protected = transaction
+                        .protect(thread_ref)
+                        .expect("the State edge names a live Thread");
+                    assert_eq!(
+                        transaction
+                            .with_ref(&protected, Thread::state_handle)
+                            .expect("protected Thread remains valid"),
+                        Some(pending.handle)
+                    );
+                    panic!("injected failure after State↔Thread binding");
+                })
+                .expect("pending state can be inserted");
+            });
+        }));
+        assert!(binding_unwind.is_err());
+        let bound_handle = bound_handle.expect("bound handle was observed");
+        assert_eq!(runtime.temporary_state_root_count(), 0);
+        assert_eq!(runtime.heap.as_ref().get_ref().gc.temporary_root_count(), 0);
+        assert_eq!(runtime.live_coroutine_state_count(), baseline_states);
+        assert!(matches!(
+            runtime
+                .heap
+                .as_ref()
+                .get_ref()
+                .state_arena
+                .validate(bound_handle),
+            Err(StateResolveError::StaleGeneration { .. })
+        ));
+
+        let published_handle = {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (main, gc, _) = parts.split_mut();
+            gc.with_publication(|transaction| {
+                let thread = transaction.alloc(Thread::new());
+                main.with_pending_coroutine_state(LuaState::new(), |pending, publisher| {
+                    pending
+                        .bind_thread(transaction, thread)
+                        .expect("both State↔Thread edges bind");
+                    pending.publish_thread_to_stack(publisher)
+                })
+                .expect("pending state can be inserted")
+                .expect("bound Thread publishes to the stack")
+            })
+        };
+
+        assert_eq!(runtime.temporary_state_root_count(), 0);
+        assert_eq!(runtime.heap.as_ref().get_ref().gc.temporary_root_count(), 0);
+        assert_eq!(runtime.live_coroutine_state_count(), baseline_states + 1);
+        assert_eq!(runtime.rejected_temporary_state_root_release_count(), 0);
+        assert_eq!(
+            runtime
+                .heap
+                .as_ref()
+                .get_ref()
+                .gc
+                .rejected_temporary_root_release_count(),
+            0
+        );
+
+        let mut parts = runtime.parts_mut().expect("parts are available");
+        let (main, gc, _) = parts.split_mut();
+        let thread = match main.stack.top_value().cloned() {
+            Some(Value::Thread(thread)) => thread,
+            other => panic!("published stack value was not a Thread: {other:?}"),
+        };
+        assert_eq!(
+            gc.with_ref(thread, Thread::state_handle)
+                .expect("published Thread remains registered"),
+            Some(published_handle)
+        );
+        main.with_resolved_state_mut(published_handle, |state| {
+            assert_eq!(state.current_thread, Some(thread));
+        })
+        .expect("published state resolves through its checked handle");
+    }
+
+    #[test]
     fn state_open_upvalues_are_unique_owned_and_sorted_by_descending_stack_index() {
         let mut runtime = Runtime::new();
         let (owner, low, middle, high, duplicate_high) = {
@@ -2717,6 +3301,8 @@ mod tests {
         assert_eq!(first.remaining_interned_strings, 0);
         assert_eq!(first.remaining_estimated_bytes, 0);
         assert_eq!(first.remaining_coroutine_states, 0);
+        assert_eq!(first.remaining_temporary_state_roots, 0);
+        assert_eq!(first.rejected_temporary_state_root_releases, 0);
         assert_eq!(first.remaining_collector_queue_entries, 0);
         assert!(first.destroyed_objects >= 2);
         assert!(first.lua_gc_callback_debt);
@@ -2736,6 +3322,8 @@ mod tests {
         );
         assert_eq!(second.remaining_objects, 0);
         assert_eq!(second.remaining_estimated_bytes, 0);
+        assert_eq!(second.remaining_temporary_state_roots, 0);
+        assert_eq!(second.rejected_temporary_state_root_releases, 0);
         assert!(!second.heap_reclamation_deferred);
         assert!(matches!(
             runtime.parts_mut(),
@@ -2949,6 +3537,65 @@ mod tests {
     }
 
     #[test]
+    fn pending_state_rollback_retires_generation_max_exactly_once() {
+        let issuer =
+            StateHandleIssuer::try_new().expect("test runtime namespace should be available");
+        let mut arena = StateArena::new(issuer);
+        let reusable = arena.insert_owned(Box::new(LuaState::new()));
+        arena
+            .remove_owned(reusable)
+            .expect("test slot becomes reusable");
+        let slot_index = reusable.slot();
+        arena.slots[slot_index].generation = u64::MAX;
+
+        let (handle, temporary_root_id) = arena
+            .insert_pending_owned(Box::new(LuaState::new()))
+            .expect("final generation can host one pending state");
+        assert_eq!(handle.slot(), slot_index);
+        assert_eq!(handle.generation(), u64::MAX);
+        assert_eq!(arena.temporary_state_root_count(), 1);
+        assert!(matches!(
+            arena.rollback_pending(handle, temporary_root_id + 1),
+            Err(PendingStateError::RootMismatch)
+        ));
+        assert_eq!(arena.temporary_state_root_count(), 1);
+        assert_eq!(arena.live_owned_state_count(), 1);
+
+        let arena_ptr = NonNull::from(&mut arena);
+        {
+            let mut publisher = LuaState::new();
+            let _pending = PendingState {
+                arena: arena_ptr,
+                publisher: NonNull::from(&mut publisher),
+                handle,
+                temporary_root_id,
+                bound_thread: None,
+                committed: false,
+                _scope: PhantomData,
+            };
+        }
+
+        let slot = &arena.slots[slot_index];
+        assert!(slot.retired);
+        assert_eq!(slot.generation, u64::MAX);
+        assert!(slot.state.is_none());
+        assert!(!arena.free_slots.contains(&slot_index));
+        assert_eq!(arena.temporary_state_root_count(), 0);
+        assert_eq!(arena.live_owned_state_count(), 0);
+        assert_eq!(arena.rejected_temporary_root_releases, 0);
+        assert!(matches!(
+            arena.validate(handle),
+            Err(StateResolveError::RetiredSlot {
+                slot,
+                generation: u64::MAX
+            }) if slot == slot_index
+        ));
+
+        let replacement = arena.insert_owned(Box::new(LuaState::new()));
+        assert_ne!(replacement.slot(), slot_index);
+    }
+
+    #[test]
     fn duplicate_or_occupied_free_list_entries_cannot_overwrite_a_live_slot() {
         let issuer =
             StateHandleIssuer::try_new().expect("test runtime namespace should be available");
@@ -3022,6 +3669,8 @@ mod tests {
         let report = runtime.close().expect("runtime closes");
         assert_eq!(report.drained_coroutine_states, 1);
         assert_eq!(report.remaining_coroutine_states, 0);
+        assert_eq!(report.remaining_temporary_state_roots, 0);
+        assert_eq!(report.rejected_temporary_state_root_releases, 0);
         assert_eq!(runtime.live_coroutine_state_count(), 0);
         assert!(matches!(
             runtime
@@ -3249,6 +3898,8 @@ mod tests {
             assert_eq!(report.remaining_interned_strings, 0);
             assert_eq!(report.remaining_estimated_bytes, 0);
             assert_eq!(report.remaining_coroutine_states, 0);
+            assert_eq!(report.remaining_temporary_state_roots, 0);
+            assert_eq!(report.rejected_temporary_state_root_releases, 0);
             assert_eq!(report.remaining_collector_queue_entries, 0);
             assert_eq!(report.drained_coroutine_states, 1);
         }

@@ -49,8 +49,9 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
 - VM 已覆盖函数、闭包、upvalue、vararg、多返回、循环、表、主要 metamethod 和 coroutine。
 - base、math、string、table、io、os、coroutine、debug、package 已有较宽的函数表面。
 - M1.8 shutdown、P1 collector provenance、managed Proto、publication-root
-  基础及 Runtime coroutine activation trampoline 切片完成后，fmt、
-  all-targets Clippy、warning-free rustdoc、`cargo check --workspace --all-targets` 和 745 个
+  基础、`TEMPORARY_STATE_ROOTS/PendingState` 及 Runtime coroutine activation
+  trampoline 切片完成后，fmt、all-targets Clippy、warning-free rustdoc、
+  `cargo check --workspace --all-targets` 和 750 个
   全 workspace Debug tests 已再次通过；远程 CI 不再允许隐式跳过
   security audit。
 - fixture manifest 当前共 131 项：101 个 non-official、24 个 official 和
@@ -73,7 +74,7 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
 | 字符串 | ByteString/GcString/StringPool、编译器和主要宿主边界已迁移 arbitrary bytes；binary chunk、C API 与“所有生产字符串必须 intern”的强制合同仍待后续门槛 | P0 |
 | GC | VM 的 `collectgarbage` 路径不 sweep；`gcinfo/step` 是模拟计数 | P0 |
 | 生命周期 | Runtime/StateArena 已有确定性 state→Thread→ordinary→fixed 销毁与 1000 轮归零测试；关闭期 Lua `__gc`、显式服务 drain、Heap/allocator owner 仍未闭环 | P0 |
-| GC 引用安全 | `GcRef` 已携带进程级不复用 `ObjectId`，collector live table 在解引用前校验地址、身份与类型；managed Proto、checked open-Upvalue owner 与临时对象根基础已落地。`Value::String` 内容 Eq/Hash、临时状态根和未迁移 publication 路径仍阻止 live sweep | P0 |
+| GC 引用安全 | `GcRef` 已携带进程级不复用 `ObjectId`，collector live table 在解引用前校验地址、身份与类型；managed Proto、checked open-Upvalue owner、临时对象根与 `PendingState` 状态根已落地。`Value::String` 内容 Eq/Hash 和未迁移 production publication 路径仍阻止 live sweep | P0 |
 | GC 安全 | table/function/upvalue 等写入路径尚未接入 write barrier | P0 |
 | IO | raw stdin/stdout/stderr、文件/tmpfile 与 scoped userdata access 已通过本地 byte/process 测试；text mode、popen 与显式 shutdown 服务语义仍待 M2/M1.12 | P1 |
 | Bytecode parity | schema v2 已补齐 constant/sub-Proto/function/line/upvalue 证据；原两例 opcode/constant/metadata 已完全一致，各只剩 2 项由固定 C++ printer 不输出 local names 导致的 fail-closed 证据差异。扩展 closure case 仍触发 500 条真实差异上限 | P0 |
@@ -142,7 +143,7 @@ M4 必须建立在 M1 和 M3 的生命周期、allocator 和公开状态合同�
 | 里程碑 | 状态 | 当前证据或入口 |
 |---|---|---|
 | M0 | `completed` | 本地统一 M0 gate 通过，0 hard failure、3 项已登记债务；详见 [M0 收口报告](docs/rust_migration/m0_report.md)。 |
-| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象根基础、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline 与 checked open-Upvalue owner 切片已完成；temporary state roots 和生产 publication 迁移是下一主线。 |
+| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline 与 checked open-Upvalue owner 切片已完成；其余生产 publication 迁移是下一主线。 |
 | M2 | `active-limited` | 原两例 bytecode 指令/常量/metadata 已对齐；C++ local-name 证据缺口、nested Proto 大量差异、88 个 non-official 差异和真实 VM trace 仍开放。 |
 | M3 | `pending` | 等待 M1 的字节表示和生命周期合同稳定。 |
 | M4 | `pending` | 等待 M1/M3 的 runtime、allocator 与公开状态合同。 |
@@ -577,9 +578,9 @@ bytecode parity 差异和真实 VM trace unsupported；它们不会把报告误�
 | M1.2 GcString/StringPool | `completed-local` | 单一 ByteString payload、byte-key interning、0x00–0xff/NUL/invalid UTF-8/identity/hash 测试通过，旧 text API 静态扫描为零。 |
 | M1.3 编译器和宿主边界 | `partial` | lexer/parser/codegen、string/io/package、CLI source 与 chunk name 已迁移并有 raw-byte 双 oracle case；真实 dump/load、未来 C API，以及所有生产 GcString 强制 intern 尚未完成。 |
 | M1.4 Runtime owner | `partial` | pinned RuntimeHeap、owner-thread/phase/active guard、main roots 与 scoped parts 已实现；P1 `ObjectId + live table + checked borrow` 已拒绝 foreign/stale/address-reuse handle，LightUserdata 也已拆型。LuaState 仍保存 transitional GC/StringPool backpointer，尚无统一 Heap/allocator/services owner。 |
-| M1.5 Coroutine state | `partial` | StateArena 独占 coroutine Box；handle identity/generation、retirement 与关闭前 arena 校验已 fail-closed。sealed `RuntimeNativeFunction`、scoped mailbox、独立 VM exit、deferred C frame、Runtime activation/upvalue transfer stack、rooted transfer seed 和 generic-for continuation 已接入生产 resume/wrap。open Upvalue 现为 `StateHandle + stack index`，远端 GET/SET 通过 Runtime 单-state turns 访问，state drain 在 generation advance/retirement 前关闭节点；reachable Upvalue 也会入队 owner state。精确 C++ `A→B→A` `Normal` 祖先 continuation、protected `pcall`、wrap yield/error 和 suspended-coroutine closure 读写均有回归。main state 仍是 external arena slot，debug/protected-helper 跨 state open-Upvalue、深链/完整 fault 矩阵仍开放。 |
+| M1.5 Coroutine state | `partial` | StateArena 独占 coroutine Box；handle identity/generation、retirement 与关闭前 arena 校验已 fail-closed。`PendingState` 以 exact-id `TEMPORARY_STATE_ROOTS` 保护未发布槽，Drop 回滚并推进/退休 generation；create/wrap 在对象临时根内完成 State↔Thread 双向绑定并仅在直接压栈后提交。sealed `RuntimeNativeFunction`、scoped mailbox、独立 VM exit、deferred C frame、Runtime activation/upvalue transfer stack、rooted transfer seed 和 generic-for continuation 已接入生产 resume/wrap。open Upvalue 现为 `StateHandle + stack index`，远端 GET/SET 通过 Runtime 单-state turns 访问，state drain 在 generation advance/retirement 前关闭节点；reachable Upvalue 也会入队 owner state。精确 C++ `A→B→A` `Normal` 祖先 continuation、protected `pcall`、wrap yield/error 和 suspended-coroutine closure 读写均有回归。main state 仍是 external arena slot，debug/protected-helper 跨 state open-Upvalue、深链/完整 fault 矩阵仍开放。 |
 | M1.6 悬垂 registry | `completed-local` | pseudo dump/source thread-local registry 已删除，`string.dump` 在 M3 serializer 前稳定返回 unsupported。 |
-| M1.7 Root inventory | `partial` | 24/24 inventory schema 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO`、checked `OPEN_UPVALUES` owner、临时对象根 registry 与 `COROUTINE_ACTIVATION_BUFFER` seed 已实现。当前为 21 partial、1 implemented（`OPEN_UPVALUES`）、2 missing（temporary state/fixed strings），无 unsafe 条目；仍禁止 destructive sweep。 |
+| M1.7 Root inventory | `partial` | 24/24 inventory schema 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO`、checked `OPEN_UPVALUES` owner、临时对象根 registry、`TEMPORARY_STATE_ROOTS/PendingState` 与 `COROUTINE_ACTIVATION_BUFFER` seed 已实现。当前为 21 partial、2 implemented（`OPEN_UPVALUES`、`TEMPORARY_STATE_ROOTS`）、1 missing（fixed strings），无 unsafe 条目；仍禁止 destructive sweep。 |
 | M1.8 确定性 shutdown | `partial` | Runtime close/Drop 以 state→非 fixed Thread→其余非 fixed→fixed 顺序释放，object/root/string/queue/state/count 均归零；7 layout、fixed/ordinary DropProbe、open-upvalue close 与 1000 轮耐久测试通过。关闭期 Lua `__gc`、显式 IO/module service drain 和 allocator live bytes 仍是公开 debt。 |
 | M1.9 真实 full collection | `pending` | `collectgarbage("collect")` 仍只做兼容 mark/weak/finalizer 路径，不 sweep。 |
 | M1.10 Incremental GC | `pending` | phase、debt、pause、stepmul 和真实 step 尚未实现。 |
@@ -1220,9 +1221,10 @@ M0 已在本地完成，M1 基础层已推进到 coroutine activation trampoline
    close-before-generation-advance 均已接入；debug/protected-helper 跨
    state 访问仍作为后续矩阵。
 3. lexical temporary-object registry、HRTB `PublicationTxn/Rooted`、panic/nested
-   cleanup 和 mark seed 已完成基础实现。下一步增加 temporary state roots，并
-   迁移 Proto→Function、compiler builder、IO/library graph、VM temporaries和
-   coroutine State→Thread；pending finalizers 与 fixed strings仍须进入
+   cleanup、mark seed 与 `TEMPORARY_STATE_ROOTS/PendingState` 已完成；
+   coroutine create/wrap 的 State→Thread→stack 也已事务化。下一步按
+   Proto→Function、compiler builder、library/package、IO、VM/app/results
+   顺序迁移其余生产 publication；pending finalizers 与 fixed strings 仍须进入
    canonical roots。
 4. 建立唯一 `Heap` owner，移除 LuaState GC/StringPool backpointer 与
    standalone collector/pool 错配，然后实现 Runtime-only、Thread/state
@@ -1252,8 +1254,10 @@ M0 已在本地完成，M1 基础层已推进到 coroutine activation trampoline
   roots；运行时 `*const/*mut Proto` 静态命中为 0，collector tag dispatch
   两处强转除外；
 - deterministic Runtime shutdown 基础和 1,000 轮归零；
-- 临时对象根基础：`PublicationTxn/Rooted`、compile-fail 防逃逸、nested/panic
-  cleanup、mark seed 和 1,000 scope zero；生产路径与临时状态根尚未迁移；
+- 临时对象/状态根：`PublicationTxn/Rooted`、compile-fail 防逃逸、nested/panic
+  cleanup、mark seed、1,000 scope zero，以及 exact-id `PendingState` 的
+  rollback/commit、独立 state root seed 和 coroutine create/wrap 直接压栈发布；
+  其余生产对象图尚未迁移；
 - bytecode schema v2 和首个指令形状切片。证据位于
   `target/compatibility/bytecode-schema-v2-original-two/report.json` 与
   `target/compatibility/bytecode-closure-schema-v2/report.json`（target
@@ -1279,7 +1283,7 @@ M0 已在本地完成，M1 基础层已推进到 coroutine activation trampoline
   Rust process regression 已逐字节匹配固定 C++ 输出；该 manifest 仍是
   non-gating characterization、无 approved deviation，因为 stock Lua 行为
   仍与项目目标不同。
-- 最新验证：fmt/check、745 个 workspace tests、all-targets Clippy、
+- 最新验证：fmt/check、750 个 workspace tests、all-targets Clippy、
   warning-free rustdoc、24/24 root inventory、差分比较器与 parity runner
   自测全部通过；fixture manifest 校验为 131 项；两个 coroutine oracle
   各重复 3 次通过精确字节校验。characterization checker 已同时通过
@@ -1303,13 +1307,16 @@ M0 已在本地完成，M1 基础层已推进到 coroutine activation trampoline
    reachable owner-state 入队、远端 Runtime turn 和
    close-before-generation-advance；debug/protected-helper 跨 state
    行为保留为显式后续矩阵。
-4. 当前第一开发项：实现 `TEMPORARY_STATE_ROOTS/PendingState`；trampoline activation buffer
-   已提供 canonical root seed，但仍须扩展 typed publication API并按
-   compiler → library/package → IO → coroutine → VM/app/results 顺序迁移。
-5. 完成所有生产字符串 canonical interning 或 scoped Eq/Hash，建立唯一 Heap
+4. 已完成 `TEMPORARY_STATE_ROOTS/PendingState`：未发布状态可独立追踪，
+   插入/绑定/压栈故障会 exact-id 回滚，`u64::MAX` 仅退休一次；create/wrap
+   已用 typed Thread/Upvalue/Function publication 接入生产路径。
+5. 当前第一开发项：从 Proto→Function 与 compiler builder 开始，按
+   compiler → library/package → IO → VM/app/results 顺序迁移其余生产
+   publication，并维持 allocation-triggered collection 禁用。
+6. 完成所有生产字符串 canonical interning 或 scoped Eq/Hash，建立唯一 Heap
    owner后，才接 Runtime-only full collection；incremental/barrier/weak/
    finalizer 最后推进。
-6. M2 并行下一步是为固定 C++ bytecode printer 的 local-name 证据建立受审计
+7. M2 并行下一步是为固定 C++ bytecode printer 的 local-name 证据建立受审计
    方案，并从 closure artifact 的第一个 Proto/PC 差异开始修，不能直接处理
    截断后的 500 条列表。
 

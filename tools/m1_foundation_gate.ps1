@@ -486,9 +486,9 @@ $openDebts = @(
         detail = "LuaState still stores transitional raw GC/StringPool service pointers."
     },
     [ordered]@{
-        id = "temporary-state-and-production-publication-roots"
+        id = "production-publication-roots"
         blocks = "destructive sweep"
-        detail = "Active/debug Proto identities, open Upvalue owners, and coroutine activation buffers are canonical roots; temporary state roots and production publication migration remain incomplete."
+        detail = "Active/debug Proto identities, open Upvalue owners, coroutine activation buffers, and PendingState handles are canonical roots; coroutine create/wrap publication is transactional, while Proto/compiler/library/IO/VM/app publication migration remains incomplete."
     },
     [ordered]@{
         id = "deterministic-runtime-shutdown"
@@ -501,9 +501,9 @@ $openDebts = @(
         detail = "Lua-visible full sweep, complete barriers, weak/finalizer semantics, and incremental phases remain gated."
     },
     [ordered]@{
-        id = "generational-gc-handles-and-temporary-roots"
+        id = "generational-gc-handles-and-publication-roots"
         blocks = "destructive sweep"
-        detail = "GcRef carries non-reused ObjectId provenance, and StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement; lexical object/state publication roots are not yet complete."
+        detail = "GcRef carries non-reused ObjectId provenance, and StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement; lexical object roots and PendingState roots are implemented, but the remaining production object graphs are not yet migrated."
     },
     [ordered]@{
         id = "string-content-equality-without-collector-borrow"
@@ -520,7 +520,7 @@ $result = [ordered]@{
         "m1-foundation-gate"
     }
     mode = if ($Smoke) { "smoke" } else { "full" }
-    scope = "ByteString, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object-root foundation, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
+    scope = "ByteString, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object roots and PendingState roots, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
     checksPassed = $failures.Count -eq 0
     foundationPassed = (
         $failures.Count -eq 0 -and

@@ -3,7 +3,7 @@
   "description": "Fail-closed inventory of every runtime or collector root required before lua_rust may sweep a live VM.",
   "provenance_audit": {
     "implemented": "GcRef carries a process-global non-reused ObjectId; each collector validates address, ObjectId, and concrete tag in an authoritative live table. LightUserdata is a separate arbitrary-pointer type, and collector explicit roots retain erased pointer + ObjectId + tag handles.",
-    "remaining_sweep_blocker": "Safe Value::String equality and hashing still preserve byte-content semantics by dereferencing without a collector borrow. Direct production GcString creation prevents an unproven switch to identity semantics. Transitional unsafe GcRef::as_ref call sites, missing temporary roots, and the absent unique Heap owner also keep live sweep disabled."
+    "remaining_sweep_blocker": "Safe Value::String equality and hashing still preserve byte-content semantics by dereferencing without a collector borrow. Direct production GcString creation prevents an unproven switch to identity semantics. Transitional unsafe GcRef::as_ref call sites, incomplete production object-publication migration, and the absent unique Heap owner also keep live sweep disabled."
   },
   "status_values": [
     "implemented",
@@ -627,25 +627,30 @@
       "source_locations": [
         {
           "path": "crates/lua_vm/src/runtime.rs",
-          "line": 347,
-          "symbol": "StateArena::insert_owned before StateHandle publication"
+          "line": 1218,
+          "symbol": "PendingState branded rollback/commit guard"
         },
         {
           "path": "crates/lua_stdlib/src/coroutine.rs",
-          "line": 250,
-          "symbol": "coroutine State to Thread publication"
+          "line": 185,
+          "symbol": "coroutine create/wrap transactional State to Thread publication"
+        },
+        {
+          "path": "crates/lua_vm/src/runtime/root_trace.rs",
+          "line": 307,
+          "symbol": "RuntimeRootKind::TemporaryStateRoots seed"
         }
       ],
-      "status": "missing",
+      "status": "implemented",
       "owner": {
-        "current": "Coroutine creation now allocates the Thread and installs State -> Thread before arena insertion, then binds Thread -> StateHandle before exposing the Thread value. The intermediate Thread/state pair is still unreachable and has neither a PendingState rollback guard nor a temporary state root.",
+        "current": "StateArena inserts a detached coroutine into a slot carrying an exact nonzero temporary-root identity. A branded PendingState is the only safe commit capability; Drop rolls an unpublished slot back and advances or permanently retires its generation. Coroutine create/wrap keep Thread, Upvalue, and wrapper objects protected while installing checked State -> Thread and Thread -> StateHandle edges, then release the state root only after direct stack publication.",
         "target": "Runtime publication owns a branded PendingState that rolls the arena slot back unless State-to-Thread publication commits."
       },
       "tracer": {
-        "current": "Arena membership is intentionally not a root and there is no temporary state-root queue.",
+        "current": "RuntimeRootTracer snapshots validated temporary StateHandles independently from ordinary arena membership and object-publication roots, labels them TEMPORARY_STATE_ROOTS, and feeds them into the state/object fixed-point queues.",
         "target": "RuntimeRootTracer seeds validated temporary StateHandles independently from temporary GC-object roots."
       },
-      "missing_risk": "A future allocation-triggered state prepass can close the unreachable inserted state before Thread publication, and an allocation/panic boundary can still leave an unreachable Thread or occupied slot without transactional rollback.",
+      "missing_risk": "This root kind is locally complete for coroutine create/wrap. Live sweep remains blocked by the separate production object-publication migration, unique Heap owner, fixed strings, finalizers, and scoped execution-borrow work.",
       "planned_test": {
         "name": "pending_state_rolls_back_or_publishes_atomically",
         "layer": "lua_vm runtime_ownership",
