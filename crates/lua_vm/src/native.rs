@@ -10,6 +10,7 @@ use lua_core::gc::gc_ref::GcRef;
 use lua_core::proto::Proto;
 use lua_core::state_handle::StateHandle;
 use lua_core::thread::Thread;
+use lua_core::upvalue::Upvalue;
 use lua_core::value::Value;
 
 use crate::state::{CallInfo, LuaState, Stack, ThreadStatus};
@@ -173,6 +174,37 @@ impl ResumeResponse {
             Self::Error(error) => gc.mark_value(error),
         }
     }
+}
+
+/// One VM suspension needed to access an open Upvalue owned by another state.
+///
+/// Runtime releases the requester turn before resolving `owner`, performs the
+/// slot access, and then resumes `requester` at the following opcode.
+#[derive(Clone, Debug)]
+pub struct UpvalueAccessRequest {
+    pub(crate) requester: StateHandle,
+    pub(crate) upvalue: GcRef<Upvalue>,
+    pub(crate) owner: StateHandle,
+    pub(crate) stack_index: usize,
+    pub(crate) operation: UpvalueAccessOperation,
+}
+
+impl UpvalueAccessRequest {
+    pub(crate) fn seed_roots(&self, gc: &mut GarbageCollector) {
+        gc.mark_registered(self.upvalue);
+        if let UpvalueAccessOperation::Write { value } = &self.operation {
+            gc.mark_value(value);
+        }
+    }
+}
+
+/// Slot operation carried by an [`UpvalueAccessRequest`].
+#[derive(Clone, Debug)]
+pub enum UpvalueAccessOperation {
+    /// Copy the owner slot into this requester stack destination.
+    Read { destination: usize },
+    /// Replace the owner slot with an owned value.
+    Write { value: Value },
 }
 
 /// Failure to publish through the scoped native mailbox.

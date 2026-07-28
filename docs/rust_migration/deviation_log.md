@@ -1,6 +1,6 @@
 ---
 status: living
-last_updated: 2026-07-28
+last_updated: 2026-07-29
 applies_to: Lua 5.1.5 compatibility, lua_cpp project extensions, and runtime safety
 oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 ---
@@ -197,6 +197,9 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 - **范围：** collector、StringPool、main/coroutine `LuaState`、registry、
   service pointers 和确定性 shutdown。
 - **Rust 位置：** `crates/lua_vm/src/state/lua_state.rs`；
+  `crates/lua_vm/src/runtime.rs`；
+  `crates/lua_vm/src/runtime/root_trace.rs`；
+  `crates/lua_core/src/upvalue.rs`；
   `crates/lua_stdlib/src/coroutine.rs`；
   `crates/lua_core/src/thread.rs`；
   `crates/lua_core/src/gc/collector.rs`。
@@ -209,9 +212,15 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   Runtime activation stack 在释放 caller borrow 后驱动 target；caller
   `Running↔Normal`、yield/result/error transfer、protected `pcall` 与固定
   C++ 的 `A→B→A` `Normal` 祖先 continuation 二次执行已有回归。
+  open Upvalue 已改为 `Open { owner: StateHandle, stack_index }`，由 owner
+  state 维护非 intrusive、按索引降序且去重的集合；跨 state GET/SET 通过
+  Runtime upvalue transfer turns 顺序访问 owner/requester，reachable Upvalue
+  会向 canonical tracer 发布 owner handle，arena drain 在 generation
+  advance/retirement 前完成关闭。
   但 main state 仍是 external arena slot，LuaState 仍保存 transitional
-  GC/StringPool backpointer，open Upvalue 仍使用 raw Stack owner；Lua
-  `__gc`、IO/module service drain 与 allocator live-byte 合同也未闭环。coroutine 创建已先建立
+  GC/StringPool backpointer，debug/protected-helper 跨 state open-Upvalue
+  访问尚未纳入同一调度协议；Lua `__gc`、IO/module service drain 与
+  allocator live-byte 合同也未闭环。coroutine 创建已先建立
   State→Thread、再插入 arena 并绑定 Thread→StateHandle，去掉了初始化时的
   第二个 state borrow，但仍缺少可回滚、可追踪的 `PendingState`。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
@@ -221,14 +230,18 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   preflight 与关闭归零已通过。`coroutine-normal-ancestor.lua` 及其独立
   characterization 工具进一步锁定了固定 C++ 允许 `A→B→A` 激活环、而
   stock Lua 拒绝 `Normal` 祖先的差异；Rust process regression 已逐字节
-  对齐该 C++ 行为。
+  对齐该 C++ 行为。另有 suspended-coroutine closure 远端读写、
+  Upvalue→owner-state root fixed point、集合去重/排序与
+  close-before-generation-invalidation 回归。
   allocator live/peak、真实 finalizer/service close、Miri/ASan 等仍在
   M1.4、M1.5、M1.7、M1.8、M1.13。
-- **影响：** 已移除 resume/wrap 递归跨 state 借用风险，并能声称当前
-  Rust-owned 对象的 deterministic shutdown substrate；raw Upvalue owner
-  等剩余路径仍有别名/UAF 风险，也不能声称完整 Lua close 或 live collection。
-- **处置状态：** `open`。Upvalue owner、唯一 Heap/service
-  owner、Lua-visible close 与 lifecycle 验收全部完成前保持开放。
+- **影响：** 已移除 resume/wrap 递归跨 state 借用和 raw open-Upvalue
+  owner 风险，并能声称当前 Rust-owned 对象的 deterministic shutdown
+  substrate；剩余 service/backpointer 与未迁移 publication 路径仍不允许
+  声称完整 Lua close 或 live collection。
+- **处置状态：** `open`。唯一 Heap/service owner、temporary state
+  publication、debug/protected-helper 跨 state、Lua-visible close 与
+  lifecycle 验收全部完成前保持开放。
 
 ### NOTE-010: Lua 字符串 intern hash 选择固定 C++ 的前向采样
 

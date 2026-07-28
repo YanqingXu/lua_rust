@@ -4,7 +4,7 @@
 //! 这些变量被"提升"为上值，在外部函数返回后仍保持可访问。
 //!
 //! ## 状态机
-//! - **Open**：上值指向栈上的活跃变量（通过 stack_index + owner_stack 访问）
+//! - **Open**：上值通过 `StateHandle + stack index` 标识栈上的活跃变量
 //! - **Closed**：上值拥有变量的独立副本（存储在 closed_value 中）
 //!
 //! 状态转换：Open → Closed（当外部函数返回，栈上的变量被销毁时）
@@ -12,57 +12,46 @@
 
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_object::GcObject;
-use crate::gc::gc_ref::GcRef;
 use crate::gc::header::GcObjectHeader;
+use crate::state_handle::StateHandle;
 use crate::types::GcObjectType;
 use crate::value::Value;
+
+#[derive(Clone, Debug)]
+enum UpvalueState {
+    Open {
+        owner: StateHandle,
+        stack_index: usize,
+    },
+    Closed {
+        value: Value,
+        former_stack_index: Option<usize>,
+    },
+}
 
 /// Upvalue 对象 — GC 管理的闭包上值
 ///
 /// 内存布局（`#[repr(C)]`，header 在开头）：
 /// - header: GcObjectHeader (16 bytes)
-/// - is_open: bool (1 byte)
-/// - stack_index: usize (8 bytes)
-/// - closed_value: Value (16 bytes)
-/// - next: `Option<GcRef<Upvalue>>`
-/// - owner_stack: *mut () (8 bytes — opaque, Phase 3 类型化为 Stack*)
-///   总计约 57+ bytes
+/// - state: Open (`StateHandle + stack index`) or Closed (`Value`)
 ///
 #[repr(C)]
 pub struct Upvalue {
     /// GC 对象头部（必须在结构体开头）
     header: GcObjectHeader,
 
-    /// 是否为 Open 状态
-    is_open: bool,
-
-    /// 栈索引（Open: 栈位置；Closed: 保持原值用于调试）
-    stack_index: usize,
-
-    /// Closed 状态下的独立存储值
-    closed_value: Value,
-
-    /// 链表指针：LuaState 中 open upvalue 链表的 next 指针
-    next: Option<GcRef<Upvalue>>,
-
-    /// 所属栈指针（仅 Open 状态有效；Phase 3 类型化为 `*const Stack`）
-    owner_stack: *mut std::ffi::c_void,
+    state: UpvalueState,
 }
 
 impl Upvalue {
     /// 创建 Open 状态的 Upvalue（指向栈上的值）
     ///
+    /// `owner`: 所属 `LuaState` 的 runtime-scoped generational handle
     /// `stack_index`: 栈索引位置
-    /// `owner_stack`: 所属栈的不透明指针（Phase 3 类型化为 `&Stack`）
-    ///
-    pub fn new_open(stack_index: usize, owner_stack: *mut std::ffi::c_void) -> Self {
+    pub fn new_open(owner: StateHandle, stack_index: usize) -> Self {
         Self {
             header: GcObjectHeader::new(GcObjectType::Upval),
-            is_open: true,
-            stack_index,
-            closed_value: Value::Nil,
-            next: None,
-            owner_stack,
+            state: UpvalueState::Open { owner, stack_index },
         }
     }
 
@@ -71,11 +60,10 @@ impl Upvalue {
     pub fn new_closed(value: Value) -> Self {
         Self {
             header: GcObjectHeader::new(GcObjectType::Upval),
-            is_open: false,
-            stack_index: 0,
-            closed_value: value,
-            next: None,
-            owner_stack: std::ptr::null_mut(),
+            state: UpvalueState::Closed {
+                value,
+                former_stack_index: None,
+            },
         }
     }
 
@@ -84,13 +72,13 @@ impl Upvalue {
     /// 检查是否为 Open 状态（指向栈上的值）
     #[inline]
     pub fn is_open(&self) -> bool {
-        self.is_open
+        matches!(&self.state, UpvalueState::Open { .. })
     }
 
     /// 检查是否为 Closed 状态（拥有值的独立副本）
     #[inline]
     pub fn is_closed(&self) -> bool {
-        !self.is_open
+        matches!(&self.state, UpvalueState::Closed { .. })
     }
 
     // ── 值访问 ──────────────────────────────────────────────────
@@ -102,8 +90,10 @@ impl Upvalue {
     /// # Panics
     /// 如果 Upvalue 处于 Open 状态则 panic。
     pub fn get_closed_value(&self) -> &Value {
-        assert!(self.is_closed(), "get_closed_value called on open upvalue");
-        &self.closed_value
+        let UpvalueState::Closed { value, .. } = &self.state else {
+            panic!("get_closed_value called on open upvalue");
+        };
+        value
     }
 
     /// 设置 Closed 状态下的值
@@ -111,9 +101,15 @@ impl Upvalue {
     /// # Panics
     /// 如果 Upvalue 处于 Open 状态则 panic。
     pub fn set_closed_value(&mut self, value: Value) {
-        assert!(self.is_closed(), "set_closed_value called on open upvalue");
+        let UpvalueState::Closed {
+            value: closed_value,
+            ..
+        } = &mut self.state
+        else {
+            panic!("set_closed_value called on open upvalue");
+        };
         // TODO Phase 1.3+: write barrier — gc->writeBarrier(this, value)
-        self.closed_value = value;
+        *closed_value = value;
     }
 
     /// 获取 Open 状态下的栈索引
@@ -122,20 +118,30 @@ impl Upvalue {
     /// 如果 Upvalue 处于 Closed 状态则 panic。
     #[inline]
     pub fn stack_index(&self) -> usize {
-        assert!(self.is_open(), "stack_index called on closed upvalue");
-        self.stack_index
+        let UpvalueState::Open { stack_index, .. } = &self.state else {
+            panic!("stack_index called on closed upvalue");
+        };
+        *stack_index
     }
 
     /// 安全获取栈索引（任何状态）
     #[inline]
     pub fn stack_index_any(&self) -> usize {
-        self.stack_index
+        match &self.state {
+            UpvalueState::Open { stack_index, .. } => *stack_index,
+            UpvalueState::Closed {
+                former_stack_index, ..
+            } => former_stack_index.unwrap_or(0),
+        }
     }
 
-    /// 获取 Open upvalue 所属栈的不透明指针。
+    /// Return the checked owner and stack slot of an open Upvalue.
     #[inline]
-    pub fn owner_stack(&self) -> *mut std::ffi::c_void {
-        self.owner_stack
+    pub fn open_location(&self) -> Option<(StateHandle, usize)> {
+        match &self.state {
+            UpvalueState::Open { owner, stack_index } => Some((*owner, *stack_index)),
+            UpvalueState::Closed { .. } => None,
+        }
     }
 
     // ── 状态转换 ────────────────────────────────────────────────
@@ -147,35 +153,17 @@ impl Upvalue {
     /// `stack_value`: 从栈上读取的当前值
     ///
     ///
-    /// Phase 1.4: 接受显式的栈值参数（而非直接访问 Stack）。
-    /// Phase 3 实现 Stack 后将改为通过 owner_stack 自动读取。
+    /// Runtime resolves the open location before calling this method.
     pub fn close(&mut self, stack_value: Value) {
-        if self.is_closed() {
-            return; // 已经是 Closed 状态
-        }
-
-        // 复制栈上的值到内部存储
-        self.closed_value = stack_value;
+        let stack_index = match &self.state {
+            UpvalueState::Open { stack_index, .. } => *stack_index,
+            UpvalueState::Closed { .. } => return,
+        };
+        self.state = UpvalueState::Closed {
+            value: stack_value,
+            former_stack_index: Some(stack_index),
+        };
         // TODO Phase 1.3+: write barrier — gc->writeBarrier(this, closedValue_)
-
-        // 标记为 Closed
-        self.is_open = false;
-        self.owner_stack = std::ptr::null_mut();
-        // stack_index 保持不变（用于调试）
-    }
-
-    // ── 链表管理 ────────────────────────────────────────────────
-
-    /// 获取链表中的下一个 Upvalue
-    #[inline]
-    pub fn next(&self) -> Option<GcRef<Upvalue>> {
-        self.next
-    }
-
-    /// 设置链表中的下一个 Upvalue
-    #[inline]
-    pub fn set_next(&mut self, next: Option<GcRef<Upvalue>>) {
-        self.next = next;
     }
 }
 
@@ -205,15 +193,10 @@ unsafe impl GcObject for Upvalue {
     ///
     /// - Closed 状态：标记 closed_value 中的 GC 对象
     /// - Open 状态：栈上的值由状态根追踪器标记
-    /// - Both states: mark the intrusive open-list successor when present
     ///
     unsafe fn mark_children(&self, collector: &mut GarbageCollector) {
-        if self.is_closed() {
-            // SAFETY: collector is valid during mark phase
-            Self::mark_value(&self.closed_value, collector);
-        }
-        if let Some(next) = self.next {
-            collector.mark_registered(next);
+        if let UpvalueState::Closed { value, .. } = &self.state {
+            Self::mark_value(value, collector);
         }
         // Open 状态的栈值由 LuaState 活跃窗口标记路径负责。
     }
@@ -236,16 +219,18 @@ impl Upvalue {
 
 impl std::fmt::Debug for Upvalue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.is_open {
-            f.debug_struct("Upvalue")
+        match &self.state {
+            UpvalueState::Open { owner, stack_index } => f
+                .debug_struct("Upvalue")
                 .field("state", &"open")
-                .field("stack_index", &self.stack_index)
-                .finish()
-        } else {
-            f.debug_struct("Upvalue")
+                .field("owner", owner)
+                .field("stack_index", stack_index)
+                .finish(),
+            UpvalueState::Closed { value, .. } => f
+                .debug_struct("Upvalue")
                 .field("state", &"closed")
-                .field("closed_value", &self.closed_value)
-                .finish()
+                .field("closed_value", value)
+                .finish(),
         }
     }
 }
@@ -261,21 +246,29 @@ mod tests {
     use super::*;
     use crate::gc::collector::GarbageCollector;
     use crate::gc::gc_ref::GcRef;
+    use crate::state_handle::StateHandleIssuer;
     use crate::string_pool::StringPool;
     use crate::table::Table;
+    use std::num::NonZeroU64;
+
+    fn state_handle(slot: usize) -> StateHandle {
+        StateHandleIssuer::try_new()
+            .expect("test runtime namespace")
+            .issue(slot, NonZeroU64::MIN)
+    }
 
     // ── 创建测试 ────────────────────────────────────────────────
 
     #[test]
     fn test_create_open_upvalue() {
-        let stack_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let uv = Upvalue::new_open(5, stack_ptr);
+        let owner = state_handle(0);
+        let uv = Upvalue::new_open(owner, 5);
 
         assert!(uv.is_open());
         assert!(!uv.is_closed());
         assert_eq!(uv.stack_index(), 5);
         assert_eq!(uv.stack_index_any(), 5);
-        assert!(uv.next().is_none());
+        assert_eq!(uv.open_location(), Some((owner, 5)));
     }
 
     #[test]
@@ -286,7 +279,7 @@ mod tests {
         assert!(uv.is_closed());
         assert_eq!(uv.stack_index_any(), 0);
         assert_eq!(*uv.get_closed_value(), Value::Number(42.0));
-        assert!(uv.next().is_none());
+        assert_eq!(uv.open_location(), None);
     }
 
     #[test]
@@ -300,14 +293,14 @@ mod tests {
 
     #[test]
     fn test_open_upvalue_stack_index() {
-        let uv = Upvalue::new_open(10, std::ptr::null_mut());
+        let uv = Upvalue::new_open(state_handle(0), 10);
         assert_eq!(uv.stack_index(), 10);
     }
 
     #[test]
     #[should_panic(expected = "get_closed_value called on open upvalue")]
     fn test_get_closed_value_on_open_panics() {
-        let uv = Upvalue::new_open(1, std::ptr::null_mut());
+        let uv = Upvalue::new_open(state_handle(0), 1);
         uv.get_closed_value();
     }
 
@@ -315,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_close_upvalue() {
-        let mut uv = Upvalue::new_open(3, std::ptr::null_mut());
+        let mut uv = Upvalue::new_open(state_handle(0), 3);
         assert!(uv.is_open());
 
         // 关闭：将栈上的值（42.0）复制到内部存储
@@ -350,24 +343,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "set_closed_value called on open upvalue")]
     fn test_set_closed_value_on_open_panics() {
-        let mut uv = Upvalue::new_open(1, std::ptr::null_mut());
+        let mut uv = Upvalue::new_open(state_handle(0), 1);
         uv.set_closed_value(Value::Nil);
-    }
-
-    // ── 链表操作 ────────────────────────────────────────────────
-
-    #[test]
-    fn test_upvalue_linked_list() {
-        let mut uv1 = Upvalue::new_closed(Value::Number(1.0));
-        let uv2 = Upvalue::new_closed(Value::Number(2.0));
-
-        // uv1 -> uv2
-        let mut gc = GarbageCollector::new();
-        let uv2_ref = gc.create(uv2);
-        uv1.set_next(Some(uv2_ref));
-
-        assert!(uv1.next().is_some());
-        assert_eq!(uv1.next().unwrap(), uv2_ref);
     }
 
     // ── GC 类型测试 ─────────────────────────────────────────────
@@ -424,7 +401,7 @@ mod tests {
         let mut gc = GarbageCollector::new();
 
         // 创建 Open upvalue（栈上的值不由它标记）
-        let uv = Upvalue::new_open(5, std::ptr::null_mut());
+        let uv = Upvalue::new_open(state_handle(0), 5);
         let uv_ref = gc.create(uv);
 
         gc.reset_marks();
@@ -515,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_upvalue_debug_open() {
-        let uv = Upvalue::new_open(7, std::ptr::null_mut());
+        let uv = Upvalue::new_open(state_handle(0), 7);
         let debug_str = format!("{:?}", uv);
         assert!(debug_str.contains("open"));
         assert!(debug_str.contains("7"));

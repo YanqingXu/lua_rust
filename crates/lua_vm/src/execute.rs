@@ -18,9 +18,9 @@ use std::cmp::Ordering;
 
 use crate::native::{
     DeferredNativeCall, DeferredVmContinuation, NativeRequestId, NativeRequestPublishError,
-    ResumeEnvelope, ResumeResponse,
+    ResumeEnvelope, ResumeResponse, UpvalueAccessOperation, UpvalueAccessRequest,
 };
-use crate::state::{LUA_MULTRET, LuaState, Stack, ThreadStatus};
+use crate::state::{LUA_MULTRET, LuaState, ThreadStatus};
 
 /// 执行结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,12 +30,14 @@ pub enum ExecResult {
 }
 
 /// Reason the VM returned control to its Runtime owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum VmExit {
     /// Ordinary Lua return or coroutine yield.
     Complete(ExecResult),
     /// A sealed native operation requested a state switch.
     NativeRequest(NativeRequestId),
+    /// An opcode must access an open Upvalue owned by another state.
+    UpvalueAccess(Box<UpvalueAccessRequest>),
 }
 
 /// 最大嵌套调用深度
@@ -183,9 +185,33 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst) as usize;
                 let b = opcode::get_arg_b(inst) as usize;
                 // R(A) := UpValue[B]
-                let val = get_upvalue(l, b)?;
-                if let Some(dst) = l.stack.at_mut(base_idx + a) {
-                    *dst = val;
+                match get_upvalue(l, gc, b)? {
+                    UpvalueRead::Ready(value) => {
+                        if let Some(dst) = l.stack.at_mut(base_idx + a) {
+                            *dst = value;
+                        }
+                    }
+                    UpvalueRead::Remote {
+                        upvalue,
+                        owner,
+                        stack_index,
+                    } => {
+                        let requester = l.state_handle().ok_or_else(|| {
+                            RuntimeError::new(
+                                "VM: open Upvalue requester is detached from its Runtime",
+                            )
+                        })?;
+                        l.status = ThreadStatus::Yield;
+                        return Ok(VmExit::UpvalueAccess(Box::new(UpvalueAccessRequest {
+                            requester,
+                            upvalue,
+                            owner,
+                            stack_index,
+                            operation: UpvalueAccessOperation::Read {
+                                destination: base_idx + a,
+                            },
+                        })));
+                    }
                 }
             }
 
@@ -237,7 +263,19 @@ fn execute_proto_inner(
                 let b = opcode::get_arg_b(inst) as usize;
                 // UpValue[B] := R(A)
                 let val = l.stack.at(base_idx + a).cloned().unwrap_or(Value::Nil);
-                set_upvalue(l, b, &val)?;
+                if let Some((upvalue, owner, stack_index)) = set_upvalue(l, gc, b, &val)? {
+                    let requester = l.state_handle().ok_or_else(|| {
+                        RuntimeError::new("VM: open Upvalue requester is detached from its Runtime")
+                    })?;
+                    l.status = ThreadStatus::Yield;
+                    return Ok(VmExit::UpvalueAccess(Box::new(UpvalueAccessRequest {
+                        requester,
+                        upvalue,
+                        owner,
+                        stack_index,
+                        operation: UpvalueAccessOperation::Write { value: val },
+                    })));
+                }
             }
 
             OpCode::SETTABLE => {
@@ -507,7 +545,7 @@ fn execute_proto_inner(
                                 ci.tailcalls = 0;
 
                                 if let Err(e) = fire_debug_hook(l, gc, "call", None) {
-                                    unwind_lua_frames_to(l, saved_ci);
+                                    unwind_lua_frames_to(l, gc, saved_ci)?;
                                     return Err(e);
                                 }
 
@@ -528,15 +566,18 @@ fn execute_proto_inner(
                                     Ok(VmExit::NativeRequest(id)) => {
                                         return Ok(VmExit::NativeRequest(id));
                                     }
+                                    Ok(VmExit::UpvalueAccess(request)) => {
+                                        return Ok(VmExit::UpvalueAccess(request));
+                                    }
                                     Err(e) => {
                                         // Restore call frame and propagate error
-                                        unwind_lua_frames_to(l, saved_ci);
+                                        unwind_lua_frames_to(l, gc, saved_ci)?;
                                         return Err(e);
                                     }
                                 }
 
                                 if l.current_ci != saved_ci {
-                                    unwind_lua_frames_to(l, saved_ci);
+                                    unwind_lua_frames_to(l, gc, saved_ci)?;
                                     return Err(RuntimeError::new("VM: call frame imbalance"));
                                 }
                                 pc += 1;
@@ -569,6 +610,9 @@ fn execute_proto_inner(
                                 Ok(VmExit::Complete(ExecResult::Returned)) => {}
                                 Ok(VmExit::NativeRequest(id)) => {
                                     return Ok(VmExit::NativeRequest(id));
+                                }
+                                Ok(VmExit::UpvalueAccess(request)) => {
+                                    return Ok(VmExit::UpvalueAccess(request));
                                 }
                                 Err(err) if err.message.starts_with("bad argument") => {
                                     return Err(runtime_error_at(active_proto, pc, err.message));
@@ -646,7 +690,7 @@ fn execute_proto_inner(
                     for i in 0..available {
                         results.push(l.stack.at(func_pos + i).cloned().unwrap_or(Value::Nil));
                     }
-                    l.close_upvalues(ci.base);
+                    close_state_upvalues(l, gc, ci.base)?;
                     if available > 0 {
                         ensure_stack_slot(l, ci.func + available - 1);
                     }
@@ -680,7 +724,7 @@ fn execute_proto_inner(
                                                 .unwrap_or(Value::Nil)
                                         })
                                         .collect();
-                                    l.close_upvalues(base_idx);
+                                    close_state_upvalues(l, gc, base_idx)?;
                                     for (i, arg) in args.iter().enumerate().take(actual_nargs) {
                                         if let Some(dst) = l.stack.at_mut(base_idx + i) {
                                             *dst = arg.clone();
@@ -729,6 +773,9 @@ fn execute_proto_inner(
                                 VmExit::NativeRequest(id) => {
                                     return Ok(VmExit::NativeRequest(id));
                                 }
+                                VmExit::UpvalueAccess(request) => {
+                                    return Ok(VmExit::UpvalueAccess(request));
+                                }
                                 VmExit::Complete(ExecResult::Returned) => {}
                             }
                             let available = l.top.saturating_sub(func_pos);
@@ -748,7 +795,7 @@ fn execute_proto_inner(
                                 results.push(result);
                             }
 
-                            l.close_upvalues(ci.base);
+                            close_state_upvalues(l, gc, ci.base)?;
                             if wanted > 0 {
                                 ensure_stack_slot(l, ci.func + wanted - 1);
                             }
@@ -791,7 +838,7 @@ fn execute_proto_inner(
                     results.push(result);
                 }
 
-                l.close_upvalues(ci.base);
+                close_state_upvalues(l, gc, ci.base)?;
 
                 fire_debug_hook(l, gc, "return", None)?;
                 for _ in 0..ci.tailcalls {
@@ -942,6 +989,9 @@ fn execute_proto_inner(
                                         }
                                         return Ok(VmExit::NativeRequest(id));
                                     }
+                                    VmExit::UpvalueAccess(request) => {
+                                        return Ok(VmExit::UpvalueAccess(request));
+                                    }
                                     VmExit::Complete(ExecResult::Returned) => {}
                                 }
                             } else if let Some(iter_proto_ref) = func_obj.proto() {
@@ -991,14 +1041,17 @@ fn execute_proto_inner(
                                     Ok(VmExit::NativeRequest(id)) => {
                                         return Ok(VmExit::NativeRequest(id));
                                     }
+                                    Ok(VmExit::UpvalueAccess(request)) => {
+                                        return Ok(VmExit::UpvalueAccess(request));
+                                    }
                                     Err(e) => {
-                                        unwind_lua_frames_to(l, saved_ci);
+                                        unwind_lua_frames_to(l, gc, saved_ci)?;
                                         return Err(e);
                                     }
                                 }
 
                                 if l.current_ci != saved_ci {
-                                    unwind_lua_frames_to(l, saved_ci);
+                                    unwind_lua_frames_to(l, gc, saved_ci)?;
                                     return Err(RuntimeError::new(
                                         "VM: generic-for call frame imbalance",
                                     ));
@@ -1072,7 +1125,7 @@ fn execute_proto_inner(
             OpCode::CLOSE => {
                 let a = opcode::get_arg_a(inst) as usize;
                 // Close upvalues at level A and above
-                l.close_upvalues(base_idx + a);
+                close_state_upvalues(l, gc, base_idx + a)?;
             }
 
             OpCode::CLOSURE => {
@@ -1103,6 +1156,11 @@ fn execute_proto_inner(
                             OpCode::MOVE => {
                                 let b = opcode::get_arg_b(pseudo) as usize;
                                 l.find_or_create_upvalue(base_idx + b, gc)
+                                    .map_err(|error| {
+                                        RuntimeError::new(format!(
+                                            "VM: could not publish open Upvalue: {error}"
+                                        ))
+                                    })?
                             }
                             OpCode::GETUPVAL => {
                                 let b = opcode::get_arg_b(pseudo) as usize;
@@ -1310,20 +1368,28 @@ fn frame_proto_for_gc(
 }
 
 fn mark_open_upvalues(l: &LuaState, gc: &mut GarbageCollector) {
-    let mut current = l.open_upvalues;
-    while let Some(upvalue_ref) = current {
-        // SAFETY: open_upvalues only contains live Upvalue refs allocated by GC.
-        let Some(upvalue) = (unsafe { upvalue_ref.as_ref() }) else {
-            break;
-        };
+    for &upvalue_ref in &l.open_upvalues {
+        let location = gc
+            .with_ref(upvalue_ref, Upvalue::open_location)
+            .ok()
+            .flatten();
         gc.mark_registered(upvalue_ref);
-        if upvalue.is_open()
-            && let Some(value) = l.stack.at(upvalue.stack_index())
+        if let Some((owner, stack_index)) = location
+            && l.state_handle() == Some(owner)
+            && let Some(value) = l.stack.at(stack_index)
         {
             gc.mark_value(value);
         }
-        current = upvalue.next();
     }
+}
+
+fn close_state_upvalues(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    level: usize,
+) -> Result<(), RuntimeError> {
+    l.close_upvalues(level, gc)
+        .map_err(|error| RuntimeError::new(format!("VM: could not close open Upvalue: {error}")))
 }
 
 fn fire_debug_hook(
@@ -1393,12 +1459,17 @@ fn execute_counted_proto(
     result
 }
 
-fn unwind_lua_frames_to(l: &mut LuaState, target_ci: usize) {
+fn unwind_lua_frames_to(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    target_ci: usize,
+) -> Result<(), RuntimeError> {
     while l.current_ci > target_ci {
         let base = l.current_call_info().base;
-        l.close_upvalues(base);
+        close_state_upvalues(l, gc, base)?;
         l.pop_call_info();
     }
+    Ok(())
 }
 
 /// Call a Lua value from host/stdlib code and collect its results.
@@ -1431,7 +1502,7 @@ pub fn call_value(
     let result = call_value_at_stack(l, gc, call_pos, args.len(), wanted_results)
         .map(|()| collect_call_results(l, call_pos));
 
-    unwind_lua_frames_to(l, saved_ci);
+    unwind_lua_frames_to(l, gc, saved_ci)?;
     l.top = saved_top;
     result
 }
@@ -1505,7 +1576,7 @@ pub fn resume_lua_thread(
         let result = match execute_proto(l, proto_ref, gc) {
             Ok(result) => result,
             Err(error) => {
-                unwind_lua_frames_to(l, 0);
+                unwind_lua_frames_to(l, gc, 0)?;
                 return Err(error);
             }
         };
@@ -1519,6 +1590,7 @@ pub fn resume_lua_thread(
                 }
             }
             VmExit::NativeRequest(id) => return Ok(VmExit::NativeRequest(id)),
+            VmExit::UpvalueAccess(request) => return Ok(VmExit::UpvalueAccess(request)),
         }
     }
 }
@@ -1557,6 +1629,11 @@ fn call_value_at_stack(
                 }
                 return Err(RuntimeError::native_request_suspend());
             }
+            VmExit::UpvalueAccess(_) => {
+                return Err(RuntimeError::new(
+                    "open Upvalue access cannot cross a protected helper boundary yet",
+                ));
+            }
         }
         return Ok(());
     }
@@ -1588,7 +1665,7 @@ fn call_value_at_stack(
     match execute_counted_proto(l, callee_proto_ref, gc, RuntimeError::new("stack overflow")) {
         Ok(VmExit::Complete(ExecResult::Returned)) => {}
         Ok(VmExit::Complete(ExecResult::Yielded)) => {
-            unwind_lua_frames_to(l, saved_ci);
+            unwind_lua_frames_to(l, gc, saved_ci)?;
             return Err(RuntimeError::new("cannot yield across pcall"));
         }
         Ok(VmExit::NativeRequest(_)) => {
@@ -1596,14 +1673,19 @@ fn call_value_at_stack(
                 "runtime-native request cannot cross a protected helper boundary yet",
             ));
         }
+        Ok(VmExit::UpvalueAccess(_)) => {
+            return Err(RuntimeError::new(
+                "open Upvalue access cannot cross a protected helper boundary yet",
+            ));
+        }
         Err(e) => {
-            unwind_lua_frames_to(l, saved_ci);
+            unwind_lua_frames_to(l, gc, saved_ci)?;
             return Err(e);
         }
     }
 
     if l.current_ci != saved_ci {
-        unwind_lua_frames_to(l, saved_ci);
+        unwind_lua_frames_to(l, gc, saved_ci)?;
         return Err(RuntimeError::new("VM: helper call frame imbalance"));
     }
     Ok(())
@@ -2141,7 +2223,7 @@ fn call_native_function(
     l.top = func_pos + 1 + nargs;
 
     if let Err(e) = fire_debug_hook(l, gc, "call", None) {
-        unwind_lua_frames_to(l, saved_ci);
+        unwind_lua_frames_to(l, gc, saved_ci)?;
         l.top = saved_top;
         return Err(e);
     }
@@ -2170,7 +2252,7 @@ fn call_native_function(
             snapshot: crate::native::StateContinuationSnapshot::capture(l),
         };
         if !l.seal_native_request(request_id, deferred) {
-            unwind_lua_frames_to(l, saved_ci);
+            unwind_lua_frames_to(l, gc, saved_ci)?;
             l.top = saved_top;
             return Err(RuntimeError::new(
                 "VM: failed to seal Runtime-native request",
@@ -2214,7 +2296,7 @@ fn finish_native_call(
             None
         };
         let display_name = c_function_display_name(l, func_pos);
-        unwind_lua_frames_to(l, saved_ci);
+        unwind_lua_frames_to(l, gc, saved_ci)?;
         l.top = saved_top;
         return Err(error_value
             .map(RuntimeError::with_value)
@@ -2227,7 +2309,7 @@ fn finish_native_call(
     let first_result = l.top.saturating_sub(nret_count);
     let wanted_count = wanted_results.unwrap_or(nret_count);
     if let Err(error) = fire_debug_hook(l, gc, "return", None) {
-        unwind_lua_frames_to(l, saved_ci);
+        unwind_lua_frames_to(l, gc, saved_ci)?;
         l.top = saved_top;
         return Err(error);
     }
@@ -2326,7 +2408,9 @@ pub(crate) fn finish_deferred_native_call(
             apply_deferred_vm_continuation(l, deferred)?;
             Ok(())
         }
-        VmExit::Complete(ExecResult::Yielded) | VmExit::NativeRequest(_) => Err(RuntimeError::new(
+        VmExit::Complete(ExecResult::Yielded)
+        | VmExit::NativeRequest(_)
+        | VmExit::UpvalueAccess(_) => Err(RuntimeError::new(
             "VM: deferred native completion produced a second suspension",
         )),
     }
@@ -2356,7 +2440,9 @@ pub(crate) fn finish_deferred_native_values(
             apply_deferred_vm_continuation(l, deferred)?;
             Ok(())
         }
-        VmExit::Complete(ExecResult::Yielded) | VmExit::NativeRequest(_) => Err(RuntimeError::new(
+        VmExit::Complete(ExecResult::Yielded)
+        | VmExit::NativeRequest(_)
+        | VmExit::UpvalueAccess(_) => Err(RuntimeError::new(
             "VM: raw deferred completion produced a second suspension",
         )),
     }
@@ -2558,54 +2644,91 @@ fn get_rk(l: &LuaState, base: usize, rk: i32, constants: &[Value]) -> Value {
 }
 
 /// 获取上值
-fn get_upvalue(l: &LuaState, upvalue_idx: usize) -> Result<Value, RuntimeError> {
+enum UpvalueRead {
+    Ready(Value),
+    Remote {
+        upvalue: GcRef<Upvalue>,
+        owner: lua_core::state_handle::StateHandle,
+        stack_index: usize,
+    },
+}
+
+fn get_upvalue(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    upvalue_idx: usize,
+) -> Result<UpvalueRead, RuntimeError> {
     let uv_ref = current_lua_function(l)
         .and_then(|function| function.upvalue(upvalue_idx))
         .ok_or_else(|| RuntimeError::new("VM: GETUPVAL invalid upvalue index"))?;
 
-    // SAFETY: the upvalue is kept alive by the currently executing closure.
-    let uv = unsafe { uv_ref.as_ref() }
-        .ok_or_else(|| RuntimeError::new("VM: GETUPVAL invalid upvalue ref"))?;
-    if uv.is_open() {
-        let owner_stack = uv.owner_stack();
-        if owner_stack.is_null() {
-            Ok(l.stack.at(uv.stack_index()).cloned().unwrap_or(Value::Nil))
+    let (location, closed) = gc
+        .with_ref(uv_ref, |upvalue| {
+            (
+                upvalue.open_location(),
+                upvalue
+                    .is_closed()
+                    .then(|| upvalue.get_closed_value().clone()),
+            )
+        })
+        .map_err(|error| RuntimeError::new(format!("VM: GETUPVAL invalid Upvalue: {error}")))?;
+    if let Some((owner, stack_index)) = location {
+        if l.state_handle() == Some(owner) {
+            if !l.open_upvalues.contains(&uv_ref) {
+                return Err(RuntimeError::new(
+                    "VM: GETUPVAL owner state lost its open Upvalue",
+                ));
+            }
+            let value = l.stack.at(stack_index).cloned().ok_or_else(|| {
+                RuntimeError::new("VM: GETUPVAL open stack index is out of range")
+            })?;
+            Ok(UpvalueRead::Ready(value))
         } else {
-            // SAFETY: open upvalues store the Stack pointer supplied by the owning LuaState.
-            let stack = unsafe { &*(owner_stack as *const Stack) };
-            Ok(stack.at(uv.stack_index()).cloned().unwrap_or(Value::Nil))
+            Ok(UpvalueRead::Remote {
+                upvalue: uv_ref,
+                owner,
+                stack_index,
+            })
         }
     } else {
-        Ok(uv.get_closed_value().clone())
+        Ok(UpvalueRead::Ready(closed.unwrap_or(Value::Nil)))
     }
 }
 
 /// 设置上值
-fn set_upvalue(l: &mut LuaState, upvalue_idx: usize, val: &Value) -> Result<(), RuntimeError> {
+fn set_upvalue(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    upvalue_idx: usize,
+    val: &Value,
+) -> Result<Option<(GcRef<Upvalue>, lua_core::state_handle::StateHandle, usize)>, RuntimeError> {
     let uv_ref = current_lua_function(l)
         .and_then(|function| function.upvalue(upvalue_idx))
         .ok_or_else(|| RuntimeError::new("VM: SETUPVAL invalid upvalue index"))?;
 
-    // SAFETY: the upvalue is kept alive by the currently executing closure.
-    let uv = unsafe { &mut *(uv_ref.as_ptr() as *mut Upvalue) };
-    if uv.is_open() {
-        let idx = uv.stack_index();
-        let owner_stack = uv.owner_stack();
-        if owner_stack.is_null() {
-            if let Some(slot) = l.stack.at_mut(idx) {
-                *slot = val.clone();
+    let location = gc
+        .with_ref(uv_ref, Upvalue::open_location)
+        .map_err(|error| RuntimeError::new(format!("VM: SETUPVAL invalid Upvalue: {error}")))?;
+    if let Some((owner, stack_index)) = location {
+        if l.state_handle() == Some(owner) {
+            if !l.open_upvalues.contains(&uv_ref) {
+                return Err(RuntimeError::new(
+                    "VM: SETUPVAL owner state lost its open Upvalue",
+                ));
             }
+            let slot = l.stack.at_mut(stack_index).ok_or_else(|| {
+                RuntimeError::new("VM: SETUPVAL open stack index is out of range")
+            })?;
+            *slot = val.clone();
+            Ok(None)
         } else {
-            // SAFETY: open upvalues store the Stack pointer supplied by the owning LuaState.
-            let stack = unsafe { &mut *(owner_stack as *mut Stack) };
-            if let Some(slot) = stack.at_mut(idx) {
-                *slot = val.clone();
-            }
+            Ok(Some((uv_ref, owner, stack_index)))
         }
     } else {
-        uv.set_closed_value(val.clone());
+        gc.with_mut(uv_ref, |upvalue| upvalue.set_closed_value(val.clone()))
+            .map_err(|error| RuntimeError::new(format!("VM: SETUPVAL invalid Upvalue: {error}")))?;
+        Ok(None)
     }
-    Ok(())
 }
 
 fn current_lua_function(l: &LuaState) -> Option<&Function> {

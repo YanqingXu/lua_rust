@@ -34,5 +34,5 @@ pub mod metatable; // ✅ P1.4 — TMS enum, metamethod lookup with flags cachin
 pub mod proto; // ✅ P1.4 — Proto: function prototype, bytecode, constants, debug info
 pub mod table; // ✅ P1.4 — Table with array/hash parts and metatable
 pub mod thread; // ✅ P1.4 — Thread: coroutine object, status mgmt, caller chain
-pub mod upvalue; // ✅ P1.4 — Upvalue: open/closed, linked list, GC integration
+pub mod upvalue; // ✅ P1.4 — Upvalue: checked open owner/closed value, GC integration
 pub mod userdata; // ✅ P1.4 — Userdata: GC-managed byte buffer, metatable, optional destructor

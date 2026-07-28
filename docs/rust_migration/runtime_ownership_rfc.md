@@ -2,7 +2,7 @@
 status: accepted-design
 implementation_status: incomplete
 schema_version: 1
-last_updated: 2026-07-28
+last_updated: 2026-07-29
 cpp_oracle: 87c15e69ceb94eb74e28226ccbefb7e196635711
 ---
 
@@ -44,9 +44,10 @@ is not closed:
   `StateHandle`. The main state is still an externally owned arena slot.
   Coroutine resume/wrap now transfer execution through the Runtime activation
   trampoline after releasing the caller state borrow;
-- coroutine/debug lookup is scoped through `with_resolved_state_mut`, but open
-  Upvalues still identify their owner with raw Stack/list pointers rather than
-  `StateHandle + stack index`;
+- coroutine/debug lookup is scoped through `with_resolved_state_mut`; open
+  Upvalues now identify their owner with `StateHandle + stack index`, owner
+  states keep the non-intrusive ordered collection, and Runtime turns schedule
+  ordinary cross-state GET/SET without overlapping state borrows;
 - M1.6 removed the dump shim that kept unrooted `GcRef<Proto>` values in
   thread-local maps; `string.dump` now fails explicitly until the M3
   serializer exists, and source loaders no longer recognize the private
@@ -578,8 +579,8 @@ The StateHandle issuance/exhaustion slice is complete locally:
   corrupted free-list, real stale/foreign tracing, and MAX-generation close
   have focused regressions.
 
-Phase B remains incomplete because main-state ownership and
-`StateHandle + stack index` open-Upvalue ownership are still outstanding.
+Phase B remains incomplete because main-state ownership and the
+debug/protected-helper cross-state scheduling matrix are still outstanding.
 
 #### B.2 Implemented Runtime turn-borrow substrate (partial)
 
@@ -638,10 +639,38 @@ This is a completed local trampoline slice, not completion of Phase B:
 
 - debug cross-state operations remain outside the request protocol;
 - deep-chain and broader fault-injection matrices remain open;
-- raw GC/StringPool backpointers, main-state external ownership, and
-  open-Upvalue Stack owners remain;
+- raw GC/StringPool backpointers and main-state external ownership remain;
 - the activation buffer is a canonical root seed, but other partial/missing
   roots still prohibit live destructive collection.
+
+#### B.4 Implemented checked open-Upvalue ownership (local-complete slice)
+
+An open `Upvalue` now stores only `Open { owner: StateHandle, stack_index }`.
+`LuaState` owns a non-intrusive `Vec<GcRef<Upvalue>>`, kept unique and sorted by
+descending stack index so close-at-level preserves the Lua ordering contract.
+Every read, write, close, debug access, root edge, and shutdown edge validates
+the collector identity and checked location before touching the stack.
+
+When ordinary bytecode accesses an open Upvalue owned by another suspended
+state, the VM returns `VmExit::UpvalueAccess`. The Runtime releases the
+requester turn, borrows the owner for one checked read/write, then returns to
+the requester to continue execution. The transfer request/response remains in
+the Runtime activation root buffer, and a pending native delivery—including
+the pinned-C++ `Normal` ancestor replay context—survives any intervening
+Upvalue turns. At no point are two state slots borrowed together.
+
+GC propagation from a reachable open Upvalue publishes its owner
+`StateHandle`; the canonical two-queue tracer then snapshots the owner state
+and marks the indexed stack value even when no reachable `Thread` provides the
+state edge. StateArena shutdown closes each validated open Upvalue before
+advancing or permanently retiring the owner generation.
+
+Focused tests cover duplicate-slot reuse and ordering, detached-state
+rejection, cross-state read/write through a closure yielded by a suspended
+coroutine, owner-state root fixed point without a Thread edge, close before
+handle invalidation, and exact preservation of the pinned-C++ `A -> B -> A`
+characterization. Debug and protected-helper cross-state access remains an
+explicit later protocol extension; it no longer uses a raw pointer fallback.
 
 ### C. Registry and dump lifetime — M1.6
 
@@ -680,16 +709,16 @@ The implementation has two independent queues and runs them to a fixed point:
 2. the Runtime seeds its global table, persistent registry, and main
    `StateHandle`;
 3. one validated state snapshot can enqueue registered GC values;
-4. one concrete GC propagation step can enqueue a reachable Thread's
-   `StateHandle`;
+4. one concrete GC propagation step can enqueue a reachable Thread's state or
+   a reachable open Upvalue's owner `StateHandle`;
 5. runtime id, slot, generation, occupancy, and borrow state are checked before
    a LuaState pointer is used to copy a snapshot.
 
 Arena membership is not a root. A coroutine state is scanned only after a
-reachable Thread publishes its handle. The state snapshot currently covers the
+reachable Thread or open Upvalue publishes its handle. The state snapshot currently covers the
 global table, thread/chunk environments, registry, nil/boolean/number
 metatables, exact `0..LuaState::top` stack window, active CallInfo function
-slots, managed Proto handles and varargs, open-Upvalue head, current Thread,
+slots, managed Proto handles and varargs, every open Upvalue, current Thread,
 debug hook and its one-shot managed Proto identity, yielded values, and last
 error. `ACTIVE_PROTO` is a direct CallInfo root, including top-level
 pseudo-frames that do not have a Function value in their function slot;
@@ -723,20 +752,16 @@ This slice still does not claim live sweep is safe. Interpreter and debug
 paths validate address, ObjectId, and concrete type immediately before
 creating a short transitional reference, but rely on the explicit invariant
 that destructive sweep cannot run during VM execution or a debug callback.
-The remaining unsafe representations include:
-
-- an open Upvalue still carries a raw owner-Stack pointer, so the state snapshot
-  reports `OpenUpvalueOwnerStackRaw`;
-- top/stack and active-frame/function-index inconsistencies are reported
-  fail-closed.
+Top/stack and active-frame/function-index inconsistencies remain explicit
+fail-closed diagnostics. The open-Upvalue root kind no longer contributes an
+unsafe-gap variant.
 
 No path in this API calls `collect`, `sweep`, `clear_all`, finalizers, or object
 destruction. Existing weak-maintenance scanners now use managed Proto roots
 and checked metadata reads, but have not yet been replaced by this Runtime-only
 safe-point API. Destructive sweep remains blocked on scoped VM borrows,
-open-Upvalue owner removal, unreachable-state close ordering, finalizer roots,
-production publication migration, temporary state roots, and complete
-finalizer/shutdown semantics.
+unreachable-state integration, finalizer roots, production publication
+migration, temporary state roots, and complete finalizer/shutdown semantics.
 
 #### D.2 Implemented temporary-object root foundation (partial)
 
@@ -810,7 +835,7 @@ foreign-thread/busy Drop reached only through unsafe host invariant violation
 uses a no-callback leak-protection fallback; explicit foreign or busy close is
 rejected before mutation.
 
-`RuntimeCloseReport` exposes rejected/cyclic open-Upvalue edges, raw owner-Stack
+`RuntimeCloseReport` exposes rejected open-Upvalue edges, checked owner-handle
 mismatches, missing active stack values, pending finalizer entries discarded,
 and two unconditional capability debts:
 
@@ -915,7 +940,7 @@ All boxes are required before a sweep can run against a live VM:
 - [ ] every handle is provenance/liveness checked and cross-heap publication is
       rejected;
 - [ ] the complete root inventory is traced through one implementation;
-- [ ] active Function/Proto and open-Upvalue owners are handles, not lifetime
+- [x] active Function/Proto and open-Upvalue owners are handles, not lifetime
       placeholders;
 - [ ] temporary allocation/publication roots are enforced by API shape;
 - [ ] pending finalizers are roots and all work queues are pruned on destroy;

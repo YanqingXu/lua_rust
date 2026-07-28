@@ -377,29 +377,29 @@
       "source_locations": [
         {
           "path": "crates/lua_vm/src/state/lua_state.rs",
-          "line": 96,
+          "line": 148,
           "symbol": "LuaState::open_upvalues"
         },
         {
           "path": "crates/lua_vm/src/runtime/root_trace.rs",
-          "line": 460,
+          "line": 472,
           "symbol": "snapshot_state OPEN_UPVALUES"
         }
       ],
-      "status": "unsafe",
+      "status": "implemented",
       "owner": {
-        "current": "LuaState owns a GcRef linked-list head; each open Upvalue stores a raw stack pointer and index.",
+        "current": "LuaState owns a descending Vec<GcRef<Upvalue>>; each open Upvalue stores its checked StateHandle owner and stack index without intrusive successor or raw stack pointers.",
         "target": "Reachable State owns the list; Upvalue stores StateHandle plus checked stack index."
       },
       "tracer": {
-        "current": "The mark-only snapshot validates and marks the open-list head, Upvalue tracing retains successors, and the active stack window retains open slots; raw owner_stack is reported as an explicit gap.",
+        "current": "State snapshots validate and mark every open Upvalue; propagation from a reachable open Upvalue enqueues its owner StateHandle, whose active stack window retains the indexed value.",
         "target": "StateTracer marks the list and its owner slots; state close converts every node before arena removal."
       },
-      "missing_risk": "Runtime close validates list membership, checks owner_stack/bounds, reports debt, and closes Upvalues before state removal; live sweep still cannot rely on the raw owner_stack representation.",
+      "missing_risk": "This root path is implemented and Runtime drain closes each validated Upvalue before owner generation advance or retirement. Live destructive collection remains blocked by other inventory gaps, publication migration, and write-barrier/finalizer work.",
       "planned_test": {
-        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "name": "reachable_open_upvalue_enqueues_its_owner_state_without_a_thread_edge",
         "layer": "lua_vm runtime_gc_roots",
-        "assertion": "The open Upvalue and its active stack value are marked, and the raw owner-Stack representation is present in unsafe_gaps."
+        "assertion": "A closure-reachable open Upvalue enqueues its owner state without a Thread edge and marks the indexed stack value with no unsafe gap."
       }
     },
     {

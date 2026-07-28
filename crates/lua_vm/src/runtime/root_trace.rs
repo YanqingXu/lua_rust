@@ -111,8 +111,6 @@ pub struct StateTraceFailure {
 /// dereference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnsafeTraceGapKind {
-    /// An open Upvalue still stores a raw owner-Stack pointer.
-    OpenUpvalueOwnerStackRaw,
     /// LuaState's logical top exceeded Stack's initialized window.
     StackWindowOutOfBounds {
         /// LuaState logical top.
@@ -279,7 +277,7 @@ impl Runtime {
         increment(
             &mut root_counts,
             RuntimeRootKind::CoroutineActivationBuffer,
-            heap.native_activations.frames.len(),
+            heap.native_activations.frames.len() + heap.native_activations.upvalue_transfers.len(),
         );
         heap.native_activations.seed_roots(&mut heap.gc);
         increment(
@@ -353,6 +351,10 @@ impl Runtime {
             }
             if let Some(handle) = step.thread_state_handle {
                 increment(&mut root_counts, RuntimeRootKind::CoroutineStack, 1);
+                state_queue.push_back(handle);
+            }
+            if let Some(handle) = step.upvalue_state_handle {
+                increment(&mut root_counts, RuntimeRootKind::OpenUpvalues, 1);
                 state_queue.push_back(handle);
             }
         }
@@ -470,14 +472,10 @@ fn snapshot_state(state: &LuaState, handle: StateHandle, is_main: bool) -> State
         }
     }
 
-    if let Some(open_upvalue) = state.open_upvalues {
+    for &open_upvalue in &state.open_upvalues {
         snapshot.edges.push(RootEdge {
             kind: RuntimeRootKind::OpenUpvalues,
             object: RootObject::Upvalue(open_upvalue),
-        });
-        snapshot.gaps.push(UnsafeTraceGap {
-            state: handle,
-            kind: UnsafeTraceGapKind::OpenUpvalueOwnerStackRaw,
         });
     }
     snapshot
@@ -608,7 +606,9 @@ mod tests {
             state.push_value(Value::Table(active_stack));
             let open_index = state.top;
             state.push_value(Value::Table(open_value));
-            let open_upvalue = state.find_or_create_upvalue(open_index, gc);
+            let open_upvalue = state
+                .find_or_create_upvalue(open_index, gc)
+                .expect("runtime-owned state publishes open Upvalue");
             state.push_value(Value::Table(retired_stack));
             assert_eq!(state.pop(), Some(Value::Table(retired_stack)));
 
@@ -703,12 +703,7 @@ mod tests {
         assert_marked(fixtures.last_error);
         assert_white(fixtures.retired_stack);
         assert_white(fixtures.inactive_vararg);
-        assert!(
-            report
-                .unsafe_gaps
-                .iter()
-                .any(|gap| { gap.kind == UnsafeTraceGapKind::OpenUpvalueOwnerStackRaw })
-        );
+        assert!(report.unsafe_gaps.is_empty());
 
         {
             let mut parts = runtime.parts_mut().expect("runtime parts");
@@ -727,7 +722,7 @@ mod tests {
             state.debug_hook_skip_proto = None;
             state.yielded_values.clear();
             state.last_error = None;
-            state.open_upvalues = None;
+            state.open_upvalues.clear();
             state.current_call_info_mut().proto = None;
             state.current_call_info_mut().varargs.clear();
             state.set_top(0);
@@ -879,6 +874,56 @@ mod tests {
         assert_marked(thread_b);
         assert_marked(payload);
         assert_white(unreachable);
+    }
+
+    #[test]
+    fn reachable_open_upvalue_enqueues_its_owner_state_without_a_thread_edge() {
+        let mut runtime = Runtime::new();
+        let main_handle = runtime.main_state_handle.expect("main state handle");
+
+        let (owner_handle, closure, open_upvalue, open_value) = {
+            let mut parts = runtime.parts_mut().expect("runtime parts");
+            let (main, gc, _) = parts.split_mut();
+            let owner_handle = main
+                .insert_coroutine_state(LuaState::new())
+                .expect("owner state inserted");
+            let open_value = gc.create(Table::new());
+            let open_upvalue = main
+                .with_resolved_state_mut(owner_handle, |owner| {
+                    owner.push_value(Value::Table(open_value));
+                    owner
+                        .find_or_create_upvalue(0, gc)
+                        .expect("owner publishes open Upvalue")
+                })
+                .expect("owner state resolves");
+
+            let proto = gc.create(Proto::new());
+            let mut function = Function::new_lua(proto);
+            function.add_upvalue(open_upvalue);
+            let closure = gc.create(function);
+            main.push_value(Value::Function(closure));
+
+            (owner_handle, closure, open_upvalue, open_value)
+        };
+
+        let report = runtime
+            .trace_roots_mark_only()
+            .expect("open Upvalue owner traversal succeeds");
+
+        assert_eq!(
+            report.traced_states,
+            sorted_handles([main_handle, owner_handle])
+        );
+        assert_eq!(
+            report.root_edge_count(RuntimeRootKind::ThreadCallerChain),
+            0
+        );
+        assert!(report.root_edge_count(RuntimeRootKind::OpenUpvalues) >= 2);
+        assert!(report.failed_state_handles.is_empty());
+        assert!(report.unsafe_gaps.is_empty());
+        assert_marked(closure);
+        assert_marked(open_upvalue);
+        assert_marked(open_value);
     }
 
     #[test]

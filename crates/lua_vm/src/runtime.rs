@@ -43,6 +43,7 @@ pub use lua_core::state_handle::{RuntimeId, RuntimeIdExhausted, StateHandle};
 use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
 use lua_core::thread::{CoroutineStatus, Thread};
+use lua_core::upvalue::Upvalue;
 use lua_core::value::Value;
 use thiserror::Error;
 
@@ -51,9 +52,11 @@ use crate::execute::{
     finish_deferred_native_values, resume_after_deferred_native_call, resume_lua_thread,
     start_lua_call_at_stack,
 };
-use crate::native::{DeferredNativeCall, ResumeRequest, ResumeResponse};
-use crate::state::LuaState;
+use crate::native::{
+    DeferredNativeCall, ResumeRequest, ResumeResponse, UpvalueAccessOperation, UpvalueAccessRequest,
+};
 use crate::state::lua_state::LuaStateShutdownReport;
+use crate::state::{LuaState, ThreadStatus};
 
 mod root_trace;
 pub use root_trace::{
@@ -163,6 +166,7 @@ struct NativeActivationFrame {
 #[derive(Debug, Default)]
 struct NativeActivationStack {
     frames: Vec<NativeActivationFrame>,
+    upvalue_transfers: Vec<UpvalueTransferFrame>,
 }
 
 impl NativeActivationStack {
@@ -176,7 +180,33 @@ impl NativeActivationStack {
                 response.seed_roots(gc);
             }
         }
+        for transfer in &self.upvalue_transfers {
+            transfer.request.seed_roots(gc);
+            if let Some(response) = &transfer.response {
+                response.seed_roots(gc);
+            }
+        }
         gc.propagate_marks();
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UpvalueTransferFrame {
+    request: UpvalueAccessRequest,
+    response: Option<UpvalueAccessResponse>,
+}
+
+#[derive(Clone, Debug)]
+enum UpvalueAccessResponse {
+    Read(Value),
+    Written,
+}
+
+impl UpvalueAccessResponse {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        if let Self::Read(value) = self {
+            gc.mark_value(value);
+        }
     }
 }
 
@@ -192,6 +222,7 @@ enum NativeDriverAction {
         response: ResumeResponse,
         replay_dead_ancestor: bool,
     },
+    DeliverUpvalue(UpvalueTransferFrame),
 }
 
 enum NativeTurnEvent {
@@ -199,6 +230,7 @@ enum NativeTurnEvent {
         request: Box<ResumeRequest>,
         caller_thread: Option<GcRef<Thread>>,
     },
+    UpvalueAccess(Box<UpvalueAccessRequest>),
     Main(Result<ExecResult, RuntimeError>),
     Coroutine {
         thread: GcRef<Thread>,
@@ -238,9 +270,7 @@ pub struct RuntimeCloseReport {
     pub closed_open_upvalues: usize,
     /// Invalid/cross-collector Upvalue list edges rejected before dereference.
     pub rejected_open_upvalue_edges: usize,
-    /// Repeated Upvalue list nodes rejected as cycles.
-    pub open_upvalue_cycles: usize,
-    /// Open Upvalues whose raw owner-Stack pointer did not match the state.
+    /// Open Upvalues whose checked owner handle did not match the state.
     pub open_upvalue_owner_mismatches: usize,
     /// Open Upvalues whose stack slot was outside the active initialized view.
     pub open_upvalue_stack_values_missing: usize,
@@ -763,12 +793,12 @@ impl StateArena {
     /// Drain every arena-owned coroutine state in deterministic slot order.
     ///
     /// All occupied owned slots are preflighted for outstanding borrows before
-    /// any mutation. Each slot generation is invalidated before its Box is
-    /// dropped, and every state closes collector-validated open Upvalues while
-    /// the collector heap is still alive.
+    /// any mutation. Every state closes collector-validated open Upvalues
+    /// before its slot generation is advanced or retired, then its Box is
+    /// reconstructed and dropped while the collector heap is still alive.
     fn drain_owned(
         &mut self,
-        gc: &GarbageCollector,
+        gc: &mut GarbageCollector,
     ) -> Result<StateArenaDrainReport, StateResolveError> {
         self.validate_owned_drain()?;
 
@@ -785,14 +815,17 @@ impl StateArena {
                 .live_owned_states
                 .checked_sub(1)
                 .expect("occupied owned slot requires a positive live count");
+            // SAFETY: shutdown preflight proved that this occupied owned slot
+            // is not borrowed. Its handle generation is still current while
+            // the state closes every Upvalue that names it.
+            report
+                .state_shutdown
+                .merge(unsafe { &mut *state.as_ptr() }.prepare_for_runtime_shutdown(gc));
             self.vacate_slot(slot_index);
             self.live_owned_states = next_live_owned_states;
             // SAFETY: each owned slot originates from exactly one Box::into_raw
             // and was made vacant before ownership is reconstructed here.
-            let mut state = unsafe { Box::from_raw(state.as_ptr()) };
-            report
-                .state_shutdown
-                .merge(state.prepare_for_runtime_shutdown(gc));
+            let state = unsafe { Box::from_raw(state.as_ptr()) };
             report.drained_owned_states += 1;
             drop(state);
         }
@@ -1396,7 +1429,9 @@ impl Runtime {
         // and activation stack are disjoint fields and remain at stable
         // addresses for the whole execution session.
         let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
-        if !heap.native_activations.frames.is_empty() {
+        if !heap.native_activations.frames.is_empty()
+            || !heap.native_activations.upvalue_transfers.is_empty()
+        {
             return Err(RuntimeExecutionError::Protocol(
                 "activation stack was not empty at execution entry".to_string(),
             ));
@@ -1411,21 +1446,25 @@ impl Runtime {
 
         let mut current = initial;
         let mut action = NativeDriverAction::StartProto(proto);
+        let mut pending_native_delivery = None;
         loop {
             activations.seed_roots(gc);
-            let replay_dead_thread = match &action {
+            let completed_activation = match &action {
                 NativeDriverAction::Deliver {
                     frame,
-                    replay_dead_ancestor: true,
+                    replay_dead_ancestor,
                     ..
-                } => frame.caller_thread,
-                _ => None,
+                } => Some((
+                    frame.request.id,
+                    replay_dead_ancestor
+                        .then_some(frame.caller_thread)
+                        .flatten(),
+                )),
+                _ => pending_native_delivery.take(),
             };
-            let completed_activation = match &action {
-                NativeDriverAction::Deliver { frame, .. } => Some(frame.request.id),
-                _ => None,
-            };
-            let event = StateArena::with_turn_state_mut(arena, current, |state| {
+            let completed_upvalue_transfer =
+                matches!(&action, NativeDriverAction::DeliverUpvalue(_));
+            let mut event = StateArena::with_turn_state_mut(arena, current, |state| {
                 state
                     .with_native_request_scope(|state| {
                         let vm_result = execute_native_driver_action(state, gc, action);
@@ -1437,7 +1476,17 @@ impl Runtime {
                     .and_then(std::convert::identity)
             })
             .map_err(|source| RuntimeAccessError::StateArena { runtime_id, source })??;
-            if let Some(request_id) = completed_activation {
+            if completed_upvalue_transfer {
+                activations.upvalue_transfers.pop().ok_or_else(|| {
+                    RuntimeExecutionError::Protocol(
+                        "Upvalue delivery lost its rooted transfer frame".to_string(),
+                    )
+                })?;
+            }
+
+            if matches!(event, NativeTurnEvent::UpvalueAccess(_)) {
+                pending_native_delivery = completed_activation;
+            } else if let Some((request_id, replay_dead_thread)) = completed_activation {
                 let completed = activations.frames.pop().ok_or_else(|| {
                     RuntimeExecutionError::Protocol(
                         "deferred delivery lost its rooted activation frame".to_string(),
@@ -1448,24 +1497,24 @@ impl Runtime {
                         "deferred delivery popped a different activation frame".to_string(),
                     ));
                 }
-            }
-
-            let event = match (replay_dead_thread, event) {
-                (
+                if let (
                     Some(replayed),
                     NativeTurnEvent::Coroutine {
                         thread,
                         response: _,
                     },
-                ) if replayed == thread => NativeTurnEvent::Coroutine {
-                    thread,
-                    response: ResumeResponse::Error(runtime_error_value(
-                        gc,
-                        &RuntimeError::new("cannot resume dead coroutine"),
-                    )),
-                },
-                (_, event) => event,
-            };
+                ) = (replay_dead_thread, &event)
+                    && replayed == *thread
+                {
+                    event = NativeTurnEvent::Coroutine {
+                        thread: *thread,
+                        response: ResumeResponse::Error(runtime_error_value(
+                            gc,
+                            &RuntimeError::new("cannot resume dead coroutine"),
+                        )),
+                    };
+                }
+            }
 
             match event {
                 NativeTurnEvent::Request {
@@ -1503,6 +1552,39 @@ impl Runtime {
                         normal_deferred,
                     };
                     current = target;
+                }
+                NativeTurnEvent::UpvalueAccess(request) => {
+                    let request = *request;
+                    if request.requester != current {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "open Upvalue request named a different requester state".to_string(),
+                        ));
+                    }
+                    if request.owner == request.requester {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "local open Upvalue escaped into the Runtime scheduler".to_string(),
+                        ));
+                    }
+
+                    activations.upvalue_transfers.push(UpvalueTransferFrame {
+                        request: request.clone(),
+                        response: None,
+                    });
+                    let response =
+                        StateArena::with_turn_state_mut(arena, request.owner, |owner_state| {
+                            execute_upvalue_owner_access(owner_state, gc, &request)
+                        })
+                        .map_err(|source| {
+                            RuntimeAccessError::StateArena { runtime_id, source }
+                        })??;
+                    let transfer = activations.upvalue_transfers.last_mut().ok_or_else(|| {
+                        RuntimeExecutionError::Protocol(
+                            "open Upvalue access lost its rooted transfer frame".to_string(),
+                        )
+                    })?;
+                    transfer.response = Some(response);
+                    action = NativeDriverAction::DeliverUpvalue(transfer.clone());
+                    current = request.requester;
                 }
                 NativeTurnEvent::Coroutine { thread, response } => {
                     let frame = activations.frames.last_mut().ok_or_else(|| {
@@ -1546,7 +1628,7 @@ impl Runtime {
                     };
                 }
                 NativeTurnEvent::Main(result) => {
-                    if !activations.frames.is_empty() {
+                    if !activations.frames.is_empty() || !activations.upvalue_transfers.is_empty() {
                         return Err(RuntimeExecutionError::Protocol(
                             "main state stopped while coroutine activations remain".to_string(),
                         ));
@@ -1677,7 +1759,9 @@ impl Runtime {
             .ok_or(StateResolveError::ArenaUnavailable)?;
         let state_pointer = NonNull::from(state);
         let heap = self.heap.as_ref().get_ref();
-        if !heap.native_activations.frames.is_empty() {
+        if !heap.native_activations.frames.is_empty()
+            || !heap.native_activations.upvalue_transfers.is_empty()
+        {
             return Err(StateResolveError::ArenaInvariant {
                 reason: "native activation stack is not empty at shutdown",
             });
@@ -1692,7 +1776,7 @@ impl Runtime {
             // SAFETY: RuntimeHeap remains pinned and shutdown has exclusive
             // owner-thread access with no execution guard.
             let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
-            heap.state_arena.drain_owned(&heap.gc)?
+            heap.state_arena.drain_owned(&mut heap.gc)?
         };
 
         let mut state_shutdown = arena_report.state_shutdown;
@@ -1745,7 +1829,6 @@ impl Runtime {
             drained_coroutine_states: summary.drained_coroutine_states,
             closed_open_upvalues: summary.state_shutdown.closed_open_upvalues,
             rejected_open_upvalue_edges: summary.state_shutdown.rejected_open_upvalue_edges,
-            open_upvalue_cycles: summary.state_shutdown.open_upvalue_cycles,
             open_upvalue_owner_mismatches: summary.state_shutdown.open_upvalue_owner_mismatches,
             open_upvalue_stack_values_missing: summary
                 .state_shutdown
@@ -1776,7 +1859,7 @@ impl Runtime {
         let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
         let state_report =
             // SAFETY: state_pointer names the still-owned main-state Box.
-            unsafe { state_pointer.as_mut() }.prepare_for_runtime_shutdown(&heap.gc);
+            unsafe { state_pointer.as_mut() }.prepare_for_runtime_shutdown(&mut heap.gc);
         heap.state_arena.detach_external(handle, state_pointer)?;
         self.main_state_handle = None;
         drop(self.main_state.take());
@@ -1887,7 +1970,105 @@ fn execute_native_driver_action(
             }
             resume_after_deferred_native_call(state, gc, deferred)
         }
+        NativeDriverAction::DeliverUpvalue(frame) => {
+            if state.state_handle() != Some(frame.request.requester) {
+                return Err(RuntimeError::new(
+                    "open Upvalue response reached a different requester state",
+                ));
+            }
+            let response = frame.response.ok_or_else(|| {
+                RuntimeError::new("open Upvalue transfer has no owner-state response")
+            })?;
+            match (frame.request.operation, response) {
+                (
+                    UpvalueAccessOperation::Read { destination },
+                    UpvalueAccessResponse::Read(value),
+                ) => {
+                    let slot = state.stack.at_mut(destination).ok_or_else(|| {
+                        RuntimeError::new(
+                            "open Upvalue read destination is outside the requester stack",
+                        )
+                    })?;
+                    *slot = value;
+                }
+                (UpvalueAccessOperation::Write { .. }, UpvalueAccessResponse::Written) => {}
+                _ => {
+                    return Err(RuntimeError::new(
+                        "open Upvalue response did not match its requested operation",
+                    ));
+                }
+            }
+            resume_after_upvalue_access(state, gc)
+        }
     }
+}
+
+fn execute_upvalue_owner_access(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    request: &UpvalueAccessRequest,
+) -> Result<UpvalueAccessResponse, RuntimeError> {
+    if state.state_handle() != Some(request.owner) {
+        return Err(RuntimeError::new(
+            "open Upvalue owner-state handle did not match the resolved state",
+        ));
+    }
+    if !state.open_upvalues.contains(&request.upvalue) {
+        return Err(RuntimeError::new(
+            "open Upvalue owner state no longer contains the requested Upvalue",
+        ));
+    }
+    let location = gc
+        .with_ref(request.upvalue, Upvalue::open_location)
+        .map_err(|error| RuntimeError::new(format!("invalid open Upvalue request: {error}")))?;
+    if location != Some((request.owner, request.stack_index)) {
+        return Err(RuntimeError::new(
+            "open Upvalue location changed before owner-state access",
+        ));
+    }
+
+    match &request.operation {
+        UpvalueAccessOperation::Read { .. } => {
+            let value = state
+                .stack
+                .at(request.stack_index)
+                .cloned()
+                .ok_or_else(|| {
+                    RuntimeError::new("open Upvalue owner stack index is out of range")
+                })?;
+            Ok(UpvalueAccessResponse::Read(value))
+        }
+        UpvalueAccessOperation::Write { value } => {
+            let slot = state.stack.at_mut(request.stack_index).ok_or_else(|| {
+                RuntimeError::new("open Upvalue owner stack index is out of range")
+            })?;
+            *slot = value.clone();
+            Ok(UpvalueAccessResponse::Written)
+        }
+    }
+}
+
+fn resume_after_upvalue_access(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+) -> Result<VmExit, RuntimeError> {
+    if state.current_ci == 0 {
+        let proto = state
+            .current_call_info()
+            .proto
+            .ok_or_else(|| RuntimeError::new("open Upvalue requester lost its root Proto"))?;
+        return execute_proto(state, proto, gc);
+    }
+
+    let result = resume_lua_thread(state, gc)?;
+    if matches!(result, VmExit::Complete(ExecResult::Returned))
+        && state.current_ci == 0
+        && let Some(root_proto) = state.current_call_info().proto
+    {
+        state.status = ThreadStatus::Yield;
+        return execute_proto(state, root_proto, gc);
+    }
+    Ok(result)
 }
 
 fn classify_native_turn(
@@ -1905,6 +2086,7 @@ fn classify_native_turn(
                 caller_thread: state.current_thread,
             })
         }
+        Ok(VmExit::UpvalueAccess(request)) => Ok(NativeTurnEvent::UpvalueAccess(request)),
         Ok(VmExit::Complete(result)) => {
             let Some(thread) = state.current_thread else {
                 return Ok(NativeTurnEvent::Main(Ok(result)));
@@ -2117,6 +2299,7 @@ impl Drop for NativeActivationSessionGuard {
                 thread.set_caller(frame.previous_target_caller);
             });
         }
+        activations.upvalue_transfers.clear();
     }
 }
 
@@ -2232,6 +2415,58 @@ mod tests {
         assert_eq!(std::ptr::from_mut(string_pool), string_pool_address);
         assert_eq!(state.gc, Some(gc_address));
         assert_eq!(state.string_pool, Some(string_pool_address));
+    }
+
+    #[test]
+    fn state_open_upvalues_are_unique_owned_and_sorted_by_descending_stack_index() {
+        let mut runtime = Runtime::new();
+        let (owner, low, middle, high, duplicate_high) = {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (main, gc, _) = parts.split_mut();
+            let owner = main
+                .insert_coroutine_state(LuaState::new())
+                .expect("owner state is inserted");
+            let (low, middle, high, duplicate_high) = main
+                .with_resolved_state_mut(owner, |state| {
+                    state.push_number(1.0);
+                    state.push_number(2.0);
+                    state.push_number(3.0);
+                    let low = state
+                        .find_or_create_upvalue(0, gc)
+                        .expect("low Upvalue is published");
+                    let high = state
+                        .find_or_create_upvalue(2, gc)
+                        .expect("high Upvalue is published");
+                    let middle = state
+                        .find_or_create_upvalue(1, gc)
+                        .expect("middle Upvalue is published");
+                    let duplicate_high = state
+                        .find_or_create_upvalue(2, gc)
+                        .expect("same stack slot reuses its Upvalue");
+                    assert_eq!(state.open_upvalues, [high, middle, low]);
+                    (low, middle, high, duplicate_high)
+                })
+                .expect("owner state resolves");
+            (owner, low, middle, high, duplicate_high)
+        };
+
+        assert_eq!(duplicate_high, high);
+        let gc = &runtime.heap.as_ref().get_ref().gc;
+        assert_eq!(
+            gc.with_ref(low, Upvalue::open_location)
+                .expect("low Upvalue remains registered"),
+            Some((owner, 0))
+        );
+        assert_eq!(
+            gc.with_ref(middle, Upvalue::open_location)
+                .expect("middle Upvalue remains registered"),
+            Some((owner, 1))
+        );
+        assert_eq!(
+            gc.with_ref(high, Upvalue::open_location)
+                .expect("high Upvalue remains registered"),
+            Some((owner, 2))
+        );
     }
 
     #[test]
@@ -2800,6 +3035,39 @@ mod tests {
     }
 
     #[test]
+    fn arena_drain_closes_open_upvalue_before_invalidating_owner_handle() {
+        let issuer =
+            StateHandleIssuer::try_new().expect("test runtime namespace should be available");
+        let mut arena = StateArena::new(issuer);
+        let mut gc = GarbageCollector::new();
+        let owner = arena.insert_owned(Box::new(LuaState::new()));
+        let arena_ptr = NonNull::from(&mut arena);
+        let upvalue = StateArena::with_turn_state_mut(arena_ptr, owner, |state| {
+            state.push_number(42.0);
+            state
+                .find_or_create_upvalue(0, &mut gc)
+                .expect("owned state publishes its Upvalue")
+        })
+        .expect("owner state turn succeeds");
+
+        let report = arena.drain_owned(&mut gc).expect("owned state drains");
+
+        assert_eq!(report.drained_owned_states, 1);
+        assert_eq!(report.state_shutdown.closed_open_upvalues, 1);
+        assert_eq!(
+            gc.with_ref(upvalue, |upvalue| {
+                (upvalue.open_location(), upvalue.get_closed_value().clone())
+            })
+            .expect("closed Upvalue remains registered"),
+            (None, Value::Number(42.0))
+        );
+        assert!(matches!(
+            arena.validate(owner),
+            Err(StateResolveError::StaleGeneration { .. })
+        ));
+    }
+
+    #[test]
     fn close_retires_a_coroutine_at_generation_max_without_reuse_or_wrap() {
         let mut runtime = Runtime::new();
         let child_handle = {
@@ -2869,14 +3137,17 @@ mod tests {
             let mut parts = runtime.parts_mut().expect("parts are available");
             let (main, gc, _) = parts.split_mut();
             main.push_value(lua_core::value::Value::Number(1.0));
-            main.find_or_create_upvalue(0, gc);
+            main.find_or_create_upvalue(0, gc)
+                .expect("main state publishes an open Upvalue");
 
             let child_handle = main
                 .insert_coroutine_state(LuaState::new())
                 .expect("child is inserted");
             main.with_resolved_state_mut(child_handle, |child| {
                 child.push_value(lua_core::value::Value::Number(2.0));
-                child.find_or_create_upvalue(0, gc);
+                child
+                    .find_or_create_upvalue(0, gc)
+                    .expect("child state publishes an open Upvalue");
             })
             .expect("child resolves");
         }
@@ -2885,7 +3156,6 @@ mod tests {
 
         assert_eq!(report.closed_open_upvalues, 2);
         assert_eq!(report.rejected_open_upvalue_edges, 0);
-        assert_eq!(report.open_upvalue_cycles, 0);
         assert_eq!(report.open_upvalue_owner_mismatches, 0);
         assert_eq!(report.open_upvalue_stack_values_missing, 0);
         assert_eq!(report.remaining_objects, 0);
@@ -2901,7 +3171,7 @@ mod tests {
         {
             let mut parts = runtime.parts_mut().expect("parts are available");
             let (main, _, _) = parts.split_mut();
-            main.open_upvalues = Some(foreign_upvalue);
+            main.open_upvalues.push(foreign_upvalue);
         }
 
         let report = runtime.close().expect("runtime closes fail-closed");

@@ -41,6 +41,8 @@ pub struct MarkTraceStep {
     pub object_type: GcObjectType,
     /// State edge carried by a reachable `Thread`, if present.
     pub thread_state_handle: Option<StateHandle>,
+    /// Owner state edge carried by a reachable open `Upvalue`, if present.
+    pub upvalue_state_handle: Option<StateHandle>,
     /// Whether the reachable `Thread` also published a caller edge.
     pub traced_thread_caller: bool,
 }
@@ -153,6 +155,12 @@ impl GarbageCollector {
             } else {
                 (None, false)
             };
+            let upvalue_state_handle = if object_type == GcObjectType::Upval {
+                let upvalue = &*(obj as *const crate::upvalue::Upvalue);
+                upvalue.open_location().map(|(owner, _)| owner)
+            } else {
+                None
+            };
 
             if object_type == GcObjectType::Table {
                 self.mark_table(obj);
@@ -163,6 +171,7 @@ impl GarbageCollector {
             Some(MarkTraceStep {
                 object_type,
                 thread_state_handle,
+                upvalue_state_handle,
                 traced_thread_caller,
             })
         }

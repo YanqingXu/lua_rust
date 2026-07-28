@@ -4,35 +4,40 @@
 
 use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::parser::Parser;
-use lua_core::gc::collector::GarbageCollector;
-use lua_core::table::Table;
 use lua_core::value::Value;
-use lua_vm::execute::execute_proto;
-use lua_vm::state::LuaState;
+use lua_vm::runtime::Runtime;
 
 /// 辅助函数：编译并执行 Lua 源码
-fn compile_and_run(source: &str) -> (LuaState, GarbageCollector) {
-    let mut gc = GarbageCollector::new();
-    let global_table = gc.create_root(Table::new());
-    let mut state = LuaState::with_global_table(global_table);
+fn compile_and_run(source: &str) -> (Value, Runtime) {
+    let mut runtime = Runtime::new();
+    let proto = {
+        let mut parts = runtime.parts_mut().expect("runtime parts are available");
+        let (_, gc, _) = parts.split_mut();
+        let mut parser = Parser::new(source);
+        let chunk = parser.parse().expect("Parse should succeed");
+        let proto = CodeGenerator::new(gc)
+            .generate(&chunk, "<test>")
+            .expect("Codegen should succeed");
+        gc.create(proto)
+    };
 
-    let mut parser = Parser::new(source);
-    let chunk = parser.parse().expect("Parse should succeed");
-    let cg = CodeGenerator::new(&mut gc);
-    let proto = cg
-        .generate(&chunk, "<test>")
-        .expect("Codegen should succeed");
-    let proto = gc.create(proto);
-
-    let _ = execute_proto(&mut state, proto, &mut gc);
-    (state, gc)
+    runtime
+        .execute_proto(proto)
+        .expect("Runtime execution should succeed");
+    let value = runtime
+        .parts_mut()
+        .expect("runtime parts remain available")
+        .state()
+        .stack
+        .at(0)
+        .cloned()
+        .unwrap_or(Value::Nil);
+    (value, runtime)
 }
 
 /// 执行后检查返回值（返回值被放置在调用帧的 func 索引位置）
-fn return_value(state: &LuaState) -> Value {
-    // After execute_proto returns, the result is at the initial call frame's func index
-    // which is typically 0 (the first stack slot)
-    state.stack.at(0).cloned().unwrap_or(Value::Nil)
+fn return_value(value: &Value) -> Value {
+    value.clone()
 }
 
 #[test]

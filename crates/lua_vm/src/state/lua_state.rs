@@ -4,9 +4,9 @@
 //! 全局表引用和线程状态。
 //!
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use lua_core::gc::collector::GarbageCollector;
+use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::proto::Proto;
 use lua_core::state_handle::StateHandle;
@@ -23,6 +23,7 @@ use crate::native::{
     ResumeEnvelope, ResumeRequest,
 };
 use crate::runtime::StateArena;
+use thiserror::Error;
 
 /// 线程执行状态
 ///
@@ -42,7 +43,6 @@ pub enum ThreadStatus {
 pub(crate) struct LuaStateShutdownReport {
     pub closed_open_upvalues: usize,
     pub rejected_open_upvalue_edges: usize,
-    pub open_upvalue_cycles: usize,
     pub open_upvalue_owner_mismatches: usize,
     pub open_upvalue_stack_values_missing: usize,
 }
@@ -51,10 +51,26 @@ impl LuaStateShutdownReport {
     pub fn merge(&mut self, other: Self) {
         self.closed_open_upvalues += other.closed_open_upvalues;
         self.rejected_open_upvalue_edges += other.rejected_open_upvalue_edges;
-        self.open_upvalue_cycles += other.open_upvalue_cycles;
         self.open_upvalue_owner_mismatches += other.open_upvalue_owner_mismatches;
         self.open_upvalue_stack_values_missing += other.open_upvalue_stack_values_missing;
     }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum OpenUpvalueError {
+    #[error("open Upvalue owner state is detached from its Runtime")]
+    DetachedState,
+    #[error("open Upvalue reference is invalid: {0}")]
+    InvalidReference(#[from] GcRefValidationError),
+    #[error("closed Upvalue remained in a state's open set")]
+    ClosedInOpenSet,
+    #[error("open Upvalue owner mismatch: expected {expected:?}, found {actual:?}")]
+    OwnerMismatch {
+        expected: StateHandle,
+        actual: StateHandle,
+    },
+    #[error("open Upvalue stack slot {index} is outside the initialized stack")]
+    StackValueMissing { index: usize },
 }
 
 /// Lua 线程状态
@@ -128,8 +144,11 @@ pub struct LuaState {
     pub debug_hook_skip_line: i32,
     /// Cache for debug.getinfo(..., "n") call-site name lookups.
     pub debug_name_cache: HashMap<(usize, usize, usize), (Option<String>, String)>,
-    /// Open upvalue 链表头（按栈索引降序排列）
-    pub open_upvalues: Option<GcRef<Upvalue>>,
+    /// Open Upvalues owned by this state, sorted by descending stack index.
+    ///
+    /// The container owns list topology; Upvalue objects carry no intrusive
+    /// successor or raw Stack pointer.
+    pub open_upvalues: Vec<GcRef<Upvalue>>,
     /// Values passed out by the most recent coroutine.yield.
     pub yielded_values: Vec<Value>,
     /// Register where resume arguments should be written when a yield call resumes.
@@ -187,7 +206,7 @@ impl LuaState {
             debug_hook_skip_proto: None,
             debug_hook_skip_line: -1,
             debug_name_cache: HashMap::new(),
-            open_upvalues: None,
+            open_upvalues: Vec::new(),
             yielded_values: Vec::new(),
             yield_result_base: None,
             yield_wanted_results: None,
@@ -349,138 +368,108 @@ impl LuaState {
 
     // ── Upvalue 管理 ────────────────────────────────────────────
 
-    pub fn find_or_create_upvalue(
+    pub(crate) fn find_or_create_upvalue(
         &mut self,
         stack_index: usize,
         gc: &mut GarbageCollector,
-    ) -> GcRef<Upvalue> {
-        let mut prev: Option<GcRef<Upvalue>> = None;
-        let mut curr = self.open_upvalues;
-
-        while let Some(curr_ref) = curr {
-            // SAFETY: open_upvalues only contains live Upvalue refs allocated by GC.
-            let curr_uv = unsafe { curr_ref.as_ref() }.expect("open upvalue should be valid");
-            if curr_uv.stack_index_any() <= stack_index {
+    ) -> Result<GcRef<Upvalue>, OpenUpvalueError> {
+        let owner = self.state_handle.ok_or(OpenUpvalueError::DetachedState)?;
+        let mut insertion_index = self.open_upvalues.len();
+        for (position, &candidate) in self.open_upvalues.iter().enumerate() {
+            let (candidate_owner, candidate_index) = gc
+                .with_ref(candidate, Upvalue::open_location)?
+                .ok_or(OpenUpvalueError::ClosedInOpenSet)?;
+            if candidate_owner != owner {
+                return Err(OpenUpvalueError::OwnerMismatch {
+                    expected: owner,
+                    actual: candidate_owner,
+                });
+            }
+            if candidate_index == stack_index {
+                return Ok(candidate);
+            }
+            if candidate_index < stack_index {
+                insertion_index = position;
                 break;
             }
-            prev = curr;
-            curr = curr_uv.next();
         }
 
-        if let Some(curr_ref) = curr {
-            // SAFETY: same as above.
-            let curr_uv = unsafe { curr_ref.as_ref() }.expect("open upvalue should be valid");
-            if curr_uv.stack_index_any() == stack_index {
-                return curr_ref;
-            }
-        }
-
-        let stack_ptr = &mut self.stack as *mut Stack as *mut std::ffi::c_void;
-        let new_ref = gc.create(Upvalue::new_open(stack_index, stack_ptr));
-        // SAFETY: new_ref is freshly allocated and uniquely reachable here.
-        unsafe {
-            (*(new_ref.as_ptr() as *mut Upvalue)).set_next(curr);
-        }
-
-        if let Some(prev_ref) = prev {
-            // SAFETY: prev_ref is a live upvalue in the open list.
-            unsafe {
-                (*(prev_ref.as_ptr() as *mut Upvalue)).set_next(Some(new_ref));
-            }
-        } else {
-            self.open_upvalues = Some(new_ref);
-        }
-
-        new_ref
+        let new_ref = gc.create(Upvalue::new_open(owner, stack_index));
+        self.open_upvalues.insert(insertion_index, new_ref);
+        Ok(new_ref)
     }
 
-    pub fn close_upvalues(&mut self, level: usize) {
-        while let Some(uv_ref) = self.open_upvalues {
-            // SAFETY: open_upvalues only contains live Upvalue refs allocated by GC.
-            let stack_index = unsafe { uv_ref.as_ref() }
-                .expect("open upvalue should be valid")
-                .stack_index_any();
+    pub(crate) fn close_upvalues(
+        &mut self,
+        level: usize,
+        gc: &mut GarbageCollector,
+    ) -> Result<(), OpenUpvalueError> {
+        if self.open_upvalues.is_empty() {
+            return Ok(());
+        }
+        let owner = self.state_handle.ok_or(OpenUpvalueError::DetachedState)?;
+        while let Some(&uv_ref) = self.open_upvalues.first() {
+            let (upvalue_owner, stack_index) = gc
+                .with_ref(uv_ref, Upvalue::open_location)?
+                .ok_or(OpenUpvalueError::ClosedInOpenSet)?;
+            if upvalue_owner != owner {
+                return Err(OpenUpvalueError::OwnerMismatch {
+                    expected: owner,
+                    actual: upvalue_owner,
+                });
+            }
             if stack_index < level {
                 break;
             }
 
-            // SAFETY: uv_ref is the current head of the open_upvalues list and
-            // therefore points to a live Upvalue allocated by GC.
-            let next = unsafe { uv_ref.as_ref() }
-                .expect("open upvalue should be valid")
-                .next();
-            self.open_upvalues = next;
-            let value = self.stack.at(stack_index).cloned().unwrap_or(Value::Nil);
-            // SAFETY: uv_ref is being removed from the open list and remains live
-            // through any closures that captured it.
-            unsafe {
-                let uv = &mut *(uv_ref.as_ptr() as *mut Upvalue);
-                uv.close(value);
-                uv.set_next(None);
-            }
+            let value = self
+                .stack
+                .at(stack_index)
+                .cloned()
+                .ok_or(OpenUpvalueError::StackValueMissing { index: stack_index })?;
+            gc.with_mut(uv_ref, |upvalue| upvalue.close(value))?;
+            self.open_upvalues.remove(0);
         }
+        Ok(())
     }
 
-    /// Close valid open Upvalues and detach every transitional Runtime
+    /// Close validated open Upvalues and detach every transitional Runtime
     /// backpointer before this state allocation is dropped.
     ///
-    /// Each Upvalue candidate is validated against the owning collector before
-    /// dereference. Invalid/cross-collector edges and cycles fail closed and
-    /// are reported as shutdown debt; the later heap teardown still releases
-    /// all collector-owned allocations without following those edges.
+    /// The caller must invoke this before the StateArena advances or retires
+    /// this state's handle generation.
     pub(crate) fn prepare_for_runtime_shutdown(
         &mut self,
-        gc: &GarbageCollector,
+        gc: &mut GarbageCollector,
     ) -> LuaStateShutdownReport {
         let mut report = LuaStateShutdownReport::default();
-        let mut visited = HashSet::new();
-        let owner_stack = std::ptr::from_mut(&mut self.stack).cast::<std::ffi::c_void>();
+        let owner = self.state_handle;
 
-        while let Some(upvalue_ref) = self.open_upvalues {
-            if !gc.contains_registered(upvalue_ref) {
-                report.rejected_open_upvalue_edges += 1;
-                self.open_upvalues = None;
-                break;
-            }
-
-            let upvalue_ptr = upvalue_ref.as_ptr() as *mut Upvalue;
-            if !visited.insert(upvalue_ptr) {
-                report.open_upvalue_cycles += 1;
-                self.open_upvalues = None;
-                break;
-            }
-
-            // SAFETY: contains_registered established a live Upvalue allocation
-            // in this Runtime collector. Shutdown has exclusive Runtime access
-            // and no execution guard is active.
-            let upvalue = unsafe { &mut *upvalue_ptr };
-            let next = upvalue.next();
-            let stack_index = upvalue.stack_index_any();
-            let owner_matches = upvalue.owner_stack() == owner_stack;
-            if !owner_matches {
-                report.open_upvalue_owner_mismatches += 1;
-            }
-            let stack_value = if owner_matches && stack_index < self.top {
-                match self.stack.at(stack_index).cloned() {
-                    Some(value) => value,
-                    None => {
-                        report.open_upvalue_stack_values_missing += 1;
-                        Value::Nil
-                    }
+        for upvalue_ref in std::mem::take(&mut self.open_upvalues) {
+            let location = match gc.with_ref(upvalue_ref, Upvalue::open_location) {
+                Ok(Some(location)) => location,
+                Ok(None) | Err(_) => {
+                    report.rejected_open_upvalue_edges += 1;
+                    continue;
                 }
-            } else {
-                if owner_matches {
-                    report.open_upvalue_stack_values_missing += 1;
-                }
-                Value::Nil
             };
-
-            if upvalue.is_open() {
-                upvalue.close(stack_value);
-                report.closed_open_upvalues += 1;
+            let (upvalue_owner, stack_index) = location;
+            if owner != Some(upvalue_owner) {
+                report.open_upvalue_owner_mismatches += 1;
+                continue;
             }
-            upvalue.set_next(None);
-            self.open_upvalues = next;
+            let Some(stack_value) = self.stack.at(stack_index).cloned() else {
+                report.open_upvalue_stack_values_missing += 1;
+                continue;
+            };
+            if gc
+                .with_mut(upvalue_ref, |upvalue| upvalue.close(stack_value))
+                .is_err()
+            {
+                report.rejected_open_upvalue_edges += 1;
+                continue;
+            }
+            report.closed_open_upvalues += 1;
         }
 
         self.global_table = None;
@@ -685,6 +674,18 @@ mod tests {
         assert_eq!(ls.current_call_info().func, 10);
         ls.pop_call_info();
         assert_eq!(ls.current_call_info().func, 0);
+    }
+
+    #[test]
+    fn detached_state_cannot_publish_an_open_upvalue() {
+        let mut gc = GarbageCollector::new();
+        let mut state = LuaState::new();
+        state.push_number(1.0);
+
+        assert_eq!(
+            state.find_or_create_upvalue(0, &mut gc),
+            Err(OpenUpvalueError::DetachedState)
+        );
     }
 
     #[test]

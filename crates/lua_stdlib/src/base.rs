@@ -14,6 +14,7 @@ use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
 use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
+use lua_core::upvalue::Upvalue;
 use lua_core::userdata::Userdata;
 use lua_core::value::Value;
 use lua_vm::execute::call_value;
@@ -512,19 +513,18 @@ fn mark_lua_roots_for_weak_cleanup(l: &LuaState, gc: &mut GarbageCollector) {
 }
 
 fn mark_open_upvalues(l: &LuaState, gc: &mut GarbageCollector) {
-    let mut current = l.open_upvalues;
-    while let Some(upvalue_ref) = current {
-        // SAFETY: open_upvalues only contains live Upvalue refs allocated by GC.
-        let Some(upvalue) = (unsafe { upvalue_ref.as_ref() }) else {
-            break;
-        };
+    for &upvalue_ref in &l.open_upvalues {
+        let location = gc
+            .with_ref(upvalue_ref, Upvalue::open_location)
+            .ok()
+            .flatten();
         gc.mark_registered(upvalue_ref);
-        if upvalue.is_open()
-            && let Some(value) = l.stack.at(upvalue.stack_index())
+        if let Some((owner, stack_index)) = location
+            && l.state_handle() == Some(owner)
+            && let Some(value) = l.stack.at(stack_index)
         {
             gc.mark_value(value);
         }
-        current = upvalue.next();
     }
 }
 

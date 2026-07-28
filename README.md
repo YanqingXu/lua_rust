@@ -45,9 +45,9 @@ chunk、动态 C 模块加载、真实 GC 闭环、任意字节字符串和完�
 | 范围 | 状态 | 证据驱动结论 |
 |---|---|---|
 | Phase 0: Project Infrastructure | ✅ M0 本地完成 | 固定双 oracle、统一质量/兼容门、当前 131-file manifest、进程 runner 与 parity 工具均已建立；M0 收口时完整 gate 通过，新增 M1 fixtures 的外部 cwd Smoke 复验通过，远程 CI 尚待首次运行。 |
-| [Phase 1: Runtime Core](docs/rust_migration/phase_1_report.md) | 🟡 partial | ByteString、GcRef ObjectId provenance、managed Proto roots、确定性 shutdown 与临时对象根基础已落地；open-Upvalue owner、生产 publication、真实 sweep/barrier/finalizer 仍开放。 |
+| [Phase 1: Runtime Core](docs/rust_migration/phase_1_report.md) | 🟡 partial | ByteString、GcRef ObjectId provenance、managed Proto roots、checked open-Upvalue owner、确定性 shutdown 与临时对象根基础已落地；生产 publication、真实 sweep/barrier/finalizer 仍开放。 |
 | [Phase 2: Compiler](docs/rust_migration/phase_2_report.md) | 🟡 partial | Byte lexer/parser/codegen、38-opcode metadata 与简单 bytecode 形状已对齐；nested Proto、结构化极限错误和逐 opcode parity 未完成。 |
-| [Phase 3: VM](docs/rust_migration/phase_3_report.md) | 🟡 partial | 主要 dispatch、调用、闭包、metamethod、coroutine、managed active Proto 与 Runtime coroutine trampoline 路径存在；Upvalue owner、全量 trace parity 和 host ABI 未完成。 |
+| [Phase 3: VM](docs/rust_migration/phase_3_report.md) | 🟡 partial | 主要 dispatch、调用、闭包、metamethod、coroutine、managed active Proto、checked open-Upvalue owner 与 Runtime coroutine trampoline 路径存在；debug/protected-helper 跨 state、全量 trace parity 和 host ABI 未完成。 |
 | [Phase 4: Standard Library](docs/rust_migration/phase_4_report.md) | 🟡 partial | 9 个库入口和大量函数有项目内测试；GC/dump/OS/string/native module 等已登记差异仍开放。 |
 | [Phase 5: CLI / tools](docs/rust_migration/phase_5_report.md) | 🟡 partial | M0 进程 runner、双 oracle、bytecode JSON schema v2 和 parity 工具已落地；88 个非官方差异、C++ local-name 证据、nested bytecode/真实 VM trace parity 和成熟 REPL 仍未完成。 |
 
@@ -148,7 +148,7 @@ non-official 中执行 92 个、按分类跳过 9 个 helper；
 |---|---|---|
 | Lua 5.1 完整兼容性 | M0 验证闭环已建立，但 non-official 仍有 88 个语义差异，official strict/slow suite 也尚未全通过。 | [M0 收口报告](docs/rust_migration/m0_report.md)、M2 总门槛 |
 | `_VERSION` | 项目有意返回 `Lua 5.1 (C core prototype)`，不是 stock 的 `Lua 5.1`。 | [NOTE-001](docs/rust_migration/deviation_log.md#note-001-项目扩展-_version-值) |
-| GC 与 runtime lifecycle | Runtime shutdown、collector provenance、StateHandle identity/retirement 与 coroutine activation trampoline 切片已完成，但 stdlib collect path 仍不执行真实 sweep，计数/step 为模拟；main-state owner、open-Upvalue owner、临时状态根、barrier/finalizer 未闭环。 | [NOTE-002](docs/rust_migration/deviation_log.md#note-002-gc-可观察行为尚未形成真实回收闭环)、[NOTE-009](docs/rust_migration/deviation_log.md#note-009-runtime-与-coroutine-所有权未闭环) |
+| GC 与 runtime lifecycle | Runtime shutdown、collector provenance、StateHandle identity/retirement、checked open-Upvalue owner 与 coroutine activation trampoline 切片已完成，但 stdlib collect path 仍不执行真实 sweep，计数/step 为模拟；main-state owner、临时状态根、debug/protected-helper 跨 state、barrier/finalizer 未闭环。 | [NOTE-002](docs/rust_migration/deviation_log.md#note-002-gc-可观察行为尚未形成真实回收闭环)、[NOTE-009](docs/rust_migration/deviation_log.md#note-009-runtime-与-coroutine-所有权未闭环) |
 | 任意字节字符串 | ByteString/GcString/StringPool 与主要编译器/stdlib/IO 边界已支持 invalid UTF-8、NUL 和 high bytes；所有生产字符串强制 canonical interning、binary chunk 与 C API 边界尚未完成。 | [NOTE-007](docs/rust_migration/deviation_log.md#note-007-lua-字符串尚未采用任意字节表示)、[NOTE-010](docs/rust_migration/deviation_log.md#note-010-lua-字符串-intern-hash-选择固定-c-的前向采样) |
 | 默认标准流 | 提交基线使用 memory file；宿主标准流修复已通过本地 process tests、完整 M0 fixture gate 与 4-case 双 oracle，尚待远程 CI 首次运行。 | [NOTE-004](docs/rust_migration/deviation_log.md#note-004-默认标准流从-memory-file-迁移到宿主流) |
 | C API / FFI | 没有 `lua_capi` crate、公开 headers、稳定 ABI 或 C consumer。 | [NOTE-008](docs/rust_migration/deviation_log.md#note-008-lua-51-c-apiabi-尚不存在) |

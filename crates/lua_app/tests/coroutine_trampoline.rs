@@ -78,3 +78,29 @@ fn wrap_transfers_yield_values_and_propagates_error_identity() {
     assert!(second.starts_with("false\t"), "{second}");
     assert!(second.ends_with(":1: wrapped-error"), "{second}");
 }
+
+#[test]
+fn closure_can_read_and_write_an_open_upvalue_owned_by_a_suspended_coroutine() {
+    let output = run_lua(&[
+        "-e",
+        concat!(
+            "local co = coroutine.create(function() ",
+            "  local value = 10; ",
+            "  coroutine.yield(function(delta) ",
+            "    value = value + delta; return value ",
+            "  end); ",
+            "  return value ",
+            "end); ",
+            "local ok, closure = coroutine.resume(co); ",
+            "print(ok, closure(5)); ",
+            "print(coroutine.resume(co))"
+        ),
+    ]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("test output is UTF-8"),
+        "true\t15\ntrue\t15\n"
+    );
+}

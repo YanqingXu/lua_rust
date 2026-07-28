@@ -13,7 +13,7 @@ use lua_core::table::Table;
 use lua_core::thread::Thread;
 use lua_core::upvalue::Upvalue;
 use lua_core::value::Value;
-use lua_vm::state::{LuaState, Stack};
+use lua_vm::state::LuaState;
 
 struct DebugInfo {
     source: Vec<u8>,
@@ -293,7 +293,11 @@ unsafe extern "C" fn lua_debug_setupvalue(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    set_upvalue_value(l, upvalue_ref, value);
+    if let Err(message) = set_upvalue_value(l, gc, upvalue_ref, value) {
+        let error = gc.create(GcString::from_bytes(message.as_bytes()));
+        l.push_value(Value::String(error));
+        return -1;
+    }
 
     let name_ref = gc.create(GcString::from_bytes(&name));
     l.push_value(Value::String(name_ref));
@@ -333,7 +337,15 @@ unsafe extern "C" fn lua_debug_getupvalue(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     let name_ref = gc.create(GcString::from_bytes(&name));
     l.push_value(Value::String(name_ref));
-    l.push_value(get_upvalue_value(l, upvalue_ref));
+    let value = match get_upvalue_value(l, gc, upvalue_ref) {
+        Ok(value) => value,
+        Err(message) => {
+            let error = gc.create(GcString::from_bytes(message.as_bytes()));
+            l.push_value(Value::String(error));
+            return -1;
+        }
+    };
+    l.push_value(value);
     2
 }
 
@@ -1464,50 +1476,63 @@ fn function_upvalue(
     func.upvalue(index)
 }
 
-fn get_upvalue_value(l: &LuaState, upvalue_ref: GcRef<Upvalue>) -> Value {
-    // SAFETY: upvalue is kept alive by the function being inspected.
-    let Some(upvalue) = (unsafe { upvalue_ref.as_ref() }) else {
-        return Value::Nil;
-    };
-    if upvalue.is_open() {
-        let owner_stack = upvalue.owner_stack();
-        if owner_stack.is_null() {
-            l.stack
-                .at(upvalue.stack_index())
-                .cloned()
-                .unwrap_or(Value::Nil)
-        } else {
-            // SAFETY: open upvalues store the Stack pointer supplied by the owning LuaState.
-            let stack = unsafe { &*(owner_stack as *const Stack) };
-            stack
-                .at(upvalue.stack_index())
-                .cloned()
-                .unwrap_or(Value::Nil)
+fn get_upvalue_value(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    upvalue_ref: GcRef<Upvalue>,
+) -> Result<Value, &'static str> {
+    let (location, closed) = gc
+        .with_ref(upvalue_ref, |upvalue| {
+            (
+                upvalue.open_location(),
+                upvalue
+                    .is_closed()
+                    .then(|| upvalue.get_closed_value().clone()),
+            )
+        })
+        .map_err(|_| "debug.getupvalue received an invalid Upvalue")?;
+    if let Some((owner, stack_index)) = location {
+        if l.state_handle() != Some(owner) {
+            return Err("debug.getupvalue cross-state open Upvalue access is not yet scheduled");
         }
+        if !l.open_upvalues.contains(&upvalue_ref) {
+            return Err("debug.getupvalue owner state lost its open Upvalue");
+        }
+        l.stack
+            .at(stack_index)
+            .cloned()
+            .ok_or("debug.getupvalue open stack index is out of range")
     } else {
-        upvalue.get_closed_value().clone()
+        Ok(closed.unwrap_or(Value::Nil))
     }
 }
 
-fn set_upvalue_value(l: &mut LuaState, upvalue_ref: GcRef<Upvalue>, value: Value) {
-    // SAFETY: upvalue is kept alive by the function being inspected.
-    let upvalue = unsafe { &mut *(upvalue_ref.as_ptr() as *mut Upvalue) };
-    if upvalue.is_open() {
-        let owner_stack = upvalue.owner_stack();
-        if owner_stack.is_null() {
-            if let Some(slot) = l.stack.at_mut(upvalue.stack_index()) {
-                *slot = value;
-            }
-        } else {
-            // SAFETY: open upvalues store the Stack pointer supplied by the owning LuaState.
-            let stack = unsafe { &mut *(owner_stack as *mut Stack) };
-            if let Some(slot) = stack.at_mut(upvalue.stack_index()) {
-                *slot = value;
-            }
+fn set_upvalue_value(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    upvalue_ref: GcRef<Upvalue>,
+    value: Value,
+) -> Result<(), &'static str> {
+    let location = gc
+        .with_ref(upvalue_ref, Upvalue::open_location)
+        .map_err(|_| "debug.setupvalue received an invalid Upvalue")?;
+    if let Some((owner, stack_index)) = location {
+        if l.state_handle() != Some(owner) {
+            return Err("debug.setupvalue cross-state open Upvalue access is not yet scheduled");
         }
+        if !l.open_upvalues.contains(&upvalue_ref) {
+            return Err("debug.setupvalue owner state lost its open Upvalue");
+        }
+        let slot = l
+            .stack
+            .at_mut(stack_index)
+            .ok_or("debug.setupvalue open stack index is out of range")?;
+        *slot = value;
     } else {
-        upvalue.set_closed_value(value);
+        gc.with_mut(upvalue_ref, |upvalue| upvalue.set_closed_value(value))
+            .map_err(|_| "debug.setupvalue received an invalid Upvalue")?;
     }
+    Ok(())
 }
 
 fn function_env(func_ref: GcRef<Function>) -> Option<GcRef<Table>> {
