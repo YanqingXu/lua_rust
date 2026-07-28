@@ -752,10 +752,7 @@ unsafe extern "C" fn lua_b_loadstring_raw(_l_ptr: *mut std::ffi::c_void) -> i32 
         .unwrap_or_else(|| default_loadstring_chunk_name(&source));
 
     match compile_chunk_function(l, &source, &chunk_name) {
-        Ok(func_ref) => {
-            l.push_value(Value::Function(func_ref));
-            1
-        }
+        Ok(_) => 1,
         Err(message) => push_load_error(l, &message),
     }
 }
@@ -795,10 +792,7 @@ unsafe extern "C" fn lua_b_load_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     };
 
     match compile_chunk_function(l, &source, &chunk_name) {
-        Ok(func_ref) => {
-            l.push_value(Value::Function(func_ref));
-            1
-        }
+        Ok(_) => 1,
         Err(message) => push_load_error(l, &message),
     }
 }
@@ -885,10 +879,7 @@ unsafe extern "C" fn lua_b_loadfile_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     let chunk_name = format!("@{filename}").into_bytes();
 
     match compile_chunk_function(l, &source, &chunk_name) {
-        Ok(func_ref) => {
-            l.push_value(Value::Function(func_ref));
-            1
-        }
+        Ok(_) => 1,
         Err(message) => push_load_error(l, &message),
     }
 }
@@ -933,7 +924,9 @@ unsafe extern "C" fn lua_b_dofile_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
 
-    match call_value(l, gc, Value::Function(func_ref), &[], None) {
+    let execution = call_value(l, gc, Value::Function(func_ref), &[], None);
+    let _ = l.pop();
+    match execution {
         Ok(results) => {
             let result_count = results.len();
             for result in results {
@@ -1021,21 +1014,39 @@ fn compile_chunk_function(
         )
     })?;
 
-    let generator = if let Some(pool_ptr) = l.string_pool {
-        // SAFETY: LuaState::string_pool is installed from a live StringPool
-        // owned by the host for the duration of this compilation.
-        CodeGenerator::new_with_pool(gc, unsafe { &mut *pool_ptr })
-    } else {
-        CodeGenerator::new(gc)
-    };
-    let proto = generator
-        .generate_with_source_bytes(&chunk, chunk_name)
-        .map_err(|err| format!("{}:{err}", chunk_name_for_diagnostic(chunk_name)))?;
+    let environment = l.thread_env.or(l.global_table);
+    gc.with_publication(|transaction| {
+        let generator = if let Some(pool_ptr) = l.string_pool {
+            // SAFETY: LuaState::string_pool is installed from a live
+            // StringPool owned by the host for this compilation.
+            CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr })
+        } else {
+            CodeGenerator::new_in_publication(transaction)
+        };
+        let proto = generator
+            .generate_with_source_bytes(&chunk, chunk_name)
+            .map_err(|err| format!("{}:{err}", chunk_name_for_diagnostic(chunk_name)))?;
+        let proto = transaction.alloc(proto);
+        let function = transaction
+            .alloc_lua_function(&proto)
+            .map_err(|err| format!("invalid chunk Function publication: {err}"))?;
+        transaction
+            .set_lua_function_environment(&function, environment)
+            .map_err(|err| format!("invalid chunk environment publication: {err}"))?;
 
-    let proto_ref = gc.create(proto);
-    let mut function = Function::new_lua(proto_ref);
-    function.set_env(l.thread_env.or(l.global_table));
-    Ok(gc.create(function))
+        // SAFETY: the callback installs the Function on the active Lua stack
+        // before its object root is released.
+        unsafe {
+            transaction.publish_function_value(function, |value| {
+                let Value::Function(function) = value.clone() else {
+                    unreachable!("typed Function publication produced another Value kind");
+                };
+                l.push_value(value);
+                function
+            })
+        }
+        .map_err(|err| format!("invalid chunk stack publication: {err}"))
+    })
 }
 
 fn chunk_name_for_diagnostic(chunk_name: &[u8]) -> std::borrow::Cow<'_, str> {

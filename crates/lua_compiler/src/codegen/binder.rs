@@ -4,12 +4,12 @@
 //! 并提供 SymbolRef → ValueResult / LValueRef 的转换。
 //!
 
-use crate::codegen::CodeGenerator;
 use crate::codegen::types::{
     AccessKind, LValueKind, LValueRef, SymbolKind, SymbolRef, ValueResult,
 };
+use crate::codegen::{CodeGenerator, CodegenObjectAllocator};
 
-impl CodeGenerator<'_> {
+impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // ── 名字解析 ──────────────────────────────────────────────────
 
     /// 解析名字到 SymbolRef（Local → Upvalue → Global 三阶段查找）

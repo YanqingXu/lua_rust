@@ -113,6 +113,7 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
         return 1;
     }
 
+    let mut compiled_loader_on_stack = false;
     let loader = match preload_loader(l, gc, package, &module_key) {
         Some(loader) => loader,
         None => {
@@ -135,11 +136,16 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
                     Ok(func_ref) => func_ref,
                     Err(message) => return raise_string(l, &message),
                 };
+            compiled_loader_on_stack = true;
             Value::Function(func_ref)
         }
     };
 
-    match call_value(l, gc, loader, &[Value::String(module_ref)], None) {
+    let execution = call_value(l, gc, loader, &[Value::String(module_ref)], None);
+    if compiled_loader_on_stack {
+        let _ = l.pop();
+    }
+    match execution {
         Ok(results) => {
             if let Some(result) = results.first()
                 && !result.is_nil()
@@ -299,19 +305,34 @@ fn compile_chunk_function(
         .parse()
         .map_err(|err| format!("{chunk_name}:{}:{}: {}", err.line, err.column, err.message))?;
 
-    let generator = if let Some(pool_ptr) = l.string_pool {
-        // SAFETY: LuaState::string_pool is a transitional runtime backpointer
-        // installed from the live host-owned pool for this VM call.
-        CodeGenerator::new_with_pool(gc, unsafe { &mut *pool_ptr })
-    } else {
-        CodeGenerator::new(gc)
-    };
-    let proto = generator
-        .generate(&chunk, chunk_name)
-        .map_err(|err| format!("{chunk_name}:{err}"))?;
-
-    let proto_ref = gc.create(proto);
-    let func_ref = gc.create(Function::new_lua(proto_ref));
+    let func_ref = gc.with_publication(|transaction| {
+        let generator = if let Some(pool_ptr) = l.string_pool {
+            // SAFETY: LuaState::string_pool is a transitional Runtime
+            // backpointer installed from the live host-owned pool.
+            CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr })
+        } else {
+            CodeGenerator::new_in_publication(transaction)
+        };
+        let proto = generator
+            .generate(&chunk, chunk_name)
+            .map_err(|err| format!("{chunk_name}:{err}"))?;
+        let proto = transaction.alloc(proto);
+        let function = transaction
+            .alloc_lua_function(&proto)
+            .map_err(|err| format!("{chunk_name}: invalid loader Function: {err}"))?;
+        // SAFETY: the callback publishes the loader on the active require
+        // stack before releasing its temporary object root.
+        unsafe {
+            transaction.publish_function_value(function, |value| {
+                let Value::Function(function) = value.clone() else {
+                    unreachable!("typed Function publication produced another Value kind");
+                };
+                l.push_value(value);
+                function
+            })
+        }
+        .map_err(|err| format!("{chunk_name}: invalid loader stack publication: {err}"))
+    })?;
     if l.gc.is_none() {
         l.gc = Some(gc as *mut GarbageCollector);
     }

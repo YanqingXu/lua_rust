@@ -8,16 +8,16 @@ use crate::ast::expr::{
     BinaryExpr, BinaryOp, CallExpr, Expr, FunctionExpr, IndexExpr, MemberExpr, TableExpr,
     UnaryExpr, UnaryOp,
 };
-use crate::codegen::CodeGenerator;
 use crate::codegen::types::{
     AccessKind, CallResultInfo, CallResultKind, CondResult, ImmediateKind, LValueKind, LValueRef,
     NO_JUMP, PatchList, ValueResult,
 };
+use crate::codegen::{CodeGenerator, CodegenObjectAllocator};
 use crate::opcode::{self, LFIELDS_PER_FLUSH, MAXARG_C, MAXINDEXRK, OpCode};
 
 use crate::opcode::rk_ask;
 
-impl CodeGenerator<'_> {
+impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // ═══════════════════════════════════════════════════════════════
     // 公开入口
     // ═══════════════════════════════════════════════════════════════

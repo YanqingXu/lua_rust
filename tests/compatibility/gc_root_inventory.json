@@ -592,8 +592,23 @@
       "source_locations": [
         {
           "path": "crates/lua_app/src/main.rs",
-          "line": 338,
-          "symbol": "compile_or_load_function Proto publication gap"
+          "line": 320,
+          "symbol": "compile_or_load_proto transaction and explicit-root handoff"
+        },
+        {
+          "path": "crates/lua_bytecode/src/main.rs",
+          "line": 64,
+          "symbol": "compile_lua_source transaction and explicit-root handoff"
+        },
+        {
+          "path": "crates/lua_stdlib/src/base.rs",
+          "line": 996,
+          "symbol": "compile_chunk_function typed Proto-to-Function stack publication"
+        },
+        {
+          "path": "crates/lua_stdlib/src/package.rs",
+          "line": 297,
+          "symbol": "compile_chunk_function typed loader stack publication"
         },
         {
           "path": "crates/lua_stdlib/src/io.rs",
@@ -602,24 +617,24 @@
         },
         {
           "path": "crates/lua_compiler/src/codegen/mod.rs",
-          "line": 132,
-          "symbol": "CodeGenerator::generate"
+          "line": 196,
+          "symbol": "CodeGenerator publication-rooted constructors"
         }
       ],
       "status": "partial",
       "owner": {
-        "current": "GarbageCollector::with_publication provides a higher-ranked PublicationTxn and branded Rooted handle. New allocations enter an ObjectId-bearing temporary-root registry before the handle is exposed; panic/nested-scope Drop removes exact identities, and safe raw-handle escape is limited to promotion into the explicit collector root set.",
+        "current": "GarbageCollector::with_publication provides a higher-ranked PublicationTxn and branded Rooted handle. New allocations enter an ObjectId-bearing temporary-root registry before the handle is exposed; panic/nested-scope Drop removes exact identities. The compiler now roots interned strings and child Proto nodes throughout builder execution, and typed Proto-to-Function/environment operations publish CLI, bytecode-tool, base load/dofile, and package file-loader outputs either to an explicit root or directly to a traced Lua stack.",
         "target": "Heap owns publication transactions with typed Table/Function/Proto/Userdata edge-publish operations and makes unprotected production allocation unavailable."
       },
       "tracer": {
         "current": "GarbageCollector::begin_mark_only validates and seeds active temporary object roots, with separate seeded/rejected counts.",
         "target": "RuntimeRootTracer seeds every active temporary-root scope."
       },
-      "missing_risk": "The registry/API foundation is tested, but compiler, IO, coroutine, library registration, VM temporaries, result Vecs, and direct production gc.create calls have not migrated. Allocation-triggered collection therefore remains disabled.",
+      "missing_risk": "The compiler Proto tree and its production top-level consumers are migrated, as is coroutine create/wrap, but general library/package registration, IO graphs, VM temporaries, app argument/result buffers, and remaining direct production gc.create calls have not migrated. Allocation-triggered collection therefore remains disabled.",
       "planned_test": {
-        "name": "allocation_is_seeded_until_transaction_drop; nested_and_panic_scopes_release_exact_roots; allocation_during_object_construction_preserves_temporaries",
+        "name": "compiler_proto_tree_publishes_atomically_into_a_lua_function; compiler_publication_panic_releases_every_partial_graph_root; allocation_during_object_construction_preserves_temporaries",
         "layer": "lua_vm runtime_gc_roots",
-        "assertion": "The foundation seeds exact temporary identities and returns to zero after 1,000 scopes; future forced-GC-at-every-allocation tests must preserve compiler, IO, coroutine, and closure construction intermediates."
+        "assertion": "Compiler strings, nested Proto nodes, top Proto, and Lua Function remain exact temporary roots until explicit-root or stack publication; future forced-GC-at-every-allocation tests must preserve library, IO, VM, app/result, and remaining closure construction intermediates."
       }
     },
     {

@@ -306,9 +306,15 @@ fn execute_source(
         }
         compile_or_load_proto(gc, string_pool, source, chunk_name)?
     };
-    runtime
+    let execution = runtime
         .execute_proto_with_args(proto, args.to_vec())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    {
+        let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
+        let (_, gc, _) = parts.split_mut();
+        gc.remove_root(proto);
+    }
+    execution
 }
 
 fn compile_or_load_proto(
@@ -322,10 +328,15 @@ fn compile_or_load_proto(
         .parse()
         .map_err(|err| format!("{chunk_name}:{}: {}", err.line, err.message))?;
 
-    let proto: Proto = CodeGenerator::new_with_pool(gc, string_pool)
-        .generate(&chunk, chunk_name)
-        .map_err(|err| format!("{chunk_name}:{err}"))?;
-    Ok(gc.create(proto))
+    gc.with_publication(|transaction| {
+        let proto: Proto = CodeGenerator::new_in_publication_with_pool(transaction, string_pool)
+            .generate(&chunk, chunk_name)
+            .map_err(|err| format!("{chunk_name}:{err}"))?;
+        let proto = transaction.alloc(proto);
+        transaction
+            .publish_as_explicit_root(proto)
+            .map_err(|err| format!("{chunk_name}: invalid Proto publication: {err}"))
+    })
 }
 
 fn install_arg_table(

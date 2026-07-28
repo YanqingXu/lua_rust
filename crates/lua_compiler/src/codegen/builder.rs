@@ -7,7 +7,6 @@
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
 use lua_core::proto::{Instruction, Proto};
-use lua_core::string_pool::StringPool;
 use lua_core::value::Value;
 
 use crate::opcode::{self, OpCode};
@@ -136,40 +135,9 @@ impl BytecodeBuilder {
         self.proto.add_constant(Value::Nil) as i32
     }
 
-    /// 添加字符串常量，返回常量索引
-    ///
-    /// 如果提供 StringPool，则优先从驻留池获取已有字符串（保证相同内容的
-    /// 字符串获得相同的 GcRef，从而使指针比较在表查找中直接生效）。
-    /// 如果未提供池，则直接由 GC 分配字符串。
-    pub fn add_string_constant(
-        &mut self,
-        gc: &mut lua_core::gc::collector::GarbageCollector,
-        string_pool: Option<&mut StringPool>,
-        value: &str,
-    ) -> Option<i32> {
-        self.add_byte_string_constant(gc, string_pool, value.as_bytes())
-    }
-
-    /// 添加任意字节的 Lua 字符串常量。
-    ///
-    /// 这是字符串字面量的规范入口；`add_string_constant` 仅作为 UTF-8
-    /// 文本（标识符、调试名）的兼容包装。
-    pub fn add_byte_string_constant(
-        &mut self,
-        gc: &mut lua_core::gc::collector::GarbageCollector,
-        string_pool: Option<&mut StringPool>,
-        value: &[u8],
-    ) -> Option<i32> {
-        // The pool is an explicit short-lived borrow. The builder never retains
-        // allocator services beyond this call.
-        let gc_str = if let Some(pool) = string_pool {
-            pool.intern_bytes(gc, value)
-        } else {
-            // No pool available — fall back to direct GC allocation
-            gc.create(GcString::from_bytes(value))
-        };
-        let idx = self.proto.add_constant(Value::String(gc_str)) as i32;
-        Some(idx)
+    /// Attach an allocator-validated Lua string constant.
+    pub(crate) fn add_gc_string_constant(&mut self, value: GcRef<GcString>) -> i32 {
+        self.proto.add_constant(Value::String(value)) as i32
     }
 
     /// 添加子原型，返回原型索引

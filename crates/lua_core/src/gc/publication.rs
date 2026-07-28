@@ -4,8 +4,9 @@
 //! Allocation-triggered collection is intentionally still disabled. This
 //! module establishes the root registry and branded transaction API required
 //! before such collection can be enabled. Safe code cannot extract a raw
-//! `GcRef` from [`Rooted`]; the only initial publication operation promotes an
-//! object into the collector's explicit root set.
+//! `GcRef` from [`Rooted`]. Typed operations validate and publish supported
+//! object graphs, while explicit-root promotion remains available for
+//! top-level owners.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -14,9 +15,12 @@ use crate::function::{Function, RuntimeNativeFunction};
 use crate::gc::collector::{GarbageCollector, GcRefValidationError};
 use crate::gc::gc_object::GcObject;
 use crate::gc::gc_ref::GcRef;
-#[cfg(test)]
 use crate::gc::mark::MarkRootSeedReport;
 use crate::gc::object_id::ObjectId;
+use crate::gc_string::GcString;
+use crate::proto::Proto;
+use crate::string_pool::StringPool;
+use crate::table::Table;
 use crate::thread::Thread;
 use crate::upvalue::Upvalue;
 use crate::value::Value;
@@ -184,6 +188,78 @@ impl<'scope> PublicationTxn<'scope> {
         Ok(self.alloc(function))
     }
 
+    /// Intern one Lua byte string and retain it as a publication root.
+    pub fn intern_bytes(
+        &mut self,
+        pool: &mut StringPool,
+        bytes: &[u8],
+    ) -> Result<Rooted<'scope, GcString>, GcRefValidationError> {
+        if let Some(existing) = pool.find_bytes(bytes) {
+            if self.collector.contains_registered(existing) {
+                return self.protect(existing);
+            }
+            pool.remove(existing);
+        }
+
+        pool.reserve(1);
+        let rooted = self.alloc(GcString::from_bytes(bytes));
+        pool.insert_reserved_bytes(bytes, rooted.reference);
+        Ok(rooted)
+    }
+
+    /// Retain a protected string for attachment to an unpublished Proto.
+    ///
+    /// # Safety
+    ///
+    /// The returned handle must be attached only to a Proto graph that is
+    /// itself protected or published before this transaction ends. It must
+    /// not escape as an independently unrooted handle.
+    pub unsafe fn retain_string_for_proto(
+        &self,
+        rooted: Rooted<'scope, GcString>,
+    ) -> Result<GcRef<GcString>, GcRefValidationError> {
+        self.validate_protection(&rooted)?;
+        Ok(rooted.reference)
+    }
+
+    /// Retain a protected child Proto for attachment to an unpublished parent.
+    ///
+    /// # Safety
+    ///
+    /// The returned handle must be attached only to a Proto graph that is
+    /// itself protected or published before this transaction ends. It must
+    /// not escape as an independently unrooted handle.
+    pub unsafe fn retain_proto_for_parent(
+        &self,
+        rooted: Rooted<'scope, Proto>,
+    ) -> Result<GcRef<Proto>, GcRefValidationError> {
+        self.validate_protection(&rooted)?;
+        Ok(rooted.reference)
+    }
+
+    /// Allocate a protected Lua Function that retains a protected Proto.
+    pub fn alloc_lua_function(
+        &mut self,
+        proto: &Rooted<'scope, Proto>,
+    ) -> Result<Rooted<'scope, Function>, GcRefValidationError> {
+        self.validate_protection(proto)?;
+        Ok(self.alloc(Function::new_lua(proto.reference)))
+    }
+
+    /// Install a validated environment on a protected Lua Function.
+    pub fn set_lua_function_environment(
+        &mut self,
+        function: &Rooted<'scope, Function>,
+        environment: Option<GcRef<Table>>,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(function)?;
+        if let Some(environment) = environment {
+            self.collector.validate_ref(environment)?;
+        }
+        self.collector
+            .with_mut(function.reference, |function| function.set_env(environment))
+    }
+
     /// Check that a protected Function retains a protected Thread through one
     /// of its closed Upvalues.
     pub fn function_reaches_thread(
@@ -225,6 +301,19 @@ impl<'scope> PublicationTxn<'scope> {
             }
         }
         Ok(false)
+    }
+
+    /// Check that a protected Lua Function retains the protected Proto.
+    pub fn function_reaches_proto(
+        &self,
+        function: &Rooted<'scope, Function>,
+        proto: &Rooted<'scope, Proto>,
+    ) -> Result<bool, GcRefValidationError> {
+        self.validate_protection(function)?;
+        self.validate_protection(proto)?;
+        self.collector.with_ref(function.reference, |function| {
+            function.proto() == Some(proto.reference)
+        })
     }
 
     /// Publish a protected Thread value while its temporary root remains
@@ -281,8 +370,9 @@ impl<'scope> PublicationTxn<'scope> {
         publish(&mut nested)
     }
 
-    #[cfg(test)]
-    fn trace_mark_only(&mut self) -> MarkRootSeedReport {
+    /// Run the collector's non-destructive mark seed while this transaction's
+    /// lexical roots are active.
+    pub fn trace_mark_only(&mut self) -> MarkRootSeedReport {
         self.collector.begin_mark_only()
     }
 

@@ -109,6 +109,17 @@ impl StringPool {
         self.pool.reserve(additional);
     }
 
+    pub(crate) fn insert_reserved_bytes(&mut self, bytes: &[u8], value: GcRef<GcString>) {
+        match self.pool.entry(ByteString::from_bytes(bytes)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                panic!("reserved StringPool publication unexpectedly found an entry");
+            }
+        }
+    }
+
     // ── 迭代 ──────────────────────────────────────────────────
 
     /// 按规范字节视图遍历所有已驻留的字符串。

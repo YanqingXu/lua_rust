@@ -9,11 +9,11 @@ use crate::ast::stmt::{
     AssignStmt, CallStmt, DoStmt, ForInStmt, ForNumStmt, FunctionStmt, IfStmt, LocalStmt,
     RepeatStmt, ReturnStmt, Stmt, WhileStmt,
 };
-use crate::codegen::CodeGenerator;
 use crate::codegen::types::{AccessKind, LValueKind, NO_JUMP, SymbolKind, ValueResult};
+use crate::codegen::{CodeGenerator, CodegenObjectAllocator};
 use crate::opcode::{MAXINDEXRK, OpCode, is_k, rk_ask};
 
-impl CodeGenerator<'_> {
+impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // ═══════════════════════════════════════════════════════════════
     // 公开入口 — 语句 / 语句块
     // ═══════════════════════════════════════════════════════════════

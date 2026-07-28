@@ -4,16 +4,15 @@
 //! upvalue 闭包元数据和调试信息附加。
 //!
 
-use lua_core::gc_string::GcString;
 use lua_core::proto::{Proto, VARARG_ISVARARG, VARARG_NEEDSARG};
 
 use crate::ast::expr::Expr;
 use crate::ast::stmt::Stmt;
-use crate::codegen::CodeGenerator;
 use crate::codegen::types::{CompiledFunction, ParentFunctionContext, UpvalueCapture};
+use crate::codegen::{CodeGenerator, CodegenObjectAllocator};
 use crate::opcode::OpCode;
 
-impl CodeGenerator<'_> {
+impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // ═══════════════════════════════════════════════════════════════
     // 函数编译
     // ═══════════════════════════════════════════════════════════════
@@ -97,8 +96,8 @@ impl CodeGenerator<'_> {
         self.builder.set_num_upvalues(upvalues.len() as u8);
         for upvalue in &upvalues {
             let name = self
-                .gc
-                .create(GcString::from_bytes(upvalue.name.as_bytes()));
+                .allocator
+                .allocate_string(self.string_pool.as_deref_mut(), upvalue.name.as_bytes());
             self.builder.add_upvalue_name(name);
         }
         let max_stack = self
@@ -112,7 +111,7 @@ impl CodeGenerator<'_> {
         let child_builder = std::mem::replace(&mut self.builder, saved_builder);
         let child_proto = child_builder.into_proto();
 
-        let child_ref = self.gc.create(child_proto);
+        let child_ref = self.allocator.allocate_proto(child_proto);
         let proto_index = self.builder.add_sub_proto(child_ref);
 
         // 恢复状态

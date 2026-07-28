@@ -4,12 +4,11 @@
 //! upvalue 注册和 CLOSE 指令发射。
 //!
 
-use crate::codegen::CodeGenerator;
 use crate::codegen::types::{BlockInfo, LocalVar, PatchList, UpvalueCapture};
+use crate::codegen::{CodeGenerator, CodegenObjectAllocator};
 use crate::opcode::OpCode;
-use lua_core::gc_string::GcString;
 
-impl CodeGenerator<'_> {
+impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // ── 局部变量 ──────────────────────────────────────────────────
 
     /// 添加局部变量，返回分配的寄存器槽位
@@ -224,7 +223,9 @@ impl CodeGenerator<'_> {
             } else {
                 self.builder.instruction_count() as i32
             };
-            let name = self.gc.create(GcString::from_bytes(var.name.as_bytes()));
+            let name = self
+                .allocator
+                .allocate_string(self.string_pool.as_deref_mut(), var.name.as_bytes());
             self.builder
                 .add_local_debug(Some(name), var.startpc, endpc, var.reg);
         }

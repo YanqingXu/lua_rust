@@ -771,8 +771,9 @@ migration, and complete finalizer/shutdown semantics.
 `(pointer, ObjectId, tag)` identity into a collector-owned temporary-root map
 before returning a branded `Rooted<'scope, T>`. The higher-ranked closure has a
 compile-fail test proving that `Rooted` cannot appear in the return type. Safe
-code cannot extract its raw `GcRef`; the initial safe publication operation
-installs an explicit collector root before releasing the temporary identity.
+code cannot extract its raw `GcRef`; typed operations either validate graph
+edges and transfer ownership to a traced stack/object, or install an explicit
+collector root before releasing the temporary identity.
 
 Nested transactions retain outer roots. Normal Drop and panic unwind remove
 only the exact IDs owned by the transaction. `begin_mark_only` validates and
@@ -781,13 +782,20 @@ cover nested panic, foreign/stale rejection, explicit-root promotion, typed
 Thread/Upvalue/runtime-native Function graph construction, checked value
 publication, mark seeding, and 1,000 scopes returning the registry to zero.
 
+The compiler is the second migrated production graph. Its sealed allocation
+substrate lets `CodeGenerator` intern strings and allocate nested Proto nodes
+inside one publication transaction; `BytecodeBuilder` no longer allocates GC
+objects itself. Typed Proto-to-Function and environment operations then keep
+the top Proto and Lua Function protected until the CLI/bytecode tool installs
+an explicit root or base/package installs the Function directly on a traced
+Lua stack. Error return and panic injection cover both partial builder graphs
+and the window after Function construction but before publication.
+
 This is an API/registry foundation, not completion of publication safety.
-Compiler Proto trees, IO graphs, library registration, VM temporaries, app
+General library/package registration, IO graphs, VM temporaries, app
 arguments, and returned `Vec<Value>` paths still use unprotected production
-allocation. Coroutine create/wrap is the first migrated production graph:
-Thread, closed Upvalue, and wrapper Function remain branded roots until the
-State↔Thread graph is bound and its exported value is on a traced stack.
-Allocation-triggered collection remains disabled.
+allocation. Coroutine create/wrap and compiler Proto publication are the
+migrated production graphs. Allocation-triggered collection remains disabled.
 
 #### D.3 Implemented temporary-state root transaction (local-complete slice)
 
@@ -817,10 +825,10 @@ temporary state roots and rejected releases; normal close and 1,000-cycle
 shutdown leave both at zero.
 
 This closes the inventory entry for coroutine state publication, not the
-broader production publication program. Proto→Function/compiler builders,
-library/package and IO graphs, VM temporaries, app arguments/results, unique
-Heap ownership, fixed strings, and finalizer roots remain blockers for live
-destructive collection.
+broader production publication program. Compiler Proto→Function builders are
+now migrated, while remaining library/package and IO graphs, VM temporaries,
+app arguments/results, unique Heap ownership, fixed strings, and finalizer
+roots remain blockers for live destructive collection.
 
 ### E. Shutdown substrate — M1.8
 

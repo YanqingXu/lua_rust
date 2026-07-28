@@ -6,6 +6,7 @@ use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::opcode::{self, OpCode};
 use lua_compiler::parser::Parser;
 use lua_core::gc::collector::GarbageCollector;
+use lua_core::gc::gc_ref::GcRef;
 use lua_core::proto::Proto;
 use lua_core::string_pool::StringPool;
 use lua_core::value::Value;
@@ -47,10 +48,15 @@ fn dump_file(filename: &str, format: &str) -> Result<(), Box<dyn std::error::Err
     let mut temp_pool = StringPool::new();
     let proto = compile_lua_source(&source, filename, &mut temp_gc, &mut temp_pool)?;
 
-    match format {
-        "json" => dump_json(&proto, filename, &temp_gc)?,
-        _ => dump_text(&proto, filename, &source),
-    }
+    let dump_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        match format {
+            "json" => temp_gc.with_ref(proto, |proto| dump_json(proto, filename, &temp_gc))??,
+            _ => temp_gc.with_ref(proto, |proto| dump_text(proto, filename, &source))?,
+        }
+        Ok(())
+    })();
+    temp_gc.remove_root(proto);
+    dump_result?;
 
     Ok(())
 }
@@ -60,10 +66,15 @@ fn compile_lua_source(
     source_name: &str,
     gc: &mut GarbageCollector,
     string_pool: &mut StringPool,
-) -> Result<Proto, Box<dyn std::error::Error>> {
+) -> Result<GcRef<Proto>, Box<dyn std::error::Error>> {
     let mut parser = Parser::from_bytes(source);
     let chunk = parser.parse()?;
-    Ok(CodeGenerator::new_with_pool(gc, string_pool).generate(&chunk, source_name)?)
+    gc.with_publication(|transaction| {
+        let proto = CodeGenerator::new_in_publication_with_pool(transaction, string_pool)
+            .generate(&chunk, source_name)?;
+        let proto = transaction.alloc(proto);
+        Ok(transaction.publish_as_explicit_root(proto)?)
+    })
 }
 
 fn read_lua_source_file(filename: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -378,21 +389,29 @@ mod byte_source_tests {
         let mut parser = Parser::from_bytes(&source);
         let chunk = parser.parse().expect("byte source should parse");
         let mut gc = GarbageCollector::new();
-        let proto = CodeGenerator::new(&mut gc)
-            .generate(&chunk, "@bytes.lua")
-            .expect("byte source should compile");
-        let string = proto
-            .constants()
-            .iter()
-            .find_map(|value| match value {
-                Value::String(string) => Some(*string),
-                _ => None,
+        let proto = gc.with_publication(|transaction| {
+            let proto = CodeGenerator::new_in_publication(transaction)
+                .generate(&chunk, "@bytes.lua")
+                .expect("byte source should compile");
+            let proto = transaction.alloc(proto);
+            transaction
+                .publish_as_explicit_root(proto)
+                .expect("test Proto should publish")
+        });
+        let string = gc
+            .with_ref(proto, |proto| {
+                proto.constants().iter().find_map(|value| match value {
+                    Value::String(string) => Some(*string),
+                    _ => None,
+                })
             })
+            .expect("test Proto remains registered")
             .expect("literal should become a string constant");
-        // SAFETY: `gc` remains live for the duration of this assertion.
-        let string = unsafe { string.as_ref() }.expect("constant must be non-null");
-
-        assert_eq!(string.as_bytes(), &[0x00, 0x80, 0xff]);
+        gc.with_ref(string, |string| {
+            assert_eq!(string.as_bytes(), &[0x00, 0x80, 0xff]);
+        })
+        .expect("constant string remains registered");
+        gc.remove_root(proto);
     }
 
     #[test]
@@ -415,23 +434,27 @@ mod byte_source_tests {
         )
         .expect("source should compile");
 
-        assert_eq!(proto.constant_count(), 3);
-        let globals = proto
-            .code()
-            .iter()
-            .copied()
-            .filter(|inst| opcode::get_opcode(*inst) == OpCode::GETGLOBAL)
-            .collect::<Vec<_>>();
-        assert_eq!(globals.len(), 2);
-        assert_eq!(opcode::get_arg_bx(globals[0]), 0);
-        assert_eq!(opcode::get_arg_bx(globals[1]), 0);
+        gc.with_ref(proto, |proto| {
+            assert_eq!(proto.constant_count(), 3);
+            let globals = proto
+                .code()
+                .iter()
+                .copied()
+                .filter(|inst| opcode::get_opcode(*inst) == OpCode::GETGLOBAL)
+                .collect::<Vec<_>>();
+            assert_eq!(globals.len(), 2);
+            assert_eq!(opcode::get_arg_bx(globals[0]), 0);
+            assert_eq!(opcode::get_arg_bx(globals[1]), 0);
 
-        let Value::String(print_name) = proto.constant(0) else {
-            panic!("first constant should be the interned global name");
-        };
-        // SAFETY: `gc` remains alive and no collection runs during this read.
-        let print_name = unsafe { print_name.as_ref() }.expect("string constant should be live");
-        assert_eq!(print_name.as_bytes(), b"print");
+            let Value::String(print_name) = proto.constant(0) else {
+                panic!("first constant should be the interned global name");
+            };
+            // SAFETY: `gc` remains alive and no collection runs during this read.
+            let print_name =
+                unsafe { print_name.as_ref() }.expect("string constant should be live");
+            assert_eq!(print_name.as_bytes(), b"print");
+        })
+        .expect("root Proto remains registered");
     }
 
     #[test]
@@ -444,8 +467,10 @@ mod byte_source_tests {
         let mut pool = StringPool::new();
         let proto = compile_lua_source(&source, "@json-evidence.lua", &mut gc, &mut pool)
             .expect("nested byte source should compile");
-        let evidence =
-            proto_json(&proto, &gc, &mut Vec::new()).expect("Proto tree should serialize");
+        let evidence = gc
+            .with_ref(proto, |proto| proto_json(proto, &gc, &mut Vec::new()))
+            .expect("root Proto remains registered")
+            .expect("Proto tree should serialize");
 
         assert_eq!(evidence["child_count"], 1);
         assert_eq!(evidence["sub_protos"].as_array().map(Vec::len), Some(1));

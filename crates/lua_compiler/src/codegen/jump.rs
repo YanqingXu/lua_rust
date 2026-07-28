@@ -6,11 +6,11 @@
 //! 跳转 PC，最终 patching 时统一回填真实目标地址。
 //!
 
-use crate::codegen::CodeGenerator;
 use crate::codegen::types::{NO_JUMP, PatchList};
+use crate::codegen::{CodeGenerator, CodegenObjectAllocator};
 use crate::opcode::{self, MAXARG_SBX, NO_REG, OpCode};
 
-impl CodeGenerator<'_> {
+impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // ── 跳转发射 ──────────────────────────────────────────────────
 
     /// 发射无条件跳转，返回跳转 PC

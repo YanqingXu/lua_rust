@@ -33,6 +33,8 @@ pub use types::{
 };
 
 use lua_core::gc::collector::GarbageCollector;
+use lua_core::gc::gc_ref::GcRef;
+use lua_core::gc::publication::PublicationTxn;
 use lua_core::gc_string::GcString;
 use lua_core::proto::Proto;
 use lua_core::string_pool::StringPool;
@@ -80,12 +82,77 @@ impl From<ParseError> for CodegenError {
 // CodeGenerator
 // =====================================================================
 
+mod allocator_sealed {
+    pub trait Sealed {}
+
+    impl Sealed for lua_core::gc::collector::GarbageCollector {}
+    impl Sealed for lua_core::gc::publication::PublicationTxn<'_> {}
+}
+
+/// Allocation substrate used by the compiler's Proto builder.
+///
+/// The trait is sealed so production callers select either direct legacy
+/// allocation or a lexical publication transaction.
+#[doc(hidden)]
+pub trait CodegenObjectAllocator: allocator_sealed::Sealed {
+    fn allocate_string(
+        &mut self,
+        string_pool: Option<&mut StringPool>,
+        bytes: &[u8],
+    ) -> GcRef<GcString>;
+
+    fn allocate_proto(&mut self, proto: Proto) -> GcRef<Proto>;
+}
+
+impl CodegenObjectAllocator for GarbageCollector {
+    fn allocate_string(
+        &mut self,
+        string_pool: Option<&mut StringPool>,
+        bytes: &[u8],
+    ) -> GcRef<GcString> {
+        match string_pool {
+            Some(pool) => pool.intern_bytes(self, bytes),
+            None => self.create(GcString::from_bytes(bytes)),
+        }
+    }
+
+    fn allocate_proto(&mut self, proto: Proto) -> GcRef<Proto> {
+        self.create(proto)
+    }
+}
+
+impl CodegenObjectAllocator for PublicationTxn<'_> {
+    fn allocate_string(
+        &mut self,
+        string_pool: Option<&mut StringPool>,
+        bytes: &[u8],
+    ) -> GcRef<GcString> {
+        let rooted = if let Some(pool) = string_pool {
+            self.intern_bytes(pool, bytes)
+                .expect("compiler StringPool entry belongs to the publication collector")
+        } else {
+            self.alloc(GcString::from_bytes(bytes))
+        };
+        // SAFETY: CodeGenerator attaches this handle only to the unpublished
+        // Proto tree owned by the same transaction.
+        unsafe { self.retain_string_for_proto(rooted) }
+            .expect("new compiler string remains protected")
+    }
+
+    fn allocate_proto(&mut self, proto: Proto) -> GcRef<Proto> {
+        let rooted = self.alloc(proto);
+        // SAFETY: CodeGenerator immediately attaches this child to its
+        // unpublished parent, and the same transaction protects both.
+        unsafe { self.retain_proto_for_parent(rooted) }
+            .expect("new compiler Proto remains protected")
+    }
+}
+
 /// Lua 5.1 字节码生成器
 ///
 /// 将 AST 编译为可执行的 Proto 对象。
 /// 实现完整的表达式/语句 lowering 和函数编译管线。
-///
-pub struct CodeGenerator<'services> {
+pub struct CodeGenerator<'services, A: CodegenObjectAllocator + ?Sized = GarbageCollector> {
     pub builder: BytecodeBuilder,
     pub reg_alloc: RegisterAllocator,
     pub current_line: i32,
@@ -104,14 +171,14 @@ pub struct CodeGenerator<'services> {
     // ── 代码块栈 ──────────────────────────────────────────────
     pub blocks: Vec<BlockInfo>,
 
-    /// 编译期间借用的 GC。生命周期保证服务不会先于编译器失效。
-    gc: &'services mut GarbageCollector,
+    /// 编译期间借用的对象分配服务；生命周期保证服务不会先于编译器失效。
+    allocator: &'services mut A,
 
-    /// 可选的字符串驻留池，与 GC 一样只在本次编译期间安全借用。
+    /// 可选的字符串驻留池，只在本次编译期间安全借用。
     string_pool: Option<&'services mut StringPool>,
 }
 
-impl<'services> CodeGenerator<'services> {
+impl<'services> CodeGenerator<'services, GarbageCollector> {
     pub fn new(gc: &'services mut GarbageCollector) -> Self {
         Self::from_services(gc, None)
     }
@@ -122,9 +189,26 @@ impl<'services> CodeGenerator<'services> {
     ) -> Self {
         Self::from_services(gc, Some(string_pool))
     }
+}
 
+impl<'services, 'scope> CodeGenerator<'services, PublicationTxn<'scope>> {
+    /// Create a compiler whose every GC allocation remains a transaction root.
+    pub fn new_in_publication(transaction: &'services mut PublicationTxn<'scope>) -> Self {
+        Self::from_services(transaction, None)
+    }
+
+    /// Create a publication-rooted compiler with canonical string interning.
+    pub fn new_in_publication_with_pool(
+        transaction: &'services mut PublicationTxn<'scope>,
+        string_pool: &'services mut StringPool,
+    ) -> Self {
+        Self::from_services(transaction, Some(string_pool))
+    }
+}
+
+impl<'services, A: CodegenObjectAllocator + ?Sized> CodeGenerator<'services, A> {
     fn from_services(
-        gc: &'services mut GarbageCollector,
+        allocator: &'services mut A,
         string_pool: Option<&'services mut StringPool>,
     ) -> Self {
         let mut proto = Proto::new();
@@ -139,7 +223,7 @@ impl<'services> CodeGenerator<'services> {
             upvalues: Vec::new(),
             parent_functions: Vec::new(),
             blocks: Vec::new(),
-            gc,
+            allocator,
             string_pool,
         }
     }
@@ -158,7 +242,9 @@ impl<'services> CodeGenerator<'services> {
         chunk: &Chunk,
         source_name: &[u8],
     ) -> Result<Proto, CodegenError> {
-        let source = self.gc.create(GcString::from_bytes(source_name));
+        let source = self
+            .allocator
+            .allocate_string(self.string_pool.as_deref_mut(), source_name);
         self.builder.set_source(Some(source));
         self.builder.set_vararg(true);
 
@@ -183,16 +269,14 @@ impl<'services> CodeGenerator<'services> {
     }
 
     pub(crate) fn add_string_constant(&mut self, value: &str) -> Option<i32> {
-        let gc = &mut *self.gc;
-        let string_pool = self.string_pool.as_deref_mut();
-        self.builder.add_string_constant(gc, string_pool, value)
+        self.add_byte_string_constant(value.as_bytes())
     }
 
     pub(crate) fn add_byte_string_constant(&mut self, value: &[u8]) -> Option<i32> {
-        let gc = &mut *self.gc;
-        let string_pool = self.string_pool.as_deref_mut();
-        self.builder
-            .add_byte_string_constant(gc, string_pool, value)
+        let string = self
+            .allocator
+            .allocate_string(self.string_pool.as_deref_mut(), value);
+        Some(self.builder.add_gc_string_constant(string))
     }
 
     // ── 指令生成便捷方法 ──────────────────────────────────────────
