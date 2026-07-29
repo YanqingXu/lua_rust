@@ -17,6 +17,7 @@ use crate::gc::header::bits;
 use crate::gc::object_id::ObjectId;
 use crate::gc::strategy::{GcStrategy, MarkSweepGc};
 use crate::gc_string::GcString;
+use crate::heap::HeapId;
 use crate::string_pool::StringPool;
 use crate::table::Table;
 use crate::types::{GcColor, GcObjectType};
@@ -112,6 +113,9 @@ impl GcDestroyAllReport {
 /// 管理侵入式 GC 对象链表和根集合。
 /// Phase 1.3 补全了完整的三色标记-清除循环。
 pub struct GarbageCollector {
+    /// Unique owner heap identity.
+    heap_id: HeapId,
+
     /// 所有 GC 对象的侵入式链表头
     pub(crate) all_objects: *mut GcObjectHeader,
 
@@ -176,7 +180,13 @@ pub struct GarbageCollector {
 impl GarbageCollector {
     /// 创建新的 GC 实例，使用默认标记-清除策略
     pub fn new() -> Self {
+        Self::new_for_heap(HeapId::allocate())
+    }
+
+    /// Create the collector owned by `heap_id`.
+    pub(crate) fn new_for_heap(heap_id: HeapId) -> Self {
         Self {
+            heap_id,
             all_objects: std::ptr::null_mut(),
             roots: Vec::new(),
             temporary_roots: HashMap::new(),
@@ -194,6 +204,11 @@ impl GarbageCollector {
             total_memory: 0,
             strategy: Box::new(MarkSweepGc),
         }
+    }
+
+    /// Return the unique identity of the owner heap.
+    pub fn heap_id(&self) -> HeapId {
+        self.heap_id
     }
 
     // ── 对象创建 ──────────────────────────────────────────────
@@ -309,6 +324,7 @@ impl GarbageCollector {
     ///
     /// 返回回收的对象数量。
     pub fn collect(&mut self, string_pool: &mut StringPool) -> usize {
+        string_pool.bind_or_assert_owner(self.heap_id);
         // 1. 标记阶段：重置标记，标记根集，传播标记
         self.mark();
 
@@ -328,6 +344,7 @@ impl GarbageCollector {
     ///
     /// 强制删除所有 GC 对象、清空根集和所有内部列表。
     pub fn clear_all(&mut self, string_pool: &mut StringPool) {
+        string_pool.bind_or_assert_owner(self.heap_id);
         assert!(
             self.temporary_roots.is_empty(),
             "cannot clear collector while publication roots are active"
@@ -387,6 +404,7 @@ impl GarbageCollector {
     /// dependency order: non-fixed Threads first, other non-fixed objects
     /// second, and fixed objects last.
     pub fn destroy_all(&mut self, string_pool: &mut StringPool) -> GcDestroyAllReport {
+        string_pool.bind_or_assert_owner(self.heap_id);
         assert!(
             self.temporary_roots.is_empty(),
             "cannot destroy collector while publication roots are active"
@@ -859,21 +877,18 @@ impl GarbageCollector {
 
 impl Drop for GarbageCollector {
     fn drop(&mut self) {
-        // 清理所有 GC 对象
-        // Note: 完整的类型感知清理需要 StringPool。
-        // 在没有 StringPool 的 drop 场景，对象将泄漏（测试中应调用 clear_all）。
         let mut current = self.all_objects;
         while !current.is_null() {
-            // SAFETY: current comes from the intrusive list
+            // SAFETY: current is a registered intrusive-list node and remains
+            // allocated until destroy_object_without_pool dispatches its tag.
             let next = unsafe { (*current).next() };
-            if !current.is_null() {
-                // SAFETY: 从链表中摘除 next 指针，避免后续重复释放
-                unsafe {
-                    (*current).set_next(std::ptr::null_mut());
-                }
-            }
+            self.destroy_object_without_pool(current);
             current = next;
         }
+        self.all_objects = std::ptr::null_mut();
+        debug_assert!(self.live_allocations.is_empty());
+        debug_assert_eq!(self.object_count, 0);
+        debug_assert_eq!(self.total_memory, 0);
     }
 }
 
@@ -1306,5 +1321,38 @@ mod tests {
         assert_eq!(gc.root_count(), 0);
         assert_eq!(gc.transient_queue_entry_count(), 0);
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn standalone_collector_drop_reclaims_registered_allocations_without_a_pool() {
+        unsafe fn count_probe(payload: *mut u8) {
+            let mut encoded = [0_u8; std::mem::size_of::<usize>()];
+            // SAFETY: the test stores one native-endian pointer-sized value.
+            unsafe {
+                std::ptr::copy_nonoverlapping(payload, encoded.as_mut_ptr(), encoded.len());
+            }
+            let counter = usize::from_ne_bytes(encoded) as *const AtomicUsize;
+            // SAFETY: the counter outlives the collector dropped below.
+            unsafe {
+                (*counter).fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = AtomicUsize::new(0);
+        {
+            let mut gc = GarbageCollector::new();
+            let mut userdata = Userdata::new(std::mem::size_of::<usize>());
+            userdata
+                .data_mut()
+                .copy_from_slice(&(std::ptr::from_ref(&drops) as usize).to_ne_bytes());
+            // SAFETY: count_probe reads the pointer encoded immediately above.
+            unsafe {
+                userdata.set_destructor(count_probe);
+            }
+            gc.create(userdata);
+            gc.create(GcString::from_bytes(b"standalone"));
+        }
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

@@ -25,16 +25,11 @@ fn compile_and_run(source: &str) -> Runtime {
     runtime
 }
 
-fn returned_bytes(runtime: &Runtime) -> Vec<u8> {
-    match runtime
-        .main_state()
-        .and_then(|state| state.stack.at(0))
-        .cloned()
-        .unwrap_or(Value::Nil)
-    {
-        Value::String(value) => runtime
-            .main_state()
-            .expect("main state remains live")
+fn returned_bytes(runtime: &mut Runtime) -> Vec<u8> {
+    let mut parts = runtime.parts_mut().expect("runtime parts remain available");
+    let (state, _, _) = parts.split_mut();
+    match state.stack.at(0).cloned().unwrap_or(Value::Nil) {
+        Value::String(value) => state
             .copy_string_bytes(value)
             .expect("returned string should be live"),
         value => panic!("expected returned string, got {value:?}"),
@@ -75,7 +70,7 @@ fn lua_path_literal(path: &Path) -> String {
 
 #[test]
 fn tmpfile_round_trips_nul_and_high_bytes_with_byte_positions_and_lines() {
-    let runtime = compile_and_run(
+    let mut runtime = compile_and_run(
         r#"
         local raw = string.char(0, 128, 255, 10, 255, 0)
         local file = assert(io.tmpfile())
@@ -103,7 +98,7 @@ fn tmpfile_round_trips_nul_and_high_bytes_with_byte_positions_and_lines() {
         "#,
     );
 
-    assert_eq!(returned_bytes(&runtime), [0xff, 0x00]);
+    assert_eq!(returned_bytes(&mut runtime), [0xff, 0x00]);
 }
 
 #[test]
@@ -131,8 +126,8 @@ fn real_file_direct_write_and_read_preserve_raw_bytes_and_offsets() {
         path = lua_path_literal(&path),
     );
 
-    let runtime = compile_and_run(&source);
-    assert_eq!(returned_bytes(&runtime), [0xff, 0x00]);
+    let mut runtime = compile_and_run(&source);
+    assert_eq!(returned_bytes(&mut runtime), [0xff, 0x00]);
     assert_eq!(
         std::fs::read(&path).expect("raw output file should be readable"),
         [0x00, 0x80, 0xff, 0x0a, 0xff, 0x00]

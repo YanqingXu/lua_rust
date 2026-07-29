@@ -111,10 +111,6 @@ pub struct LuaState {
     pub boolean_metatable: Option<GcRef<Table>>,
     /// Optional metatable for number values, configured through debug.setmetatable.
     pub number_metatable: Option<GcRef<Table>>,
-    /// 字符串驻留池（用于跨编译器和标准库的字符串共享）
-    pub string_pool: Option<*mut StringPool>,
-    /// 当前运行时 GC（供 C 函数创建返回字符串/表等 GC 对象）
-    pub gc: Option<*mut GarbageCollector>,
     /// This state's runtime-scoped generational identity.
     pub(crate) state_handle: Option<StateHandle>,
     /// Stable transitional pointer to the Runtime-owned StateArena.
@@ -190,8 +186,6 @@ impl LuaState {
             nil_metatable: None,
             boolean_metatable: None,
             number_metatable: None,
-            string_pool: None,
-            gc: None,
             state_handle: None,
             state_arena: None,
             native_request_scope: false,
@@ -227,10 +221,11 @@ impl LuaState {
         string: GcRef<GcString>,
         read: impl for<'a> FnOnce(&'a [u8]) -> R,
     ) -> Result<R, GcRefValidationError> {
-        let gc = self.gc.ok_or(GcRefValidationError::CollectorUnavailable)?;
-        // SAFETY: Runtime installs this transitional backpointer for the
-        // complete state turn; the returned borrow is confined to `read`.
-        unsafe { &*gc }.with_string_bytes(string, read)
+        let (gc, _) = super::vm_context::active_service_pointers(self)
+            .ok_or(GcRefValidationError::CollectorUnavailable)?;
+        // SAFETY: the dynamically scoped context is installed only while this
+        // exact state and Heap are exclusively active.
+        unsafe { gc.as_ref() }.with_string_bytes(string, read)
     }
 
     /// Copy one live Lua string after collector validation.
@@ -247,22 +242,33 @@ impl LuaState {
         &self,
         bytes: &[u8],
     ) -> Result<Option<GcRef<GcString>>, GcRefValidationError> {
-        let pool = self
-            .string_pool
+        let (gc, pool) = super::vm_context::active_service_pointers(self)
             .ok_or(GcRefValidationError::StringPoolUnavailable)?;
-        let Some(candidate) = (
-            // SAFETY: Runtime installs the live pool for the complete state
-            // turn; `find_bytes` returns a copied identity handle only.
-            unsafe { &*pool }
-        )
-        .find_bytes(bytes) else {
+        // SAFETY: both pointers belong to the active context for this state.
+        let Some(candidate) = (unsafe { pool.as_ref() }).find_bytes(bytes) else {
             return Ok(None);
         };
-        let gc = self.gc.ok_or(GcRefValidationError::CollectorUnavailable)?;
-        // SAFETY: same scoped Runtime backpointer invariant as
-        // `with_string_bytes`; no object borrow escapes this validation.
-        unsafe { &*gc }.with_ref(candidate, |_| ())?;
+        // SAFETY: same dynamically scoped context; no object borrow escapes.
+        unsafe { gc.as_ref() }.with_ref(candidate, |_| ())?;
         Ok(Some(candidate))
+    }
+
+    /// Return the active collector pointer for the dynamic native callback.
+    ///
+    /// The pointer is absent outside a Runtime/VM context and must never be
+    /// stored past the current callback.
+    #[doc(hidden)]
+    pub fn active_gc_ptr(&self) -> Option<*mut GarbageCollector> {
+        super::vm_context::active_service_pointers(self).map(|(collector, _)| collector.as_ptr())
+    }
+
+    /// Return the active canonical StringPool pointer for this state turn.
+    ///
+    /// The pointer is absent outside a Runtime/VM context and must never be
+    /// stored past the current callback.
+    #[doc(hidden)]
+    pub fn active_string_pool_ptr(&self) -> Option<*mut StringPool> {
+        super::vm_context::active_service_pointers(self).map(|(_, strings)| strings.as_ptr())
     }
 
     /// 创建带全局表的 Lua 线程
@@ -539,8 +545,6 @@ impl LuaState {
         self.yielded_values.clear();
         self.last_error = None;
         self.debug_hook_skip_proto = None;
-        self.gc = None;
-        self.string_pool = None;
         self.state_handle = None;
         self.state_arena = None;
         self.native_request_scope = false;

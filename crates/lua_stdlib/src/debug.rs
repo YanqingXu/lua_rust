@@ -81,7 +81,7 @@ fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
 unsafe extern "C" fn lua_debug_getinfo(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -225,7 +225,7 @@ fn push_name_info(
 unsafe extern "C" fn lua_debug_setupvalue(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -265,7 +265,7 @@ unsafe extern "C" fn lua_debug_setupvalue(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_debug_getupvalue(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -308,7 +308,7 @@ unsafe extern "C" fn lua_debug_getupvalue(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_debug_getregistry(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -328,7 +328,7 @@ unsafe extern "C" fn lua_debug_getregistry(l_ptr: *mut std::ffi::c_void) -> i32 
 unsafe extern "C" fn lua_debug_traceback(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -510,7 +510,7 @@ unsafe extern "C" fn lua_debug_gethook(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -595,7 +595,7 @@ unsafe extern "C" fn lua_debug_getfenv(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_debug_getlocal(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -642,7 +642,7 @@ unsafe extern "C" fn lua_debug_getlocal(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_debug_setlocal(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -1117,7 +1117,7 @@ fn validated_proto_ptr(l: &LuaState, proto: GcRef<Proto>) -> Option<NonNull<Prot
 }
 
 fn state_gc(l: &LuaState) -> Option<&GarbageCollector> {
-    let gc = l.gc?;
+    let gc = l.active_gc_ptr()?;
     // SAFETY: the VM installs the owning collector for the complete duration
     // of C/debug callbacks. This immutable borrow is scoped to one helper call.
     Some(unsafe { &*gc })
@@ -1620,23 +1620,22 @@ mod byte_string_tests {
         let mut gc = GarbageCollector::new();
         let mut string_pool = StringPool::new();
         let mut state = LuaState::new();
-        state.gc = Some(&mut gc);
-        state.string_pool = Some(&mut string_pool);
         let message = [0xff, 0, 0x80, b'x'];
         let message_ref = string_pool.intern_bytes(&mut gc, &message);
         state.push_value(Value::String(message_ref));
 
-        // SAFETY: the callback receives a valid LuaState pointer for exactly
-        // this dynamic call, matching the VM C-function ABI.
-        let results = unsafe {
-            lua_debug_traceback((&mut state as *mut LuaState).cast::<std::ffi::c_void>())
-        };
-        assert_eq!(results, 1);
+        lua_vm::with_vm_context(&mut state, &mut gc, &mut string_pool, |state| {
+            // SAFETY: the callback receives a valid LuaState pointer for exactly
+            // this dynamic call, matching the VM C-function ABI.
+            let results =
+                unsafe { lua_debug_traceback((state as *mut LuaState).cast::<std::ffi::c_void>()) };
+            assert_eq!(results, 1);
 
-        let output = state.at(-1).expect("traceback result is on the stack");
-        let mut expected = message.to_vec();
-        expected.extend_from_slice(b"\nstack traceback:\n");
-        assert_eq!(string_bytes(&state, output), expected);
+            let output = state.at(-1).expect("traceback result is on the stack");
+            let mut expected = message.to_vec();
+            expected.extend_from_slice(b"\nstack traceback:\n");
+            assert_eq!(string_bytes(state, output), expected);
+        });
     }
 
     #[test]
@@ -1644,8 +1643,6 @@ mod byte_string_tests {
         let mut gc = GarbageCollector::new();
         let mut string_pool = StringPool::new();
         let mut state = LuaState::new();
-        state.gc = Some(&mut gc);
-        state.string_pool = Some(&mut string_pool);
         let hook_ref = gc.create(Function::new_c(test_hook));
         let mask: Vec<u8> = (0..=u8::MAX).collect();
         let mask_ref = string_pool.intern_bytes(&mut gc, &mask);
@@ -1653,23 +1650,25 @@ mod byte_string_tests {
         state.push_value(Value::String(mask_ref));
         state.push_number(7.0);
 
-        assert_eq!(
-            // SAFETY: the callback receives the live test state only for this
-            // dynamic ABI call.
-            unsafe { lua_debug_sethook((&mut state as *mut LuaState).cast()) },
-            0
-        );
-        state.set_top(0);
-        assert_eq!(
-            // SAFETY: the callback receives the live test state only for this
-            // dynamic ABI call.
-            unsafe { lua_debug_gethook((&mut state as *mut LuaState).cast()) },
-            3
-        );
-        assert_eq!(
-            string_bytes(&state, state.at(2).expect("gethook returns mask second")),
-            mask
-        );
-        assert_eq!(mask_storage_to_bytes(&state.debug_hook_mask), mask);
+        lua_vm::with_vm_context(&mut state, &mut gc, &mut string_pool, |state| {
+            assert_eq!(
+                // SAFETY: the callback receives the live test state only for this
+                // dynamic ABI call.
+                unsafe { lua_debug_sethook((state as *mut LuaState).cast()) },
+                0
+            );
+            state.set_top(0);
+            assert_eq!(
+                // SAFETY: the callback receives the live test state only for this
+                // dynamic ABI call.
+                unsafe { lua_debug_gethook((state as *mut LuaState).cast()) },
+                3
+            );
+            assert_eq!(
+                string_bytes(state, state.at(2).expect("gethook returns mask second")),
+                mask
+            );
+            assert_eq!(mask_storage_to_bytes(&state.debug_hook_mask), mask);
+        });
     }
 }

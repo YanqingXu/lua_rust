@@ -23,6 +23,7 @@ impl GarbageCollector {
     /// 字符串对象被回收时会同步从 StringPool 中移除。
     ///
     pub fn sweep(&mut self, string_pool: &mut StringPool) -> usize {
+        string_pool.bind_or_assert_owner(self.heap_id());
         let mut collected = 0;
         let mut prev: *mut GcObjectHeader = std::ptr::null_mut();
         let mut current = self.all_objects;
@@ -84,6 +85,23 @@ impl GarbageCollector {
         obj: *mut GcObjectHeader,
         string_pool: &mut StringPool,
     ) {
+        self.destroy_object_inner(obj, Some(string_pool));
+    }
+
+    /// Destroy one allocation when no StringPool owner is available.
+    ///
+    /// This is reserved for the standalone collector Drop safety net. Any
+    /// external pool entry becomes a stale identity handle, which checked
+    /// collector APIs reject without dereferencing.
+    pub(crate) fn destroy_object_without_pool(&mut self, obj: *mut GcObjectHeader) {
+        self.destroy_object_inner(obj, None);
+    }
+
+    fn destroy_object_inner(
+        &mut self,
+        obj: *mut GcObjectHeader,
+        string_pool: Option<&mut StringPool>,
+    ) {
         if obj.is_null() {
             return;
         }
@@ -113,7 +131,9 @@ impl GarbageCollector {
         let obj_size = unsafe { self.object_size_of(obj, live.object_type) };
 
         // 如果是字符串，从 StringPool 中移除
-        if live.object_type == GcObjectType::String {
+        if live.object_type == GcObjectType::String
+            && let Some(string_pool) = string_pool
+        {
             let pointer = std::ptr::NonNull::new(obj.cast::<GcString>())
                 .expect("intrusive-list nodes are non-null");
             // SAFETY: the removed entry proves this exact allocation identity

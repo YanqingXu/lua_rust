@@ -26,6 +26,7 @@ pub mod value;
 // Phase 1.2: GC infrastructure + String pool ✅
 pub mod gc;
 pub mod gc_string;
+pub mod heap;
 pub mod string_pool;
 
 // Phase 1.4: Core object model

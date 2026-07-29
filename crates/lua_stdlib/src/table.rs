@@ -92,7 +92,7 @@ fn append_concat_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ()> {
 }
 
 fn push_lua_bytes(l: &mut LuaState, bytes: &[u8]) -> bool {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return false;
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -308,7 +308,7 @@ unsafe extern "C" fn lua_table_foreach(l_ptr: *mut std::ffi::c_void) -> i32 {
         value @ Value::Function(_) => value,
         _ => return table_error(l, "bad argument #2 to 'foreach' (function expected)"),
     };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return table_error(l, "foreach unavailable without an active GC");
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -362,7 +362,7 @@ unsafe extern "C" fn lua_table_foreachi(l_ptr: *mut std::ffi::c_void) -> i32 {
         value @ Value::Function(_) => value,
         _ => return table_error(l, "bad argument #2 to 'foreachi' (function expected)"),
     };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return table_error(l, "foreachi unavailable without an active GC");
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -577,7 +577,7 @@ unsafe extern "C" fn lua_table_sort(l_ptr: *mut std::ffi::c_void) -> i32 {
         None
     };
 
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return table_error(l, "table.sort unavailable without an active GC");
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -621,13 +621,13 @@ mod byte_string_tests {
         let mut string_pool = StringPool::new();
         let value = Value::String(string_pool.intern_bytes(&mut gc, &[0, 0x80, 0xff]));
         let mut state = LuaState::new();
-        state.gc = Some(&mut gc);
-        state.string_pool = Some(&mut string_pool);
 
-        assert_eq!(
-            value_to_concat_bytes(&state, &value),
-            Some(vec![0x00, 0x80, 0xff])
-        );
+        lua_vm::with_vm_context(&mut state, &mut gc, &mut string_pool, |state| {
+            assert_eq!(
+                value_to_concat_bytes(state, &value),
+                Some(vec![0x00, 0x80, 0xff])
+            );
+        });
     }
 
     #[test]
@@ -635,14 +635,11 @@ mod byte_string_tests {
         let mut gc = GarbageCollector::new();
         let mut string_pool = StringPool::new();
         let mut state = LuaState::new();
-        state.gc = Some(&mut gc);
-        state.string_pool = Some(&mut string_pool);
         let left = Value::String(string_pool.intern_bytes(&mut gc, b"a\0b"));
         let right = Value::String(string_pool.intern_bytes(&mut gc, b"a\0c"));
 
-        assert!(matches!(
-            default_less(&mut state, &mut gc, &left, &right),
-            Ok(true)
-        ));
+        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut string_pool, |state, gc, _| {
+            assert!(matches!(default_less(state, gc, &left, &right), Ok(true)));
+        });
     }
 }

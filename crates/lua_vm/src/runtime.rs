@@ -1,12 +1,14 @@
-//! Transitional owner for one Lua runtime.
+//! Unique owner for one Lua runtime.
 //!
-//! `Runtime` is the first ownership boundary for the Rust VM. It keeps the
-//! collector, string pool, and generational state arena in a pinned heap
-//! allocation. It owns a boxed main `LuaState`; the arena owns every coroutine
-//! state. Legacy service and arena backpointers are installed only after their
-//! targets have stable addresses. Callers can borrow the three execution parts
-//! together through `Runtime::parts_mut`; the returned guard records both the
-//! Runtime execution and main-state arena borrow.
+//! `Runtime` keeps one [`Heap`], the generational state arena, and runtime
+//! services in a pinned storage allocation. The Heap couples collector
+//! accounting and the canonical string pool under one non-reused identity. A
+//! boxed main `LuaState` remains Runtime-owned; the arena owns every coroutine
+//! state. LuaState stores no collector or string-pool backpointer: each state
+//! turn installs a dynamically scoped service context. Callers can borrow the
+//! three execution parts together through `Runtime::parts_mut`; the returned
+//! guard records the service scope, Runtime execution, and main-state arena
+//! borrow.
 //!
 //! The first coroutine-trampoline substrate additionally provides a
 //! Runtime-owned turn driver. It confines one state borrow to one callback,
@@ -41,6 +43,9 @@ use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc::object_id::ObjectId;
 use lua_core::gc::publication::{PublicationTxn, Rooted};
+use lua_core::gc_string::GcString;
+use lua_core::heap::Heap;
+use lua_core::metatable::METAMETHOD_NAMES;
 use lua_core::proto::Proto;
 use lua_core::state_handle::StateHandleIssuer;
 pub use lua_core::state_handle::{RuntimeId, RuntimeIdExhausted, StateHandle};
@@ -60,7 +65,9 @@ use crate::native::{
     DeferredNativeCall, ResumeRequest, ResumeResponse, UpvalueAccessOperation, UpvalueAccessRequest,
 };
 use crate::state::lua_state::LuaStateShutdownReport;
-use crate::state::{LuaState, ThreadStatus};
+use crate::state::{
+    ActiveVmContext, LuaState, ThreadStatus, enter_vm_context, with_vm_context_parts,
+};
 
 mod root_trace;
 pub use root_trace::{
@@ -1378,7 +1385,7 @@ impl Drop for StateBorrow {
     fn drop(&mut self) {
         let mut arena = self.arena;
         // SAFETY: StateBorrow never escapes the resolving LuaState call. The
-        // pinned RuntimeHeap and its StateArena therefore still exist.
+        // pinned RuntimeStorage and its StateArena therefore still exist.
         let released = match self.kind {
             // SAFETY: StateBorrow never escapes the resolving LuaState call.
             StateBorrowKind::Nested => unsafe { arena.as_mut() }.release(self.handle),
@@ -1482,28 +1489,29 @@ impl LuaState {
             .state_arena
             .ok_or(StateResolveError::ArenaUnavailable)?;
         let current_state = NonNull::from(&mut *self);
-        // SAFETY: state_arena is installed only from the pinned RuntimeHeap.
+        // SAFETY: state_arena is installed only from the pinned RuntimeStorage.
         // StateArena validates target identity and guards the mutable borrow
         // until the higher-ranked closure returns.
         StateArena::with_state_mut(arena, handle, current_state, f)
     }
 }
 
-/// Stable allocation for services referenced by transitional raw backpointers.
-struct RuntimeHeap {
+/// Stable allocation for the Heap, state arena, and Runtime-scoped services.
+struct RuntimeStorage {
     state_arena: StateArena,
-    gc: GarbageCollector,
-    string_pool: StringPool,
+    heap: Heap,
     native_activations: NativeActivationStack,
     _pin: PhantomPinned,
 }
 
-impl RuntimeHeap {
+const FIXED_RUNTIME_STRING_BYTES: [&[u8]; 3] =
+    [b"not enough memory", b"error in error handling", b"_ENV"];
+
+impl RuntimeStorage {
     fn new(handle_issuer: StateHandleIssuer) -> Self {
         Self {
             state_arena: StateArena::new(handle_issuer),
-            gc: GarbageCollector::new(),
-            string_pool: StringPool::new(),
+            heap: Heap::new(),
             native_activations: NativeActivationStack::default(),
             _pin: PhantomPinned,
         }
@@ -1524,16 +1532,17 @@ pub struct Runtime {
     main_state_handle: Option<StateHandle>,
     global_root: Option<GcRef<Table>>,
     registry_root: Option<GcRef<Table>>,
+    fixed_strings: Vec<GcRef<GcString>>,
     shutdown_summary: Option<RuntimeShutdownSummary>,
-    heap: Pin<Box<RuntimeHeap>>,
+    heap: Pin<Box<RuntimeStorage>>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl Runtime {
     /// Create a running runtime with a rooted global table and main state.
     ///
-    /// The legacy `LuaState::gc` and `LuaState::string_pool` pointers target
-    /// the pinned heap and stay stable even when the `Runtime` value moves.
+    /// Each LuaState receives scoped Heap service access only while Runtime
+    /// holds its exclusive turn borrow.
     ///
     /// # Panics
     ///
@@ -1557,29 +1566,40 @@ impl Runtime {
     pub fn try_new() -> Result<Self, RuntimeIdExhausted> {
         let handle_issuer = StateHandleIssuer::try_new()?;
         let id = handle_issuer.runtime_id();
-        let mut heap = Box::pin(RuntimeHeap::new(handle_issuer));
+        let mut heap = Box::pin(RuntimeStorage::new(handle_issuer));
 
-        // SAFETY: `RuntimeHeap` is pinned for the remainder of the Runtime's
+        // SAFETY: `RuntimeStorage` is pinned for the remainder of the Runtime's
         // life. We take field addresses and never move out of the heap.
         let heap_mut = unsafe { Pin::get_unchecked_mut(heap.as_mut()) };
-        let gc_ptr = &mut heap_mut.gc as *mut GarbageCollector;
-        let string_pool_ptr = &mut heap_mut.string_pool as *mut StringPool;
-        let (global_root, registry_root) = heap_mut.gc.with_publication(|transaction| {
-            let global = transaction.alloc(Table::new());
-            let registry = transaction.alloc(Table::new());
-            let global = transaction
-                .publish_as_explicit_root(global)
-                .expect("new Runtime global Table remains registered");
-            let registry = transaction
-                .publish_as_explicit_root(registry)
-                .expect("new Runtime registry Table remains registered");
-            (global, registry)
-        });
+        let (global_root, registry_root, fixed_strings) =
+            heap_mut.heap.with_parts_mut(|gc, strings| {
+                let fixed_strings = METAMETHOD_NAMES
+                    .iter()
+                    .map(|name| name.as_bytes())
+                    .chain(FIXED_RUNTIME_STRING_BYTES)
+                    .map(|bytes| {
+                        let string = strings.intern_bytes(gc, bytes);
+                        gc.with_ref(string, GcString::mark_fixed)
+                            .expect("new fixed Runtime string remains registered");
+                        string
+                    })
+                    .collect();
+                let (global_root, registry_root) = gc.with_publication(|transaction| {
+                    let global = transaction.alloc(Table::new());
+                    let registry = transaction.alloc(Table::new());
+                    let global = transaction
+                        .publish_as_explicit_root(global)
+                        .expect("new Runtime global Table remains registered");
+                    let registry = transaction
+                        .publish_as_explicit_root(registry)
+                        .expect("new Runtime registry Table remains registered");
+                    (global, registry)
+                });
+                (global_root, registry_root, fixed_strings)
+            });
 
         let mut main_state = Box::new(LuaState::with_global_table(global_root));
         main_state.registry = Some(registry_root);
-        main_state.gc = Some(gc_ptr);
-        main_state.string_pool = Some(string_pool_ptr);
         let main_state_ptr = NonNull::from(main_state.as_mut());
         let main_state_handle = heap_mut.state_arena.attach_external(main_state_ptr);
         main_state
@@ -1594,6 +1614,7 @@ impl Runtime {
             main_state_handle: Some(main_state_handle),
             global_root: Some(global_root),
             registry_root: Some(registry_root),
+            fixed_strings,
             shutdown_summary: None,
             heap,
             _not_send_or_sync: PhantomData,
@@ -1628,6 +1649,47 @@ impl Runtime {
     /// Return the Runtime-owned persistent registry root while open.
     pub fn registry_root(&self) -> Option<GcRef<Table>> {
         self.registry_root
+    }
+
+    /// Read one live Runtime-owned Lua string within a checked Heap scope.
+    pub fn with_string_bytes<R>(
+        &self,
+        string: GcRef<GcString>,
+        read: impl for<'bytes> FnOnce(&'bytes [u8]) -> R,
+    ) -> Result<R, GcRefValidationError> {
+        if self.check_owner().is_err() || self.phase == RuntimePhase::Closed {
+            return Err(GcRefValidationError::CollectorUnavailable);
+        }
+        self.heap
+            .as_ref()
+            .get_ref()
+            .heap
+            .collector()
+            .with_string_bytes(string, read)
+    }
+
+    /// Copy one live Runtime-owned Lua string.
+    pub fn copy_string_bytes(
+        &self,
+        string: GcRef<GcString>,
+    ) -> Result<Vec<u8>, GcRefValidationError> {
+        self.with_string_bytes(string, <[u8]>::to_vec)
+    }
+
+    /// Resolve and validate one canonical interned string without allocating.
+    pub fn find_interned_string(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Option<GcRef<GcString>>, GcRefValidationError> {
+        if self.check_owner().is_err() || self.phase == RuntimePhase::Closed {
+            return Err(GcRefValidationError::CollectorUnavailable);
+        }
+        let heap = &self.heap.as_ref().get_ref().heap;
+        let Some(string) = heap.strings().find_bytes(bytes) else {
+            return Ok(None);
+        };
+        heap.collector().with_ref(string, |_| ())?;
+        Ok(Some(string))
     }
 
     /// Return the boxed main state while the runtime remains open.
@@ -1718,10 +1780,21 @@ impl Runtime {
             })?;
         self.active_executions = next_active_executions;
 
+        let (gc, string_pool) = heap.heap.parts_mut();
+        // SAFETY: RuntimePartsMut owns the three exclusive borrows and drops
+        // vm_context before releasing the arena borrow or any service.
+        let vm_context = unsafe {
+            enter_vm_context(
+                NonNull::from(&mut *state),
+                NonNull::from(&mut *gc),
+                NonNull::from(&mut *string_pool),
+            )
+        };
         Ok(RuntimePartsMut {
             state,
-            gc: &mut heap.gc,
-            string_pool: &mut heap.string_pool,
+            gc,
+            string_pool,
+            vm_context: Some(vm_context),
             state_arena: NonNull::from(&mut heap.state_arena),
             state_handle,
             active_executions: &mut self.active_executions,
@@ -1783,18 +1856,19 @@ impl Runtime {
         };
         let runtime_id = self.id;
 
-        // SAFETY: RuntimeHeap was pinned during construction and no API moves
+        // SAFETY: RuntimeStorage was pinned during construction and no API moves
         // its fields. The arena and service fields are disjoint, and state
         // references are confined to one HRTB callback at a time.
         let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
         let arena = NonNull::from(&mut heap.state_arena);
-        let gc = &mut heap.gc;
-        let string_pool = &mut heap.string_pool;
+        let (gc, string_pool) = heap.heap.parts_mut();
         let mut current = initial;
 
         loop {
             let outcome = StateArena::with_turn_state_mut(arena, current, |state| {
-                execute_turn(current, state, gc, string_pool)
+                with_vm_context_parts(state, gc, string_pool, |state, gc, string_pool| {
+                    execute_turn(current, state, gc, string_pool)
+                })
             })
             .map_err(|source| RuntimeAccessError::StateArena { runtime_id, source })?;
 
@@ -1852,7 +1926,7 @@ impl Runtime {
         };
         let runtime_id = self.id;
 
-        // SAFETY: RuntimeHeap was pinned at construction. The arena, collector,
+        // SAFETY: RuntimeStorage was pinned at construction. The arena, collector,
         // and activation stack are disjoint fields and remain at stable
         // addresses for the whole execution session.
         let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
@@ -1864,7 +1938,7 @@ impl Runtime {
             ));
         }
         let arena = NonNull::from(&mut heap.state_arena);
-        let gc = &mut heap.gc;
+        let (gc, string_pool) = heap.heap.parts_mut();
         let activations = &mut heap.native_activations;
         let _activation_cleanup = NativeActivationSessionGuard {
             activations: NonNull::from(&mut *activations),
@@ -1892,15 +1966,19 @@ impl Runtime {
             let completed_upvalue_transfer =
                 matches!(&action, NativeDriverAction::DeliverUpvalue(_));
             let mut event = StateArena::with_turn_state_mut(arena, current, |state| {
-                state
-                    .with_native_request_scope(|state| {
-                        let vm_result = execute_native_driver_action(state, gc, action);
-                        classify_native_turn(state, gc, vm_result)
-                    })
-                    .map_err(|error| {
-                        RuntimeError::new(format!("Runtime-native mailbox scope failed: {error:?}"))
-                    })
-                    .and_then(std::convert::identity)
+                with_vm_context_parts(state, gc, string_pool, |state, gc, _| {
+                    state
+                        .with_native_request_scope(|state| {
+                            let vm_result = execute_native_driver_action(state, gc, action);
+                            classify_native_turn(state, gc, vm_result)
+                        })
+                        .map_err(|error| {
+                            RuntimeError::new(format!(
+                                "Runtime-native mailbox scope failed: {error:?}"
+                            ))
+                        })
+                        .and_then(std::convert::identity)
+                })
             })
             .map_err(|source| RuntimeAccessError::StateArena { runtime_id, source })??;
             if completed_upvalue_transfer {
@@ -1934,11 +2012,13 @@ impl Runtime {
                     && replayed == *thread
                 {
                     let error = StateArena::with_turn_state_mut(arena, current, |state| {
-                        runtime_error_value(
-                            state,
-                            gc,
-                            &RuntimeError::new("cannot resume dead coroutine"),
-                        )
+                        with_vm_context_parts(state, gc, string_pool, |state, gc, _| {
+                            runtime_error_value(
+                                state,
+                                gc,
+                                &RuntimeError::new("cannot resume dead coroutine"),
+                            )
+                        })
                     })
                     .map_err(|source| RuntimeAccessError::StateArena { runtime_id, source })?;
                     event = NativeTurnEvent::Coroutine {
@@ -2004,7 +2084,14 @@ impl Runtime {
                     });
                     let response =
                         StateArena::with_turn_state_mut(arena, request.owner, |owner_state| {
-                            execute_upvalue_owner_access(owner_state, gc, &request)
+                            with_vm_context_parts(
+                                owner_state,
+                                gc,
+                                string_pool,
+                                |owner_state, gc, _| {
+                                    execute_upvalue_owner_access(owner_state, gc, &request)
+                                },
+                            )
                         })
                         .map_err(|source| {
                             RuntimeAccessError::StateArena { runtime_id, source }
@@ -2207,10 +2294,10 @@ impl Runtime {
 
     fn shutdown_contents(&mut self) -> Result<RuntimeShutdownSummary, StateResolveError> {
         let arena_report = {
-            // SAFETY: RuntimeHeap remains pinned and shutdown has exclusive
+            // SAFETY: RuntimeStorage remains pinned and shutdown has exclusive
             // owner-thread access with no execution guard.
             let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
-            heap.state_arena.drain_owned(&mut heap.gc)?
+            heap.state_arena.drain_owned(heap.heap.collector_mut())?
         };
 
         let mut state_shutdown = arena_report.state_shutdown;
@@ -2218,17 +2305,18 @@ impl Runtime {
 
         let global_root = self.global_root.take();
         let registry_root = self.registry_root.take();
+        self.fixed_strings.clear();
         // SAFETY: same pinned/exclusive shutdown invariant as above. All state
-        // allocations and their service backpointers have already been
-        // detached before collector allocations are destroyed.
+        // allocations have been detached and no VM service context remains
+        // active before collector allocations are destroyed.
         let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
         if let Some(global_root) = global_root {
-            heap.gc.remove_root(global_root);
+            heap.heap.collector_mut().remove_root(global_root);
         }
         if let Some(registry_root) = registry_root {
-            heap.gc.remove_root(registry_root);
+            heap.heap.collector_mut().remove_root(registry_root);
         }
-        let gc_report = heap.gc.destroy_all(&mut heap.string_pool);
+        let gc_report = heap.heap.destroy_all();
 
         Ok(RuntimeShutdownSummary {
             drained_coroutine_states: arena_report.drained_owned_states,
@@ -2242,24 +2330,24 @@ impl Runtime {
 
     fn close_report(&self, already_closed: bool) -> RuntimeCloseReport {
         let heap = self.heap.as_ref().get_ref();
-        let remaining_objects = heap.gc.object_count();
+        let remaining_objects = heap.heap.object_count();
         let remaining_coroutine_states = heap.state_arena.live_owned_state_count();
         let remaining_temporary_state_roots = heap.state_arena.temporary_state_root_count();
-        let remaining_collector_queue_entries = heap.gc.transient_queue_entry_count();
+        let remaining_collector_queue_entries = heap.heap.collector().transient_queue_entry_count();
         let summary = self.shutdown_summary.unwrap_or_default();
         RuntimeCloseReport {
             runtime_id: self.id,
             already_closed,
             heap_reclamation_deferred: remaining_objects != 0
-                || heap.gc.root_count() != 0
-                || !heap.string_pool.is_empty()
+                || heap.heap.collector().root_count() != 0
+                || !heap.heap.strings().is_empty()
                 || remaining_coroutine_states != 0
                 || remaining_temporary_state_roots != 0
                 || remaining_collector_queue_entries != 0,
             remaining_objects,
-            remaining_roots: heap.gc.root_count(),
-            remaining_interned_strings: heap.string_pool.len(),
-            remaining_estimated_bytes: heap.gc.total_memory(),
+            remaining_roots: heap.heap.collector().root_count(),
+            remaining_interned_strings: heap.heap.interned_string_count(),
+            remaining_estimated_bytes: heap.heap.accounted_bytes(),
             remaining_coroutine_states,
             remaining_temporary_state_roots,
             rejected_temporary_state_root_releases: heap
@@ -2293,13 +2381,14 @@ impl Runtime {
             .main_state_handle
             .ok_or(StateResolveError::ArenaUnavailable)?;
         let mut state_pointer = NonNull::from(state);
-        // SAFETY: RuntimeHeap is pinned, and close has exclusive Runtime access
+        // SAFETY: RuntimeStorage is pinned, and close has exclusive Runtime access
         // with no active execution guard. The preflight validated this exact
         // external allocation and slot generation before any shutdown work.
         let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
         let state_report =
             // SAFETY: state_pointer names the still-owned main-state Box.
-            unsafe { state_pointer.as_mut() }.prepare_for_runtime_shutdown(&mut heap.gc);
+            unsafe { state_pointer.as_mut() }
+                .prepare_for_runtime_shutdown(heap.heap.collector_mut());
         heap.state_arena.detach_external(handle, state_pointer)?;
         self.main_state_handle = None;
         drop(self.main_state.take());
@@ -2320,19 +2409,17 @@ impl Runtime {
 
         // Safe Rust cannot move Runtime across threads or enter Drop while a
         // RuntimePartsMut borrow exists. If unsafe host code violates those
-        // invariants, avoid cross-thread callbacks/reclamation; field Drop
-        // releases state Boxes while the collector retains its documented
-        // leak-on-drop fallback.
+        // invariants, avoid cross-thread callbacks; field Drop releases state
+        // Boxes and Heap::Drop reclaims registered objects without Lua hooks.
         if let Some(state) = self.main_state.as_deref_mut() {
             state.state_handle = None;
             state.state_arena = None;
-            state.gc = None;
-            state.string_pool = None;
         }
         self.main_state_handle = None;
         drop(self.main_state.take());
         self.global_root.take();
         self.registry_root.take();
+        self.fixed_strings.clear();
         self.phase = RuntimePhase::Closed;
     }
 }
@@ -2719,10 +2806,9 @@ fn runtime_error_value(
 
     gc.with_publication(|transaction| {
         let pool = state
-            .string_pool
+            .active_string_pool_ptr()
             .ok_or(GcRefValidationError::StringPoolUnavailable)?;
-        // SAFETY: this state turn exclusively owns the pinned RuntimeHeap
-        // StringPool service.
+        // SAFETY: this state turn owns the dynamically scoped Heap services.
         let message = transaction.intern_bytes(unsafe { &mut *pool }, error.message.as_bytes())?;
         // SAFETY: last_error is a Runtime-traced LuaState owner and receives
         // the string before its temporary publication root is released.
@@ -2751,7 +2837,7 @@ struct NativeActivationSessionGuard {
 
 impl Drop for NativeActivationSessionGuard {
     fn drop(&mut self) {
-        // SAFETY: both pointers target disjoint fields of the pinned RuntimeHeap
+        // SAFETY: both pointers target disjoint fields of the pinned RuntimeStorage
         // and this guard drops before `Runtime::execute_proto` releases its
         // exclusive Runtime borrow.
         let activations = unsafe { self.activations.as_mut() };
@@ -2794,6 +2880,7 @@ pub struct RuntimePartsMut<'runtime> {
     state: &'runtime mut LuaState,
     gc: &'runtime mut GarbageCollector,
     string_pool: &'runtime mut StringPool,
+    vm_context: Option<ActiveVmContext>,
     state_arena: NonNull<StateArena>,
     state_handle: StateHandle,
     active_executions: &'runtime mut usize,
@@ -2818,6 +2905,7 @@ impl RuntimePartsMut<'_> {
 
 impl Drop for RuntimePartsMut<'_> {
     fn drop(&mut self) {
+        drop(self.vm_context.take());
         let mut arena = self.state_arena;
         // SAFETY: RuntimePartsMut is tied to the exclusive Runtime borrow, so
         // its pinned heap and StateArena outlive this guard.
@@ -2855,7 +2943,35 @@ mod tests {
     }
 
     #[test]
-    fn service_backpointers_remain_stable_when_runtime_moves() {
+    fn runtime_owns_and_traces_fixed_strings_until_heap_shutdown() {
+        let mut runtime = Runtime::new();
+        let expected = METAMETHOD_NAMES.len() + FIXED_RUNTIME_STRING_BYTES.len();
+        assert_eq!(runtime.fixed_strings.len(), expected);
+        let collector = runtime.heap.as_ref().get_ref().heap.collector();
+        for string in &runtime.fixed_strings {
+            assert!(
+                collector
+                    .with_ref(*string, GcString::is_fixed)
+                    .expect("fixed Runtime string remains registered")
+            );
+        }
+
+        let mark = runtime
+            .trace_roots_mark_only()
+            .expect("fixed Runtime strings participate in canonical tracing");
+        assert_eq!(
+            mark.root_edge_count(root_trace::RuntimeRootKind::FixedStrings),
+            expected
+        );
+
+        let close = runtime.close().expect("Runtime should close");
+        assert_eq!(close.destroyed_fixed_objects, expected);
+        assert_eq!(close.remaining_objects, 0);
+        assert_eq!(close.remaining_interned_strings, 0);
+    }
+
+    #[test]
+    fn heap_services_are_scoped_and_remain_stable_when_runtime_moves() {
         let mut runtime = Runtime::new();
         let global_root = runtime.global_root().expect("global root is owned");
         let main_handle = runtime
@@ -2874,10 +2990,18 @@ mod tests {
             assert_eq!(state.state_handle(), Some(main_handle));
             assert!(state.state_arena.is_some());
             assert!(gc.is_root(global_root));
-            assert_eq!(state.gc, Some(std::ptr::from_mut(gc)));
-            assert_eq!(state.string_pool, Some(std::ptr::from_mut(string_pool)));
+            assert_eq!(state.active_gc_ptr(), Some(std::ptr::from_mut(gc)));
+            assert_eq!(
+                state.active_string_pool_ptr(),
+                Some(std::ptr::from_mut(string_pool))
+            );
             (std::ptr::from_mut(gc), std::ptr::from_mut(string_pool))
         };
+        assert!(
+            runtime
+                .main_state()
+                .is_some_and(|state| state.active_gc_ptr().is_none())
+        );
 
         let mut runtime = move_runtime(runtime);
         let mut parts = runtime.parts_mut().expect("parts survive Runtime move");
@@ -2885,8 +3009,8 @@ mod tests {
         assert_eq!(std::ptr::from_ref(state), main_state_address);
         assert_eq!(std::ptr::from_mut(gc), gc_address);
         assert_eq!(std::ptr::from_mut(string_pool), string_pool_address);
-        assert_eq!(state.gc, Some(gc_address));
-        assert_eq!(state.string_pool, Some(string_pool_address));
+        assert_eq!(state.active_gc_ptr(), Some(gc_address));
+        assert_eq!(state.active_string_pool_ptr(), Some(string_pool_address));
     }
 
     #[test]
@@ -2904,7 +3028,16 @@ mod tests {
             });
         }));
         assert!(allocation_unwind.is_err());
-        assert_eq!(runtime.heap.as_ref().get_ref().gc.temporary_root_count(), 0);
+        assert_eq!(
+            runtime
+                .heap
+                .as_ref()
+                .get_ref()
+                .heap
+                .collector()
+                .temporary_root_count(),
+            0
+        );
         assert_eq!(runtime.live_coroutine_state_count(), baseline_states);
 
         let mut inserted_handle = None;
@@ -2990,7 +3123,16 @@ mod tests {
         assert!(binding_unwind.is_err());
         let bound_handle = bound_handle.expect("bound handle was observed");
         assert_eq!(runtime.temporary_state_root_count(), 0);
-        assert_eq!(runtime.heap.as_ref().get_ref().gc.temporary_root_count(), 0);
+        assert_eq!(
+            runtime
+                .heap
+                .as_ref()
+                .get_ref()
+                .heap
+                .collector()
+                .temporary_root_count(),
+            0
+        );
         assert_eq!(runtime.live_coroutine_state_count(), baseline_states);
         assert!(matches!(
             runtime
@@ -3019,7 +3161,16 @@ mod tests {
         };
 
         assert_eq!(runtime.temporary_state_root_count(), 0);
-        assert_eq!(runtime.heap.as_ref().get_ref().gc.temporary_root_count(), 0);
+        assert_eq!(
+            runtime
+                .heap
+                .as_ref()
+                .get_ref()
+                .heap
+                .collector()
+                .temporary_root_count(),
+            0
+        );
         assert_eq!(runtime.live_coroutine_state_count(), baseline_states + 1);
         assert_eq!(runtime.rejected_temporary_state_root_release_count(), 0);
         assert_eq!(
@@ -3027,7 +3178,8 @@ mod tests {
                 .heap
                 .as_ref()
                 .get_ref()
-                .gc
+                .heap
+                .collector()
                 .rejected_temporary_root_release_count(),
             0
         );
@@ -3083,7 +3235,7 @@ mod tests {
         };
 
         assert_eq!(duplicate_high, high);
-        let gc = &runtime.heap.as_ref().get_ref().gc;
+        let gc = runtime.heap.as_ref().get_ref().heap.collector();
         assert_eq!(
             gc.with_ref(low, Upvalue::open_location)
                 .expect("low Upvalue remains registered"),
@@ -3256,7 +3408,7 @@ mod tests {
                 .insert_coroutine_state(LuaState::new())
                 .expect("child is inserted")
         };
-        // SAFETY: RuntimeHeap is pinned and no execution guard is live.
+        // SAFETY: RuntimeStorage is pinned and no execution guard is live.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
         heap.state_arena
             .remove_owned(stale)
@@ -3276,7 +3428,7 @@ mod tests {
                 .as_deref_mut()
                 .expect("main state remains available"),
         );
-        // SAFETY: RuntimeHeap is pinned and the test releases this synthetic
+        // SAFETY: RuntimeStorage is pinned and the test releases this synthetic
         // direct borrow before any teardown or further state access.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
         heap.state_arena
@@ -3408,7 +3560,7 @@ mod tests {
                 .insert_coroutine_state(LuaState::new())
                 .expect("child is inserted")
         };
-        // SAFETY: RuntimeHeap is pinned and no execution guard is live.
+        // SAFETY: RuntimeStorage is pinned and no execution guard is live.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
         heap.state_arena
             .remove_owned(removed)
@@ -3430,7 +3582,7 @@ mod tests {
 
         // Repair the deliberately injected duplicate and prove normal shutdown
         // remains available after the fail-closed preflight.
-        // SAFETY: RuntimeHeap remains pinned and the failed close did not
+        // SAFETY: RuntimeStorage remains pinned and the failed close did not
         // create an execution guard or mutate arena ownership.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
         assert_eq!(heap.state_arena.free_slots.pop(), Some(removed.slot()));
@@ -3494,7 +3646,7 @@ mod tests {
                 .expect("first child is inserted")
         };
 
-        // SAFETY: RuntimeHeap is pinned and no execution guard is live.
+        // SAFETY: RuntimeStorage is pinned and no execution guard is live.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
         heap.state_arena
             .remove_owned(first_handle)
@@ -3775,7 +3927,7 @@ mod tests {
                 .expect("child is inserted")
         };
 
-        // SAFETY: RuntimeHeap is pinned and no execution guard is live.
+        // SAFETY: RuntimeStorage is pinned and no execution guard is live.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
         let arena = &mut heap.state_arena;
         let slot_index = child_handle.slot();

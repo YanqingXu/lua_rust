@@ -444,7 +444,7 @@ fn publish_file_to_table_and_stack(
 unsafe extern "C" fn lua_io_tmpfile(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -463,7 +463,7 @@ unsafe extern "C" fn lua_io_tmpfile(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_input(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -521,7 +521,7 @@ unsafe extern "C" fn lua_io_input(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_open(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -569,7 +569,7 @@ unsafe extern "C" fn lua_io_read(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_type(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -611,7 +611,7 @@ unsafe extern "C" fn lua_io_flush(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_lines(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -653,7 +653,7 @@ unsafe extern "C" fn lua_io_lines(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_output(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -756,7 +756,7 @@ fn write_to_file(
     first_arg: i32,
     throw_on_error: bool,
 ) -> i32 {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -901,7 +901,7 @@ unsafe extern "C" fn lua_io_file_seek(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -956,7 +956,7 @@ unsafe extern "C" fn lua_io_file_lines(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -987,7 +987,7 @@ unsafe extern "C" fn lua_io_file_setvbuf(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_value(Value::Boolean(false));
         return 1;
     };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_value(Value::Boolean(false));
         return 1;
     };
@@ -1011,7 +1011,7 @@ unsafe extern "C" fn lua_io_file_setvbuf(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_file_tostring(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -1031,7 +1031,7 @@ unsafe extern "C" fn lua_io_file_tostring(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_file_gc(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return 0;
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
@@ -1047,7 +1047,7 @@ unsafe extern "C" fn lua_io_file_gc(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_lines_iter(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -1091,7 +1091,7 @@ unsafe extern "C" fn lua_io_lines_iter(l_ptr: *mut std::ffi::c_void) -> i32 {
 }
 
 fn close_file_handle(l: &mut LuaState, file_ref: GcRef<Userdata>) -> i32 {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_value(Value::Boolean(false));
         return 1;
     };
@@ -1157,7 +1157,7 @@ enum ReadValue {
 }
 
 fn read_from_file(l: &mut LuaState, file_ref: GcRef<Userdata>, first_arg: i32) -> i32 {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -2000,11 +2000,8 @@ mod tests {
     use super::*;
     use lua_core::string_pool::StringPool;
 
-    fn state_with_services(gc: &mut GarbageCollector, pool: &mut StringPool) -> LuaState {
-        let mut state = LuaState::new();
-        state.gc = Some(gc);
-        state.string_pool = Some(pool);
-        state
+    fn state_with_services() -> LuaState {
+        LuaState::new()
     }
 
     fn state_with_io_table(
@@ -2012,10 +2009,12 @@ mod tests {
         pool: &mut StringPool,
     ) -> (LuaState, GcRef<Table>, GcRef<Table>) {
         let global = gc.create_root(Table::new());
-        let mut state = state_with_services(gc, pool);
+        let mut state = state_with_services();
         state.global_table = Some(global);
-        let io = crate::registration::publish_new_table(&state, gc, global, b"io")
-            .expect("IO table should publish");
+        let io = lua_vm::with_vm_context_parts(&mut state, gc, pool, |state, gc, _| {
+            crate::registration::publish_new_table(state, gc, global, b"io")
+                .expect("IO table should publish")
+        });
         (state, global, io)
     }
 
@@ -2045,37 +2044,39 @@ mod tests {
         let mut pool = StringPool::new();
         let (mut state, global, io) = state_with_io_table(&mut gc, &mut pool);
 
-        open_io(&mut state, &mut gc);
+        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+            open_io(state, gc);
 
-        assert_eq!(gc.temporary_root_count(), 0);
-        for name in [b"stdin".as_slice(), b"stdout", b"stderr"] {
-            let file =
-                table_get_string(&state, io, std::str::from_utf8(name).unwrap()).as_userdata();
-            let metatable = file_state_ref(&gc, file)
-                .expect("file Userdata should validate")
-                .expect("file metatable should publish");
-            assert!(matches!(
-                table_get_string(&state, metatable, "__index"),
-                Value::Table(index) if index == metatable
-            ));
-            assert!(matches!(
-                table_get_string(&state, metatable, "write"),
-                Value::Function(_)
-            ));
-        }
+            assert_eq!(gc.temporary_root_count(), 0);
+            for name in [b"stdin".as_slice(), b"stdout", b"stderr"] {
+                let file =
+                    table_get_string(state, io, std::str::from_utf8(name).unwrap()).as_userdata();
+                let metatable = file_state_ref(gc, file)
+                    .expect("file Userdata should validate")
+                    .expect("file metatable should publish");
+                assert!(matches!(
+                    table_get_string(state, metatable, "__index"),
+                    Value::Table(index) if index == metatable
+                ));
+                assert!(matches!(
+                    table_get_string(state, metatable, "write"),
+                    Value::Function(_)
+                ));
+            }
 
-        let seed = gc.begin_mark_only();
-        assert_eq!(seed.rejected, 0);
-        gc.propagate_marks();
-        assert_eq!(gc.rejected_mark_edge_count(), 0);
-        assert_eq!(gc.marked_object_count(), gc.object_count());
+            let seed = gc.begin_mark_only();
+            assert_eq!(seed.rejected, 0);
+            gc.propagate_marks();
+            assert_eq!(gc.rejected_mark_edge_count(), 0);
+            assert_eq!(gc.marked_object_count(), gc.object_count());
 
-        let object_count = gc.object_count();
-        gc.remove_root(global);
-        gc.mark();
-        assert_eq!(gc.sweep(&mut pool), object_count);
-        assert_eq!(gc.object_count(), 0);
-        assert!(pool.is_empty());
+            let object_count = gc.object_count();
+            gc.remove_root(global);
+            gc.mark();
+            assert_eq!(gc.sweep(pool), object_count);
+            assert_eq!(gc.object_count(), 0);
+            assert!(pool.is_empty());
+        });
     }
 
     #[test]
@@ -2091,40 +2092,42 @@ mod tests {
         for target in stages {
             let mut gc = GarbageCollector::new();
             let mut pool = StringPool::new();
-            let state = state_with_services(&mut gc, &mut pool);
-            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                gc.with_publication(|transaction| {
-                    let mut checkpoint = |stage| {
-                        if stage == target {
-                            panic!("injected file graph publication failure");
-                        }
-                        Ok(())
-                    };
-                    let _file = build_file(
-                        &state,
-                        transaction,
-                        memory_file_construction(None, b"w+", true, None),
-                        &mut checkpoint,
-                    )
-                    .expect("pre-injection construction should validate");
-                });
-            }));
+            let mut state = state_with_services();
+            lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+                let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    gc.with_publication(|transaction| {
+                        let mut checkpoint = |stage| {
+                            if stage == target {
+                                panic!("injected file graph publication failure");
+                            }
+                            Ok(())
+                        };
+                        let _file = build_file(
+                            state,
+                            transaction,
+                            memory_file_construction(None, b"w+", true, None),
+                            &mut checkpoint,
+                        )
+                        .expect("pre-injection construction should validate");
+                    });
+                }));
 
-            assert!(unwind.is_err(), "stage {target:?} should inject a panic");
-            assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
-            assert_eq!(
-                gc.rejected_temporary_root_release_count(),
-                0,
-                "stage {target:?}"
-            );
-            let object_count = gc.object_count();
-            let seed = gc.begin_mark_only();
-            assert_eq!(seed.seeded, 0, "stage {target:?}");
-            gc.propagate_marks();
-            assert_eq!(gc.marked_object_count(), 0, "stage {target:?}");
-            assert_eq!(gc.sweep(&mut pool), object_count, "stage {target:?}");
-            assert_eq!(gc.object_count(), 0, "stage {target:?}");
-            assert!(pool.is_empty(), "stage {target:?}");
+                assert!(unwind.is_err(), "stage {target:?} should inject a panic");
+                assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
+                assert_eq!(
+                    gc.rejected_temporary_root_release_count(),
+                    0,
+                    "stage {target:?}"
+                );
+                let object_count = gc.object_count();
+                let seed = gc.begin_mark_only();
+                assert_eq!(seed.seeded, 0, "stage {target:?}");
+                gc.propagate_marks();
+                assert_eq!(gc.marked_object_count(), 0, "stage {target:?}");
+                assert_eq!(gc.sweep(pool), object_count, "stage {target:?}");
+                assert_eq!(gc.object_count(), 0, "stage {target:?}");
+                assert!(pool.is_empty(), "stage {target:?}");
+            });
         }
     }
 
@@ -2132,27 +2135,29 @@ mod tests {
     fn file_builder_early_return_drops_all_temporary_roots() {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
-        let state = state_with_services(&mut gc, &mut pool);
+        let mut state = state_with_services();
 
-        let result: Result<(), GcRefValidationError> = gc.with_publication(|transaction| {
-            let mut checkpoint = |_| Ok(());
-            let _file = build_file(
-                &state,
-                transaction,
-                memory_file_construction(None, b"w+", true, None),
-                &mut checkpoint,
-            )?;
-            Err(GcRefValidationError::Null)
+        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+            let result: Result<(), GcRefValidationError> = gc.with_publication(|transaction| {
+                let mut checkpoint = |_| Ok(());
+                let _file = build_file(
+                    state,
+                    transaction,
+                    memory_file_construction(None, b"w+", true, None),
+                    &mut checkpoint,
+                )?;
+                Err(GcRefValidationError::Null)
+            });
+
+            assert!(result.is_err());
+            assert_eq!(gc.temporary_root_count(), 0);
+            assert_eq!(gc.rejected_temporary_root_release_count(), 0);
+            let object_count = gc.object_count();
+            gc.mark();
+            assert_eq!(gc.sweep(pool), object_count);
+            assert_eq!(gc.object_count(), 0);
+            assert!(pool.is_empty());
         });
-
-        assert!(result.is_err());
-        assert_eq!(gc.temporary_root_count(), 0);
-        assert_eq!(gc.rejected_temporary_root_release_count(), 0);
-        let object_count = gc.object_count();
-        gc.mark();
-        assert_eq!(gc.sweep(&mut pool), object_count);
-        assert_eq!(gc.object_count(), 0);
-        assert!(pool.is_empty());
     }
 
     #[test]
@@ -2163,39 +2168,41 @@ mod tests {
         ] {
             let mut gc = GarbageCollector::new();
             let mut pool = StringPool::new();
-            let state = state_with_services(&mut gc, &mut pool);
+            let mut state = state_with_services();
 
-            let result: Result<(), GcRefValidationError> = gc.with_publication(|transaction| {
-                let mut checkpoint = |stage| {
-                    if stage == target {
-                        Err(GcRefValidationError::Null)
-                    } else {
-                        Ok(())
-                    }
-                };
-                let file = build_file(
-                    &state,
-                    transaction,
-                    memory_file_construction(None, b"r", false, None),
-                    &mut checkpoint,
-                )?;
-                let _iterator =
-                    build_lines_iterator(&state, transaction, &file, true, &mut checkpoint)?;
-                Ok(())
+            lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+                let result: Result<(), GcRefValidationError> = gc.with_publication(|transaction| {
+                    let mut checkpoint = |stage| {
+                        if stage == target {
+                            Err(GcRefValidationError::Null)
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    let file = build_file(
+                        state,
+                        transaction,
+                        memory_file_construction(None, b"r", false, None),
+                        &mut checkpoint,
+                    )?;
+                    let _iterator =
+                        build_lines_iterator(state, transaction, &file, true, &mut checkpoint)?;
+                    Ok(())
+                });
+
+                assert!(result.is_err(), "stage {target:?} should return an error");
+                assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
+                assert_eq!(
+                    gc.rejected_temporary_root_release_count(),
+                    0,
+                    "stage {target:?}"
+                );
+                let object_count = gc.object_count();
+                gc.mark();
+                assert_eq!(gc.sweep(pool), object_count, "stage {target:?}");
+                assert_eq!(gc.object_count(), 0, "stage {target:?}");
+                assert!(pool.is_empty(), "stage {target:?}");
             });
-
-            assert!(result.is_err(), "stage {target:?} should return an error");
-            assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
-            assert_eq!(
-                gc.rejected_temporary_root_release_count(),
-                0,
-                "stage {target:?}"
-            );
-            let object_count = gc.object_count();
-            gc.mark();
-            assert_eq!(gc.sweep(&mut pool), object_count, "stage {target:?}");
-            assert_eq!(gc.object_count(), 0, "stage {target:?}");
-            assert!(pool.is_empty(), "stage {target:?}");
         }
     }
 
@@ -2203,51 +2210,53 @@ mod tests {
     fn lines_iterator_graph_is_reachable_and_fully_collectable() {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
-        let mut state = state_with_services(&mut gc, &mut pool);
+        let mut state = state_with_services();
 
-        assert_eq!(
-            push_new_file_lines_iterator(
-                &mut state,
-                &mut gc,
-                memory_file_construction(None, b"r", false, None),
-                true,
-            ),
-            1
-        );
-        assert_eq!(gc.temporary_root_count(), 0);
-        let iterator = match state.at(-1) {
-            Some(Value::Function(iterator)) => *iterator,
-            value => panic!("expected iterator Function, got {value:?}"),
-        };
-        let environment = gc
-            .with_ref(iterator, |iterator| iterator.env())
-            .expect("iterator should remain live")
-            .expect("iterator environment should publish");
-        let file = match table_get_string(&state, environment, "__file") {
-            Value::Userdata(file) => file,
-            value => panic!("expected iterator file Userdata, got {value:?}"),
-        };
-        assert!(
-            file_state_ref(&gc, file)
-                .expect("file Userdata should validate")
-                .is_some()
-        );
+        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+            assert_eq!(
+                push_new_file_lines_iterator(
+                    state,
+                    gc,
+                    memory_file_construction(None, b"r", false, None),
+                    true,
+                ),
+                1
+            );
+            assert_eq!(gc.temporary_root_count(), 0);
+            let iterator = match state.at(-1) {
+                Some(Value::Function(iterator)) => *iterator,
+                value => panic!("expected iterator Function, got {value:?}"),
+            };
+            let environment = gc
+                .with_ref(iterator, |iterator| iterator.env())
+                .expect("iterator should remain live")
+                .expect("iterator environment should publish");
+            let file = match table_get_string(state, environment, "__file") {
+                Value::Userdata(file) => file,
+                value => panic!("expected iterator file Userdata, got {value:?}"),
+            };
+            assert!(
+                file_state_ref(gc, file)
+                    .expect("file Userdata should validate")
+                    .is_some()
+            );
 
-        gc.add_root(iterator);
-        let seed = gc.begin_mark_only();
-        assert_eq!(seed.seeded, 1);
-        assert_eq!(seed.rejected, 0);
-        gc.propagate_marks();
-        assert_eq!(gc.rejected_mark_edge_count(), 0);
-        assert_eq!(gc.marked_object_count(), gc.object_count());
+            gc.add_root(iterator);
+            let seed = gc.begin_mark_only();
+            assert_eq!(seed.seeded, 1);
+            assert_eq!(seed.rejected, 0);
+            gc.propagate_marks();
+            assert_eq!(gc.rejected_mark_edge_count(), 0);
+            assert_eq!(gc.marked_object_count(), gc.object_count());
 
-        let object_count = gc.object_count();
-        state.pop();
-        gc.remove_root(iterator);
-        gc.mark();
-        assert_eq!(gc.sweep(&mut pool), object_count);
-        assert_eq!(gc.object_count(), 0);
-        assert!(pool.is_empty());
+            let object_count = gc.object_count();
+            state.pop();
+            gc.remove_root(iterator);
+            gc.mark();
+            assert_eq!(gc.sweep(pool), object_count);
+            assert_eq!(gc.object_count(), 0);
+            assert!(pool.is_empty());
+        });
     }
 
     #[test]
@@ -2261,40 +2270,42 @@ mod tests {
         for target in stages {
             let mut gc = GarbageCollector::new();
             let mut pool = StringPool::new();
-            let state = state_with_services(&mut gc, &mut pool);
-            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                gc.with_publication(|transaction| {
-                    let mut checkpoint = |stage| {
-                        if stage == target {
-                            panic!("injected iterator graph publication failure");
-                        }
-                        Ok(())
-                    };
-                    let file = build_file(
-                        &state,
-                        transaction,
-                        memory_file_construction(None, b"r", false, None),
-                        &mut checkpoint,
-                    )
-                    .expect("file should build before iterator injection");
-                    let _iterator =
-                        build_lines_iterator(&state, transaction, &file, true, &mut checkpoint)
-                            .expect("pre-injection iterator construction should validate");
-                });
-            }));
+            let mut state = state_with_services();
+            lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+                let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    gc.with_publication(|transaction| {
+                        let mut checkpoint = |stage| {
+                            if stage == target {
+                                panic!("injected iterator graph publication failure");
+                            }
+                            Ok(())
+                        };
+                        let file = build_file(
+                            state,
+                            transaction,
+                            memory_file_construction(None, b"r", false, None),
+                            &mut checkpoint,
+                        )
+                        .expect("file should build before iterator injection");
+                        let _iterator =
+                            build_lines_iterator(state, transaction, &file, true, &mut checkpoint)
+                                .expect("pre-injection iterator construction should validate");
+                    });
+                }));
 
-            assert!(unwind.is_err(), "stage {target:?} should inject a panic");
-            assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
-            assert_eq!(
-                gc.rejected_temporary_root_release_count(),
-                0,
-                "stage {target:?}"
-            );
-            let object_count = gc.object_count();
-            gc.mark();
-            assert_eq!(gc.sweep(&mut pool), object_count, "stage {target:?}");
-            assert_eq!(gc.object_count(), 0, "stage {target:?}");
-            assert!(pool.is_empty(), "stage {target:?}");
+                assert!(unwind.is_err(), "stage {target:?} should inject a panic");
+                assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
+                assert_eq!(
+                    gc.rejected_temporary_root_release_count(),
+                    0,
+                    "stage {target:?}"
+                );
+                let object_count = gc.object_count();
+                gc.mark();
+                assert_eq!(gc.sweep(pool), object_count, "stage {target:?}");
+                assert_eq!(gc.object_count(), 0, "stage {target:?}");
+                assert!(pool.is_empty(), "stage {target:?}");
+            });
         }
     }
 
@@ -2302,36 +2313,35 @@ mod tests {
     fn foreign_and_stale_file_edges_are_rejected_before_table_mutation() {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
-        let (state, global, io) = state_with_io_table(&mut gc, &mut pool);
+        let (mut state, global, io) = state_with_io_table(&mut gc, &mut pool);
         let mut foreign_gc = GarbageCollector::new();
         let foreign = foreign_gc.create_root(Userdata::new(0));
 
-        let foreign_result =
-            set_table_ref_value(&state, &mut gc, io, b"foreign", &Value::Userdata(foreign));
-        assert!(foreign_result.is_err());
-        assert!(file_state_ref(&gc, foreign).is_err());
-        assert!(matches!(
-            table_get_string(&state, io, "foreign"),
-            Value::Nil
-        ));
-        assert_eq!(gc.temporary_root_count(), 0);
+        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+            let foreign_result =
+                set_table_ref_value(state, gc, io, b"foreign", &Value::Userdata(foreign));
+            assert!(foreign_result.is_err());
+            assert!(file_state_ref(gc, foreign).is_err());
+            assert!(matches!(table_get_string(state, io, "foreign"), Value::Nil));
+            assert_eq!(gc.temporary_root_count(), 0);
 
-        let stale = gc.create_root(Userdata::new(0));
-        gc.remove_root(stale);
-        gc.mark();
-        assert!(gc.sweep(&mut pool) >= 1);
-        let stale_result =
-            set_table_ref_value(&state, &mut gc, io, b"stale", &Value::Userdata(stale));
-        assert!(stale_result.is_err());
-        assert!(file_state_ref(&gc, stale).is_err());
-        assert!(matches!(table_get_string(&state, io, "stale"), Value::Nil));
-        assert_eq!(gc.temporary_root_count(), 0);
+            let stale = gc.create_root(Userdata::new(0));
+            gc.remove_root(stale);
+            gc.mark();
+            assert!(gc.sweep(pool) >= 1);
+            let stale_result =
+                set_table_ref_value(state, gc, io, b"stale", &Value::Userdata(stale));
+            assert!(stale_result.is_err());
+            assert!(file_state_ref(gc, stale).is_err());
+            assert!(matches!(table_get_string(state, io, "stale"), Value::Nil));
+            assert_eq!(gc.temporary_root_count(), 0);
 
-        gc.remove_root(global);
-        gc.mark();
-        let remaining = gc.object_count();
-        assert_eq!(gc.sweep(&mut pool), remaining);
-        assert_eq!(gc.object_count(), 0);
-        assert!(pool.is_empty());
+            gc.remove_root(global);
+            gc.mark();
+            let remaining = gc.object_count();
+            assert_eq!(gc.sweep(pool), remaining);
+            assert_eq!(gc.object_count(), 0);
+            assert!(pool.is_empty());
+        });
     }
 }

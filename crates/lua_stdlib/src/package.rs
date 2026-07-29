@@ -89,7 +89,7 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
         return raise_string(l, "invalid module name");
     }
 
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return raise_string(l, "require unavailable without an active GC");
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
@@ -189,7 +189,7 @@ unsafe extern "C" fn lua_package_seeall(l_ptr: *mut std::ffi::c_void) -> i32 {
     let Some(Value::Table(module_ref)) = l.at(1).cloned() else {
         return raise_string(l, "bad argument #1 to 'seeall' (table expected)");
     };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return raise_string(l, "seeall unavailable without an active GC");
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
@@ -241,7 +241,7 @@ unsafe extern "C" fn lua_package_module(l_ptr: *mut std::ffi::c_void) -> i32 {
         Ok(name) => name,
         Err(_) => return raise_string(l, "invalid module name"),
     };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return raise_string(l, "module unavailable without an active GC");
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
@@ -338,12 +338,11 @@ fn compile_chunk_function(
         .parse()
         .map_err(|err| format!("{chunk_name}:{}:{}: {}", err.line, err.column, err.message))?;
     let pool_ptr = l
-        .string_pool
+        .active_string_pool_ptr()
         .ok_or_else(|| format!("{chunk_name}: loader unavailable without an active StringPool"))?;
 
     let func_ref = gc.with_publication(|transaction| {
-        // SAFETY: LuaState::string_pool is a transitional Runtime backpointer
-        // installed from the live host-owned pool.
+        // SAFETY: the pool belongs to the dynamically scoped Runtime turn.
         let generator =
             CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr });
         let proto = generator
@@ -366,9 +365,6 @@ fn compile_chunk_function(
         }
         .map_err(|err| format!("{chunk_name}: invalid loader stack publication: {err}"))
     })?;
-    if l.gc.is_none() {
-        l.gc = Some(gc as *mut GarbageCollector);
-    }
     Ok(func_ref)
 }
 
@@ -678,7 +674,7 @@ fn global_value(l: &LuaState, name: &str) -> Option<Value> {
 }
 
 fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return false;
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
@@ -721,7 +717,7 @@ fn push_runtime_error_value(
 }
 
 fn raise_string(l: &mut LuaState, message: &str) -> i32 {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_value(Value::Nil);
         return -1;
     };

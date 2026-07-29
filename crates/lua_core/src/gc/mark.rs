@@ -32,6 +32,10 @@ pub struct MarkRootSeedReport {
     pub temporary_seeded: usize,
     /// Rejected lexical publication roots.
     pub temporary_rejected: usize,
+    /// Pending-finalizer queue entries successfully seeded as roots.
+    pub pending_finalizers_seeded: usize,
+    /// Stale, foreign, or mistyped pending-finalizer entries rejected.
+    pub pending_finalizers_rejected: usize,
 }
 
 /// One concrete-object propagation step.
@@ -112,6 +116,22 @@ impl GarbageCollector {
                 Err(_) => {
                     report.rejected += 1;
                     report.temporary_rejected += 1;
+                    self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
+                }
+            }
+        }
+
+        let pending_finalizers = self.pending_finalizers.clone();
+        for userdata in pending_finalizers {
+            match self.validate_ref(userdata) {
+                Ok(pointer) => {
+                    self.mark_live_object(pointer.as_ptr().cast());
+                    report.seeded += 1;
+                    report.pending_finalizers_seeded += 1;
+                }
+                Err(_) => {
+                    report.rejected += 1;
+                    report.pending_finalizers_rejected += 1;
                     self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
                 }
             }
@@ -473,6 +493,7 @@ mod tests {
     use crate::table::Table;
     use crate::thread::Thread;
     use crate::types::GcColor;
+    use crate::userdata::Userdata;
 
     #[test]
     fn test_mark_and_sweep_basic() {
@@ -712,5 +733,21 @@ mod tests {
         gc.collect(&mut pool);
 
         assert_eq!(gc.object_count(), count_before);
+    }
+
+    #[test]
+    fn pending_finalizers_are_seeded_as_identity_checked_roots() {
+        let mut gc = GarbageCollector::new();
+        let userdata = gc.create(Userdata::new(0));
+        gc.pending_finalizers.push(userdata);
+
+        let report = gc.begin_mark_only();
+        assert_eq!(report.pending_finalizers_seeded, 1);
+        assert_eq!(report.pending_finalizers_rejected, 0);
+        gc.propagate_marks();
+
+        // SAFETY: begin_mark_only is non-destructive and the handle remains
+        // registered in this collector.
+        assert!(unsafe { &*userdata.as_ptr() }.gc_header().is_black());
     }
 }

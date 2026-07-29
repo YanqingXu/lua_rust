@@ -59,8 +59,14 @@ pub enum RuntimeRootKind {
     LastError,
     /// Runtime-owned deferred coroutine requests, snapshots, and responses.
     CoroutineActivationBuffer,
+    /// Collector-owned userdata awaiting protected finalizer delivery.
+    PendingFinalizers,
+    /// Lexical object-publication roots.
+    TemporaryProtectedRoots,
     /// Lexical PendingState handles not yet reachable through a Thread.
     TemporaryStateRoots,
+    /// Runtime-owned fixed metamethod and emergency strings.
+    FixedStrings,
 }
 
 impl RuntimeRootKind {
@@ -86,7 +92,10 @@ impl RuntimeRootKind {
             Self::YieldedValues => "YIELDED_VALUES",
             Self::LastError => "LAST_ERROR",
             Self::CoroutineActivationBuffer => "COROUTINE_ACTIVATION_BUFFER",
+            Self::PendingFinalizers => "PENDING_FINALIZERS",
+            Self::TemporaryProtectedRoots => "TEMPORARY_PROTECTED_ROOTS",
             Self::TemporaryStateRoots => "TEMPORARY_STATE_ROOTS",
+            Self::FixedStrings => "FIXED_STRINGS",
         }
     }
 }
@@ -268,43 +277,69 @@ impl Runtime {
                 })?;
         let global_root = self.global_root;
         let registry_root = self.registry_root;
+        let fixed_strings = self.fixed_strings.clone();
 
-        // SAFETY: RuntimeHeap is pinned, Runtime is exclusively borrowed, and
+        // SAFETY: RuntimeStorage is pinned, Runtime is exclusively borrowed, and
         // the active-execution check establishes U-03 for immutable state
         // snapshots alongside mutable collector mark state.
         let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
-        let total_objects = heap.gc.object_count();
-        let seed_report = heap.gc.begin_mark_only();
+        let state_arena = &mut heap.state_arena;
+        let native_activations = &mut heap.native_activations;
+        let gc = heap.heap.collector_mut();
+        let total_objects = gc.object_count();
+        let seed_report = gc.begin_mark_only();
 
         let mut root_counts = BTreeMap::new();
         increment(
             &mut root_counts,
-            RuntimeRootKind::CoroutineActivationBuffer,
-            heap.native_activations.frames.len() + heap.native_activations.upvalue_transfers.len(),
+            RuntimeRootKind::CollectorExplicitRoot,
+            seed_report
+                .seeded
+                .saturating_sub(seed_report.temporary_seeded)
+                .saturating_sub(seed_report.pending_finalizers_seeded),
         );
-        heap.native_activations.seed_roots(&mut heap.gc);
         increment(
             &mut root_counts,
-            RuntimeRootKind::CollectorExplicitRoot,
-            seed_report.seeded,
+            RuntimeRootKind::TemporaryProtectedRoots,
+            seed_report.temporary_seeded,
         );
+        increment(
+            &mut root_counts,
+            RuntimeRootKind::PendingFinalizers,
+            seed_report.pending_finalizers_seeded,
+        );
+        let fixed_strings_seeded = fixed_strings
+            .into_iter()
+            .filter(|string| gc.mark_registered(*string))
+            .count();
+        increment(
+            &mut root_counts,
+            RuntimeRootKind::FixedStrings,
+            fixed_strings_seeded,
+        );
+        increment(
+            &mut root_counts,
+            RuntimeRootKind::CoroutineActivationBuffer,
+            native_activations.frames.len() + native_activations.upvalue_transfers.len(),
+        );
+        native_activations.seed_roots(gc);
         let mut unresolved_object_edges = Vec::new();
         mark_runtime_table(
-            &mut heap.gc,
+            gc,
             global_root,
             RuntimeRootKind::GlobalTable,
             &mut root_counts,
             &mut unresolved_object_edges,
         );
         mark_runtime_table(
-            &mut heap.gc,
+            gc,
             registry_root,
             RuntimeRootKind::Registry,
             &mut root_counts,
             &mut unresolved_object_edges,
         );
 
-        let temporary_state_roots = heap.state_arena.temporary_state_roots();
+        let temporary_state_roots = state_arena.temporary_state_roots();
         increment(
             &mut root_counts,
             RuntimeRootKind::TemporaryStateRoots,
@@ -319,13 +354,13 @@ impl Runtime {
         let mut unsafe_gaps = Vec::new();
         let mut object_trace_steps = 0;
 
-        while !state_queue.is_empty() || heap.gc.pending_mark_count() != 0 {
+        while !state_queue.is_empty() || gc.pending_mark_count() != 0 {
             while let Some(handle) = state_queue.pop_front() {
                 if !attempted_states.insert(handle) {
                     continue;
                 }
 
-                let state_pointer = match heap.state_arena.resolve_for_trace(handle) {
+                let state_pointer = match state_arena.resolve_for_trace(handle) {
                     Ok(state) => state,
                     Err(error) => {
                         failed_state_handles.push(StateTraceFailure { handle, error });
@@ -344,7 +379,7 @@ impl Runtime {
                 traced_states.push(handle);
                 unsafe_gaps.extend(snapshot.gaps);
                 mark_snapshot(
-                    &mut heap.gc,
+                    gc,
                     handle,
                     snapshot.edges,
                     &mut root_counts,
@@ -352,7 +387,7 @@ impl Runtime {
                 );
             }
 
-            let Some(step) = heap.gc.propagate_one_marked_object() else {
+            let Some(step) = gc.propagate_one_marked_object() else {
                 continue;
             };
             object_trace_steps += 1;
@@ -374,8 +409,8 @@ impl Runtime {
         unsafe_gaps.sort_unstable();
         unresolved_object_edges.sort_unstable();
 
-        let marked_objects = heap.gc.marked_object_count();
-        debug_assert_eq!(heap.gc.object_count(), total_objects);
+        let marked_objects = gc.marked_object_count();
+        debug_assert_eq!(gc.object_count(), total_objects);
         Ok(MarkOnlyReport {
             runtime_id: self.id,
             total_objects,
@@ -385,14 +420,14 @@ impl Runtime {
             failed_state_handles,
             collector_roots_seeded: seed_report.seeded,
             collector_roots_rejected: seed_report.rejected,
-            rejected_child_edges: heap.gc.rejected_mark_edge_count(),
+            rejected_child_edges: gc.rejected_mark_edge_count(),
             root_edges: root_counts
                 .into_iter()
                 .map(|(kind, edges)| RootEdgeCount { kind, edges })
                 .collect(),
             unsafe_gaps,
             unresolved_object_edges,
-            pending_objects: heap.gc.pending_mark_count(),
+            pending_objects: gc.pending_mark_count(),
         })
     }
 }
@@ -651,14 +686,14 @@ mod tests {
             }
         };
 
-        let object_count = runtime.heap.as_ref().get_ref().gc.object_count();
+        let object_count = runtime.heap.as_ref().get_ref().heap.object_count();
         let report = runtime
             .trace_roots_mark_only()
             .expect("mark-only traversal succeeds");
 
         assert_eq!(report.total_objects, object_count);
         assert_eq!(
-            runtime.heap.as_ref().get_ref().gc.object_count(),
+            runtime.heap.as_ref().get_ref().heap.object_count(),
             object_count
         );
         assert_eq!(report.pending_objects, 0);
@@ -744,8 +779,14 @@ mod tests {
         let absent = runtime
             .trace_roots_mark_only()
             .expect("cleared roots produce another mark-only report");
-        assert_eq!(absent.marked_objects, 0);
+        let fixed_string_count = lua_core::metatable::METAMETHOD_NAMES.len()
+            + crate::runtime::FIXED_RUNTIME_STRING_BYTES.len();
+        assert_eq!(absent.marked_objects, fixed_string_count);
         assert_eq!(absent.collector_roots_seeded, 0);
+        assert_eq!(
+            absent.root_edge_count(RuntimeRootKind::FixedStrings),
+            fixed_string_count
+        );
         assert_eq!(absent.root_edge_count(RuntimeRootKind::MainStateEntry), 1);
         for kind in [
             RuntimeRootKind::CollectorExplicitRoot,
@@ -802,9 +843,9 @@ mod tests {
         let main_handle = runtime.main_state_handle.expect("main state handle");
 
         let (pending_handle, temporary_root_id, payload) = {
-            // SAFETY: RuntimeHeap is pinned and no execution guard is live.
+            // SAFETY: RuntimeStorage is pinned and no execution guard is live.
             let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
-            let payload = heap.gc.create(Table::new());
+            let payload = heap.heap.collector_mut().create(Table::new());
             let mut pending = LuaState::new();
             pending.push_value(Value::Table(payload));
             let (handle, root_id) = heap
@@ -992,7 +1033,7 @@ mod tests {
                 .insert_coroutine_state(LuaState::new())
                 .expect("stale candidate is inserted")
         };
-        // SAFETY: RuntimeHeap is pinned and no execution guard is live.
+        // SAFETY: RuntimeStorage is pinned and no execution guard is live.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
         heap.state_arena
             .remove_owned(stale)
@@ -1016,13 +1057,13 @@ mod tests {
             state.push_value(Value::Thread(foreign_thread));
         }
 
-        let object_count = runtime.heap.as_ref().get_ref().gc.object_count();
+        let object_count = runtime.heap.as_ref().get_ref().heap.object_count();
         let report = runtime
             .trace_roots_mark_only()
             .expect("invalid edges are diagnostics, not traversal failure");
 
         assert_eq!(
-            runtime.heap.as_ref().get_ref().gc.object_count(),
+            runtime.heap.as_ref().get_ref().heap.object_count(),
             object_count
         );
         assert_eq!(report.failed_state_handles.len(), 2);

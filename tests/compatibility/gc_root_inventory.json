@@ -3,7 +3,7 @@
   "description": "Fail-closed inventory of every runtime or collector root required before lua_rust may sweep a live VM.",
   "provenance_audit": {
     "implemented": "GcRef carries a process-global non-reused ObjectId; each collector validates address, ObjectId, and concrete tag in an authoritative live table. LightUserdata is a separate arbitrary-pointer type, and collector explicit roots retain erased pointer + ObjectId + tag handles.",
-    "remaining_sweep_blocker": "Production strings now use canonical StringPool identity, safe Value::String equality/hash never dereference, and byte-content operations use collector/state-scoped validation under a separate 17-path contract gate. The absent unique Heap/service owner, incomplete fixed-string/finalizer roots, broader transitional non-string GcRef::as_ref call sites, and the lack of a Runtime-only collector entry point still keep live sweep disabled. Current compiler, library/package, IO, VM/app, and result-construction publication slices are transactional, but allocation-triggered collection remains intentionally off until those separate blockers close."
+    "remaining_sweep_blocker": "Runtime now owns one Heap that couples collector accounting and the canonical StringPool by HeapId; LuaState has no GC/StringPool backpointer, and the canonical Runtime tracer seeds fixed strings, pending finalizers, temporary publication roots, state roots, and runtime service roots. Broader transitional non-string GcRef::as_ref call sites, incomplete mutation barriers/weak-finalizer semantics, and the lack of a Runtime-only destructive collector entry point still keep live sweep disabled. Current compiler, library/package, IO, VM/app, and result-construction publication slices are transactional, but allocation-triggered collection remains intentionally off until those separate blockers close."
   },
   "status_values": [
     "implemented",
@@ -28,14 +28,14 @@
       ],
       "status": "partial",
       "owner": {
-        "current": "GarbageCollector stores erased pointer + ObjectId + concrete tag root handles; ObjectId is process-global and never reused.",
+        "current": "Runtime's unique Heap owns the GarbageCollector and canonical StringPool under one HeapId. The collector stores erased pointer + ObjectId + concrete tag root handles; ObjectId is process-global and never reused.",
         "target": "Heap owns scoped RootToken entries with HeapId and generation validation."
       },
       "tracer": {
-        "current": "begin_mark_only validates every root's address, ObjectId, and tag against the collector live table before header access, then reports rejected roots without dereference.",
+        "current": "RuntimeRootTracer calls begin_mark_only, which validates every root's address, ObjectId, and tag against the collector live table before header access, then labels seeded and rejected collector roots without dereference.",
         "target": "RuntimeRootTracer seeds validated collector roots and labels them with RootKind."
       },
-      "missing_risk": "Address-reuse provenance is closed for collector roots and exact-id lexical publication roots are implemented, but persistent storage remains unscoped and is not yet owned by one unique Heap lifetime.",
+      "missing_risk": "Unique Heap lifetime and address-reuse provenance are closed, but persistent explicit-root storage still lacks lexical RootToken generations and destructive collection is not yet wired to the canonical Runtime tracer.",
       "planned_test": {
         "name": "mark_only_seed_rejects_unregistered_explicit_root_without_dereference; address_reuse_injection_rejects_old_object_id_at_same_pointer",
         "layer": "lua_core GC integration",
@@ -573,14 +573,14 @@
       ],
       "status": "partial",
       "owner": {
-        "current": "GarbageCollector stores GcRef<Userdata> entries carrying ObjectId; finalizer entry points are still split between a stub and a compatibility path.",
+        "current": "The Heap-owned GarbageCollector stores GcRef<Userdata> entries carrying ObjectId; finalizer entry points are still split between a stub and a compatibility path.",
         "target": "Heap owns a validated finalizer queue whose entries remain roots through protected callback completion."
       },
       "tracer": {
-        "current": "Collector mark does not seed pending_finalizers; queue membership is identity-aware, central destroy_object prunes entries before drop, and Runtime close reports then discards the remaining queue without Lua callbacks.",
+        "current": "begin_mark_only identity-validates and seeds every pending_finalizer as a canonical root, reports rejected entries, and RuntimeRootTracer labels the accepted edges. Central destruction prunes entries before drop; Runtime close reports then discards the remaining queue without Lua callbacks.",
         "target": "RuntimeRootTracer marks every pending entry and central destruction prunes it before free."
       },
-      "missing_risk": "Address-reuse aliasing is closed, but pending entries are not canonical roots; reentrant/error paths can still skip later finalizers or free the finalizer closure graph.",
+      "missing_risk": "Pending entries are now canonical roots and address-reuse aliasing is closed, but protected Lua callback delivery, reentrancy, error continuation, exactly-once behavior, and resurrection are not implemented.",
       "planned_test": {
         "name": "persistent_queues_do_not_reidentify_reused_addresses; pending_finalizers_are_rooted_pruned_and_drained",
         "layer": "lua_stdlib gc_semantics",
@@ -665,7 +665,7 @@
         "current": "GarbageCollector::begin_mark_only validates and seeds active temporary object roots, with separate seeded/rejected counts.",
         "target": "RuntimeRootTracer seeds every active temporary-root scope."
       },
-      "missing_risk": "The current compiler, coroutine, library/package, IO, VM/app, result-construction, and production string identity/access slices are migrated. The M1 gate rejects direct production gc.create in publication targets and separately enforces canonical construction plus scoped string reads. Allocation-triggered collection remains disabled because one unique Heap/service owner is absent, finalizer/fixed-string roots remain incomplete, broader non-string object access still has transitional escape hatches, and the live collector is not wired to the Runtime root tracer.",
+      "missing_risk": "The current compiler, coroutine, library/package, IO, VM/app, result-construction, production string identity/access, unique Heap, fixed-string, and finalizer-root slices are migrated. The M1 gate rejects direct production gc.create and standalone production GC/StringPool construction. Allocation-triggered collection remains disabled because broader non-string object access still has transitional escape hatches and the destructive collector is not wired to the Runtime tracer.",
       "planned_test": {
         "name": "compiler_proto_tree_publishes_atomically_into_a_lua_function; open_all_publishes_every_library_graph_from_the_global_root; standard_file_graph_is_reachable_from_global_and_fully_collectable; result_slice_foreign_failure_and_panic_cleanup_exact_roots; protected_call_results_are_published_before_stack_window_restores; script_argument_table_and_varargs_survive_runtime_publication_handoff",
         "layer": "lua_core/lua_stdlib/lua_vm publication and runtime root tracing",
@@ -700,7 +700,7 @@
         "current": "RuntimeRootTracer snapshots validated temporary StateHandles independently from ordinary arena membership and object-publication roots, labels them TEMPORARY_STATE_ROOTS, and feeds them into the state/object fixed-point queues.",
         "target": "RuntimeRootTracer seeds validated temporary StateHandles independently from temporary GC-object roots."
       },
-      "missing_risk": "This root kind is locally complete for coroutine create/wrap, and the production object-publication plus string identity/access slices are migrated. Live sweep remains blocked by the unique Heap/service owner, fixed strings, finalizers, broader non-string scoped object access, and Runtime-only tracer wiring.",
+      "missing_risk": "This root kind is locally complete for coroutine create/wrap, and the production object-publication, string identity/access, unique Heap, fixed-string, and finalizer-root slices are migrated. Live sweep remains blocked by broader non-string scoped object access and a Runtime-only destructive collector entry point.",
       "planned_test": {
         "name": "pending_state_rolls_back_or_publishes_atomically",
         "layer": "lua_vm runtime_ownership",
@@ -723,11 +723,11 @@
       ],
       "status": "partial",
       "owner": {
-        "current": "RuntimeHeap owns every active ResumeRequest, deferred native frame, caller/target Thread edge, continuation snapshot, and pending response until delivery. NativeActivationSessionGuard restores links and drains the buffer on success, error, or panic.",
-        "target": "The unique Heap owner exposes the same activation buffer as a canonical root provider to full and incremental collection."
+        "current": "The unique RuntimeStorage lifecycle owns Heap and NativeActivationStack together. It retains every active ResumeRequest, deferred native frame, caller/target Thread edge, continuation snapshot, and pending response until delivery; NativeActivationSessionGuard restores links and drains the buffer on success, error, or panic.",
+        "target": "The unique Runtime owner exposes the activation buffer as a canonical root provider to full and incremental collection."
       },
       "tracer": {
-        "current": "NativeActivationStack::seed_roots marks request arguments, Thread handles, caller Proto, saved stack/call-frame values, yielded/error values, and pending responses at every state-turn boundary before the next state is borrowed.",
+        "current": "RuntimeRootTracer invokes NativeActivationStack::seed_roots and labels the provider. It marks request arguments, Thread handles, caller Proto, saved stack/call-frame values, yielded/error values, and pending responses at every state-turn boundary before the next state is borrowed.",
         "target": "RuntimeRootTracer labels activation-buffer edges and invokes the provider during every stop-the-world and incremental root seed."
       },
       "missing_risk": "Live destructive collection remains disabled. Before enabling it, the collector entry point must call this provider as part of the canonical root seed rather than relying only on the current turn-boundary seed.",
@@ -781,20 +781,20 @@
           "symbol": "GarbageCollector::destroy_all fixed-object pass"
         }
       ],
-      "status": "missing",
+      "status": "implemented",
       "owner": {
-        "current": "Fixed marking exists and Runtime shutdown destroy_all releases fixed objects last with a live StringPool, but no Runtime fixed-string owner initializes the required set.",
+        "current": "Runtime owns canonical fixed metamethod, emergency-error, and _ENV string handles. Heap shutdown destroy_all releases fixed objects last while its StringPool is alive.",
         "target": "GlobalRoots owns fixed metamethod/error strings and Heap shutdown explicitly destroys them last."
       },
       "tracer": {
-        "current": "Fixed bits prevent sweep, but no runtime root inventory initializes or traces the required set.",
+        "current": "Runtime construction initializes and marks the complete fixed set; RuntimeRootTracer validates, marks, and labels each fixed string, and Heap::destroy_all frees it in the final pass.",
         "target": "RuntimeRootTracer labels fixed strings; Heap::destroy_all frees them after ordinary objects."
       },
-      "missing_risk": "Required emergency strings and their tracing owner are absent; standalone GarbageCollector Drop still lacks a StringPool even though Runtime close reclaims fixed objects.",
+      "missing_risk": "This root kind is locally complete. Future additions to the VM's fixed-string set must enter the Runtime initializer and inventory together; the heap contract gate prevents the owner and tracer from being removed silently.",
       "planned_test": {
-        "name": "destroy_all_drops_every_layout_thread_first_and_fixed_last",
-        "layer": "lua_core GC shutdown",
-        "assertion": "A fixed interned string is destroyed only in the fixed pass, removed from the live StringPool, and all collector accounting reaches zero."
+        "name": "runtime_owns_and_traces_fixed_strings_until_heap_shutdown; destroy_all_drops_every_layout_thread_first_and_fixed_last",
+        "layer": "lua_vm Runtime roots and lua_core GC shutdown",
+        "assertion": "Every canonical fixed string is labeled by the Runtime tracer, survives ordinary sweep policy, is destroyed only in the fixed pass, is removed from the live StringPool, and leaves collector accounting at zero."
       }
     }
   ]

@@ -7,6 +7,7 @@ use lua_compiler::opcode::{self, OpCode};
 use lua_compiler::parser::Parser;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::heap::Heap;
 use lua_core::proto::Proto;
 use lua_core::string_pool::StringPool;
 use lua_core::value::Value;
@@ -44,18 +45,22 @@ fn dump_file(filename: &str, format: &str) -> Result<(), Box<dyn std::error::Err
 
     // Compile with the same explicit string-interning service used by the
     // runtime. The pool stays alive while the resulting Proto is inspected.
-    let mut temp_gc = GarbageCollector::new();
-    let mut temp_pool = StringPool::new();
-    let proto = compile_lua_source(&source, filename, &mut temp_gc, &mut temp_pool)?;
+    let mut temp_heap = Heap::new();
+    let proto = temp_heap
+        .with_parts_mut(|gc, strings| compile_lua_source(&source, filename, gc, strings))?;
 
     let dump_result = (|| -> Result<(), Box<dyn std::error::Error>> {
         match format {
-            "json" => temp_gc.with_ref(proto, |proto| dump_json(proto, filename, &temp_gc))??,
-            _ => temp_gc.with_ref(proto, |proto| dump_text(proto, filename, &source))?,
+            "json" => temp_heap.collector().with_ref(proto, |proto| {
+                dump_json(proto, filename, temp_heap.collector())
+            })??,
+            _ => temp_heap
+                .collector()
+                .with_ref(proto, |proto| dump_text(proto, filename, &source))?,
         }
         Ok(())
     })();
-    temp_gc.remove_root(proto);
+    temp_heap.collector_mut().remove_root(proto);
     dump_result?;
 
     Ok(())

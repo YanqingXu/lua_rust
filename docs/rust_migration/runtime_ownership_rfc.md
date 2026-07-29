@@ -17,9 +17,10 @@ runtime-scoped host services. `Heap` owns the allocator/accounting layer,
 
 This document and
 [`gc_root_inventory.json`](../../tests/compatibility/gc_root_inventory.json)
-are design and audit artifacts. M1.7 mark-only tracing and the M1.8 partial
-shutdown substrate described below are implemented, but their presence does
-**not** mean live-VM collection or complete Lua shutdown semantics are enabled.
+are design and audit artifacts. The unique Heap/service owner, M1.7 mark-only
+tracing, fixed/finalizer root seeds, and the M1.8 partial shutdown substrate
+described below are implemented, but their presence does **not** mean live-VM
+collection or complete Lua shutdown semantics are enabled.
 
 The current public Lua `collectgarbage("collect")` path must not be connected
 to a destructive sweep until every prerequisite in section 10 is green.
@@ -28,15 +29,16 @@ safely.
 
 ## 2. Why this is a hard prerequisite
 
-The audited implementation has useful GC components, but the lifetime contract
-is not closed:
+The audited implementation now has one owner graph, but the complete
+live-collection contract is not closed:
 
 - `GarbageCollector` stores an intrusive raw-pointer list and raw-pointer work
   queues in `crates/lua_core/src/gc/collector.rs:22-59`.
 - allocation transfers `Box` ownership into a raw pointer at
   `crates/lua_core/src/gc/collector.rs:87-107`;
-- normal `GarbageCollector::drop` deliberately unlinks without freeing objects
-  at `crates/lua_core/src/gc/collector.rs:405-422`;
+- `GarbageCollector::Drop` now type-dispatches and frees every registered
+  allocation even for standalone test collectors; production hosts use
+  `Heap::Drop`, which destroys objects while its canonical StringPool lives;
 - `clear_all` keeps fixed objects at
   `crates/lua_core/src/gc/collector.rs:169-208`;
 - `StateArena` now owns coroutine `Box<LuaState>` allocations and reconstructs
@@ -53,18 +55,18 @@ is not closed:
   serializer exists, and source loaders no longer recognize the private
   pseudo-dump prefix;
 - `Runtime::trace_roots_mark_only` now provides the canonical object/state
-  fixed-point root callback; temporary state roots are implemented, while
-  pending finalizers, fixed strings, and unique Heap ownership remain
-  incomplete;
+  fixed-point root callback. It seeds temporary object/state roots, pending
+  finalizers, fixed strings, the activation buffer, and reachable state/object
+  graphs under the unique Heap identity;
 - the two VM-side weak-cleanup scanners at
   `crates/lua_vm/src/execute.rs:1137-1188` and
   `crates/lua_stdlib/src/base.rs:432-495` disagree and are not safe sweep root
   scanners;
 - `GcRef<T>` now carries a process-unique, non-reused `ObjectId`, and each
   collector has an authoritative address-to-identity/type live table. This
-  closes pointer-address reuse for checked collector entry points, but does
-  not yet provide the final unique `Heap` owner or a general scoped object
-  execution context.
+  closes pointer-address reuse for checked collector entry points. `Runtime`
+  now owns the final unique `Heap`, and each active state turn installs an
+  unwind-safe scoped GC/StringPool context instead of storing backpointers.
 - the production string contract is locally closed: every production
   constructor is routed through the owning `StringPool`; `Value::String`
   equality and hashing use non-reused handle identity without dereferencing;
@@ -72,11 +74,11 @@ is not closed:
   bytes, foreign/stale handles, embedded NUL/high-byte keys, and address reuse
   are covered by regression tests and a static inventory gate.
 
-Standalone collector Drop and incomplete live-collection paths still use
-leaking as a fail-safe for several dangling-reference defects. Runtime close
-now has an explicit shutdown-only reclamation path; wiring the same destruction
-into a live sweep before closing the remaining ownership/root contracts would
-still turn those defects into use-after-free.
+Standalone collector Drop and Runtime/Heap shutdown no longer leak registered
+objects. Runtime close has an explicit shutdown-only reclamation path; wiring
+the same destruction into a live sweep before closing the remaining scoped
+non-string access, mutation, weak/finalizer, and unreachable-state contracts
+would still turn those defects into use-after-free.
 
 ## 3. Oracle contract
 
@@ -233,6 +235,31 @@ Requirements:
 8. `Heap::Drop` can finish cleanup while its string pool and allocator are
    still alive. A standalone collector destructor may not depend on an already
    destroyed external pool.
+
+#### 4.2.1 Implemented unique-owner slice
+
+`lua_core::heap::Heap` now owns one `GarbageCollector` and one canonical
+`StringPool` under a process-unique, nonzero, non-reused `HeapId`. Runtime's
+pinned `RuntimeStorage` owns that Heap together with `StateArena` and the
+native-activation service. Production app, bytecode, compiler, VM, and stdlib
+paths no longer construct independent collector/pool pairs; the
+[`heap-contract`](../../tools/check_heap_contract.ps1) gate checks 52
+production source paths and is part of the M1 foundation gate.
+
+`LuaState` no longer stores `Option<*mut GarbageCollector>` or
+`Option<*mut StringPool>`. Runtime installs an `ActiveVmContext` only for the
+dynamic extent of one exclusively borrowed state turn. The context is
+stack-disciplined, restores nested scopes, unwinds on panic, and rejects
+collector/pool pairs with different HeapIds.
+
+Heap Drop calls `destroy_all` while the StringPool is alive. The standalone
+collector constructor remains available for core/test fixtures, but its Drop
+now type-dispatches every registered allocation instead of unlinking and
+leaking it; a pool from another HeapId is rejected before use.
+
+This slice owns existing collector object-count and estimated-byte accounting.
+The conceptual `LuaAllocator` callback and separate allocator live/peak
+metrics above remain M1.13 work and are not claimed by this implementation.
 
 ### 4.3 `StateArena` and `StateHandle`
 
@@ -434,11 +461,12 @@ That gate rejects production raw constructors, common unscoped string
 dereferences, compiler no-pool fallbacks, and regressions in the `Value`
 identity trait implementation.
 
-This still does **not** authorize live sweep. A unique `Heap` does not yet own
-collector, pool, allocator/accounting, and services as one lifetime; fixed
-strings and pending finalizers are not complete canonical roots; and the
-Runtime tracer is not yet the only destructive collector entry point. General
-non-string `GcRef::as_ref` migration also remains broader owner/context work.
+This still does **not** authorize live sweep. The unique Runtime/Heap lifetime,
+fixed strings, pending-finalizer root seed, and canonical mark-only tracer are
+implemented, but the Runtime tracer is not yet the only destructive collector
+entry point. General non-string `GcRef::as_ref` migration, allocator
+live/peak accounting, mutation barriers, unreachable-state prepass, and full
+weak/finalizer semantics remain broader M1 work.
 
 ## 5. Root tracing contract
 
@@ -597,7 +625,7 @@ The StateHandle issuance/exhaustion slice is complete locally:
   corrupted free-list, real stale/foreign tracing, and MAX-generation close
   have focused regressions.
 
-Phase B remains incomplete because main-state ownership and the
+Phase B remains incomplete because arena ownership of the main state and the
 debug/protected-helper cross-state scheduling matrix are still outstanding.
 
 #### B.2 Implemented Runtime turn-borrow substrate (partial)
@@ -657,9 +685,10 @@ This is a completed local trampoline slice, not completion of Phase B:
 
 - debug cross-state operations remain outside the request protocol;
 - deep-chain and broader fault-injection matrices remain open;
-- raw GC/StringPool backpointers and main-state external ownership remain;
-- the activation buffer is a canonical root seed, but other partial/missing
-  roots still prohibit live destructive collection.
+- main-state external ownership remains;
+- raw GC/StringPool backpointers are removed and the activation buffer is a
+  canonical Runtime root provider, but other partial root/mutation contracts
+  still prohibit live destructive collection.
 
 #### B.4 Implemented checked open-Upvalue ownership (local-complete slice)
 
@@ -777,9 +806,9 @@ unsafe-gap variant.
 No path in this API calls `collect`, `sweep`, `clear_all`, finalizers, or object
 destruction. Existing weak-maintenance scanners now use managed Proto roots
 and checked metadata reads, but have not yet been replaced by this Runtime-only
-safe-point API. Destructive sweep remains blocked on scoped VM/string borrows,
-unreachable-state integration, finalizer roots, unique Heap ownership, and
-complete finalizer/shutdown semantics.
+safe-point API. Destructive sweep remains blocked on broader scoped non-string
+borrows, unreachable-state integration, mutation/weak behavior, and complete
+finalizer/shutdown semantics.
 
 #### D.2 Implemented temporary-object root foundation (partial)
 
@@ -858,9 +887,11 @@ Coroutine create/wrap, compiler, library/package, IO, VM/app, synchronous
 result publication, and the production string identity/access boundary are
 migrated. Protected-call and top-level result callbacks are unit-returning, so
 collectable results cannot escape the rooted callback as Rust return values.
-Allocation-triggered collection remains disabled until one Heap owns all
-services, fixed/finalizer roots are complete, and the Runtime root tracer drives
-the collector.
+The unique Heap, fixed strings, pending-finalizer root seed, and Runtime tracer
+are now implemented. Allocation-triggered collection remains disabled until a
+Runtime-only destructive entry point consumes that tracer and the broader
+non-string access, mutation, weak/finalizer, and unreachable-state contracts
+are closed.
 
 #### D.3 Implemented temporary-state root transaction (local-complete slice)
 
@@ -891,9 +922,10 @@ shutdown leave both at zero.
 
 This closes the inventory entry for coroutine state publication. Compiler
 Proto→Function builders, library/package, IO, VM/app, synchronous result
-construction, and string identity/scoped access are now migrated. Unique Heap
-ownership, fixed strings, finalizer roots, and Runtime-only tracer wiring remain
-blockers for live destructive collection.
+construction, string identity/scoped access, unique Heap ownership, fixed
+strings, and pending-finalizer roots are now migrated. The Runtime-only
+destructive collection entry point and broader non-string/mutation/finalizer
+contracts remain blockers for live destructive collection.
 
 ### E. Shutdown substrate — M1.8
 
@@ -1039,8 +1071,8 @@ update.
 
 All boxes are required before a sweep can run against a live VM:
 
-- [ ] one unique `Runtime`/`Heap` owner and verified dependency lifetime;
-- [ ] no standalone collector drop path that lacks a live string pool and
+- [x] one unique `Runtime`/`Heap` owner and verified dependency lifetime;
+- [x] no standalone collector drop path that lacks a live string pool and
       allocator;
 - [ ] main and coroutine states have a single, reclaiming owner;
 - [ ] no `Box::into_raw(LuaState)` ownership transfer and no runtime
@@ -1052,7 +1084,7 @@ All boxes are required before a sweep can run against a live VM:
 - [x] active Function/Proto and open-Upvalue owners are handles, not lifetime
       placeholders;
 - [ ] temporary allocation/publication roots are enforced by API shape;
-- [ ] pending finalizers are roots and all work queues are pruned on destroy;
+- [x] pending finalizers are roots and all work queues are pruned on destroy;
 - [ ] unreachable coroutine states close before Thread/object sweep;
 - [x] ordinary and fixed objects have a deterministic shutdown destruction route;
 - [x] mark-only root tests, shutdown Drop probes, and inventory validation pass.

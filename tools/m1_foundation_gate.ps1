@@ -155,6 +155,7 @@ function Test-RequiredFiles {
         "tests/compatibility/string_access_inventory.json",
         "tests/compatibility/m1-byte-differential-cases.json",
         "tools/check_gc_root_inventory.ps1",
+        "tools/check_heap_contract.ps1",
         "tools/check_string_contract.ps1",
         "tools/run_lua51_differential.ps1"
     )
@@ -453,6 +454,14 @@ try {
         -Arguments @("-Root", $Root, "-ResultPath", $stringContractArtifact) `
         -Artifact $stringContractArtifact
 
+    $heapContractArtifact =
+        Resolve-RootedPath "target/compatibility/heap-contract.json"
+    Invoke-PowerShellStep `
+        -Name "unique-heap-service-contract" `
+        -Script (Join-Path $Root "tools/check_heap_contract.ps1") `
+        -Arguments @("-Root", $Root, "-ResultPath", $heapContractArtifact) `
+        -Artifact $heapContractArtifact
+
     $inventoryArtifact =
         Resolve-RootedPath "target/compatibility/gc-root-inventory.json"
     Invoke-PowerShellStep `
@@ -584,14 +593,9 @@ try {
 
 $openDebts = @(
     [ordered]@{
-        id = "lua-state-service-backpointers"
-        blocks = "M1 complete"
-        detail = "LuaState still stores transitional raw GC/StringPool service pointers."
-    },
-    [ordered]@{
-        id = "unique-heap-service-owner"
+        id = "runtime-only-stop-the-world-collection"
         blocks = "destructive sweep"
-        detail = "Publication and production string identity/access slices are locally complete. One Heap must still own collector, StringPool, allocator/accounting, and services; fixed/finalizer roots and Runtime-only live collector integration also remain open."
+        detail = "The unique Heap/service owner, fixed/pending-finalizer root seeds, and canonical Runtime tracer are locally complete. A Runtime-only destructive entry point and unreachable-state prepass must consume that tracer before live sweep."
     },
     [ordered]@{
         id = "deterministic-runtime-shutdown"
@@ -606,7 +610,7 @@ $openDebts = @(
     [ordered]@{
         id = "generational-gc-handles-and-publication-roots"
         blocks = "destructive sweep"
-        detail = "GcRef carries non-reused ObjectId provenance, StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement, lexical publication roots are implemented, and production string Eq/Hash is identity-only with scoped byte access. Unique Heap ownership, fixed/finalizer roots, broader non-string object contexts, and live collector integration remain open."
+        detail = "GcRef carries non-reused ObjectId provenance, StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement, lexical publication roots and HeapId service pairing are implemented, and production string Eq/Hash is identity-only with scoped byte access. Broader non-string object contexts and destructive collector integration remain open."
     }
 )
 
@@ -618,7 +622,7 @@ $result = [ordered]@{
         "m1-foundation-gate"
     }
     mode = if ($Smoke) { "smoke" } else { "full" }
-    scope = "ByteString and canonical/scoped production string access, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, compiler, library/package, IO, VM/app, and synchronous result publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
+    scope = "ByteString and canonical/scoped production string access, unique Heap/service ownership and HeapId pairing, fixed/pending-finalizer/runtime-service roots, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, compiler, library/package, IO, VM/app, and synchronous result publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
     checksPassed = $failures.Count -eq 0
     foundationPassed = (
         $failures.Count -eq 0 -and

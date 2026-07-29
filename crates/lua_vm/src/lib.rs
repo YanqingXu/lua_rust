@@ -25,4 +25,6 @@ pub use runtime::{
     RuntimeExecutionError, RuntimeId, RuntimeIdExhausted, RuntimePartsMut, RuntimePhase,
     StateArena, StateHandle, StateResolveError,
 };
-pub use state::{CallInfo, LUA_MULTRET, LuaState, Stack, ThreadStatus};
+pub use state::{
+    CallInfo, LUA_MULTRET, LuaState, Stack, ThreadStatus, with_vm_context, with_vm_context_parts,
+};

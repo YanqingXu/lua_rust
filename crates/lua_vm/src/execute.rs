@@ -51,10 +51,10 @@ fn rooted_vm_bytes<'scope>(
     bytes: &[u8],
 ) -> Result<Rooted<'scope, GcString>, GcRefValidationError> {
     let pool = state
-        .string_pool
+        .active_string_pool_ptr()
         .ok_or(GcRefValidationError::StringPoolUnavailable)?;
-    // SAFETY: LuaState::string_pool points at the pinned RuntimeHeap service
-    // for the duration of this exclusive VM state turn.
+    // SAFETY: the pointer belongs to the dynamically scoped VM context for
+    // this exact state turn.
     transaction.intern_bytes(unsafe { &mut *pool }, bytes)
 }
 
@@ -98,8 +98,6 @@ fn execute_proto_inner(
             "VM: stack overflow (too many nested calls)",
         ));
     }
-    l.gc = Some(gc as *mut GarbageCollector);
-
     let mut active_proto_ref = proto;
     let initial_max_stack = gc
         .with_ref(active_proto_ref, Proto::max_stack_size)
@@ -1531,8 +1529,6 @@ pub fn call_value_with_results(
     wanted_results: Option<usize>,
     publish: impl FnOnce(&mut LuaState, &mut GarbageCollector, &[Value]),
 ) -> Result<(), RuntimeError> {
-    l.gc = Some(gc as *mut GarbageCollector);
-
     let saved_ci = l.current_ci;
     let saved_top = l.top;
     let call_pos = saved_top;
@@ -1588,8 +1584,6 @@ pub fn start_lua_call_at_stack(
     nargs: usize,
     wanted_results: Option<usize>,
 ) -> Result<(), RuntimeError> {
-    l.gc = Some(gc as *mut GarbageCollector);
-
     let func = l.stack.at(func_pos).cloned().unwrap_or(Value::Nil);
     let Value::Function(func_ref) = func else {
         return Err(RuntimeError::new(format!(
@@ -1632,8 +1626,6 @@ pub fn resume_lua_thread(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
 ) -> Result<VmExit, RuntimeError> {
-    l.gc = Some(gc as *mut GarbageCollector);
-
     loop {
         if l.current_ci == 0 {
             return Ok(VmExit::Complete(ExecResult::Returned));
@@ -3254,7 +3246,7 @@ fn exec_concat_into(
         let mut bytes = Vec::with_capacity(len);
         bytes.extend_from_slice(&left);
         bytes.extend_from_slice(&right);
-        let pool = l.string_pool;
+        let pool = l.active_string_pool_ptr();
         return gc
             .with_publication(|transaction| {
                 let pool = pool.ok_or(GcRefValidationError::StringPoolUnavailable)?;
@@ -3526,8 +3518,8 @@ fn value_metatable(l: &LuaState, gc: &GarbageCollector, value: &Value) -> Option
 }
 
 fn interned_name_ref(l: &LuaState, gc: &GarbageCollector, name: &[u8]) -> Option<GcRef<GcString>> {
-    let string_pool = l.string_pool?;
-    // SAFETY: Runtime installs its live StringPool for exactly the state turn.
+    let string_pool = l.active_string_pool_ptr()?;
+    // SAFETY: Runtime installs the pool only for this dynamic state turn.
     let candidate = unsafe { &*string_pool }.find_bytes(name)?;
     gc.with_ref(candidate, |_| candidate).ok()
 }
@@ -3694,10 +3686,10 @@ mod byte_string_tests {
     unsafe extern "C" fn return_fresh_string(state: *mut std::ffi::c_void) -> i32 {
         // SAFETY: the VM passes its live LuaState to test C functions.
         let state = unsafe { &mut *state.cast::<LuaState>() };
-        let Some(gc) = state.gc else {
+        let Some(gc) = state.active_gc_ptr() else {
             return 0;
         };
-        let Some(string_pool) = state.string_pool else {
+        let Some(string_pool) = state.active_string_pool_ptr() else {
             return 0;
         };
         // SAFETY: the collector pointer is installed for this call.
@@ -3728,21 +3720,21 @@ mod byte_string_tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
         let mut state = LuaState::new();
-        state.gc = Some(&mut gc);
-        state.string_pool = Some(&mut pool);
         let left = byte_value(&mut gc, &mut pool, &[0x00, 0x80, 0xff]);
         let right = byte_value(&mut gc, &mut pool, &[0xfe, 0xc3, 0x00]);
         let expected = [0x00, 0x80, 0xff, 0xfe, 0xc3, 0x00];
 
-        ensure_stack_slot(&mut state, 0);
-        exec_concat_into(&mut state, &mut gc, 0, &left, &right, 0).expect("byte concat succeeds");
-        let result = state.stack.at(0).cloned().unwrap_or(Value::Nil);
-        let Value::String(result_ref) = result else {
-            panic!("concat must return a Lua string");
-        };
-        gc.with_string_bytes(result_ref, |bytes| assert_eq!(bytes, expected))
-            .expect("non-null string");
-        assert_eq!(pool.find_bytes(&expected), Some(result_ref));
+        crate::state::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+            ensure_stack_slot(state, 0);
+            exec_concat_into(state, gc, 0, &left, &right, 0).expect("byte concat succeeds");
+            let result = state.stack.at(0).cloned().unwrap_or(Value::Nil);
+            let Value::String(result_ref) = result else {
+                panic!("concat must return a Lua string");
+            };
+            gc.with_string_bytes(result_ref, |bytes| assert_eq!(bytes, expected))
+                .expect("non-null string");
+            assert_eq!(pool.find_bytes(&expected), Some(result_ref));
+        });
     }
 
     #[test]
@@ -3771,12 +3763,12 @@ mod byte_string_tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
         let mut state = LuaState::new();
-        state.gc = Some(&mut gc);
-        state.string_pool = Some(&mut pool);
         let left = byte_value(&mut gc, &mut pool, b"a\0b");
         let right = byte_value(&mut gc, &mut pool, b"a\0c");
-        assert!(exec_lt(&mut state, &mut gc, 0, &left, &right).expect("strings compare"));
-        assert!(exec_le(&mut state, &mut gc, 0, &left, &right).expect("strings compare"));
+        crate::state::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, _| {
+            assert!(exec_lt(state, gc, 0, &left, &right).expect("strings compare"));
+            assert!(exec_le(state, gc, 0, &left, &right).expect("strings compare"));
+        });
     }
 
     #[test]
@@ -3798,27 +3790,32 @@ mod byte_string_tests {
         let mut string_pool = StringPool::new();
         let function = gc.create(Function::new_c(return_fresh_string));
         let mut state = LuaState::new();
-        state.gc = Some(&mut gc);
-        state.string_pool = Some(&mut string_pool);
 
-        call_value_with_results(
+        crate::state::with_vm_context_parts(
             &mut state,
             &mut gc,
-            Value::Function(function),
-            &[],
-            Some(1),
-            |state, gc, results| {
-                assert_eq!(state.top, 0);
-                assert_eq!(gc.temporary_root_count(), 1);
-                let report = gc.begin_mark_only();
-                assert_eq!(report.temporary_seeded, 1);
-                state.push_value(results[0].clone());
-            },
-        )
-        .expect("fresh result publishes to the restored caller stack");
+            &mut string_pool,
+            |state, gc, _| {
+                call_value_with_results(
+                    state,
+                    gc,
+                    Value::Function(function),
+                    &[],
+                    Some(1),
+                    |state, gc, results| {
+                        assert_eq!(state.top, 0);
+                        assert_eq!(gc.temporary_root_count(), 1);
+                        let report = gc.begin_mark_only();
+                        assert_eq!(report.temporary_seeded, 1);
+                        state.push_value(results[0].clone());
+                    },
+                )
+                .expect("fresh result publishes to the restored caller stack");
 
-        assert_eq!(gc.temporary_root_count(), 0);
-        assert!(matches!(state.stack.at(0), Some(Value::String(_))));
+                assert_eq!(gc.temporary_root_count(), 0);
+                assert!(matches!(state.stack.at(0), Some(Value::String(_))));
+            },
+        );
     }
 }
 
@@ -3877,17 +3874,22 @@ mod proto_handle_tests {
         let mut gc = GarbageCollector::new();
         let mut string_pool = StringPool::new();
         let mut returned = LuaState::new();
-        returned.gc = Some(&mut gc);
-        returned.string_pool = Some(&mut string_pool);
         let return_proto = compile(
             &mut gc,
             &mut string_pool,
             "local function f(...) return 42 end return f(1, 2)",
         );
-        assert!(matches!(
-            execute_proto(&mut returned, return_proto, &mut gc),
-            Ok(VmExit::Complete(ExecResult::Returned))
-        ));
+        crate::state::with_vm_context_parts(
+            &mut returned,
+            &mut gc,
+            &mut string_pool,
+            |returned, gc, _| {
+                assert!(matches!(
+                    execute_proto(returned, return_proto, gc),
+                    Ok(VmExit::Complete(ExecResult::Returned))
+                ));
+            },
+        );
         assert_eq!(returned.current_ci, 0);
         assert!(
             returned
@@ -3899,15 +3901,20 @@ mod proto_handle_tests {
         );
 
         let mut errored = LuaState::new();
-        errored.gc = Some(&mut gc);
-        errored.string_pool = Some(&mut string_pool);
         let error_proto = compile(
             &mut gc,
             &mut string_pool,
             "local function f(...) return nil + 1 end return f(1, 2)",
         );
-        execute_proto(&mut errored, error_proto, &mut gc)
-            .expect_err("nested arithmetic error must propagate");
+        crate::state::with_vm_context_parts(
+            &mut errored,
+            &mut gc,
+            &mut string_pool,
+            |errored, gc, _| {
+                execute_proto(errored, error_proto, gc)
+                    .expect_err("nested arithmetic error must propagate");
+            },
+        );
         assert_eq!(errored.current_ci, 0);
         assert!(
             errored
@@ -3932,26 +3939,31 @@ mod proto_handle_tests {
 
         let hook = gc.create(Function::new_c(counting_line_hook));
         let mut state = LuaState::new();
-        state.gc = Some(&mut gc);
-        state.string_pool = Some(&mut string_pool);
         state.debug_hook = Some(Value::Function(hook));
         state.debug_hook_mask = "l".to_string();
         state.debug_hook_skip_proto = Some(first);
         state.debug_hook_skip_line = 17;
 
-        run_debug_instruction_hooks(&mut state, &mut gc, second, 0, OpCode::MOVE)
-            .expect("different Proto identity runs the hook");
-        assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(state.debug_hook_skip_proto, Some(first));
+        crate::state::with_vm_context_parts(
+            &mut state,
+            &mut gc,
+            &mut string_pool,
+            |state, gc, _| {
+                run_debug_instruction_hooks(state, gc, second, 0, OpCode::MOVE)
+                    .expect("different Proto identity runs the hook");
+                assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 1);
+                assert_eq!(state.debug_hook_skip_proto, Some(first));
 
-        run_debug_instruction_hooks(&mut state, &mut gc, first, 0, OpCode::MOVE)
-            .expect("matching Proto consumes the skip");
-        assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(state.debug_hook_skip_proto, None);
-        assert_eq!(state.debug_hook_skip_line, -1);
+                run_debug_instruction_hooks(state, gc, first, 0, OpCode::MOVE)
+                    .expect("matching Proto consumes the skip");
+                assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 1);
+                assert_eq!(state.debug_hook_skip_proto, None);
+                assert_eq!(state.debug_hook_skip_line, -1);
 
-        run_debug_instruction_hooks(&mut state, &mut gc, first, 0, OpCode::MOVE)
-            .expect("consumed skip no longer suppresses the line");
-        assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 2);
+                run_debug_instruction_hooks(state, gc, first, 0, OpCode::MOVE)
+                    .expect("consumed skip no longer suppresses the line");
+                assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 2);
+            },
+        );
     }
 }

@@ -35,18 +35,14 @@ fn load_and_loadstring_keep_lua_provided_chunk_name_bytes() {
         execute_proto(state, proto, gc).expect("test source should execute");
     }
 
-    let result = runtime
-        .main_state()
-        .and_then(|state| state.stack.at(0))
-        .cloned()
-        .unwrap_or(Value::Nil);
+    let mut parts = runtime.parts_mut().expect("runtime parts remain available");
+    let (state, _, _) = parts.split_mut();
+    let result = state.stack.at(0).cloned().unwrap_or(Value::Nil);
     let Value::String(result) = result else {
         panic!("expected a string result, got {result:?}");
     };
     assert_eq!(
-        runtime
-            .main_state()
-            .expect("main state remains live")
+        state
             .copy_string_bytes(result)
             .expect("result string should be live"),
         [0x00, 0x80, 0xff]

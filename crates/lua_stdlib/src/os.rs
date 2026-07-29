@@ -197,7 +197,7 @@ unsafe extern "C" fn lua_os_date(l_ptr: *mut std::ffi::c_void) -> i32 {
     let parts = DateParts::from_timestamp(timestamp);
 
     if format == "*t" {
-        let Some(gc_ptr) = l.gc else {
+        let Some(gc_ptr) = l.active_gc_ptr() else {
             l.push_nil();
             return 1;
         };
@@ -458,7 +458,7 @@ fn parse_lua_number_bytes(mut bytes: &[u8]) -> Option<f64> {
 }
 
 fn push_lua_string(l: &mut LuaState, text: &str) -> i32 {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };

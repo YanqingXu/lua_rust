@@ -529,8 +529,8 @@ fn value_to_string(state: &LuaState, value: &Value) -> String {
 fn global_string(state: &LuaState, name: &str) -> Option<String> {
     let global = state.global_table?;
     let key = state.find_interned_string(name.as_bytes()).ok().flatten()?;
-    let gc = state.gc?;
-    // SAFETY: Runtime installs the live collector for the main state.
+    let gc = state.active_gc_ptr()?;
+    // SAFETY: Runtime installs the live collector for the dynamic main-state turn.
     let Value::String(value) = unsafe { &*gc }
         .with_ref(global, |table| table.get(&Value::String(key)))
         .ok()?

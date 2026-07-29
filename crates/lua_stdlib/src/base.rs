@@ -202,7 +202,7 @@ unsafe extern "C" fn lua_b_tostring_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
             && let Some(metamethod) = metatable_field(l, mt, "__tostring")
             && matches!(metamethod, Value::Function(_))
         {
-            let Some(gc_ptr) = l.gc else {
+            let Some(gc_ptr) = l.active_gc_ptr() else {
                 return -1;
             };
             // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -252,7 +252,7 @@ fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
 }
 
 fn push_lua_bytes(l: &mut LuaState, bytes: &[u8]) -> bool {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return false;
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -377,7 +377,7 @@ unsafe extern "C" fn lua_b_gcinfo_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
 }
 
 fn run_gc_compat_cycle(l: &mut LuaState) -> Result<(), lua_vm::RuntimeError> {
-    if let Some(gc_ptr) = l.gc {
+    if let Some(gc_ptr) = l.active_gc_ptr() {
         // SAFETY: LuaState::gc is installed by the VM before calling C functions.
         let gc = unsafe { &mut *gc_ptr };
         gc.reset_marks();
@@ -550,7 +550,7 @@ unsafe extern "C" fn lua_b_pcall_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
         .map(|idx| l.at(idx).cloned().unwrap_or(Value::Nil))
         .collect();
 
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_value(Value::Boolean(false));
         if !push_lua_string(l, "pcall unavailable without an active GC") {
             return -1;
@@ -596,7 +596,7 @@ unsafe extern "C" fn lua_b_xpcall_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
 
     let func = l.at(1).cloned().unwrap_or(Value::Nil);
     let handler = l.at(2).cloned().unwrap_or(Value::Nil);
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_value(Value::Boolean(false));
         if !push_lua_string(l, "xpcall unavailable without an active GC") {
             return -1;
@@ -721,7 +721,7 @@ unsafe extern "C" fn lua_b_load_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
 }
 
 fn read_from_lua_reader(l: &mut LuaState, reader: Value) -> Result<Vec<u8>, Value> {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return Err(Value::Nil);
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -848,7 +848,7 @@ unsafe extern "C" fn lua_b_dofile_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
         }
     };
 
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         if !push_lua_string(l, "dofile unavailable without an active GC") {
             return -1;
         }
@@ -937,7 +937,7 @@ fn compile_chunk_function(
     source: &[u8],
     chunk_name: &[u8],
 ) -> Result<GcRef<Function>, String> {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return Err("chunk compilation unavailable without an active GC".to_string());
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -955,11 +955,10 @@ fn compile_chunk_function(
 
     let environment = l.thread_env.or(l.global_table);
     let pool_ptr = l
-        .string_pool
+        .active_string_pool_ptr()
         .ok_or_else(|| "chunk compilation unavailable without an active StringPool".to_string())?;
     gc.with_publication(|transaction| {
-        // SAFETY: LuaState::string_pool is installed from a live StringPool
-        // owned by the host for this compilation.
+        // SAFETY: the pool belongs to this dynamically scoped Runtime turn.
         let generator =
             CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr });
         let proto = generator
@@ -1297,7 +1296,7 @@ unsafe extern "C" fn lua_b_getmetatable_raw(_l_ptr: *mut std::ffi::c_void) -> i3
 unsafe extern "C" fn lua_b_newproxy_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: _l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l: &mut LuaState = unsafe { &mut *(_l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return -1;
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -1356,7 +1355,7 @@ unsafe extern "C" fn lua_b_setmetatable_raw(_l_ptr: *mut std::ffi::c_void) -> i3
     unsafe { &mut *(table_ref.as_ptr() as *mut Table) }.set_metatable(mt);
     if let Some(mt_ref) = mt
         && let Some((weak_keys, weak_values)) = weak_mode(l, mt_ref)
-        && let Some(gc_ptr) = l.gc
+        && let Some(gc_ptr) = l.active_gc_ptr()
     {
         // SAFETY: LuaState::gc is installed by the VM before calling C functions.
         let gc = unsafe { &mut *gc_ptr };
@@ -1422,7 +1421,7 @@ fn function_ref_at_level(l: &LuaState, level: usize) -> Option<GcRef<Function>> 
 
 fn error_location_prefix(l: &LuaState, level: usize) -> Option<String> {
     let func_ref = function_ref_at_level(l, level)?;
-    let gc_ptr = l.gc?;
+    let gc_ptr = l.active_gc_ptr()?;
     // SAFETY: the VM installs the owning collector for the duration of the
     // active base-library callback.
     let gc = unsafe { &*gc_ptr };
@@ -1592,7 +1591,7 @@ fn push_c_function(
     l: &mut LuaState,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) -> bool {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return false;
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.

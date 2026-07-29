@@ -7,8 +7,8 @@ last_updated: 2026-07-29
 rust_baseline: 6284135
 cpp_oracle: 87c15e6
 lua_oracle: Lua 5.1.5
-implementation_checkpoint: working-tree@895564ec969e519633a0d87ce3d35fc34fcb95ed
-next_primary_task: M1 unique Heap/service owner
+implementation_checkpoint: working-tree@895564ec969e519633a0d87ce3d35fc34fcb95ed+m1-heap-owner
+next_primary_task: M1 Runtime-only stop-the-world full collection
 ---
 
 # lua_rust 完整复刻 lua_cpp 开发计划
@@ -51,12 +51,11 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
 - VM 已覆盖函数、闭包、upvalue、vararg、多返回、循环、表、主要 metamethod 和 coroutine。
 - base、math、string、table、io、os、coroutine、debug、package 已有较宽的函数表面。
 - M1.8 shutdown、P1 collector provenance、managed Proto、publication-root
-  基础、`TEMPORARY_STATE_ROOTS/PendingState` 及 Runtime coroutine activation
-  trampoline、compiler Proto→Function、library/package 与 IO construction
-  publication 切片完成后，fmt、all-targets Clippy、warning-free rustdoc、
-  `cargo check --workspace --all-targets` 和 772 个
-  全 workspace Debug tests 已再次通过；远程 CI 不再允许隐式跳过
-  security audit。
+  基础、`TEMPORARY_STATE_ROOTS/PendingState`、Runtime coroutine activation
+  trampoline、compiler/stdlib/VM/app publication、production string contract
+  以及唯一 Heap/service owner 完成后，782 个 workspace tests 已枚举；当前
+  owner 切片的 fmt、定向 tests、24/24 root inventory、17-path string contract
+  与 52-path heap contract 已通过，完整质量门结果见本节最新续接记录。
 - fixture manifest 当前共 131 项：101 个 non-official、24 个 official 和
   6 个 differential（4 个 M0 focused cases，加 2 个 M1 raw-byte cases）。
 - 101 个 non-official 中执行 92 个、跳过 9 个 helper；92/92 退出码一致，
@@ -76,8 +75,8 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
 | CI | 本地统一质量/M0 门已通过，远程 workflow 尚待首次运行 | P1 |
 | 字符串 | ByteString/GcString/StringPool、编译器和宿主边界已迁移 arbitrary bytes；当前生产构造强制 canonical interning，`Value::String` Eq/Hash 使用身份，内容语义走 collector/state-scoped bytes 并受静态合同门保护；binary chunk 与未来 C API 仍待后续里程碑 | P0 |
 | GC | VM 的 `collectgarbage` 路径不 sweep；`gcinfo/step` 是模拟计数 | P0 |
-| 生命周期 | Runtime/StateArena 已有确定性 state→Thread→ordinary→fixed 销毁与 1000 轮归零测试；关闭期 Lua `__gc`、显式服务 drain、Heap/allocator owner 仍未闭环 | P0 |
-| GC 引用安全 | `GcRef` 已携带进程级不复用 `ObjectId`，collector live table 在解引用前校验地址、身份与类型；managed Proto、checked open-Upvalue owner、临时对象/状态根、publication 切片以及 canonical/scoped string 合同已落地。唯一 Heap/service owner、fixed/finalizer roots 与 live tracer 接线仍阻止 live sweep | P0 |
+| 生命周期 | Runtime/StateArena 已有确定性 state→Thread→ordinary→fixed 销毁与 1000 轮归零测试；唯一 Heap/HeapId、scoped service context 与 standalone Drop reclaim 已闭环。关闭期 Lua `__gc`、显式服务 drain、main-state arena owner 和 allocator live/peak 仍开放 | P0 |
+| GC 引用安全 | `GcRef` 已携带进程级不复用 `ObjectId`，collector live table 在解引用前校验地址、身份与类型；managed Proto、checked open-Upvalue owner、临时对象/状态根、publication、canonical/scoped string、fixed/pending-finalizer roots 与 Runtime canonical tracer 已落地。通用非字符串 scoped access、Runtime-only destructive entry、mutation/weak/finalizer 语义仍阻止 live sweep | P0 |
 | GC 安全 | table/function/upvalue 等写入路径尚未接入 write barrier | P0 |
 | IO | raw stdin/stdout/stderr、文件/tmpfile 与 scoped userdata access 已通过本地 byte/process 测试；text mode、popen 与显式 shutdown 服务语义仍待 M2/M1.12 | P1 |
 | Bytecode parity | schema v2 已补齐 constant/sub-Proto/function/line/upvalue 证据；原两例 opcode/constant/metadata 已完全一致，各只剩 2 项由固定 C++ printer 不输出 local names 导致的 fail-closed 证据差异。扩展 closure case 仍触发 500 条真实差异上限 | P0 |
@@ -146,7 +145,7 @@ M4 必须建立在 M1 和 M3 的生命周期、allocator 和公开状态合同�
 | 里程碑 | 状态 | 当前证据或入口 |
 |---|---|---|
 | M0 | `completed` | 本地统一 M0 gate 通过，0 hard failure、3 项已登记债务；详见 [M0 收口报告](docs/rust_migration/m0_report.md)。 |
-| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline、checked open-Upvalue owner、compiler/library/package/IO/VM/app/result publication，以及 production string canonicalization/scoped Eq/Hash 合同已完成；唯一 Heap/service owner 是下一条主线。 |
+| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline、checked open-Upvalue owner、compiler/library/package/IO/VM/app/result publication、production string contract，以及唯一 Heap/service owner 已完成；Runtime-only stop-the-world full collection 是下一条主线。 |
 | M2 | `active-limited` | 原两例 bytecode 指令/常量/metadata 已对齐；C++ local-name 证据缺口、nested Proto 大量差异、88 个 non-official 差异和真实 VM trace 仍开放。 |
 | M3 | `pending` | 等待 M1 的字节表示和生命周期合同稳定。 |
 | M4 | `pending` | 等待 M1/M3 的 runtime、allocator 与公开状态合同。 |
@@ -580,15 +579,15 @@ bytecode parity 差异和真实 VM trace unsupported；它们不会把报告误�
 | M1.1 ByteString 设计 | `completed-local` | RFC 已冻结 arbitrary bytes、NUL、pointer+length、显式 UTF-8/lossy 边界与 C++ 前向采样 hash。 |
 | M1.2 GcString/StringPool | `completed-local` | 单一 ByteString payload、byte-key interning、0x00–0xff/NUL/invalid UTF-8/identity/hash 测试通过，旧 text API 静态扫描为零。 |
 | M1.3 编译器和宿主边界 | `partial` | lexer/parser/codegen、string/io/package、CLI source 与 chunk name 已迁移并有 raw-byte 双 oracle case；当前生产 GcString 构造已强制走 StringPool，内容读取已迁移到 collector/state-scoped API。真实 dump/load 与未来 C API 尚未完成。 |
-| M1.4 Runtime owner | `partial` | pinned RuntimeHeap、owner-thread/phase/active guard、main roots 与 scoped parts 已实现；P1 `ObjectId + live table + checked borrow` 已拒绝 foreign/stale/address-reuse handle，LightUserdata 也已拆型。LuaState 仍保存 transitional GC/StringPool backpointer，尚无统一 Heap/allocator/services owner。 |
+| M1.4 Runtime owner | `completed-slice` | pinned `RuntimeStorage` 唯一持有 Heap、StateArena 与 activation service；Heap 以不复用 HeapId 共同持有 collector/accounting 和 canonical StringPool，生产 app/bytecode/compiler/stdlib/VM 无 standalone 构造。LuaState 的 GC/StringPool raw backpointer 已删除，单 state turn 使用 nested/panic-safe 动态 service context；Heap/standalone collector Drop 都回收对象。自定义 Lua allocator 与 live/peak 指标仍由 M1.13 跟踪。 |
 | M1.5 Coroutine state | `partial` | StateArena 独占 coroutine Box；handle identity/generation、retirement 与关闭前 arena 校验已 fail-closed。`PendingState` 以 exact-id `TEMPORARY_STATE_ROOTS` 保护未发布槽，Drop 回滚并推进/退休 generation；create/wrap 在对象临时根内完成 State↔Thread 双向绑定并仅在直接压栈后提交。sealed `RuntimeNativeFunction`、scoped mailbox、独立 VM exit、deferred C frame、Runtime activation/upvalue transfer stack、rooted transfer seed 和 generic-for continuation 已接入生产 resume/wrap。open Upvalue 现为 `StateHandle + stack index`，远端 GET/SET 通过 Runtime 单-state turns 访问，state drain 在 generation advance/retirement 前关闭节点；reachable Upvalue 也会入队 owner state。精确 C++ `A→B→A` `Normal` 祖先 continuation、protected `pcall`、wrap yield/error 和 suspended-coroutine closure 读写均有回归。main state 仍是 external arena slot，debug/protected-helper 跨 state open-Upvalue、深链/完整 fault 矩阵仍开放。 |
 | M1.6 悬垂 registry | `completed-local` | pseudo dump/source thread-local registry 已删除，`string.dump` 在 M3 serializer 前稳定返回 unsupported。 |
-| M1.7 Root inventory | `partial` | 24/24 inventory schema 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO`、checked `OPEN_UPVALUES` owner、临时对象根 registry、`TEMPORARY_STATE_ROOTS/PendingState`、`COROUTINE_ACTIVATION_BUFFER` seed，以及 compiler/library/package/IO/VM/app/result 事务发布已实现。当前为 21 partial、2 implemented（`OPEN_UPVALUES`、`TEMPORARY_STATE_ROOTS`）、1 missing（fixed strings），无 unsafe 条目；string identity/access 另由 17-path inventory 和静态门闭合。唯一 Heap owner、fixed/finalizer roots 与 live tracer 接线仍阻止 destructive sweep。 |
+| M1.7 Root inventory | `partial` | 24/24 inventory schema 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO`、checked `OPEN_UPVALUES` owner、temporary object/state roots、activation service、compiler/library/package/IO/VM/app/result publication、pending-finalizer seed 与 Runtime fixed strings 已接入同一 mark-only tracer。当前为 21 partial、3 implemented（`OPEN_UPVALUES`、`TEMPORARY_STATE_ROOTS`、`FIXED_STRINGS`）、0 missing、0 unsafe；另有 17-path string 与 52-path heap 静态门。Runtime-only destructive entry、非字符串 scope、mutation/weak/finalizer 语义仍阻止 sweep。 |
 | M1.8 确定性 shutdown | `partial` | Runtime close/Drop 以 state→非 fixed Thread→其余非 fixed→fixed 顺序释放，object/root/string/queue/state/count 均归零；7 layout、fixed/ordinary DropProbe、open-upvalue close 与 1000 轮耐久测试通过。关闭期 Lua `__gc`、显式 IO/module service drain 和 allocator live bytes 仍是公开 debt。 |
 | M1.9 真实 full collection | `pending` | `collectgarbage("collect")` 仍只做兼容 mark/weak/finalizer 路径，不 sweep。 |
 | M1.10 Incremental GC | `pending` | phase、debt、pause、stepmul 和真实 step 尚未实现。 |
 | M1.11 Write barrier | `pending` | helper 存在但 production mutation 尚未统一接线，部分 raw barrier 在 provenance 基座前仍不安全。 |
-| M1.12 Weak/finalizer/resurrection | `pending` | 只有组件级近似；pending-finalizer root、reentrancy、exactly-once、resurrection 与 close drain 未验收。 |
+| M1.12 Weak/finalizer/resurrection | `pending` | pending-finalizer 已成为 identity-checked canonical root；protected callback delivery、reentrancy、exactly-once、resurrection 与 close drain 未验收。 |
 | M1.13 内存与耐久 | `partial` | 1000 runtime/coroutine close 与 DropProbe 已通过；allocator、真实多周期 collection、Miri/ASan 和 binary dump 生命周期待补。 |
 
 本台账中的 `completed-local` 只表示对应子任务的本地实现与定向证据完成；
@@ -1211,12 +1210,13 @@ PR-5 完成前不得合并 PR-6。
 
 M0 已在本地完成，M1 基础层已经完成 coroutine activation trampoline、compiler
 Proto→Function、library/package、IO construction、VM/app/result publication
-切片以及 production string canonicalization/scoped Eq/Hash 合同。下一步建立唯一
-Heap/service owner，按以下依赖顺序执行：
+切片、production string canonicalization/scoped Eq/Hash 合同，以及唯一
+Heap/service owner。下一步建立 Runtime-only stop-the-world full collection，
+按以下依赖顺序执行：
 
 1. 已完成 LightUserdata 拆型、`ObjectId + collector live table` 与字符串
-   identity/scoped access 合同；继续保持 live sweep 禁用，直到唯一 Heap owner、
-   fixed/finalizer roots 和 Runtime root-tracer 接线都闭环。
+   identity/scoped access 合同；唯一 HeapId owner、fixed strings、
+   pending-finalizer root seed 和 Runtime root-tracer 接线也已闭环。
 2. top-level/active/debug Proto 已全部改为受管 `GcRef<Proto>`；
    RuntimeId/StateHandle issuance 与 slot generation exhaustion 也已
    fail-closed；scoped mailbox、`VmExit::NativeRequest`、deferred C frame
@@ -1234,10 +1234,11 @@ Heap/service owner，按以下依赖顺序执行：
    argument buffers 与同步 call/top-level results 均已事务化；目标生产路径
    直接 `gc.create` 为 0。生产字符串构造也已强制经过 StringPool，
    `Value::String` Eq/Hash 使用 canonical identity，内容读取经 collector/state
-   作用域验证；pending finalizers 与 fixed strings 仍须进入 canonical roots。
-4. 建立唯一 `Heap` owner，移除 LuaState GC/StringPool backpointer 与
-   standalone collector/pool 错配，然后实现 Runtime-only、Thread/state
-   prepass 的 stop-the-world full collection。
+   作用域验证；pending finalizers 与 fixed strings 已进入 canonical roots。
+4. 已建立唯一 `Heap` owner，移除 LuaState GC/StringPool backpointer，并以
+   HeapId/52-path gate 拒绝 production standalone collector/pool 错配。
+   下一步先让 Runtime-only、Thread/state prepass 的 stop-the-world full
+   collection 消费 canonical tracer；allocation-triggered collection 仍禁用。
 5. full collection、weak/finalizer/resurrection 全部通过后才替换
    `collectgarbage` 模拟计数；production mutation 全部接线后再做
    incremental phase/debt/barrier。
@@ -1296,9 +1297,10 @@ Heap/service owner，按以下依赖顺序执行：
   Rust process regression 已逐字节匹配固定 C++ 输出；该 manifest 仍是
   non-gating characterization、无 approved deviation，因为 stock Lua 行为
   仍与项目目标不同。
-- 最新验证：fmt/check、772 个 workspace tests、all-targets Clippy、
-  warning-free rustdoc、24/24 root inventory、差分比较器与 parity runner
-  自测全部通过；fixture manifest 校验为 131 项；两个 coroutine oracle
+- 最新验证：fmt/check、782 个 workspace tests、all-targets Clippy、
+  warning-free rustdoc、24/24 root inventory、17-path string contract、
+  52-path heap contract、差分比较器与 parity runner 自测全部通过；
+  fixture manifest 校验为 131 项；两个 coroutine oracle
   各重复 3 次通过精确字节校验。characterization checker 已同时通过
   Windows PowerShell 5.1 与 PowerShell 7，并将实际执行文件的 SHA-256
   绑定到现有 C++/Lua 5.1.5 provenance build reports。M1 smoke 汇总为
@@ -1344,9 +1346,9 @@ Heap/service owner，按以下依赖顺序执行：
    canonicalization/scoped Eq/Hash 也已完成：生产构造强制池化，身份
    Eq/Hash、作用域 byte access 与静态 inventory/gate 均已落地；继续维持
    allocation-triggered collection 禁用。
-6. 下一步建立唯一 Heap/service owner；owner 图、fixed/finalizer roots 和
-   Runtime tracer 接线闭合后，才接 Runtime-only full collection；
-   incremental/barrier/weak/finalizer 最后推进。
+6. 已完成唯一 Heap/service owner、fixed/pending-finalizer roots 与 Runtime
+   tracer 接线；下一步接 Runtime-only stop-the-world full collection；
+   allocation-triggered/incremental/barrier/weak/finalizer 最后推进。
 7. M2 并行下一步是为固定 C++ bytecode printer 的 local-name 证据建立受审计
    方案，并从 closure artifact 的第一个 Proto/PC 差异开始修，不能直接处理
    截断后的 500 条列表。
@@ -1359,6 +1361,7 @@ cargo check --workspace --all-targets
 cargo test --workspace --all-targets --quiet
 cargo clippy --workspace --all-targets -- -D warnings
 pwsh -NoProfile -File tools/check_string_contract.ps1
+pwsh -NoProfile -File tools/check_heap_contract.ps1
 pwsh -NoProfile -File tools/check_gc_root_inventory.ps1
 pwsh -NoProfile -File tools/check_coroutine_normal_ancestor_characterization.ps1
 pwsh -NoProfile -File tools/run_lua51_differential.ps1 -ComparatorSelfTestOnly
@@ -1389,11 +1392,12 @@ pwsh -NoProfile -File tools/run_lua51_differential.ps1 -ComparatorSelfTestOnly
 | IO construction/publication graph | `completed-slice` | file Userdata/metatable/method 与 lines Function/environment/file 图已事务化；生产 `io.rs` 直接 `gc.create` 为 0，故障清理、mark-only、全回收与行为回归已通过 |
 | VM/app/result publication | `completed-slice` | VM Table/closure/string/open-Upvalue、Runtime roots/errors、CLI args 与同步 call/top-level result publication 已事务化；目标生产 direct-create 为 0 |
 | production string canonicalization/scoped Eq/Hash | `completed-local` | 生产构造强制 StringPool canonical identity；`Value::String` Eq/Hash 不解引用；内容比较/排序/展示走 collector/state-scoped bytes；17-path inventory、静态门与 duplicate/foreign/stale/NUL/high-byte/address-reuse 回归已落地 |
-| 唯一 Heap/service owner | `next` | 合并 GC/StringPool/allocator/services 生命周期，移除 LuaState transitional backpointer 与 standalone collector/pool 错配 |
-| Runtime-only full collection | `blocked` | 等唯一 owner、fixed/finalizer roots 与 canonical Runtime tracer 接线闭环 |
+| 唯一 Heap/service owner | `completed-slice` | `RuntimeStorage` 唯一持有 Heap/StateArena/activation service；HeapId 绑定 collector/accounting 与 canonical StringPool；LuaState 无 service backpointer；fixed/pending-finalizer roots 与 52-path heap gate 已落地 |
+| Runtime-only full collection | `next` | owner/root/tracer 前置已闭环；下一入口是 Thread/state prepass + canonical tracer + sweep 的 Runtime-only STW API，仍不得启用 allocation-triggered collection |
 
-最近一次完整基线是 772 个 workspace tests；fmt、all-targets check/Clippy、
-warning-free rustdoc、24/24 root inventory 与 17-path string contract 均通过。M1 smoke 为
+当前 782 个 workspace tests、fmt、all-targets check/Clippy、warning-free
+rustdoc、24/24 root inventory、17-path string contract 与 52-path heap
+contract 均通过。当前 M1 smoke 为
 `checksPassed=true`、`hardFailures=[]`；`foundationPassed=false` 是因为这是显式
 skip audit 的 smoke 且 M1 未完成；双-lane raw-byte differential 已通过，不能把
 该 smoke 改写为完整 M1 foundation 通过。
@@ -1575,16 +1579,41 @@ IO 收口后的固定顺序是：重新盘点并迁移 VM/app/results publicatio
    为 `checksPassed=true`、`hardFailures=[]`；本机未安装 `cargo-audit`，因此
    audit 被显式跳过且 `foundationPassed=false`。
 
-#### 16.3.4 下一主任务
+#### 16.3.4 已完成主任务：唯一 Heap/service owner
 
-建立唯一 Heap/service owner：
+1. `lua_core::Heap` 以进程级不复用 `HeapId` 共同持有
+   `GarbageCollector`、现有 object/estimated-byte accounting 与 canonical
+   `StringPool`；跨 Heap collector/pool 组合在读取对象前 fail-closed。
+2. pinned `RuntimeStorage` 唯一持有 Heap、StateArena 与
+   `NativeActivationStack`。app、bytecode tool、compiler、VM 和 stdlib 的
+   production prefix 不再构造 standalone `GarbageCollector::new` 或
+   `StringPool::new`。
+3. `LuaState` 的 GC/StringPool raw backpointer 已删除。Runtime 每次只在独占
+   state turn 的动态范围安装 `ActiveVmContext`；nested scope、panic unwind、
+   inactive state 和跨 Heap service 错配均有回归。
+4. Runtime 初始化 canonical metamethod、emergency error 与 `_ENV` fixed
+   strings；`begin_mark_only` identity-check 并 seed pending finalizers。
+   `Runtime::trace_roots_mark_only` 对 fixed、pending、temporary 与 activation
+   roots 使用 inventory 对齐标签。
+5. `Heap::destroy_all/Drop` 在 StringPool 存活时释放普通与 fixed 对象；
+   standalone collector Drop 也按类型释放全部 registered allocation，不再
+   仅 unlink 泄漏。自定义 Lua allocator callback 与 allocator live/peak
+   仍由 M1.13 跟踪，不在本切片夸大完成。
+6. 新增 10 项回归，workspace tests 由 772 增至 782；24/24 root inventory
+   当前为 21 partial、3 implemented、0 missing、0 unsafe。新增 52-path
+   `check_heap_contract.ps1` 并接入 M1 foundation gate；fmt、all-targets
+   check/test/Clippy、warning-free rustdoc 与 smoke 均通过，smoke 的
+   `hardFailures=[]`。allocation-triggered collection 继续禁用。
 
-1. 盘点 Runtime、LuaState、compiler/loader 与测试夹具中独立
-   `GarbageCollector`/`StringPool` 的所有权和 backpointer；
-2. 让一个 Heap 生命周期共同拥有 allocator/accounting、collector、StringPool
-   和 runtime services，删除可错配的 standalone 组合；
-3. 移除 `LuaState` transitional GC/StringPool raw backpointer，由 scoped
-   Runtime/Heap context 提供对象访问；
-4. fixed strings、pending finalizers 和 Runtime canonical root tracer 闭合后，
-   再实现 Runtime-only stop-the-world full collection。allocation-triggered
-   collection 继续禁用。
+#### 16.3.5 下一主任务
+
+实现 Runtime-only stop-the-world full collection：
+
+1. 只允许 owner thread、`Running` phase、无 active execution 时进入，并让
+   destructive cycle 强制消费 canonical Runtime tracer；
+2. 在 object sweep 前完成 unreachable Thread/coroutine state prepass，关闭
+   open Upvalue 后再使 StateHandle generation 失效；
+3. 先以 internal API 验证 reachable probe 保留、unreachable probe 析构、
+   object/accounted-byte 下降和 stale handle fail-closed；
+4. weak/finalizer callback、resurrection 与 public `collectgarbage("collect")`
+   仍留在后续门，allocation-triggered collection 继续禁用。

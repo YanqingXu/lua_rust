@@ -208,6 +208,7 @@ impl<'scope> PublicationTxn<'scope> {
         pool: &mut StringPool,
         bytes: &[u8],
     ) -> Result<Rooted<'scope, GcString>, GcRefValidationError> {
+        pool.bind_or_assert_owner(self.collector.heap_id());
         if let Some(existing) = pool.find_bytes(bytes) {
             if self.collector.contains_registered(existing) {
                 return self.protect(existing);

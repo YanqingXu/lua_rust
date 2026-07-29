@@ -12,6 +12,7 @@ use crate::byte_string::ByteString;
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_ref::GcRef;
 use crate::gc_string::GcString;
+use crate::heap::HeapId;
 
 /// 字符串驻留池
 ///
@@ -24,6 +25,9 @@ use crate::gc_string::GcString;
 /// 4. 如果不存在 → 通过 GC 创建新 `GcString`，加入池，返回
 ///
 pub struct StringPool {
+    /// Heap identity this pool is paired with. Standalone test pools bind on
+    /// first use; production Heap pools are bound at construction.
+    heap_id: Option<HeapId>,
     /// 字符串哈希表: key = 字符串内容, value = GC 引用
     /// 使用 owned ByteString 作为 key，支持任意字节并避免悬空引用。
     pool: HashMap<ByteString, GcRef<GcString>>,
@@ -33,6 +37,14 @@ impl StringPool {
     /// 创建空的字符串池
     pub fn new() -> Self {
         Self {
+            heap_id: None,
+            pool: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn new_for_heap(heap_id: HeapId) -> Self {
+        Self {
+            heap_id: Some(heap_id),
             pool: HashMap::new(),
         }
     }
@@ -40,6 +52,7 @@ impl StringPool {
     /// 创建预分配容量的字符串池
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
+            heap_id: None,
             pool: HashMap::with_capacity(capacity),
         }
     }
@@ -51,6 +64,7 @@ impl StringPool {
     /// 该接口不执行 UTF-8 验证或编码转换；相同字节内容总是返回同一
     /// `GcRef<GcString>`。
     pub fn intern_bytes(&mut self, gc: &mut GarbageCollector, bytes: &[u8]) -> GcRef<GcString> {
+        self.bind_or_assert_owner(gc.heap_id());
         if let Some(&existing) = self.pool.get(bytes) {
             if gc.contains_registered(existing) {
                 return existing;
@@ -64,6 +78,23 @@ impl StringPool {
         let gc_ref = gc.create(GcString::from_bytes(bytes));
         self.pool.insert(ByteString::from_bytes(bytes), gc_ref);
         gc_ref
+    }
+
+    /// Return the heap identity this pool is bound to, if any.
+    pub fn heap_id(&self) -> Option<HeapId> {
+        self.heap_id
+    }
+
+    /// Bind a fresh standalone pool or reject a mismatched service pairing.
+    #[doc(hidden)]
+    pub fn bind_or_assert_owner(&mut self, heap_id: HeapId) {
+        match self.heap_id {
+            Some(owner) => assert_eq!(
+                owner, heap_id,
+                "StringPool belongs to {owner:?}, not collector heap {heap_id:?}"
+            ),
+            None => self.heap_id = Some(heap_id),
+        }
     }
 
     /// 按完整字节内容查找字符串，不创建新对象。
@@ -270,28 +301,21 @@ mod tests {
     }
 
     #[test]
-    fn intern_evicts_foreign_and_stale_pool_entries_before_reuse() {
+    fn intern_rejects_a_collector_from_another_heap() {
         let mut first_gc = GarbageCollector::new();
         let mut second_gc = GarbageCollector::new();
         let mut pool = StringPool::new();
 
         let first = pool.intern_bytes(&mut first_gc, b"identity");
-        let second = pool.intern_bytes(&mut second_gc, b"identity");
-        assert_ne!(first, second);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.intern_bytes(&mut second_gc, b"identity")
+        }));
+
+        assert!(rejected.is_err());
+        assert!(first_gc.contains_registered(first));
         assert!(!second_gc.contains_registered(first));
-        assert!(second_gc.contains_registered(second));
-        assert_eq!(pool.find_bytes(b"identity"), Some(second));
-
-        // Destroy through a deliberately different pool to inject a stale
-        // copied entry into `pool` without dereferencing it.
-        let mut destroy_pool = StringPool::new();
-        assert_eq!(second_gc.sweep(&mut destroy_pool), 1);
-        assert_eq!(pool.find_bytes(b"identity"), Some(second));
-
-        let replacement = pool.intern_bytes(&mut second_gc, b"identity");
-        assert_ne!(second, replacement);
-        assert!(second_gc.contains_registered(replacement));
-        assert_eq!(pool.find_bytes(b"identity"), Some(replacement));
+        assert_eq!(pool.find_bytes(b"identity"), Some(first));
+        first_gc.destroy_all(&mut pool);
     }
 
     #[test]

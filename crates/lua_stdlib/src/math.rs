@@ -127,7 +127,7 @@ fn check_number(l: &mut LuaState, index: usize, func: &str) -> Result<f64, i32> 
 }
 
 fn push_error(l: &mut LuaState, message: &str) -> i32 {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return -1;
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.

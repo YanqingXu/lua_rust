@@ -39,8 +39,6 @@ fn return_value(runtime: &Runtime) -> Value {
 fn returned_string(runtime: &Runtime) -> String {
     match return_value(runtime) {
         Value::String(s) => runtime
-            .main_state()
-            .expect("main state is live")
             .with_string_bytes(s, |bytes| {
                 std::str::from_utf8(bytes)
                     .expect("returned test string should be UTF-8 text")
@@ -54,8 +52,6 @@ fn returned_string(runtime: &Runtime) -> String {
 fn returned_bytes(runtime: &Runtime) -> Vec<u8> {
     match return_value(runtime) {
         Value::String(s) => runtime
-            .main_state()
-            .expect("main state is live")
             .copy_string_bytes(s)
             .expect("string ref should be valid"),
         value => panic!("expected string, got {value:?}"),
@@ -188,8 +184,7 @@ fn io_lines_graph_is_traced_from_the_runtime_main_stack() {
             .expect("iterator environment should publish")
     };
     let file = {
-        let state = runtime.main_state().expect("main state remains live");
-        let file_key = state
+        let file_key = runtime
             .find_interned_string(b"__file")
             .expect("string services remain live")
             .expect("__file is interned");

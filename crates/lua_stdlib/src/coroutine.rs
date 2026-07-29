@@ -61,7 +61,7 @@ fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
 unsafe extern "C" fn lua_coroutine_create(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -85,7 +85,7 @@ unsafe extern "C" fn lua_coroutine_create(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_coroutine_status(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -117,7 +117,7 @@ unsafe extern "C" fn lua_coroutine_running(l_ptr: *mut std::ffi::c_void) -> i32 
 unsafe extern "C" fn lua_coroutine_wrap(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_nil();
         return 1;
     };
@@ -146,14 +146,12 @@ unsafe extern "C" fn lua_coroutine_yield(l_ptr: *mut std::ffi::c_void) -> i32 {
     0
 }
 
-fn coroutine_state(l: &LuaState, gc: &mut GarbageCollector, entry: Value) -> LuaState {
+fn coroutine_state(l: &LuaState, entry: Value) -> LuaState {
     let mut state = if let Some(global) = l.global_table {
         LuaState::with_global_table(global)
     } else {
         LuaState::new()
     };
-    state.string_pool = l.string_pool;
-    state.gc = Some(gc as *mut GarbageCollector);
     state.thread_env = l.thread_env.or(l.global_table);
     state.chunk_env = l.chunk_env.or(l.thread_env).or(l.global_table);
     state.nil_metatable = l.nil_metatable;
@@ -168,7 +166,7 @@ fn publish_thread_to_stack(
     gc: &mut GarbageCollector,
     entry: Value,
 ) -> Result<(), String> {
-    let state = coroutine_state(l, gc, entry);
+    let state = coroutine_state(l, entry);
     let published: Result<(), PendingStateError> = gc.with_publication(|transaction| {
         let thread = transaction.alloc(Thread::new());
         l.with_pending_coroutine_state(state, |pending, publisher| {
@@ -185,7 +183,7 @@ fn publish_wrapper_to_stack(
     gc: &mut GarbageCollector,
     entry: Value,
 ) -> Result<(), String> {
-    let state = coroutine_state(l, gc, entry);
+    let state = coroutine_state(l, entry);
     let published: Result<(), PendingStateError> = gc.with_publication(|transaction| {
         let thread = transaction.alloc(Thread::new());
         l.with_pending_coroutine_state(state, |pending, publisher| {
@@ -235,7 +233,7 @@ fn push_lua_bytes(l: &mut LuaState, gc: &mut GarbageCollector, bytes: &[u8]) {
 }
 
 fn push_error(l: &mut LuaState, message: &'static [u8]) -> i32 {
-    if let Some(gc_ptr) = l.gc {
+    if let Some(gc_ptr) = l.active_gc_ptr() {
         // SAFETY: LuaState::gc is installed by the VM before calling C functions.
         let gc = unsafe { &mut *gc_ptr };
         push_lua_bytes(l, gc, message);
@@ -263,11 +261,11 @@ mod byte_string_tests {
         global.set(&Value::String(exact_key), &Value::Table(target));
         let global_ref = gc.create(global);
         let mut state = LuaState::with_global_table(global_ref);
-        state.gc = Some(&mut gc);
-        state.string_pool = Some(&mut string_pool);
 
-        assert_eq!(find_lib_table(&state, "coroutine"), target);
-        assert_ne!(find_lib_table(&state, "coroutine"), decoy);
+        lua_vm::with_vm_context(&mut state, &mut gc, &mut string_pool, |state| {
+            assert_eq!(find_lib_table(state, "coroutine"), target);
+            assert_ne!(find_lib_table(state, "coroutine"), decoy);
+        });
     }
 
     #[test]
@@ -283,19 +281,19 @@ mod byte_string_tests {
         let mut gc = GarbageCollector::new();
         let mut string_pool = StringPool::new();
         let mut state = LuaState::new();
-        state.gc = Some(&mut gc);
-        state.string_pool = Some(&mut string_pool);
         let bytes = [0, 0xff, 0x80, b'x'];
 
-        push_lua_bytes(&mut state, &mut gc, &bytes);
-        let Value::String(string_ref) = state.at(-1).expect("result is pushed") else {
-            panic!("expected Lua string result");
-        };
-        assert_eq!(
-            state
-                .copy_string_bytes(*string_ref)
-                .expect("test string is live"),
-            bytes
-        );
+        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut string_pool, |state, gc, _| {
+            push_lua_bytes(state, gc, &bytes);
+            let Value::String(string_ref) = state.at(-1).expect("result is pushed") else {
+                panic!("expected Lua string result");
+            };
+            assert_eq!(
+                state
+                    .copy_string_bytes(*string_ref)
+                    .expect("test string is live"),
+                bytes
+            );
+        });
     }
 }

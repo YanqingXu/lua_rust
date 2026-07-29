@@ -97,7 +97,7 @@ fn number_to_lua_string(n: f64) -> String {
 }
 
 fn make_lua_string(l: &mut LuaState, bytes: &[u8]) -> Option<GcRef<GcString>> {
-    let gc_ptr = l.gc?;
+    let gc_ptr = l.active_gc_ptr()?;
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
     gc.with_publication(|transaction| {
@@ -120,7 +120,7 @@ fn make_lua_string(l: &mut LuaState, bytes: &[u8]) -> Option<GcRef<GcString>> {
 }
 
 fn push_lua_string(l: &mut LuaState, bytes: &[u8]) -> bool {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return false;
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -406,7 +406,7 @@ unsafe extern "C" fn lua_string_gmatch(l_ptr: *mut std::ffi::c_void) -> i32 {
     if let Err(message) = validate_pattern(&pattern) {
         return string_format_error(l, &message);
     }
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         return -1;
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
@@ -1626,7 +1626,7 @@ fn gsub_function_replacement(
     found: &PatternMatch,
     replacement: &Value,
 ) -> Option<Vec<u8>> {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         push_lua_string(l, b"gsub unavailable without an active GC");
         return None;
     };
@@ -1748,7 +1748,7 @@ fn call_index_metamethod(
     table_value: Value,
     key: &Value,
 ) -> Option<Value> {
-    let Some(gc_ptr) = l.gc else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         push_lua_string(l, b"gsub unavailable without an active GC");
         return None;
     };

@@ -242,12 +242,17 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   `call_value_with_results` 替代；callee stack 清空后，collectable results
   在 publication callback 完成前仍由 exact-id temporary roots 保护。
   M1 静态门会排除 `#[cfg(test)]` 后检查目标生产前缀，并拒绝直接
-  `gc.create` 或旧 `call_value` API。
-  但 main state 仍是 external arena slot，LuaState 仍保存 transitional
-  GC/StringPool backpointer，debug/protected-helper 跨 state open-Upvalue
-  访问尚未纳入同一调度协议；Lua `__gc`、IO/module service drain 与
-  allocator live-byte 合同也未闭环。生产字符串 Eq/Hash/canonical/scoped
-  access 已由独立 inventory 和静态门本地闭合。
+  `gc.create` 或旧 `call_value` API。唯一 `RuntimeStorage -> Heap ->
+  {GarbageCollector, StringPool}` owner 图现以 HeapId 防错配；LuaState 不再
+  保存 GC/StringPool backpointer，而是在单 state turn 内使用可展开的动态
+  service scope。固定字符串、pending-finalizer root seed 与 activation
+  service 已由 canonical Runtime tracer 标记，52-path heap contract 防止生产
+  路径恢复 standalone 构造。
+  但 main state 仍是 external arena slot，debug/protected-helper 跨 state
+  open-Upvalue 访问尚未纳入同一调度协议；Lua `__gc`、IO/module service
+  drain、allocator live/peak 和 Runtime-only destructive collection 合同也
+  未闭环。生产字符串 Eq/Hash/canonical/scoped access 已由独立 inventory 和
+  静态门本地闭合。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
   close、coroutine lifecycle 和 allocator live-byte 合同。
 - **测试与任务：** 1000 轮 state/coroutine create-close、fixed/ordinary
@@ -266,17 +271,21 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   VM/app/result 回归还覆盖 result slice mark seed、foreign/panic exact-id 清理、
   callee stack 恢复后的同步发布，以及 CLI `arg` 与 chunk varargs 的进程级
   handoff；目标生产文件直接 `gc.create` 静态命中为 0。
+  Heap/VM 回归覆盖同 Heap canonical identity、跨 Heap service 错配拒绝、
+  nested/panic service scope、固定字符串 root/close 和 standalone collector
+  Drop reclaim；heap contract 已接入 M1 foundation gate。
   allocator live/peak、真实 finalizer/service close、Miri/ASan 等仍在
   M1.4、M1.5、M1.7、M1.8、M1.13。
 - **影响：** 已移除 resume/wrap 递归跨 state 借用和 raw open-Upvalue
   owner 风险，并能声称当前 Rust-owned 对象的 deterministic shutdown
-  substrate；当前 production publication 切片已关闭，但剩余
-  service/backpointer/Heap owner 风险仍不允许声称完整 Lua close 或
-  live collection。
+  substrate；当前 production publication 与唯一 Heap/service owner 切片已
+  关闭，但剩余 main-state、allocator/service drain、finalizer 与 destructive
+  collector entry 风险仍不允许声称完整 Lua close 或 live collection。
 - **处置状态：** `open`。temporary state、compiler Proto→Function、
-  library/package、IO、VM/app/result publication 与字符串 identity/access
-  子项已关闭；唯一 Heap/service owner、debug/protected-helper 跨 state、
-  Lua-visible close 与 lifecycle 验收全部完成前保持开放。
+  library/package、IO、VM/app/result publication、字符串 identity/access 与
+  唯一 Heap/service owner 子项已关闭；debug/protected-helper 跨 state、
+  Runtime-only collection、Lua-visible close 与 lifecycle 验收全部完成前
+  保持开放。
 
 ### NOTE-010: Lua 字符串 intern hash 选择固定 C++ 的前向采样
 
