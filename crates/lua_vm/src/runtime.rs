@@ -37,12 +37,21 @@ use std::thread::{self, ThreadId};
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::proto::Proto;
 use lua_core::state_handle::StateHandleIssuer;
 pub use lua_core::state_handle::{RuntimeId, RuntimeIdExhausted, StateHandle};
 use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
+use lua_core::thread::{CoroutineStatus, Thread};
+use lua_core::value::Value;
 use thiserror::Error;
 
+use crate::execute::{
+    ExecResult, RuntimeError, VmExit, execute_proto, finish_deferred_native_call,
+    finish_deferred_native_values, resume_after_deferred_native_call, resume_lua_thread,
+    start_lua_call_at_stack,
+};
+use crate::native::{DeferredNativeCall, ResumeRequest, ResumeResponse};
 use crate::state::LuaState;
 use crate::state::lua_state::LuaStateShutdownReport;
 
@@ -108,6 +117,20 @@ pub enum RuntimeAccessError {
     },
 }
 
+/// Failure while executing through the Runtime-owned state scheduler.
+#[derive(Debug, Error)]
+pub enum RuntimeExecutionError {
+    /// Runtime ownership, phase, or state-arena validation failed.
+    #[error(transparent)]
+    Access(#[from] RuntimeAccessError),
+    /// Lua VM execution failed.
+    #[error(transparent)]
+    Vm(#[from] RuntimeError),
+    /// The sealed native request protocol violated an internal invariant.
+    #[error("runtime-native protocol error: {0}")]
+    Protocol(String),
+}
+
 /// Result produced by one Runtime-owned state execution turn.
 ///
 /// This is the ownership substrate for the future coroutine trampoline. A
@@ -123,6 +146,64 @@ pub(crate) enum RuntimeTurn<T> {
     Switch(StateHandle),
     /// Release the current state and return the completed value.
     Complete(T),
+}
+
+#[derive(Clone, Debug)]
+struct NativeActivationFrame {
+    caller: StateHandle,
+    caller_thread: Option<GcRef<Thread>>,
+    previous_caller_status: Option<CoroutineStatus>,
+    previous_target_status: CoroutineStatus,
+    previous_target_caller: Option<GcRef<Thread>>,
+    request: ResumeRequest,
+    pending_response: Option<ResumeResponse>,
+    replay_dead_ancestor: bool,
+}
+
+#[derive(Debug, Default)]
+struct NativeActivationStack {
+    frames: Vec<NativeActivationFrame>,
+}
+
+impl NativeActivationStack {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        for frame in &self.frames {
+            frame.request.seed_roots(gc);
+            if let Some(caller) = frame.caller_thread {
+                gc.mark_value(&Value::Thread(caller));
+            }
+            if let Some(response) = &frame.pending_response {
+                response.seed_roots(gc);
+            }
+        }
+        gc.propagate_marks();
+    }
+}
+
+enum NativeDriverAction {
+    StartProto(GcRef<Proto>),
+    StartTarget {
+        request: ResumeRequest,
+        previous_status: CoroutineStatus,
+        normal_deferred: Option<DeferredNativeCall>,
+    },
+    Deliver {
+        frame: NativeActivationFrame,
+        response: ResumeResponse,
+        replay_dead_ancestor: bool,
+    },
+}
+
+enum NativeTurnEvent {
+    Request {
+        request: Box<ResumeRequest>,
+        caller_thread: Option<GcRef<Thread>>,
+    },
+    Main(Result<ExecResult, RuntimeError>),
+    Coroutine {
+        thread: GcRef<Thread>,
+        response: ResumeResponse,
+    },
 }
 
 /// Result of explicit Runtime teardown.
@@ -980,6 +1061,7 @@ struct RuntimeHeap {
     state_arena: StateArena,
     gc: GarbageCollector,
     string_pool: StringPool,
+    native_activations: NativeActivationStack,
     _pin: PhantomPinned,
 }
 
@@ -989,6 +1071,7 @@ impl RuntimeHeap {
             state_arena: StateArena::new(handle_issuer),
             gc: GarbageCollector::new(),
             string_pool: StringPool::new(),
+            native_activations: NativeActivationStack::default(),
             _pin: PhantomPinned,
         }
     }
@@ -1262,6 +1345,274 @@ impl Runtime {
         }
     }
 
+    /// Execute a Proto through the Runtime-owned coroutine trampoline.
+    ///
+    /// Sealed Runtime-native operations publish owned requests and return
+    /// [`VmExit::NativeRequest`]. The current state borrow ends before this
+    /// driver validates and borrows the requested target. Deferred call frames
+    /// and transfer values remain in the Runtime-owned activation stack until
+    /// the target yields, returns, or errors.
+    pub fn execute_proto(
+        &mut self,
+        proto: GcRef<Proto>,
+    ) -> Result<ExecResult, RuntimeExecutionError> {
+        self.check_owner()?;
+        if self.phase != RuntimePhase::Running {
+            return Err(RuntimeAccessError::NotRunning {
+                runtime_id: self.id,
+                phase: self.phase,
+            }
+            .into());
+        }
+        let initial = self
+            .main_state_handle
+            .ok_or(RuntimeAccessError::MainStateUnavailable {
+                runtime_id: self.id,
+            })?;
+        if self.main_state.is_none() {
+            return Err(RuntimeAccessError::MainStateUnavailable {
+                runtime_id: self.id,
+            }
+            .into());
+        }
+        if self.active_executions != 0 {
+            return Err(RuntimeAccessError::ActiveExecutions {
+                runtime_id: self.id,
+                count: self.active_executions,
+            }
+            .into());
+        }
+
+        self.active_executions = self
+            .active_executions
+            .checked_add(1)
+            .expect("runtime active-execution counter overflow");
+        let _active_execution = ActiveExecutionGuard {
+            active_executions: &mut self.active_executions,
+        };
+        let runtime_id = self.id;
+
+        // SAFETY: RuntimeHeap was pinned at construction. The arena, collector,
+        // and activation stack are disjoint fields and remain at stable
+        // addresses for the whole execution session.
+        let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
+        if !heap.native_activations.frames.is_empty() {
+            return Err(RuntimeExecutionError::Protocol(
+                "activation stack was not empty at execution entry".to_string(),
+            ));
+        }
+        let arena = NonNull::from(&mut heap.state_arena);
+        let gc = &mut heap.gc;
+        let activations = &mut heap.native_activations;
+        let _activation_cleanup = NativeActivationSessionGuard {
+            activations: NonNull::from(&mut *activations),
+            gc: NonNull::from(&mut *gc),
+        };
+
+        let mut current = initial;
+        let mut action = NativeDriverAction::StartProto(proto);
+        loop {
+            activations.seed_roots(gc);
+            let replay_dead_thread = match &action {
+                NativeDriverAction::Deliver {
+                    frame,
+                    replay_dead_ancestor: true,
+                    ..
+                } => frame.caller_thread,
+                _ => None,
+            };
+            let completed_activation = match &action {
+                NativeDriverAction::Deliver { frame, .. } => Some(frame.request.id),
+                _ => None,
+            };
+            let event = StateArena::with_turn_state_mut(arena, current, |state| {
+                state
+                    .with_native_request_scope(|state| {
+                        let vm_result = execute_native_driver_action(state, gc, action);
+                        classify_native_turn(state, gc, vm_result)
+                    })
+                    .map_err(|error| {
+                        RuntimeError::new(format!("Runtime-native mailbox scope failed: {error:?}"))
+                    })
+                    .and_then(std::convert::identity)
+            })
+            .map_err(|source| RuntimeAccessError::StateArena { runtime_id, source })??;
+            if let Some(request_id) = completed_activation {
+                let completed = activations.frames.pop().ok_or_else(|| {
+                    RuntimeExecutionError::Protocol(
+                        "deferred delivery lost its rooted activation frame".to_string(),
+                    )
+                })?;
+                if completed.request.id != request_id {
+                    return Err(RuntimeExecutionError::Protocol(
+                        "deferred delivery popped a different activation frame".to_string(),
+                    ));
+                }
+            }
+
+            let event = match (replay_dead_thread, event) {
+                (
+                    Some(replayed),
+                    NativeTurnEvent::Coroutine {
+                        thread,
+                        response: _,
+                    },
+                ) if replayed == thread => NativeTurnEvent::Coroutine {
+                    thread,
+                    response: ResumeResponse::Error(runtime_error_value(
+                        gc,
+                        &RuntimeError::new("cannot resume dead coroutine"),
+                    )),
+                },
+                (_, event) => event,
+            };
+
+            match event {
+                NativeTurnEvent::Request {
+                    request,
+                    caller_thread,
+                } => {
+                    let request = *request;
+                    let target = request.target;
+                    let frame = prepare_native_activation(gc, current, caller_thread, request)?;
+                    let normal_deferred = if frame.previous_target_status == CoroutineStatus::Normal
+                    {
+                        activations
+                            .frames
+                            .iter()
+                            .rev()
+                            .find(|active| active.caller == target)
+                            .and_then(|active| active.request.deferred.clone())
+                    } else {
+                        None
+                    };
+                    if frame.previous_target_status == CoroutineStatus::Normal
+                        && normal_deferred.is_none()
+                    {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "Normal coroutine target has no suspended ancestor activation"
+                                .to_string(),
+                        ));
+                    }
+                    let request = frame.request.clone();
+                    let previous_status = frame.previous_target_status;
+                    activations.frames.push(frame);
+                    action = NativeDriverAction::StartTarget {
+                        request,
+                        previous_status,
+                        normal_deferred,
+                    };
+                    current = target;
+                }
+                NativeTurnEvent::Coroutine { thread, response } => {
+                    let frame = activations.frames.last_mut().ok_or_else(|| {
+                        RuntimeExecutionError::Protocol(
+                            "coroutine stopped without an activation frame".to_string(),
+                        )
+                    })?;
+                    if frame.request.thread != thread {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "stopped coroutine does not match activation target".to_string(),
+                        ));
+                    }
+                    restore_native_activation_links(gc, frame)?;
+                    let replay_dead_ancestor = match frame.caller_thread {
+                        Some(caller) => {
+                            gc.with_ref(caller, Thread::status).map_err(|error| {
+                                RuntimeExecutionError::Protocol(format!(
+                                    "invalid caller Thread: {error}"
+                                ))
+                            })? == CoroutineStatus::Dead
+                        }
+                        None => false,
+                    };
+                    if replay_dead_ancestor && let Some(caller) = frame.caller_thread {
+                        gc.with_mut(caller, |thread| {
+                            thread.set_status(CoroutineStatus::Running);
+                        })
+                        .map_err(|error| {
+                            RuntimeExecutionError::Protocol(format!(
+                                "invalid replay caller Thread: {error}"
+                            ))
+                        })?;
+                    }
+                    frame.pending_response = Some(response.clone());
+                    frame.replay_dead_ancestor = replay_dead_ancestor;
+                    current = frame.caller;
+                    action = NativeDriverAction::Deliver {
+                        frame: frame.clone(),
+                        response,
+                        replay_dead_ancestor,
+                    };
+                }
+                NativeTurnEvent::Main(result) => {
+                    if !activations.frames.is_empty() {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "main state stopped while coroutine activations remain".to_string(),
+                        ));
+                    }
+                    return result.map_err(RuntimeExecutionError::Vm);
+                }
+            }
+        }
+    }
+
+    /// Execute a top-level Proto with Lua varargs and return owned results.
+    ///
+    /// Preparation and result collection occur outside the scheduler session;
+    /// the middle execution always uses the same Runtime-owned trampoline as
+    /// [`Runtime::execute_proto`].
+    pub fn execute_proto_with_args(
+        &mut self,
+        proto: GcRef<Proto>,
+        args: Vec<Value>,
+    ) -> Result<Vec<Value>, RuntimeExecutionError> {
+        self.check_owner()?;
+        if self.phase != RuntimePhase::Running {
+            return Err(RuntimeAccessError::NotRunning {
+                runtime_id: self.id,
+                phase: self.phase,
+            }
+            .into());
+        }
+        if self.active_executions != 0 {
+            return Err(RuntimeAccessError::ActiveExecutions {
+                runtime_id: self.id,
+                count: self.active_executions,
+            }
+            .into());
+        }
+        let state =
+            self.main_state
+                .as_deref_mut()
+                .ok_or(RuntimeAccessError::MainStateUnavailable {
+                    runtime_id: self.id,
+                })?;
+        state.unwind_call_info_to(0);
+        state.current_call_info_mut().reset();
+        state.current_call_info_mut().varargs = args;
+        state.top = 0;
+        state.status = crate::state::ThreadStatus::Ok;
+
+        let execution = self.execute_proto(proto);
+        let state =
+            self.main_state
+                .as_deref_mut()
+                .ok_or(RuntimeAccessError::MainStateUnavailable {
+                    runtime_id: self.id,
+                })?;
+        let results = if execution.is_ok() {
+            state_stack_values(state)
+        } else {
+            Vec::new()
+        };
+        state.unwind_call_info_to(0);
+        state.current_call_info_mut().reset();
+        state.top = 0;
+        execution?;
+        Ok(results)
+    }
+
     /// Deterministically reclaim Runtime-owned Rust states and GC allocations.
     ///
     /// Close is idempotent after the first successful call. This M1.8 partial
@@ -1326,6 +1677,11 @@ impl Runtime {
             .ok_or(StateResolveError::ArenaUnavailable)?;
         let state_pointer = NonNull::from(state);
         let heap = self.heap.as_ref().get_ref();
+        if !heap.native_activations.frames.is_empty() {
+            return Err(StateResolveError::ArenaInvariant {
+                reason: "native activation stack is not empty at shutdown",
+            });
+        }
         heap.state_arena
             .validate_external_detach(handle, state_pointer)?;
         heap.state_arena.validate_owned_drain()
@@ -1465,6 +1821,302 @@ impl Drop for Runtime {
         // owner-thread path delegates to the same deterministic teardown used
         // by explicit close.
         self.close_for_drop();
+    }
+}
+
+fn execute_native_driver_action(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    action: NativeDriverAction,
+) -> Result<VmExit, RuntimeError> {
+    match action {
+        NativeDriverAction::StartProto(proto) => execute_proto(state, proto, gc),
+        NativeDriverAction::StartTarget {
+            request,
+            previous_status,
+            normal_deferred,
+        } => {
+            if state.current_thread != Some(request.thread) {
+                return Err(RuntimeError::new(
+                    "Runtime-native target state does not own the requested Thread",
+                ));
+            }
+            state.allow_yield = state
+                .allow_yield
+                .checked_add(1)
+                .ok_or_else(|| RuntimeError::new("coroutine yield permission overflow"))?;
+
+            let first_resume = gc
+                .with_ref(request.thread, Thread::is_first_resume)
+                .map_err(|error| RuntimeError::new(format!("invalid coroutine Thread: {error}")))?;
+            if first_resume {
+                install_initial_resume_args(state, &request.args);
+                start_lua_call_at_stack(state, gc, 0, request.args.len(), None)?;
+                gc.with_mut(request.thread, |thread| {
+                    thread.mark_resumed();
+                    thread.set_saved_nexeccalls(state.nccalls);
+                })
+                .map_err(|error| RuntimeError::new(format!("invalid coroutine Thread: {error}")))?;
+                resume_lua_thread(state, gc)
+            } else if previous_status == CoroutineStatus::Normal {
+                let deferred = normal_deferred.ok_or_else(|| {
+                    RuntimeError::new(
+                        "Normal coroutine re-entry has no deferred ancestor continuation",
+                    )
+                })?;
+                finish_deferred_native_values(state, gc, &deferred, request.args)?;
+                resume_after_deferred_native_call(state, gc, &deferred)
+            } else {
+                install_resume_args(state, &request.args);
+                resume_lua_thread(state, gc)
+            }
+        }
+        NativeDriverAction::Deliver {
+            frame,
+            response,
+            replay_dead_ancestor,
+        } => {
+            let deferred = frame.request.deferred.as_ref().ok_or_else(|| {
+                RuntimeError::new("Runtime-native activation lost its deferred call")
+            })?;
+            if replay_dead_ancestor {
+                deferred.snapshot.restore(state);
+                finish_deferred_native_values(state, gc, deferred, Vec::new())?;
+            } else {
+                finish_deferred_native_call(state, gc, deferred, frame.request.envelope, response)?;
+            }
+            resume_after_deferred_native_call(state, gc, deferred)
+        }
+    }
+}
+
+fn classify_native_turn(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    result: Result<VmExit, RuntimeError>,
+) -> Result<NativeTurnEvent, RuntimeError> {
+    match result {
+        Ok(VmExit::NativeRequest(id)) => {
+            let request = state.take_native_request(id).ok_or_else(|| {
+                RuntimeError::new("VM exited for a missing or unsealed native request")
+            })?;
+            Ok(NativeTurnEvent::Request {
+                request: Box::new(request),
+                caller_thread: state.current_thread,
+            })
+        }
+        Ok(VmExit::Complete(result)) => {
+            let Some(thread) = state.current_thread else {
+                return Ok(NativeTurnEvent::Main(Ok(result)));
+            };
+            release_yield_permission(state)?;
+            let response = match result {
+                ExecResult::Yielded => {
+                    gc.with_mut(thread, |thread| {
+                        thread.set_status(CoroutineStatus::Suspended);
+                        thread.set_saved_nexeccalls(state.nccalls);
+                    })
+                    .map_err(|error| {
+                        RuntimeError::new(format!("invalid coroutine Thread: {error}"))
+                    })?;
+                    state.last_error = None;
+                    ResumeResponse::Success(state.yielded_values.clone())
+                }
+                ExecResult::Returned => {
+                    gc.with_mut(thread, |thread| {
+                        thread.set_status(CoroutineStatus::Dead);
+                    })
+                    .map_err(|error| {
+                        RuntimeError::new(format!("invalid coroutine Thread: {error}"))
+                    })?;
+                    state.last_error = None;
+                    ResumeResponse::Success(state_stack_values(state))
+                }
+            };
+            Ok(NativeTurnEvent::Coroutine { thread, response })
+        }
+        Err(error) => {
+            let Some(thread) = state.current_thread else {
+                return Ok(NativeTurnEvent::Main(Err(error)));
+            };
+            release_yield_permission(state)?;
+            gc.with_mut(thread, |thread| {
+                thread.set_status(CoroutineStatus::Dead);
+            })
+            .map_err(|validation| {
+                RuntimeError::new(format!("invalid coroutine Thread: {validation}"))
+            })?;
+            let error = runtime_error_value(gc, &error);
+            state.last_error = Some(error.clone());
+            Ok(NativeTurnEvent::Coroutine {
+                thread,
+                response: ResumeResponse::Error(error),
+            })
+        }
+    }
+}
+
+fn prepare_native_activation(
+    gc: &mut GarbageCollector,
+    caller: StateHandle,
+    caller_thread: Option<GcRef<Thread>>,
+    request: ResumeRequest,
+) -> Result<NativeActivationFrame, RuntimeExecutionError> {
+    if request.deferred.is_none() {
+        return Err(RuntimeExecutionError::Protocol(
+            "native request reached Runtime without deferred call metadata".to_string(),
+        ));
+    }
+    let (previous_target_status, previous_target_caller) = gc
+        .with_ref(request.thread, |thread| (thread.status(), thread.caller()))
+        .map_err(|error| {
+            RuntimeExecutionError::Protocol(format!("invalid target Thread: {error}"))
+        })?;
+    if matches!(
+        previous_target_status,
+        CoroutineStatus::Running | CoroutineStatus::Dead
+    ) {
+        return Err(RuntimeExecutionError::Protocol(format!(
+            "native request targeted a {previous_target_status} coroutine"
+        )));
+    }
+
+    let previous_caller_status = match caller_thread {
+        Some(thread) => Some(gc.with_ref(thread, Thread::status).map_err(|error| {
+            RuntimeExecutionError::Protocol(format!("invalid caller Thread: {error}"))
+        })?),
+        None => None,
+    };
+    if let Some(thread) = caller_thread {
+        gc.with_mut(thread, |thread| {
+            thread.set_status(CoroutineStatus::Normal);
+        })
+        .map_err(|error| {
+            RuntimeExecutionError::Protocol(format!("invalid caller Thread: {error}"))
+        })?;
+    }
+    gc.with_mut(request.thread, |thread| {
+        thread.set_caller(caller_thread);
+        thread.set_status(CoroutineStatus::Running);
+    })
+    .map_err(|error| RuntimeExecutionError::Protocol(format!("invalid target Thread: {error}")))?;
+
+    Ok(NativeActivationFrame {
+        caller,
+        caller_thread,
+        previous_caller_status,
+        previous_target_status,
+        previous_target_caller,
+        request,
+        pending_response: None,
+        replay_dead_ancestor: false,
+    })
+}
+
+fn restore_native_activation_links(
+    gc: &mut GarbageCollector,
+    frame: &NativeActivationFrame,
+) -> Result<(), RuntimeExecutionError> {
+    gc.with_mut(frame.request.thread, |thread| {
+        thread.set_caller(frame.previous_target_caller);
+    })
+    .map_err(|error| RuntimeExecutionError::Protocol(format!("invalid target Thread: {error}")))?;
+    if let (Some(caller), Some(previous_status)) =
+        (frame.caller_thread, frame.previous_caller_status)
+    {
+        gc.with_mut(caller, |thread| {
+            if thread.status() != CoroutineStatus::Dead {
+                thread.set_status(previous_status);
+            }
+        })
+        .map_err(|error| {
+            RuntimeExecutionError::Protocol(format!("invalid caller Thread: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn install_initial_resume_args(state: &mut LuaState, args: &[Value]) {
+    ensure_state_stack_slot(state, args.len());
+    for (index, value) in args.iter().enumerate() {
+        if let Some(destination) = state.stack.at_mut(1 + index) {
+            *destination = value.clone();
+        }
+    }
+    state.top = 1 + args.len();
+}
+
+fn install_resume_args(state: &mut LuaState, args: &[Value]) {
+    let base = state.yield_result_base.take().unwrap_or(state.top);
+    let wanted = state.yield_wanted_results.take().unwrap_or(args.len());
+    if wanted > 0 {
+        ensure_state_stack_slot(state, base + wanted - 1);
+    }
+    for index in 0..wanted {
+        let value = args.get(index).cloned().unwrap_or(Value::Nil);
+        if let Some(destination) = state.stack.at_mut(base + index) {
+            *destination = value;
+        }
+    }
+    state.top = base + wanted;
+    state.yielded_values.clear();
+}
+
+fn ensure_state_stack_slot(state: &mut LuaState, index: usize) {
+    if state.stack.size() <= index {
+        state.stack.set_top(index + 1);
+    }
+}
+
+fn state_stack_values(state: &LuaState) -> Vec<Value> {
+    (0..state.top)
+        .map(|index| state.stack.at(index).cloned().unwrap_or(Value::Nil))
+        .collect()
+}
+
+fn runtime_error_value(gc: &mut GarbageCollector, error: &RuntimeError) -> Value {
+    error.error_value().unwrap_or_else(|| {
+        Value::String(gc.create(lua_core::gc_string::GcString::from_utf8_text(
+            &error.message,
+        )))
+    })
+}
+
+fn release_yield_permission(state: &mut LuaState) -> Result<(), RuntimeError> {
+    state.allow_yield = state
+        .allow_yield
+        .checked_sub(1)
+        .ok_or_else(|| RuntimeError::new("coroutine yield permission underflow"))?;
+    Ok(())
+}
+
+struct NativeActivationSessionGuard {
+    activations: NonNull<NativeActivationStack>,
+    gc: NonNull<GarbageCollector>,
+}
+
+impl Drop for NativeActivationSessionGuard {
+    fn drop(&mut self) {
+        // SAFETY: both pointers target disjoint fields of the pinned RuntimeHeap
+        // and this guard drops before `Runtime::execute_proto` releases its
+        // exclusive Runtime borrow.
+        let activations = unsafe { self.activations.as_mut() };
+        // SAFETY: see the invariant above; no other collector reference is used
+        // during this cleanup loop.
+        let gc = unsafe { self.gc.as_mut() };
+        while let Some(frame) = activations.frames.pop() {
+            if let Some(caller) = frame.caller_thread
+                && let Some(previous_status) = frame.previous_caller_status
+            {
+                let _ = gc.with_mut(caller, |thread| {
+                    thread.set_status(previous_status);
+                });
+            }
+            let _ = gc.with_mut(frame.request.thread, |thread| {
+                thread.set_status(frame.previous_target_status);
+                thread.set_caller(frame.previous_target_caller);
+            });
+        }
     }
 }
 

@@ -14,7 +14,7 @@ const STACK_GROW_MARGIN: usize = 32;
 ///
 /// 管理 Lua 值的动态栈，支持 push/pop 操作和自动扩展。
 ///
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Stack {
     values: Vec<Value>,
     top: usize,
@@ -45,6 +45,10 @@ impl Stack {
     /// 栈容量
     pub fn capacity(&self) -> usize {
         self.values.capacity()
+    }
+
+    pub(crate) fn initialized_values(&self) -> &[Value] {
+        &self.values[..self.top]
     }
 
     /// 压入值到栈顶

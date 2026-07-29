@@ -1,6 +1,6 @@
 ---
 status: living
-last_updated: 2026-07-26
+last_updated: 2026-07-28
 applies_to: Lua 5.1.5 compatibility, lua_cpp project extensions, and runtime safety
 oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 ---
@@ -204,11 +204,14 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   只保存受 runtime/slot/generation 校验的 handle；RuntimeId 不回绕且不可由
   safe raw integer 重建，generation `u64::MAX` 释放后永久退休。Runtime
   close/Drop 已执行 state→Thread→ordinary→fixed 的 Rust-owned 确定性销毁。
+  coroutine resume/wrap 已改为 sealed runtime-native request：scoped
+  mailbox 与独立 `VmExit::NativeRequest` 暂停 caller，deferred C frame 和
+  Runtime activation stack 在释放 caller borrow 后驱动 target；caller
+  `Running↔Normal`、yield/result/error transfer、protected `pcall` 与固定
+  C++ 的 `A→B→A` `Normal` 祖先 continuation 二次执行已有回归。
   但 main state 仍是 external arena slot，LuaState 仍保存 transitional
-  GC/StringPool backpointer，递归 resume 尚无 Runtime trampoline：父 state
-  borrow 在子 VM 的完整执行期保持存活，caller 也未切换为 `Normal`。open
-  Upvalue 仍使用 raw Stack owner；Lua `__gc`、IO/module service drain 与
-  allocator live-byte 合同也未闭环。coroutine 创建已先建立
+  GC/StringPool backpointer，open Upvalue 仍使用 raw Stack owner；Lua
+  `__gc`、IO/module service drain 与 allocator live-byte 合同也未闭环。coroutine 创建已先建立
   State→Thread、再插入 arena 并绑定 Thread→StateHandle，去掉了初始化时的
   第二个 state borrow，但仍缺少可回滚、可追踪的 `PendingState`。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
@@ -217,13 +220,14 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   DropProbe、并发 RuntimeId 唯一性、MAX-generation retirement、free-list
   preflight 与关闭归零已通过。`coroutine-normal-ancestor.lua` 及其独立
   characterization 工具进一步锁定了固定 C++ 允许 `A→B→A` 激活环、而
-  stock Lua 拒绝 `Normal` 祖先的差异；当前 Rust 尚未对齐该 C++ 行为。
+  stock Lua 拒绝 `Normal` 祖先的差异；Rust process regression 已逐字节
+  对齐该 C++ 行为。
   allocator live/peak、真实 finalizer/service close、Miri/ASan 等仍在
   M1.4、M1.5、M1.7、M1.8、M1.13。
-- **影响：** 已能声称当前 Rust-owned 对象的 deterministic shutdown
-  substrate，但递归跨 state 执行和 raw Upvalue owner 仍有别名/UAF 风险，
-  也不能声称完整 Lua close 或 live collection。
-- **处置状态：** `open`。Runtime trampoline、Upvalue owner、唯一 Heap/service
+- **影响：** 已移除 resume/wrap 递归跨 state 借用风险，并能声称当前
+  Rust-owned 对象的 deterministic shutdown substrate；raw Upvalue owner
+  等剩余路径仍有别名/UAF 风险，也不能声称完整 Lua close 或 live collection。
+- **处置状态：** `open`。Upvalue owner、唯一 Heap/service
   owner、Lua-visible close 与 lifecycle 验收全部完成前保持开放。
 
 ### NOTE-010: Lua 字符串 intern hash 选择固定 C++ 的前向采样

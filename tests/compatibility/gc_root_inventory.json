@@ -653,6 +653,36 @@
       }
     },
     {
+      "root_kind": "COROUTINE_ACTIVATION_BUFFER",
+      "source_locations": [
+        {
+          "path": "crates/lua_vm/src/runtime.rs",
+          "line": 142,
+          "symbol": "NativeActivationStack"
+        },
+        {
+          "path": "crates/lua_vm/src/native.rs",
+          "line": 44,
+          "symbol": "ResumeRequest and StateContinuationSnapshot"
+        }
+      ],
+      "status": "partial",
+      "owner": {
+        "current": "RuntimeHeap owns every active ResumeRequest, deferred native frame, caller/target Thread edge, continuation snapshot, and pending response until delivery. NativeActivationSessionGuard restores links and drains the buffer on success, error, or panic.",
+        "target": "The unique Heap owner exposes the same activation buffer as a canonical root provider to full and incremental collection."
+      },
+      "tracer": {
+        "current": "NativeActivationStack::seed_roots marks request arguments, Thread handles, caller Proto, saved stack/call-frame values, yielded/error values, and pending responses at every state-turn boundary before the next state is borrowed.",
+        "target": "RuntimeRootTracer labels activation-buffer edges and invokes the provider during every stop-the-world and incremental root seed."
+      },
+      "missing_risk": "Live destructive collection remains disabled. Before enabling it, the collector entry point must call this provider as part of the canonical root seed rather than relying only on the current turn-boundary seed.",
+      "planned_test": {
+        "name": "runtime_native_activation_roots_survive_switch_delivery_and_unwind",
+        "layer": "lua_vm runtime coroutine trampoline",
+        "assertion": "Request arguments, continuation values, pending results/errors, and caller/target Threads remain marked while peak borrowed StateArena slots stays one; success, VM error, and panic all leave the activation buffer empty."
+      }
+    },
+    {
       "root_kind": "LIBRARY_LIVE_HANDLES",
       "source_locations": [
         {

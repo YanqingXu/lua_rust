@@ -18,6 +18,10 @@ use lua_core::value::Value;
 
 use super::call_info::CallInfo;
 use super::stack::Stack;
+use crate::native::{
+    DeferredNativeCall, DeferredVmContinuation, NativeRequestId, NativeRequestPublishError,
+    ResumeEnvelope, ResumeRequest,
+};
 use crate::runtime::StateArena;
 
 /// 线程执行状态
@@ -98,6 +102,12 @@ pub struct LuaState {
     pub(crate) state_handle: Option<StateHandle>,
     /// Stable transitional pointer to the Runtime-owned StateArena.
     pub(crate) state_arena: Option<std::ptr::NonNull<StateArena>>,
+    /// Whether Runtime opened publication for the current state turn.
+    native_request_scope: bool,
+    /// Next per-state request identifier. Zero is permanently reserved.
+    next_native_request_id: u64,
+    /// Request published by the current sealed Runtime-native operation.
+    pending_native_request: Option<ResumeRequest>,
     /// Active debug hook function configured through debug.sethook.
     pub debug_hook: Option<Value>,
     /// Debug hook event mask, e.g. "crl".
@@ -164,6 +174,9 @@ impl LuaState {
             gc: None,
             state_handle: None,
             state_arena: None,
+            native_request_scope: false,
+            next_native_request_id: 1,
+            pending_native_request: None,
             debug_hook: None,
             debug_hook_mask: String::new(),
             debug_hook_count: 0,
@@ -486,6 +499,8 @@ impl LuaState {
         self.string_pool = None;
         self.state_handle = None;
         self.state_arena = None;
+        self.native_request_scope = false;
+        self.pending_native_request = None;
 
         report
     }
@@ -498,6 +513,137 @@ impl LuaState {
 
     pub fn set_status(&mut self, s: ThreadStatus) {
         self.status = s;
+    }
+
+    pub(crate) fn with_native_request_scope<R>(
+        &mut self,
+        f: impl for<'scope> FnOnce(&'scope mut LuaState) -> R,
+    ) -> Result<R, NativeRequestPublishError> {
+        if self.native_request_scope || self.pending_native_request.is_some() {
+            return Err(NativeRequestPublishError::MailboxOccupied);
+        }
+        self.native_request_scope = true;
+        let guard = NativeRequestScopeGuard {
+            state: std::ptr::NonNull::from(&mut *self),
+        };
+        let result = f(self);
+        drop(guard);
+        Ok(result)
+    }
+
+    pub(crate) fn publish_resume_request(
+        &mut self,
+        thread: GcRef<Thread>,
+        target: StateHandle,
+        args: Vec<Value>,
+        envelope: ResumeEnvelope,
+    ) -> Result<NativeRequestId, NativeRequestPublishError> {
+        if !self.native_request_scope {
+            return Err(NativeRequestPublishError::ScopeUnavailable);
+        }
+        if self.pending_native_request.is_some() {
+            return Err(NativeRequestPublishError::MailboxOccupied);
+        }
+        let id = NativeRequestId::new(self.next_native_request_id);
+        self.next_native_request_id = self
+            .next_native_request_id
+            .checked_add(1)
+            .ok_or(NativeRequestPublishError::IdExhausted)?;
+        self.pending_native_request = Some(ResumeRequest {
+            id,
+            thread,
+            target,
+            args,
+            envelope,
+            deferred: None,
+        });
+        Ok(id)
+    }
+
+    pub(crate) fn pending_native_request_id(&self) -> Option<NativeRequestId> {
+        self.pending_native_request
+            .as_ref()
+            .map(|request| request.id)
+    }
+
+    pub(crate) fn seal_native_request(
+        &mut self,
+        id: NativeRequestId,
+        deferred: DeferredNativeCall,
+    ) -> bool {
+        let Some(request) = self.pending_native_request.as_mut() else {
+            return false;
+        };
+        if request.id != id || deferred.request_id != id || request.deferred.is_some() {
+            return false;
+        }
+        request.deferred = Some(deferred);
+        true
+    }
+
+    pub(crate) fn take_native_request(&mut self, id: NativeRequestId) -> Option<ResumeRequest> {
+        if self
+            .pending_native_request
+            .as_ref()
+            .is_some_and(|request| request.id == id && request.deferred.is_some())
+        {
+            self.pending_native_request.take()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_native_request_continuation(
+        &mut self,
+        id: NativeRequestId,
+        continuation: DeferredVmContinuation,
+    ) -> bool {
+        let Some(request) = self.pending_native_request.as_mut() else {
+            return false;
+        };
+        let Some(deferred) = request.deferred.as_mut() else {
+            return false;
+        };
+        if request.id != id || deferred.request_id != id {
+            return false;
+        }
+        deferred.continuation = continuation;
+        true
+    }
+
+    pub(crate) fn retarget_native_request_to_protected_resume(
+        &mut self,
+        id: NativeRequestId,
+    ) -> bool {
+        let Some(request) = self.pending_native_request.as_mut() else {
+            return false;
+        };
+        if request.id != id {
+            return false;
+        }
+        request.envelope = match request.envelope {
+            ResumeEnvelope::Resume => ResumeEnvelope::ProtectedResume,
+            ResumeEnvelope::Wrap => ResumeEnvelope::ProtectedWrap,
+            ResumeEnvelope::ProtectedResume | ResumeEnvelope::ProtectedWrap => return false,
+        };
+        request.deferred = None;
+        true
+    }
+}
+
+struct NativeRequestScopeGuard {
+    state: std::ptr::NonNull<LuaState>,
+}
+
+impl Drop for NativeRequestScopeGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard is created from the uniquely borrowed LuaState and
+        // drops before `with_native_request_scope` returns or unwinds.
+        let state = unsafe { self.state.as_mut() };
+        state.native_request_scope = false;
+        if std::thread::panicking() {
+            state.pending_native_request = None;
+        }
     }
 }
 

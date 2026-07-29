@@ -35,6 +35,20 @@ use crate::upvalue::Upvalue;
 ///
 pub type CFunction = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
 
+/// Sealed VM-native operations that require Runtime scheduling support.
+///
+/// Unlike a [`CFunction`], these operations are interpreted by `lua_vm` and
+/// never receive a raw `LuaState` pointer. This keeps coroutine state switching
+/// behind the Runtime's scoped native-request capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RuntimeNativeFunction {
+    /// `coroutine.resume`.
+    CoroutineResume = 0,
+    /// The closure returned by `coroutine.wrap`.
+    CoroutineWrapRunner = 1,
+}
+
 // =====================================================================
 // Function 结构体
 // =====================================================================
@@ -79,6 +93,9 @@ pub struct Function {
     /// 对应 CClosure 的 `lua_CFunction f` 字段
     c_function: Option<CFunction>,
 
+    /// Runtime-dispatched native operation.
+    runtime_native: Option<RuntimeNativeFunction>,
+
     /// 函数原型（仅当 is_c 为 false 时有效）
     /// 对应 LClosure 的 `struct Proto *p` 字段
     proto: Option<GcRef<Proto>>,
@@ -102,6 +119,26 @@ impl Function {
             gclist: None,
             env: None,
             c_function: Some(func),
+            runtime_native: None,
+            proto: None,
+            upvalues: Vec::new(),
+        }
+    }
+
+    /// Create a sealed Runtime-native closure.
+    ///
+    /// Runtime-native closures share the Lua-visible C-closure shape (including
+    /// upvalues and environment) but are dispatched by the VM without exposing
+    /// a raw state pointer to the operation.
+    pub fn new_runtime_native(operation: RuntimeNativeFunction) -> Self {
+        Self {
+            header: GcObjectHeader::new(GcObjectType::Function),
+            is_c: true,
+            nupvalues: 0,
+            gclist: None,
+            env: None,
+            c_function: None,
+            runtime_native: Some(operation),
             proto: None,
             upvalues: Vec::new(),
         }
@@ -121,6 +158,7 @@ impl Function {
             gclist: None,
             env: None,
             c_function: None,
+            runtime_native: None,
             proto: Some(proto),
             upvalues: Vec::new(),
         }
@@ -147,6 +185,12 @@ impl Function {
     #[inline]
     pub fn c_function(&self) -> Option<CFunction> {
         self.c_function
+    }
+
+    /// Return the sealed Runtime-native operation, if any.
+    #[inline]
+    pub fn runtime_native_function(&self) -> Option<RuntimeNativeFunction> {
+        self.runtime_native
     }
 
     // ── Lua 函数访问 ──────────────────────────────────────────────
@@ -288,7 +332,12 @@ impl std::fmt::Debug for Function {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_c {
             f.debug_struct("Function")
-                .field("type", &"C")
+                .field(
+                    "type",
+                    &self
+                        .runtime_native
+                        .map_or_else(|| "C".to_string(), |op| format!("RuntimeNative::{op:?}")),
+                )
                 .field("upvalues", &self.upvalues.len())
                 .field("env", &self.env.is_some())
                 .finish()
@@ -343,9 +392,24 @@ mod tests {
         assert!(!f.is_c_function());
         assert!(f.is_lua_function());
         assert!(f.c_function().is_none());
+        assert!(f.runtime_native_function().is_none());
         assert_eq!(f.proto(), Some(proto));
         assert_eq!(f.upvalue_count(), 0);
         assert!(f.env().is_none());
+    }
+
+    #[test]
+    fn test_new_runtime_native_function() {
+        let f = Function::new_runtime_native(RuntimeNativeFunction::CoroutineResume);
+
+        assert!(f.is_c_function());
+        assert!(!f.is_lua_function());
+        assert!(f.c_function().is_none());
+        assert_eq!(
+            f.runtime_native_function(),
+            Some(RuntimeNativeFunction::CoroutineResume)
+        );
+        assert!(f.proto().is_none());
     }
 
     #[test]

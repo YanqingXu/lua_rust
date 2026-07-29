@@ -202,10 +202,10 @@ $manifest = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
 if ([int]$manifest.schemaVersion -ne 1 -or
     [bool]$manifest.gate -or
     [string]$manifest.classification -cne "characterization-only" -or
-    [string]$manifest.implementationStatus -cne "pending-lua-rust") {
+    [string]$manifest.implementationStatus -cne "matched-lua-rust-cpp-oracle") {
     throw (
         "Manifest must be schema 1, characterization-only, non-gating, " +
-        "and pending-lua-rust"
+        "and matched-lua-rust-cpp-oracle"
     )
 }
 if ($null -ne $manifest.PSObject.Properties["expectedDifferences"] -or

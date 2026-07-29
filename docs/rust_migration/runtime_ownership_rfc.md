@@ -2,7 +2,7 @@
 status: accepted-design
 implementation_status: incomplete
 schema_version: 1
-last_updated: 2026-07-26
+last_updated: 2026-07-28
 cpp_oracle: 87c15e69ceb94eb74e28226ccbefb7e196635711
 ---
 
@@ -41,9 +41,9 @@ is not closed:
   `crates/lua_core/src/gc/collector.rs:169-208`;
 - `StateArena` now owns coroutine `Box<LuaState>` allocations and reconstructs
   them during removal/shutdown; `Thread` stores and traces a validated
-  `StateHandle`. The main state is still an externally owned arena slot, and
-  recursive coroutine resume still nests state borrows instead of transferring
-  execution through a Runtime trampoline;
+  `StateHandle`. The main state is still an externally owned arena slot.
+  Coroutine resume/wrap now transfer execution through the Runtime activation
+  trampoline after releasing the caller state borrow;
 - coroutine/debug lookup is scoped through `with_resolved_state_mut`, but open
   Upvalues still identify their owner with raw Stack/list pointers rather than
   `StateHandle + stack index`;
@@ -578,9 +578,8 @@ The StateHandle issuance/exhaustion slice is complete locally:
   corrupted free-list, real stale/foreign tracing, and MAX-generation close
   have focused regressions.
 
-Phase B remains incomplete because main-state ownership, Runtime coroutine
-trampoline execution, and `StateHandle + stack index` open-Upvalue ownership
-are still outstanding.
+Phase B remains incomplete because main-state ownership and
+`StateHandle + stack index` open-Upvalue ownership are still outstanding.
 
 #### B.2 Implemented Runtime turn-borrow substrate (partial)
 
@@ -601,7 +600,7 @@ pre-existing borrowed slot. Test-only acquisition/release instrumentation
 proves the exact `main -> child -> main` event order and a peak of one borrowed
 slot. Panic unwind releases the turn marker, state borrow, and active-execution
 count; foreign, stale, and already-borrowed handles fail closed; a released
-handle can be selected again in a later turn. These tests increase the
+handle can be selected again in a later turn. These tests increased the
 workspace total from 733 to 737.
 
 Coroutine creation also now installs `State -> Thread` before inserting the
@@ -609,21 +608,40 @@ state, then binds `Thread -> StateHandle` before exposing the Thread value.
 This removes its former initialization-only second-state borrow. It does not
 replace the still-missing `PendingState` rollback/root transaction.
 
-This substrate is deliberately not a completed coroutine trampoline:
+This substrate is now the ownership foundation used by the production
+coroutine trampoline described below.
 
-- `coroutine.resume` and `wrap` still recursively resolve and execute another
-  state through `RuntimePartsMut`/`with_resolved_state_mut`;
-- no runtime-native request mailbox, deferred C-call continuation, activation
-  frame stack, or rooted transfer buffer exists yet;
-- app and stdlib test harnesses still use the long-lived `RuntimePartsMut`
-  production entry;
-- debug cross-state operations remain outside this turn protocol;
-- raw GC/StringPool backpointers and open-Upvalue Stack owners remain.
+#### B.3 Implemented Runtime coroutine activation trampoline (local-complete slice)
 
-Live destructive collection therefore remains disabled. The next slice must
-add a scoped request capability and a distinct VM exit for `resume`/`wrap`,
-then exercise it through an opt-in Runtime driver before production entry
-migration.
+`coroutine.resume` and the wrap runner are sealed `RuntimeNativeFunction`
+operations. They publish a `ResumeRequest` through a scoped mailbox and return
+`VmExit::NativeRequest`; they cannot recursively resolve or execute a target
+state. The VM seals the suspended native call as a deferred C frame, including
+its continuation snapshot and exact result destination.
+
+`Runtime::execute_proto` drives the request with an owned activation stack.
+It drops the caller guard before validating and borrowing the target, moves
+arguments/results/errors through owned activation buffers, and seeds those
+buffers from the canonical root tracer. It restores status, caller links,
+yield permission and saved execution counters on unwind. Generic-for
+continuations and protected `pcall` boundaries around resume/wrap are also
+resumed through the same protocol.
+
+The CLI and stdlib integration harness now enter execution through Runtime
+scheduling. Focused process tests cover ordinary yield/resume, protected
+resume, wrap yield/error, and the exact pinned-C++ `A -> B -> A` `Normal`
+ancestor behavior, including the continuation's second execution. Together
+with the sealed-function unit test, this increases the workspace total from
+737 to 741.
+
+This is a completed local trampoline slice, not completion of Phase B:
+
+- debug cross-state operations remain outside the request protocol;
+- deep-chain and broader fault-injection matrices remain open;
+- raw GC/StringPool backpointers, main-state external ownership, and
+  open-Upvalue Stack owners remain;
+- the activation buffer is a canonical root seed, but other partial/missing
+  roots still prohibit live destructive collection.
 
 ### C. Registry and dump lifetime — M1.6
 

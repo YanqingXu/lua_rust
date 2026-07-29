@@ -57,6 +57,8 @@ pub enum RuntimeRootKind {
     YieldedValues,
     /// Last error Value retained by a state.
     LastError,
+    /// Runtime-owned deferred coroutine requests, snapshots, and responses.
+    CoroutineActivationBuffer,
 }
 
 impl RuntimeRootKind {
@@ -81,6 +83,7 @@ impl RuntimeRootKind {
             Self::DebugHook => "DEBUG_HOOK",
             Self::YieldedValues => "YIELDED_VALUES",
             Self::LastError => "LAST_ERROR",
+            Self::CoroutineActivationBuffer => "COROUTINE_ACTIVATION_BUFFER",
         }
     }
 }
@@ -273,6 +276,12 @@ impl Runtime {
         let seed_report = heap.gc.begin_mark_only();
 
         let mut root_counts = BTreeMap::new();
+        increment(
+            &mut root_counts,
+            RuntimeRootKind::CoroutineActivationBuffer,
+            heap.native_activations.frames.len(),
+        );
+        heap.native_activations.seed_roots(&mut heap.gc);
         increment(
             &mut root_counts,
             RuntimeRootKind::CollectorExplicitRoot,

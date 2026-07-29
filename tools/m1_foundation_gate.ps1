@@ -488,7 +488,7 @@ $openDebts = @(
     [ordered]@{
         id = "active-proto-and-open-upvalue-owners"
         blocks = "destructive sweep"
-        detail = "Active/debug Proto identities are managed GcRef handles and canonical roots; open Upvalue ownership still contains a raw Stack pointer and requires the coroutine trampoline before StateHandle migration."
+        detail = "Active/debug Proto identities and coroutine activation buffers are canonical roots; the Runtime trampoline is implemented, while open Upvalue ownership still contains a raw Stack pointer awaiting StateHandle migration."
     },
     [ordered]@{
         id = "deterministic-runtime-shutdown"
@@ -520,7 +520,7 @@ $result = [ordered]@{
         "m1-foundation-gate"
     }
     mode = if ($Smoke) { "smoke" } else { "full" }
-    scope = "ByteString, GcRef provenance, managed Proto roots, temporary object-root foundation, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
+    scope = "ByteString, GcRef provenance, managed Proto and coroutine activation roots, temporary object-root foundation, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
     checksPassed = $failures.Count -eq 0
     foundationPassed = (
         $failures.Count -eq 0 -and

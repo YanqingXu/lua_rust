@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "purpose": "Characterize coroutine.resume of a Normal ancestor before the Runtime trampoline is implemented",
+  "purpose": "Lock the project-target behavior of coroutine.resume for a Normal ancestor and verify the Rust Runtime trampoline matches it",
   "classification": "characterization-only",
   "gate": false,
-  "implementationStatus": "pending-lua-rust",
+  "implementationStatus": "matched-lua-rust-cpp-oracle",
   "fixture": "tests/characterization/coroutine-normal-ancestor.lua",
   "stabilityRuns": 3,
   "provenance": {
@@ -58,6 +58,7 @@
   "notes": [
     "The C++ target accepts resuming A while A is Normal, re-enters A, and executes A:after-B twice.",
     "Official Lua 5.1.5 rejects resuming the Normal ancestor and completes in ordinary LIFO order.",
+    "crates/lua_app/tests/coroutine_trampoline.rs locks the Rust process output to the C++ target bytes.",
     "The checker binds both executed binaries to the existing provenance build reports and their SHA-256 values.",
     "This manifest is not part of a compatibility gate and does not approve a deviation."
   ]

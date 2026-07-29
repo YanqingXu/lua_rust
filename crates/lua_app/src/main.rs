@@ -2,7 +2,6 @@
 
 use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::parser::Parser;
-use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
@@ -11,7 +10,6 @@ use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_stdlib::catalog::open_all;
-use lua_vm::execute::call_value;
 use lua_vm::runtime::Runtime;
 use lua_vm::state::LuaState;
 
@@ -193,14 +191,24 @@ fn run_app(args: &[String], options: &AppOptions) -> i32 {
             return 1;
         }
     };
-    let status = match runtime.parts_mut() {
+    let initialized = match runtime.parts_mut() {
         Ok(mut parts) => {
             let (state, gc, string_pool) = parts.split_mut();
-            run_app_with_parts(args, options, state, gc, string_pool)
+            let _ = string_pool;
+            open_all(state, gc);
+            Ok(())
         }
+        Err(err) => Err(err.to_string()),
+    };
+    if let Err(err) = initialized {
+        eprintln!("{err}");
+        return 1;
+    }
+    let status = match run_app_with_runtime(&mut runtime, args, options) {
+        Ok(()) => 0,
         Err(err) => {
             eprintln!("{err}");
-            return 1;
+            1
         }
     };
 
@@ -212,71 +220,48 @@ fn run_app(args: &[String], options: &AppOptions) -> i32 {
     status
 }
 
-fn run_app_with_parts(
+fn run_app_with_runtime(
+    runtime: &mut Runtime,
     args: &[String],
     options: &AppOptions,
-    state: &mut LuaState,
-    gc: &mut GarbageCollector,
-    string_pool: &mut StringPool,
-) -> i32 {
-    open_all(state, gc);
-
-    if let Err(err) = execute_startup_actions(state, gc, string_pool, options) {
-        eprintln!("{err}");
-        return 1;
-    }
+) -> Result<(), String> {
+    execute_startup_actions(runtime, options)?;
 
     if let (Some(script), Some(script_index)) = (&options.script_file, options.script_index) {
-        install_arg_table(state, gc, args, script_index);
-        let script_args = lua_script_args(gc, args, script_index);
+        let script_args = {
+            let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
+            let (state, gc, _) = parts.split_mut();
+            install_arg_table(state, gc, args, script_index);
+            lua_script_args(gc, args, script_index)
+        };
         let result = if script == "-" {
             let mut source = Vec::new();
             if let Err(err) = io::stdin().read_to_end(&mut source) {
                 Err(err.to_string())
             } else {
-                execute_source(
-                    state,
-                    gc,
-                    string_pool,
-                    &source,
-                    "=stdin",
-                    &script_args,
-                    None,
-                )
-                .map(|_| ())
+                execute_source(runtime, &source, "=stdin", &script_args, None).map(|_| ())
             }
         } else {
-            execute_file(state, gc, string_pool, script, &script_args).map(|_| ())
+            execute_file(runtime, script, &script_args).map(|_| ())
         };
-        if let Err(err) = result {
-            eprintln!("{err}");
-            return 1;
-        }
+        result?;
     }
 
     if (options.interactive || (options.mode == RunMode::Repl && options.script_file.is_none()))
-        && let Err(err) = run_quiet_interactive(state, gc, string_pool)
+        && let Err(err) = run_quiet_interactive(runtime)
     {
-        eprintln!("{err}");
-        return 1;
+        return Err(err);
     }
 
-    0
+    Ok(())
 }
 
-fn execute_startup_actions(
-    state: &mut LuaState,
-    gc: &mut GarbageCollector,
-    string_pool: &mut StringPool,
-    options: &AppOptions,
-) -> Result<(), String> {
+fn execute_startup_actions(runtime: &mut Runtime, options: &AppOptions) -> Result<(), String> {
     for action in &options.startup_actions {
         match action.kind {
             StartupActionKind::ExecuteChunk => {
                 execute_source(
-                    state,
-                    gc,
-                    string_pool,
+                    runtime,
                     action.argument.as_bytes(),
                     "=(command line)",
                     &[],
@@ -285,18 +270,10 @@ fn execute_startup_actions(
             }
             StartupActionKind::RequireModule => {
                 if Path::new(&action.argument).exists() {
-                    execute_file(state, gc, string_pool, &action.argument, &[])?;
+                    execute_file(runtime, &action.argument, &[])?;
                 } else {
                     let source = format!("require({})", lua_string_literal(&action.argument));
-                    execute_source(
-                        state,
-                        gc,
-                        string_pool,
-                        source.as_bytes(),
-                        "=(command line)",
-                        &[],
-                        None,
-                    )?;
+                    execute_source(runtime, source.as_bytes(), "=(command line)", &[], None)?;
                 }
             }
         }
@@ -305,49 +282,41 @@ fn execute_startup_actions(
 }
 
 fn execute_file(
-    state: &mut LuaState,
-    gc: &mut GarbageCollector,
-    string_pool: &mut StringPool,
+    runtime: &mut Runtime,
     filename: &str,
     args: &[Value],
 ) -> Result<Vec<Value>, String> {
     let bytes = fs::read(filename).map_err(|err| format!("cannot open {filename}: {err}"))?;
     let chunk_name = format!("@{filename}");
-    execute_source(
-        state,
-        gc,
-        string_pool,
-        &bytes,
-        &chunk_name,
-        args,
-        Some(filename),
-    )
+    execute_source(runtime, &bytes, &chunk_name, args, Some(filename))
 }
 
 fn execute_source(
-    state: &mut LuaState,
-    gc: &mut GarbageCollector,
-    string_pool: &mut StringPool,
+    runtime: &mut Runtime,
     source: &[u8],
     chunk_name: &str,
     args: &[Value],
     script_path: Option<&str>,
 ) -> Result<Vec<Value>, String> {
-    if let Some(path) = script_path {
-        lua_stdlib::package::add_script_directory_to_path(state, gc, &format!("@{path}"));
-    }
-
-    let function_ref = compile_or_load_function(state, gc, string_pool, source, chunk_name)?;
-    call_value(state, gc, Value::Function(function_ref), args, None).map_err(|err| err.to_string())
+    let proto = {
+        let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
+        let (state, gc, string_pool) = parts.split_mut();
+        if let Some(path) = script_path {
+            lua_stdlib::package::add_script_directory_to_path(state, gc, &format!("@{path}"));
+        }
+        compile_or_load_proto(gc, string_pool, source, chunk_name)?
+    };
+    runtime
+        .execute_proto_with_args(proto, args.to_vec())
+        .map_err(|error| error.to_string())
 }
 
-fn compile_or_load_function(
-    state: &mut LuaState,
+fn compile_or_load_proto(
     gc: &mut GarbageCollector,
     string_pool: &mut StringPool,
     source: &[u8],
     chunk_name: &str,
-) -> Result<GcRef<Function>, String> {
+) -> Result<GcRef<Proto>, String> {
     let mut parser = Parser::from_bytes(source);
     let chunk = parser
         .parse()
@@ -356,10 +325,7 @@ fn compile_or_load_function(
     let proto: Proto = CodeGenerator::new_with_pool(gc, string_pool)
         .generate(&chunk, chunk_name)
         .map_err(|err| format!("{chunk_name}:{err}"))?;
-    let proto_ref = gc.create(proto);
-    let mut function = Function::new_lua(proto_ref);
-    function.set_env(state.thread_env.or(state.global_table));
-    Ok(gc.create(function))
+    Ok(gc.create(proto))
 }
 
 fn install_arg_table(
@@ -402,11 +368,7 @@ fn lua_script_args(gc: &mut GarbageCollector, args: &[String], script_index: usi
         .collect()
 }
 
-fn run_quiet_interactive(
-    state: &mut LuaState,
-    gc: &mut GarbageCollector,
-    string_pool: &mut StringPool,
-) -> Result<(), String> {
+fn run_quiet_interactive(runtime: &mut Runtime) -> Result<(), String> {
     let stdin = io::stdin();
     let mut input = String::new();
     let mut buffer = String::new();
@@ -415,9 +377,15 @@ fn run_quiet_interactive(
 
     loop {
         let prompt = if first_line {
-            global_string(state, "_PROMPT").unwrap_or_else(|| "> ".to_string())
+            runtime
+                .main_state()
+                .and_then(|state| global_string(state, "_PROMPT"))
+                .unwrap_or_else(|| "> ".to_string())
         } else {
-            global_string(state, "_PROMPT2").unwrap_or_else(|| ">> ".to_string())
+            runtime
+                .main_state()
+                .and_then(|state| global_string(state, "_PROMPT2"))
+                .unwrap_or_else(|| ">> ".to_string())
         };
         print!("{prompt}");
         io::stdout().flush().map_err(|err| err.to_string())?;
@@ -452,15 +420,7 @@ fn run_quiet_interactive(
             buffer.push_str(&input);
         }
 
-        match execute_source(
-            state,
-            gc,
-            string_pool,
-            buffer.as_bytes(),
-            "=stdin",
-            &[],
-            None,
-        ) {
+        match execute_source(runtime, buffer.as_bytes(), "=stdin", &[], None) {
             Ok(results) => {
                 if expression {
                     print_values(&results);

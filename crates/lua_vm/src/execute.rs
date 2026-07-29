@@ -5,16 +5,21 @@
 //!
 
 use lua_compiler::opcode::{self, OpCode};
-use lua_core::function::{CFunction, Function};
+use lua_core::function::{CFunction, Function, RuntimeNativeFunction};
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
 use lua_core::proto::{Proto, VARARG_NEEDSARG};
 use lua_core::table::Table;
+use lua_core::thread::{CoroutineStatus, Thread};
 use lua_core::upvalue::Upvalue;
 use lua_core::value::Value;
 use std::cmp::Ordering;
 
+use crate::native::{
+    DeferredNativeCall, DeferredVmContinuation, NativeRequestId, NativeRequestPublishError,
+    ResumeEnvelope, ResumeResponse,
+};
 use crate::state::{LUA_MULTRET, LuaState, Stack, ThreadStatus};
 
 /// 执行结果
@@ -22,6 +27,15 @@ use crate::state::{LUA_MULTRET, LuaState, Stack, ThreadStatus};
 pub enum ExecResult {
     Returned,
     Yielded,
+}
+
+/// Reason the VM returned control to its Runtime owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmExit {
+    /// Ordinary Lua return or coroutine yield.
+    Complete(ExecResult),
+    /// A sealed native operation requested a state switch.
+    NativeRequest(NativeRequestId),
 }
 
 /// 最大嵌套调用深度
@@ -45,7 +59,7 @@ pub fn execute_proto(
     l: &mut LuaState,
     proto: GcRef<Proto>,
     gc: &mut GarbageCollector,
-) -> Result<ExecResult, RuntimeError> {
+) -> Result<VmExit, RuntimeError> {
     let entry_ci = l.current_ci;
     let result = execute_proto_inner(l, proto, gc);
     if result.is_err() && entry_ci == 0 && l.current_ci == 0 {
@@ -62,7 +76,7 @@ fn execute_proto_inner(
     l: &mut LuaState,
     proto: GcRef<Proto>,
     gc: &mut GarbageCollector,
-) -> Result<ExecResult, RuntimeError> {
+) -> Result<VmExit, RuntimeError> {
     if l.nccalls > MAX_CALLS {
         return Err(RuntimeError::new(
             "VM: stack overflow (too many nested calls)",
@@ -505,11 +519,14 @@ fn execute_proto_inner(
                                     callee_proto_ref,
                                     gc,
                                 ) {
-                                    Ok(ExecResult::Returned) => {
+                                    Ok(VmExit::Complete(ExecResult::Returned)) => {
                                         // Results already placed by RETURN handler
                                     }
-                                    Ok(ExecResult::Yielded) => {
-                                        return Ok(ExecResult::Yielded);
+                                    Ok(VmExit::Complete(ExecResult::Yielded)) => {
+                                        return Ok(VmExit::Complete(ExecResult::Yielded));
+                                    }
+                                    Ok(VmExit::NativeRequest(id)) => {
+                                        return Ok(VmExit::NativeRequest(id));
                                     }
                                     Err(e) => {
                                         // Restore call frame and propagate error
@@ -526,7 +543,7 @@ fn execute_proto_inner(
                                 continue;
                             }
                             return Err(RuntimeError::new("Lua function has no proto"));
-                        } else if let Some(cfunc) = func_obj.c_function() {
+                        } else if let Some(callable) = native_callable(func_obj) {
                             let func_pos = base_idx + a;
                             let actual_nargs = if b == 0 {
                                 l.top.saturating_sub(func_pos + 1)
@@ -538,16 +555,21 @@ fn execute_proto_inner(
                             } else {
                                 Some(nresults as usize)
                             };
-                            match call_c_function(
+                            match call_native_function(
                                 l,
                                 gc,
                                 func_pos,
                                 actual_nargs,
                                 wanted_results,
-                                cfunc,
+                                callable,
                             ) {
-                                Ok(ExecResult::Yielded) => return Ok(ExecResult::Yielded),
-                                Ok(ExecResult::Returned) => {}
+                                Ok(VmExit::Complete(ExecResult::Yielded)) => {
+                                    return Ok(VmExit::Complete(ExecResult::Yielded));
+                                }
+                                Ok(VmExit::Complete(ExecResult::Returned)) => {}
+                                Ok(VmExit::NativeRequest(id)) => {
+                                    return Ok(VmExit::NativeRequest(id));
+                                }
                                 Err(err) if err.message.starts_with("bad argument") => {
                                     return Err(runtime_error_at(active_proto, pc, err.message));
                                 }
@@ -635,7 +657,7 @@ fn execute_proto_inner(
                     }
                     l.top = ci.func + available;
                     l.pop_call_info();
-                    return Ok(ExecResult::Returned);
+                    return Ok(VmExit::Complete(ExecResult::Returned));
                 }
 
                 if let Value::Function(func_ref) = func {
@@ -692,11 +714,22 @@ fn execute_proto_inner(
                                     continue;
                                 }
                             }
-                        } else if let Some(cfunc) = func_obj.c_function() {
-                            if call_c_function(l, gc, func_pos, actual_nargs, None, cfunc)?
-                                == ExecResult::Yielded
-                            {
-                                return Ok(ExecResult::Yielded);
+                        } else if let Some(callable) = native_callable(func_obj) {
+                            match call_native_function(
+                                l,
+                                gc,
+                                func_pos,
+                                actual_nargs,
+                                None,
+                                callable,
+                            )? {
+                                VmExit::Complete(ExecResult::Yielded) => {
+                                    return Ok(VmExit::Complete(ExecResult::Yielded));
+                                }
+                                VmExit::NativeRequest(id) => {
+                                    return Ok(VmExit::NativeRequest(id));
+                                }
+                                VmExit::Complete(ExecResult::Returned) => {}
                             }
                             let available = l.top.saturating_sub(func_pos);
                             let ci = l.current_call_info().clone();
@@ -726,7 +759,7 @@ fn execute_proto_inner(
                             }
                             l.top = ci.func + wanted;
                             l.pop_call_info();
-                            return Ok(ExecResult::Returned);
+                            return Ok(VmExit::Complete(ExecResult::Returned));
                         }
                     }
                 }
@@ -776,7 +809,7 @@ fn execute_proto_inner(
                 }
                 l.top = ci.func + wanted;
                 l.pop_call_info();
-                return Ok(ExecResult::Returned);
+                return Ok(VmExit::Complete(ExecResult::Returned));
             }
 
             // ── 循环 (3) ─────────────────────────────────────
@@ -879,7 +912,7 @@ fn execute_proto_inner(
                     Value::Function(func_ref) => {
                         // SAFETY: iterator function is kept alive by the stack.
                         if let Some(func_obj) = unsafe { func_ref.as_ref() } {
-                            if let Some(cfunc) = func_obj.c_function() {
+                            if let Some(callable) = native_callable(func_obj) {
                                 let call_pos = base_idx + a + 3;
                                 ensure_stack_slot(l, call_pos + 2);
                                 if let Some(dst) = l.stack.at_mut(call_pos) {
@@ -891,10 +924,25 @@ fn execute_proto_inner(
                                 if let Some(dst) = l.stack.at_mut(call_pos + 2) {
                                     *dst = control;
                                 }
-                                if call_c_function(l, gc, call_pos, 2, Some(c), cfunc)?
-                                    == ExecResult::Yielded
-                                {
-                                    return Ok(ExecResult::Yielded);
+                                match call_native_function(l, gc, call_pos, 2, Some(c), callable)? {
+                                    VmExit::Complete(ExecResult::Yielded) => {
+                                        return Ok(VmExit::Complete(ExecResult::Yielded));
+                                    }
+                                    VmExit::NativeRequest(id) => {
+                                        if !l.set_native_request_continuation(
+                                            id,
+                                            DeferredVmContinuation::GenericFor {
+                                                base: base_idx,
+                                                register: a,
+                                            },
+                                        ) {
+                                            return Err(RuntimeError::new(
+                                                "VM: failed to attach generic-for continuation",
+                                            ));
+                                        }
+                                        return Ok(VmExit::NativeRequest(id));
+                                    }
+                                    VmExit::Complete(ExecResult::Returned) => {}
                                 }
                             } else if let Some(iter_proto_ref) = func_obj.proto() {
                                 let iter_proto_ptr = gc
@@ -936,8 +984,13 @@ fn execute_proto_inner(
                                     iter_proto_ref,
                                     gc,
                                 ) {
-                                    Ok(ExecResult::Returned) => {}
-                                    Ok(ExecResult::Yielded) => return Ok(ExecResult::Yielded),
+                                    Ok(VmExit::Complete(ExecResult::Returned)) => {}
+                                    Ok(VmExit::Complete(ExecResult::Yielded)) => {
+                                        return Ok(VmExit::Complete(ExecResult::Yielded));
+                                    }
+                                    Ok(VmExit::NativeRequest(id)) => {
+                                        return Ok(VmExit::NativeRequest(id));
+                                    }
                                     Err(e) => {
                                         unwind_lua_frames_to(l, saved_ci);
                                         return Err(e);
@@ -1108,7 +1161,7 @@ fn execute_proto_inner(
     }
 
     l.pop_call_info();
-    Ok(ExecResult::Returned)
+    Ok(VmExit::Complete(ExecResult::Returned))
 }
 
 fn run_debug_instruction_hooks(
@@ -1316,7 +1369,7 @@ fn execute_nested_proto_at(
     caller_pc: usize,
     callee_proto: GcRef<Proto>,
     gc: &mut GarbageCollector,
-) -> Result<ExecResult, RuntimeError> {
+) -> Result<VmExit, RuntimeError> {
     let caller_proto_ptr = gc.validate_ref(caller_proto).map_err(invalid_proto_error)?;
     // SAFETY: validated above; destructive sweep is disabled throughout VM
     // execution.
@@ -1330,7 +1383,7 @@ fn execute_counted_proto(
     proto: GcRef<Proto>,
     gc: &mut GarbageCollector,
     overflow: RuntimeError,
-) -> Result<ExecResult, RuntimeError> {
+) -> Result<VmExit, RuntimeError> {
     if l.nccalls >= MAX_CALLS {
         return Err(overflow);
     }
@@ -1433,12 +1486,12 @@ pub fn start_lua_call_at_stack(
 pub fn resume_lua_thread(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-) -> Result<ExecResult, RuntimeError> {
+) -> Result<VmExit, RuntimeError> {
     l.gc = Some(gc as *mut GarbageCollector);
 
     loop {
         if l.current_ci == 0 {
-            return Ok(ExecResult::Returned);
+            return Ok(VmExit::Complete(ExecResult::Returned));
         }
 
         let proto_ref = l
@@ -1457,12 +1510,15 @@ pub fn resume_lua_thread(
             }
         };
         match result {
-            ExecResult::Yielded => return Ok(ExecResult::Yielded),
-            ExecResult::Returned => {
+            VmExit::Complete(ExecResult::Yielded) => {
+                return Ok(VmExit::Complete(ExecResult::Yielded));
+            }
+            VmExit::Complete(ExecResult::Returned) => {
                 if l.current_ci == 0 {
-                    return Ok(ExecResult::Returned);
+                    return Ok(VmExit::Complete(ExecResult::Returned));
                 }
             }
+            VmExit::NativeRequest(id) => return Ok(VmExit::NativeRequest(id)),
         }
     }
 }
@@ -1487,9 +1543,20 @@ fn call_value_at_stack(
         return Err(RuntimeError::new("attempt to call an invalid function"));
     };
 
-    if let Some(cfunc) = func_obj.c_function() {
-        if call_c_function(l, gc, func_pos, nargs, wanted_results, cfunc)? == ExecResult::Yielded {
-            return Err(RuntimeError::new("cannot yield across pcall"));
+    if let Some(callable) = native_callable(func_obj) {
+        match call_native_function(l, gc, func_pos, nargs, wanted_results, callable)? {
+            VmExit::Complete(ExecResult::Returned) => {}
+            VmExit::Complete(ExecResult::Yielded) => {
+                return Err(RuntimeError::new("cannot yield across pcall"));
+            }
+            VmExit::NativeRequest(id) => {
+                if !l.retarget_native_request_to_protected_resume(id) {
+                    return Err(RuntimeError::new(
+                        "VM: failed to retarget protected Runtime-native request",
+                    ));
+                }
+                return Err(RuntimeError::native_request_suspend());
+            }
         }
         return Ok(());
     }
@@ -1519,10 +1586,15 @@ fn call_value_at_stack(
     ci.tailcalls = 0;
 
     match execute_counted_proto(l, callee_proto_ref, gc, RuntimeError::new("stack overflow")) {
-        Ok(ExecResult::Returned) => {}
-        Ok(ExecResult::Yielded) => {
+        Ok(VmExit::Complete(ExecResult::Returned)) => {}
+        Ok(VmExit::Complete(ExecResult::Yielded)) => {
             unwind_lua_frames_to(l, saved_ci);
             return Err(RuntimeError::new("cannot yield across pcall"));
+        }
+        Ok(VmExit::NativeRequest(_)) => {
+            return Err(RuntimeError::new(
+                "runtime-native request cannot cross a protected helper boundary yet",
+            ));
         }
         Err(e) => {
             unwind_lua_frames_to(l, saved_ci);
@@ -2009,16 +2081,47 @@ fn install_arg_table(l: &mut LuaState, gc: &mut GarbageCollector, slot: usize, v
     }
 }
 
-fn call_c_function(
+#[derive(Clone, Copy)]
+enum NativeCallable {
+    C(CFunction),
+    Runtime(RuntimeNativeFunction),
+}
+
+#[derive(Clone, Copy)]
+struct NativeCallFrame {
+    func_pos: usize,
+    nargs: usize,
+    wanted_results: Option<usize>,
+    saved_ci: usize,
+    saved_top: usize,
+}
+
+fn native_callable(function: &Function) -> Option<NativeCallable> {
+    function
+        .runtime_native_function()
+        .map(NativeCallable::Runtime)
+        .or_else(|| function.c_function().map(NativeCallable::C))
+}
+
+fn call_native_function(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     func_pos: usize,
     nargs: usize,
     wanted_results: Option<usize>,
-    cfunc: CFunction,
-) -> Result<ExecResult, RuntimeError> {
+    callable: NativeCallable,
+) -> Result<VmExit, RuntimeError> {
     let saved_ci = l.current_ci;
     let saved_top = l.top;
+    let caller_proto = l.current_call_info().proto;
+    let caller_pc = l.current_call_info().savedpc;
+    let frame = NativeCallFrame {
+        func_pos,
+        nargs,
+        wanted_results,
+        saved_ci,
+        saved_top,
+    };
     let ci_top = {
         let ci = l.push_call_info();
         ci.func = func_pos;
@@ -2043,18 +2146,63 @@ fn call_c_function(
         return Err(e);
     }
 
-    let l_ptr = l as *mut LuaState as *mut std::ffi::c_void;
-    // SAFETY: l_ptr points to the currently executing LuaState.
-    let nret = unsafe { cfunc(l_ptr) };
+    let nret = match callable {
+        NativeCallable::C(cfunc) => {
+            let l_ptr = l as *mut LuaState as *mut std::ffi::c_void;
+            // SAFETY: l_ptr points to the currently executing LuaState and the
+            // ordinary C ABI owns no Runtime state-switch capability.
+            unsafe { cfunc(l_ptr) }
+        }
+        NativeCallable::Runtime(operation) => invoke_runtime_native(l, gc, operation),
+    };
+
+    if let Some(request_id) = l.pending_native_request_id() {
+        let deferred = DeferredNativeCall {
+            request_id,
+            func_pos,
+            nargs,
+            wanted_results,
+            saved_ci,
+            saved_top,
+            caller_proto,
+            caller_pc,
+            continuation: DeferredVmContinuation::Call,
+            snapshot: crate::native::StateContinuationSnapshot::capture(l),
+        };
+        if !l.seal_native_request(request_id, deferred) {
+            unwind_lua_frames_to(l, saved_ci);
+            l.top = saved_top;
+            return Err(RuntimeError::new(
+                "VM: failed to seal Runtime-native request",
+            ));
+        }
+        return Ok(VmExit::NativeRequest(request_id));
+    }
 
     if l.status == ThreadStatus::Yield {
         l.yield_result_base = Some(func_pos);
         l.yield_wanted_results = wanted_results;
         l.pop_call_info();
         l.top = func_pos;
-        return Ok(ExecResult::Yielded);
+        return Ok(VmExit::Complete(ExecResult::Yielded));
     }
 
+    finish_native_call(l, gc, frame, nret)
+}
+
+fn finish_native_call(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    frame: NativeCallFrame,
+    nret: i32,
+) -> Result<VmExit, RuntimeError> {
+    let NativeCallFrame {
+        func_pos,
+        nargs,
+        wanted_results,
+        saved_ci,
+        saved_top,
+    } = frame;
     if nret < 0 {
         let initial_top = func_pos + 1 + nargs;
         let error_value = if l.top > initial_top {
@@ -2065,15 +2213,13 @@ fn call_c_function(
         } else {
             None
         };
+        let display_name = c_function_display_name(l, func_pos);
         unwind_lua_frames_to(l, saved_ci);
         l.top = saved_top;
         return Err(error_value
             .map(RuntimeError::with_value)
             .unwrap_or_else(|| {
-                RuntimeError::new(format!(
-                    "C function call failed: {}",
-                    c_function_display_name(l, func_pos)
-                ))
+                RuntimeError::new(format!("C function call failed: {display_name}"))
             }));
     }
 
@@ -2100,7 +2246,304 @@ fn call_c_function(
     }
     l.pop_call_info();
     l.top = func_pos + wanted_count;
-    Ok(ExecResult::Returned)
+    Ok(VmExit::Complete(ExecResult::Returned))
+}
+
+pub(crate) fn finish_deferred_native_call(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+    envelope: ResumeEnvelope,
+    response: ResumeResponse,
+) -> Result<(), RuntimeError> {
+    validate_deferred_native_call(l, deferred)?;
+
+    l.top = deferred.func_pos + 1 + deferred.nargs;
+    let nret = match (envelope, response) {
+        (ResumeEnvelope::Resume, ResumeResponse::Success(values)) => {
+            l.push_boolean(true);
+            let count = values.len() + 1;
+            for value in values {
+                l.push_value(value);
+            }
+            count as i32
+        }
+        (ResumeEnvelope::Resume, ResumeResponse::Error(error)) => {
+            l.push_boolean(false);
+            l.push_value(error);
+            2
+        }
+        (ResumeEnvelope::Wrap, ResumeResponse::Success(values)) => {
+            let count = values.len();
+            for value in values {
+                l.push_value(value);
+            }
+            count as i32
+        }
+        (ResumeEnvelope::Wrap, ResumeResponse::Error(error)) => {
+            l.push_value(error);
+            -1
+        }
+        (ResumeEnvelope::ProtectedResume, ResumeResponse::Success(values)) => {
+            l.push_boolean(true);
+            l.push_boolean(true);
+            let count = values.len() + 2;
+            for value in values {
+                l.push_value(value);
+            }
+            count as i32
+        }
+        (ResumeEnvelope::ProtectedResume, ResumeResponse::Error(error)) => {
+            l.push_boolean(true);
+            l.push_boolean(false);
+            l.push_value(error);
+            3
+        }
+        (ResumeEnvelope::ProtectedWrap, ResumeResponse::Success(values)) => {
+            l.push_boolean(true);
+            let count = values.len() + 1;
+            for value in values {
+                l.push_value(value);
+            }
+            count as i32
+        }
+        (ResumeEnvelope::ProtectedWrap, ResumeResponse::Error(error)) => {
+            l.push_boolean(false);
+            l.push_value(error);
+            2
+        }
+    };
+
+    let frame = NativeCallFrame {
+        func_pos: deferred.func_pos,
+        nargs: deferred.nargs,
+        wanted_results: deferred.wanted_results,
+        saved_ci: deferred.saved_ci,
+        saved_top: deferred.saved_top,
+    };
+    match finish_native_call(l, gc, frame, nret)? {
+        VmExit::Complete(ExecResult::Returned) => {
+            apply_deferred_vm_continuation(l, deferred)?;
+            Ok(())
+        }
+        VmExit::Complete(ExecResult::Yielded) | VmExit::NativeRequest(_) => Err(RuntimeError::new(
+            "VM: deferred native completion produced a second suspension",
+        )),
+    }
+}
+
+pub(crate) fn finish_deferred_native_values(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+    values: Vec<Value>,
+) -> Result<(), RuntimeError> {
+    validate_deferred_native_call(l, deferred)?;
+    l.top = deferred.func_pos + 1 + deferred.nargs;
+    let count = values.len();
+    for value in values {
+        l.push_value(value);
+    }
+    let frame = NativeCallFrame {
+        func_pos: deferred.func_pos,
+        nargs: deferred.nargs,
+        wanted_results: deferred.wanted_results,
+        saved_ci: deferred.saved_ci,
+        saved_top: deferred.saved_top,
+    };
+    match finish_native_call(l, gc, frame, count as i32)? {
+        VmExit::Complete(ExecResult::Returned) => {
+            apply_deferred_vm_continuation(l, deferred)?;
+            Ok(())
+        }
+        VmExit::Complete(ExecResult::Yielded) | VmExit::NativeRequest(_) => Err(RuntimeError::new(
+            "VM: raw deferred completion produced a second suspension",
+        )),
+    }
+}
+
+pub(crate) fn resume_after_deferred_native_call(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+) -> Result<VmExit, RuntimeError> {
+    l.status = ThreadStatus::Yield;
+    if deferred.saved_ci == 0 {
+        let proto = deferred
+            .caller_proto
+            .ok_or_else(|| RuntimeError::new("VM: deferred root call lost its Proto"))?;
+        execute_proto(l, proto, gc)
+    } else {
+        resume_lua_thread(l, gc)
+    }
+}
+
+fn validate_deferred_native_call(
+    l: &LuaState,
+    deferred: &DeferredNativeCall,
+) -> Result<(), RuntimeError> {
+    if l.current_ci != deferred.saved_ci + 1 {
+        return Err(RuntimeError::new(
+            "VM: deferred native call frame depth changed before delivery",
+        ));
+    }
+    let ci = l.current_call_info();
+    if ci.func != deferred.func_pos
+        || ci.nargs != deferred.nargs as i32
+        || ci.proto.is_some()
+        || deferred.caller_proto != l.call_stack[deferred.saved_ci].proto
+        || deferred.caller_pc != l.call_stack[deferred.saved_ci].savedpc
+    {
+        return Err(RuntimeError::new(
+            "VM: deferred native call continuation no longer matches",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_deferred_vm_continuation(
+    l: &mut LuaState,
+    deferred: &DeferredNativeCall,
+) -> Result<(), RuntimeError> {
+    match deferred.continuation {
+        DeferredVmContinuation::Call => Ok(()),
+        DeferredVmContinuation::GenericFor { base, register } => {
+            let first_result = l
+                .stack
+                .at(base + register + 3)
+                .cloned()
+                .unwrap_or(Value::Nil);
+            if first_result.is_nil() {
+                let caller = l.call_stack.get_mut(deferred.saved_ci).ok_or_else(|| {
+                    RuntimeError::new("VM: generic-for continuation lost caller frame")
+                })?;
+                caller.savedpc = deferred.caller_pc.and_then(|pc| pc.checked_add(1));
+            } else if let Some(destination) = l.stack.at_mut(base + register + 2) {
+                *destination = first_result;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn invoke_runtime_native(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    operation: RuntimeNativeFunction,
+) -> i32 {
+    let (thread_ref, args, envelope) = match operation {
+        RuntimeNativeFunction::CoroutineResume => {
+            let Value::Thread(thread_ref) = l.at(1).cloned().unwrap_or(Value::Nil) else {
+                return publish_runtime_native_error(
+                    l,
+                    gc,
+                    ResumeEnvelope::Resume,
+                    b"bad argument #1 to 'resume' (coroutine expected)",
+                );
+            };
+            (thread_ref, native_args_from(l, 2), ResumeEnvelope::Resume)
+        }
+        RuntimeNativeFunction::CoroutineWrapRunner => {
+            let Some(Value::Thread(thread_ref)) = current_native_upvalue(l, 0) else {
+                return publish_runtime_native_error(
+                    l,
+                    gc,
+                    ResumeEnvelope::Wrap,
+                    b"coroutine wrapper is missing its thread",
+                );
+            };
+            (thread_ref, native_args_from(l, 1), ResumeEnvelope::Wrap)
+        }
+    };
+
+    let (status, target) = match gc.with_ref(thread_ref, |thread: &Thread| {
+        (thread.status(), thread.state_handle())
+    }) {
+        Ok((status, Some(target))) => (status, target),
+        _ => {
+            return publish_runtime_native_error(l, gc, envelope, b"invalid coroutine");
+        }
+    };
+    let status_error = match status {
+        CoroutineStatus::Dead => Some(b"cannot resume dead coroutine".as_slice()),
+        CoroutineStatus::Running => Some(b"cannot resume running coroutine".as_slice()),
+        CoroutineStatus::Suspended | CoroutineStatus::Normal => None,
+    };
+    if let Some(message) = status_error {
+        return publish_runtime_native_error(l, gc, envelope, message);
+    }
+
+    match l.publish_resume_request(thread_ref, target, args, envelope) {
+        Ok(_) => 0,
+        Err(error) => {
+            let message = match error {
+                NativeRequestPublishError::ScopeUnavailable => {
+                    b"runtime-native dispatcher unavailable".as_slice()
+                }
+                NativeRequestPublishError::MailboxOccupied => {
+                    b"runtime-native mailbox already occupied".as_slice()
+                }
+                NativeRequestPublishError::IdExhausted => {
+                    b"runtime-native request id exhausted".as_slice()
+                }
+            };
+            publish_runtime_native_error(l, gc, envelope, message)
+        }
+    }
+}
+
+fn publish_runtime_native_error(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    envelope: ResumeEnvelope,
+    message: &[u8],
+) -> i32 {
+    let error = Value::String(gc.create(GcString::from_bytes(message)));
+    match envelope {
+        ResumeEnvelope::Resume => {
+            l.push_boolean(false);
+            l.push_value(error);
+            2
+        }
+        ResumeEnvelope::Wrap => {
+            l.push_value(error);
+            -1
+        }
+        ResumeEnvelope::ProtectedResume => {
+            l.push_boolean(true);
+            l.push_boolean(false);
+            l.push_value(error);
+            3
+        }
+        ResumeEnvelope::ProtectedWrap => {
+            l.push_boolean(false);
+            l.push_value(error);
+            2
+        }
+    }
+}
+
+fn native_args_from(l: &LuaState, first: i32) -> Vec<Value> {
+    let top = l.get_top();
+    if top < first {
+        return Vec::new();
+    }
+    (first..=top)
+        .map(|index| l.at(index).cloned().unwrap_or(Value::Nil))
+        .collect()
+}
+
+fn current_native_upvalue(l: &LuaState, index: usize) -> Option<Value> {
+    let func_idx = l.current_call_info().func;
+    let Value::Function(func_ref) = l.stack.at(func_idx).cloned()? else {
+        return None;
+    };
+    // SAFETY: the current native frame's function slot keeps the closure live.
+    let function = unsafe { func_ref.as_ref() }?;
+    let upvalue_ref = function.upvalue(index)?;
+    // SAFETY: the closure owns this upvalue and destructive sweep is disabled.
+    let upvalue = unsafe { upvalue_ref.as_ref() }?;
+    Some(upvalue.get_closed_value().clone())
 }
 
 /// 获取 RK 操作数——寄存器或常量
@@ -2904,6 +3347,7 @@ fn value_to_string(val: &Value) -> String {
 pub struct RuntimeError {
     pub message: String,
     error_value: Option<Value>,
+    native_request_suspend: bool,
 }
 
 fn invalid_proto_error(error: lua_core::gc::collector::GcRefValidationError) -> RuntimeError {
@@ -2915,6 +3359,7 @@ impl RuntimeError {
         Self {
             message: msg.into(),
             error_value: None,
+            native_request_suspend: false,
         }
     }
 
@@ -2922,11 +3367,24 @@ impl RuntimeError {
         Self {
             message: value_to_string(&value),
             error_value: Some(value),
+            native_request_suspend: false,
         }
     }
 
     pub fn error_value(&self) -> Option<Value> {
         self.error_value.clone()
+    }
+
+    fn native_request_suspend() -> Self {
+        Self {
+            message: "Runtime-native request suspended protected helper".to_string(),
+            error_value: None,
+            native_request_suspend: true,
+        }
+    }
+
+    pub fn is_native_request_suspend(&self) -> bool {
+        self.native_request_suspend
     }
 }
 
@@ -3076,7 +3534,7 @@ mod proto_handle_tests {
         );
         assert!(matches!(
             execute_proto(&mut returned, return_proto, &mut gc),
-            Ok(ExecResult::Returned)
+            Ok(VmExit::Complete(ExecResult::Returned))
         ));
         assert_eq!(returned.current_ci, 0);
         assert!(

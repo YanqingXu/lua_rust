@@ -634,6 +634,9 @@ unsafe extern "C" fn lua_b_pcall_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
             1 + result_count as i32
         }
         Err(err) => {
+            if err.is_native_request_suspend() {
+                return 0;
+            }
             l.push_value(Value::Boolean(false));
             push_runtime_error_value(l, &err);
             2

@@ -3,12 +3,11 @@ use lua_compiler::parser::Parser;
 use lua_core::value::Value;
 use lua_stdlib::catalog::open_all;
 use lua_vm::Runtime;
-use lua_vm::execute::execute_proto;
 use std::path::{Path, PathBuf};
 
 fn compile_and_run(source: &str) -> (Runtime, ()) {
     let mut runtime = Runtime::new();
-    {
+    let proto = {
         let mut parts = runtime.parts_mut().expect("runtime parts are available");
         let (state, gc, _) = parts.split_mut();
         open_all(state, gc);
@@ -19,10 +18,11 @@ fn compile_and_run(source: &str) -> (Runtime, ()) {
         let proto = cg
             .generate(&chunk, "<stdlib-test>")
             .expect("codegen should succeed");
-        let proto = gc.create(proto);
-
-        execute_proto(state, proto, gc).expect("VM should execute");
-    }
+        gc.create(proto)
+    };
+    runtime
+        .execute_proto(proto)
+        .expect("Runtime trampoline should execute");
     (runtime, ())
 }
 
