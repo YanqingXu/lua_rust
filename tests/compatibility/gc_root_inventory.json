@@ -3,7 +3,7 @@
   "description": "Fail-closed inventory of every runtime or collector root required before lua_rust may sweep a live VM.",
   "provenance_audit": {
     "implemented": "GcRef carries a process-global non-reused ObjectId; each collector validates address, ObjectId, and concrete tag in an authoritative live table. LightUserdata is a separate arbitrary-pointer type, and collector explicit roots retain erased pointer + ObjectId + tag handles.",
-    "remaining_sweep_blocker": "Runtime now owns one Heap that couples collector accounting and the canonical StringPool by HeapId; LuaState has no GC/StringPool backpointer, and the canonical Runtime tracer seeds fixed strings, pending finalizers, temporary publication roots, state roots, and runtime service roots. Broader transitional non-string GcRef::as_ref call sites, incomplete mutation barriers/weak-finalizer semantics, and the lack of a Runtime-only destructive collector entry point still keep live sweep disabled. Current compiler, library/package, IO, VM/app, and result-construction publication slices are transactional, but allocation-triggered collection remains intentionally off until those separate blockers close."
+    "remaining_sweep_blocker": "Runtime now owns one Heap and an internal owner-thread/Running/no-active-execution stop-the-world entry consumes the canonical tracer, pre-closes unreachable coroutine states, invalidates their handles, and sweeps strong object graphs with real object/byte accounting. The entry fails closed on every trace rejection/gap and explicitly refuses active weak tables or pending/new finalizers. Broader transitional non-string GcRef::as_ref call sites, mutation barriers, complete weak/finalizer/resurrection semantics, Lua-visible collectgarbage integration, and allocation-triggered/incremental collection remain disabled."
   },
   "status_values": [
     "implemented",
@@ -35,7 +35,7 @@
         "current": "RuntimeRootTracer calls begin_mark_only, which validates every root's address, ObjectId, and tag against the collector live table before header access, then labels seeded and rejected collector roots without dereference.",
         "target": "RuntimeRootTracer seeds validated collector roots and labels them with RootKind."
       },
-      "missing_risk": "Unique Heap lifetime and address-reuse provenance are closed, but persistent explicit-root storage still lacks lexical RootToken generations and destructive collection is not yet wired to the canonical Runtime tracer.",
+      "missing_risk": "Unique Heap lifetime, address-reuse provenance, and internal STW tracer integration are closed, but persistent explicit-root storage still lacks lexical RootToken generations; Lua-visible and allocation-triggered collection remain gated.",
       "planned_test": {
         "name": "mark_only_seed_rejects_unregistered_explicit_root_without_dereference; address_reuse_injection_rejects_old_object_id_at_same_pointer",
         "layer": "lua_core GC integration",
@@ -65,7 +65,7 @@
         "current": "Runtime::trace_roots_mark_only marks both the Runtime global root and every reachable state's global_table.",
         "target": "RuntimeRootTracer always traces GlobalRoots::global_table."
       },
-      "missing_risk": "The handles still lack heap generation validation and destructive/full/incremental collection is not wired to this mark-only tracer.",
+      "missing_risk": "The handles still lack heap generation validation. The internal strong-graph STW cycle consumes this tracer, while public, weak/finalizer, and incremental collection remain gated.",
       "planned_test": {
         "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
         "layer": "lua_vm runtime_gc_roots",
@@ -95,7 +95,7 @@
         "current": "The Runtime state snapshot marks thread_env and chunk_env for every StateHandle reached through the two-queue traversal.",
         "target": "StateTracer marks both environments for every reachable state."
       },
-      "missing_risk": "Direct assignments still lack provenance checks/root barriers and destructive collection is intentionally disconnected.",
+      "missing_risk": "Direct assignments still lack provenance checks/root barriers. Internal STW collection runs only outside execution; allocation-triggered and incremental collection remain disconnected.",
       "planned_test": {
         "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
         "layer": "lua_vm runtime_gc_roots",
@@ -125,7 +125,7 @@
         "current": "The mark-only tracer seeds Runtime::registry_root and scans registry handles in every reachable state.",
         "target": "RuntimeRootTracer marks GlobalRoots::registry in every collection."
       },
-      "missing_risk": "debug.getregistry does not yet return the Runtime table and no destructive collection consumes the tracer.",
+      "missing_risk": "debug.getregistry does not yet return the Runtime table. Internal STW consumes the tracer, but the Lua-visible collector remains gated.",
       "planned_test": {
         "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
         "layer": "lua_vm runtime_gc_roots",
@@ -155,7 +155,7 @@
         "current": "The mark-only state snapshot marks every installed nil, boolean, and number metatable.",
         "target": "RuntimeRootTracer marks every installed primitive metatable."
       },
-      "missing_risk": "Only three primitive types have slots, assignments lack barriers, and destructive collection is not wired to the snapshot.",
+      "missing_risk": "Only three primitive types have slots and assignments lack barriers. The internal STW cycle consumes the snapshot; public/incremental collection remains gated.",
       "planned_test": {
         "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
         "layer": "lua_vm runtime_gc_roots",
@@ -245,7 +245,7 @@
         "current": "The mark-only state snapshot scans exactly 0..LuaState::top and reports top/Stack inconsistencies without reading past initialized values.",
         "target": "StateTracer marks the complete active window and nils retired slots."
       },
-      "missing_risk": "Retired slots are excluded but not yet nilled; publication barriers and destructive collector integration remain absent.",
+      "missing_risk": "Retired slots are excluded but not yet nilled and publication barriers remain absent. Internal STW consumes the active window only at a no-execution safe point.",
       "planned_test": {
         "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
         "layer": "lua_vm runtime_gc_roots",
@@ -305,7 +305,7 @@
         "current": "The mark-only snapshot scans function slots only for CallInfo records through current_ci and reports out-of-bounds slots.",
         "target": "StateTracer marks every active frame function slot exactly once."
       },
-      "missing_risk": "CallInfo still stores an unvalidated integer slot and destructive collection is not wired to the snapshot.",
+      "missing_risk": "CallInfo still stores an integer slot; the internal STW cycle rejects an out-of-bounds slot before sweep, but a typed frame-slot representation remains open.",
       "planned_test": {
         "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
         "layer": "lua_vm runtime_gc_roots",
@@ -335,7 +335,7 @@
         "current": "The mark-only state snapshot marks each active CallInfo Proto handle directly, including pseudo-frames with no Function stack slot; stale or foreign handles are rejected by collector provenance checks.",
         "target": "The same canonical StateTracer feeds destructive collection at a proven safe point."
       },
-      "missing_risk": "VM execution validates the handle before dereference but still uses a scoped unsafe borrow under the explicit no-destructive-sweep execution invariant; the canonical tracer is not yet wired to collection.",
+      "missing_risk": "VM execution validates the handle before a scoped unsafe borrow. Internal STW now consumes the canonical tracer only with zero active executions, while allocation-triggered and incremental collection remain disabled.",
       "planned_test": {
         "name": "active_call_info_proto_is_rooted_without_a_function_slot",
         "layer": "lua_vm runtime_gc_roots",
@@ -365,7 +365,7 @@
         "current": "The mark-only snapshot scans varargs only for active CallInfo records through current_ci.",
         "target": "StateTracer scans only active frame varargs."
       },
-      "missing_risk": "Inactive CallInfo reset/clearing and destructive collector integration remain incomplete.",
+      "missing_risk": "Inactive CallInfo reset/clearing remains incomplete. Internal STW tracer integration is implemented and rejects inconsistent active frames.",
       "planned_test": {
         "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
         "layer": "lua_vm runtime_gc_roots",
@@ -395,7 +395,7 @@
         "current": "State snapshots validate and mark every open Upvalue; propagation from a reachable open Upvalue enqueues its owner StateHandle, whose active stack window retains the indexed value.",
         "target": "StateTracer marks the list and its owner slots; state close converts every node before arena removal."
       },
-      "missing_risk": "This root path is implemented and Runtime drain closes each validated Upvalue before owner generation advance or retirement. Live destructive collection remains blocked by other inventory gaps, publication migration, and write-barrier/finalizer work.",
+      "missing_risk": "This root path is implemented. Runtime internal STW and shutdown both close each unreachable state's validated Upvalues before owner generation advance or retirement; public weak/finalizer and incremental work remains.",
       "planned_test": {
         "name": "reachable_open_upvalue_enqueues_its_owner_state_without_a_thread_edge",
         "layer": "lua_vm runtime_gc_roots",
@@ -485,7 +485,7 @@
         "current": "The mark-only state snapshot marks debug_hook_skip_proto directly; debug inspection validates Proto handles against the owning collector before dereference.",
         "target": "The canonical StateTracer feeds destructive collection at a proven safe point."
       },
-      "missing_risk": "Destructive collection remains disabled during debug callbacks, and debug Proto reads still use validated transitional unsafe borrows rather than a scoped Heap/VmContext API.",
+      "missing_risk": "Collection remains disabled during debug callbacks. Internal STW runs only with zero active executions and consumes this root; debug Proto reads still use validated transitional unsafe borrows rather than a scoped Heap/VmContext API.",
       "planned_test": {
         "name": "debug_line_skip_is_one_shot_and_matches_full_object_identity",
         "layer": "lua_vm execute",
@@ -515,7 +515,7 @@
         "current": "The mark-only snapshot marks all yielded_values for every reachable state.",
         "target": "StateTracer marks yielded values for every reachable suspended state."
       },
-      "missing_risk": "Mutation barriers and destructive collector integration are still missing.",
+      "missing_risk": "Mutation barriers remain missing. Internal STW consumes this root only outside execution; allocation-triggered and incremental integration remain gated.",
       "planned_test": {
         "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
         "layer": "lua_vm runtime_gc_roots",
@@ -545,7 +545,7 @@
         "current": "The mark-only snapshot marks last_error for every reachable state.",
         "target": "StateTracer marks the error until it is explicitly cleared."
       },
-      "missing_risk": "Assignment/clear barriers and destructive collector integration are still missing.",
+      "missing_risk": "Assignment/clear barriers remain missing. Internal STW consumes this root only outside execution; public and incremental integration remain gated.",
       "planned_test": {
         "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
         "layer": "lua_vm runtime_gc_roots",
@@ -665,7 +665,7 @@
         "current": "GarbageCollector::begin_mark_only validates and seeds active temporary object roots, with separate seeded/rejected counts.",
         "target": "RuntimeRootTracer seeds every active temporary-root scope."
       },
-      "missing_risk": "The current compiler, coroutine, library/package, IO, VM/app, result-construction, production string identity/access, unique Heap, fixed-string, and finalizer-root slices are migrated. The M1 gate rejects direct production gc.create and standalone production GC/StringPool construction. Allocation-triggered collection remains disabled because broader non-string object access still has transitional escape hatches and the destructive collector is not wired to the Runtime tracer.",
+      "missing_risk": "The compiler, coroutine, library/package, IO, VM/app, result-construction, string identity/access, unique Heap, fixed-string, and finalizer-root slices are migrated. Internal STW consumes these roots, but allocation-triggered collection remains disabled because broader non-string object access and mutation paths still have transitional escape hatches.",
       "planned_test": {
         "name": "compiler_proto_tree_publishes_atomically_into_a_lua_function; open_all_publishes_every_library_graph_from_the_global_root; standard_file_graph_is_reachable_from_global_and_fully_collectable; result_slice_foreign_failure_and_panic_cleanup_exact_roots; protected_call_results_are_published_before_stack_window_restores; script_argument_table_and_varargs_survive_runtime_publication_handoff",
         "layer": "lua_core/lua_stdlib/lua_vm publication and runtime root tracing",
@@ -700,7 +700,7 @@
         "current": "RuntimeRootTracer snapshots validated temporary StateHandles independently from ordinary arena membership and object-publication roots, labels them TEMPORARY_STATE_ROOTS, and feeds them into the state/object fixed-point queues.",
         "target": "RuntimeRootTracer seeds validated temporary StateHandles independently from temporary GC-object roots."
       },
-      "missing_risk": "This root kind is locally complete for coroutine create/wrap, and the production object-publication, string identity/access, unique Heap, fixed-string, and finalizer-root slices are migrated. Live sweep remains blocked by broader non-string scoped object access and a Runtime-only destructive collector entry point.",
+      "missing_risk": "This root kind is locally complete for coroutine create/wrap. Internal STW consumes the canonical tracer and pre-sweeps only untraced owned states; allocation-triggered and incremental collection remain blocked by broader scoped object access and mutation contracts.",
       "planned_test": {
         "name": "pending_state_rolls_back_or_publishes_atomically",
         "layer": "lua_vm runtime_ownership",
@@ -730,7 +730,7 @@
         "current": "RuntimeRootTracer invokes NativeActivationStack::seed_roots and labels the provider. It marks request arguments, Thread handles, caller Proto, saved stack/call-frame values, yielded/error values, and pending responses at every state-turn boundary before the next state is borrowed.",
         "target": "RuntimeRootTracer labels activation-buffer edges and invokes the provider during every stop-the-world and incremental root seed."
       },
-      "missing_risk": "Live destructive collection remains disabled. Before enabling it, the collector entry point must call this provider as part of the canonical root seed rather than relying only on the current turn-boundary seed.",
+      "missing_risk": "The internal STW entry calls this canonical provider, but requires zero active executions so the buffer is normally empty. Reentrant/public/incremental collection during activation remains disabled.",
       "planned_test": {
         "name": "runtime_native_activation_roots_survive_switch_delivery_and_unwind",
         "layer": "lua_vm runtime coroutine trampoline",

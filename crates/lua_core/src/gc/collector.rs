@@ -757,6 +757,11 @@ impl GarbageCollector {
         self.pending_finalizers.len()
     }
 
+    /// Number of weak tables discovered by the current mark traversal.
+    pub fn active_weak_table_count(&self) -> usize {
+        self.weak_tables.len()
+    }
+
     /// Register a table for weak-entry cleanup without running a full GC cycle.
     pub fn register_weak_table(&mut self, table: GcRef<Table>, weak_keys: bool, weak_values: bool) {
         if !weak_keys && !weak_values {

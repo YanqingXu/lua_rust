@@ -69,6 +69,7 @@ use crate::state::{
     ActiveVmContext, LuaState, ThreadStatus, enter_vm_context, with_vm_context_parts,
 };
 
+mod full_collection;
 mod root_trace;
 pub use root_trace::{
     MarkOnlyReport, RootEdgeCount, RuntimeRootKind, StateTraceFailure, UnresolvedObjectEdge,
@@ -471,6 +472,12 @@ enum TurnBorrowEvent {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct StateArenaDrainReport {
     drained_owned_states: usize,
+    state_shutdown: LuaStateShutdownReport,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StateArenaCollectionReport {
+    swept_state_handles: Vec<StateHandle>,
     state_shutdown: LuaStateShutdownReport,
 }
 
@@ -1024,6 +1031,70 @@ impl StateArena {
         }
 
         debug_assert_eq!(self.live_owned_states, 0);
+        Ok(report)
+    }
+
+    /// Close and remove arena-owned states that the canonical tracer did not
+    /// reach during the current stop-the-world mark.
+    ///
+    /// The complete candidate set and free-list capacity are preflighted
+    /// before the first state is mutated. Each state's open Upvalues close
+    /// while its current StateHandle is still valid; only then is the slot
+    /// generation advanced or permanently retired.
+    fn sweep_unreachable_owned(
+        &mut self,
+        reachable: &HashSet<StateHandle>,
+        gc: &mut GarbageCollector,
+    ) -> Result<StateArenaCollectionReport, StateResolveError> {
+        self.validate_owned_drain()?;
+
+        let mut candidates = Vec::new();
+        for slot_index in 0..self.slots.len() {
+            let slot = &self.slots[slot_index];
+            let Some(state) = slot.state else {
+                continue;
+            };
+            if !slot.owned {
+                continue;
+            }
+            let handle = self.issue_handle(slot_index);
+            if !reachable.contains(&handle) {
+                candidates.push((slot_index, handle, state));
+            }
+        }
+
+        let reusable_slots = candidates
+            .iter()
+            .filter(|(slot_index, _, _)| self.slots[*slot_index].generation != u64::MAX)
+            .count();
+        self.free_slots.reserve(reusable_slots);
+        let mut report = StateArenaCollectionReport {
+            swept_state_handles: Vec::with_capacity(candidates.len()),
+            state_shutdown: LuaStateShutdownReport::default(),
+        };
+        let expected_live_states = self
+            .live_owned_states
+            .checked_sub(candidates.len())
+            .expect("unreachable candidates cannot exceed live owned states");
+
+        for (slot_index, handle, state) in candidates {
+            // SAFETY: preflight proved the slot is an unborrowed owned state.
+            // Its current generation remains valid while open Upvalues close.
+            report
+                .state_shutdown
+                .merge(unsafe { &mut *state.as_ptr() }.prepare_for_runtime_shutdown(gc));
+            self.vacate_slot(slot_index);
+            self.live_owned_states = self
+                .live_owned_states
+                .checked_sub(1)
+                .expect("occupied owned slot requires a positive live count");
+            // SAFETY: each owned slot originates from one Box::into_raw and
+            // has just been made vacant before ownership is reconstructed.
+            drop(unsafe { Box::from_raw(state.as_ptr()) });
+            report.swept_state_handles.push(handle);
+        }
+
+        debug_assert_eq!(self.live_owned_states, expected_live_states);
         Ok(report)
     }
 

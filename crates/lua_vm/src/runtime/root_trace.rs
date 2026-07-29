@@ -496,7 +496,20 @@ fn snapshot_state(state: &LuaState, handle: StateHandle, is_main: bool) -> State
         }
     };
     for (frame, call_info) in state.call_stack.iter().take(active_frames).enumerate() {
-        if call_info.func < stack_size
+        let idle_placeholder = frame == 0
+            && active_frames == 1
+            && state.top == 0
+            && stack_size == 0
+            && call_info.func == 0
+            && call_info.base == 0
+            && call_info.top == 0
+            && call_info.savedpc.is_none()
+            && call_info.proto.is_none()
+            && call_info.varargs.is_empty();
+        if idle_placeholder {
+            // A freshly created or fully unwound LuaState retains one empty
+            // CallInfo sentinel. It owns no function stack edge.
+        } else if call_info.func < stack_size
             && let Some(value) = state.stack.at(call_info.func)
         {
             snapshot.push_value(RuntimeRootKind::CallFunction, value.clone());

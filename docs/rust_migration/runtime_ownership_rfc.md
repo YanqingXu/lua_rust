@@ -461,12 +461,14 @@ That gate rejects production raw constructors, common unscoped string
 dereferences, compiler no-pool fallbacks, and regressions in the `Value`
 identity trait implementation.
 
-This still does **not** authorize live sweep. The unique Runtime/Heap lifetime,
-fixed strings, pending-finalizer root seed, and canonical mark-only tracer are
-implemented, but the Runtime tracer is not yet the only destructive collector
-entry point. General non-string `GcRef::as_ref` migration, allocator
-live/peak accounting, mutation barriers, unreachable-state prepass, and full
-weak/finalizer semantics remain broader M1 work.
+This still does **not** authorize Lua-visible, allocation-triggered, or
+all-graph sweep. The unique Runtime/Heap lifetime, fixed strings,
+pending-finalizer root seed, canonical tracer, and one crate-private
+stop-the-world strong-graph cycle are implemented. That cycle refuses every
+trace gap/rejection plus all active weak-table and finalizer work. General
+non-string `GcRef::as_ref` migration, allocator live/peak accounting, mutation
+barriers, and full weak/finalizer/resurrection semantics remain broader M1
+work.
 
 ## 5. Root tracing contract
 
@@ -687,8 +689,8 @@ This is a completed local trampoline slice, not completion of Phase B:
 - deep-chain and broader fault-injection matrices remain open;
 - main-state external ownership remains;
 - raw GC/StringPool backpointers are removed and the activation buffer is a
-  canonical Runtime root provider, but other partial root/mutation contracts
-  still prohibit live destructive collection.
+  canonical Runtime root provider. Internal STW requires zero active
+  executions; reentrant/public/incremental collection remains prohibited.
 
 #### B.4 Implemented checked open-Upvalue ownership (local-complete slice)
 
@@ -805,10 +807,11 @@ unsafe-gap variant.
 
 No path in this API calls `collect`, `sweep`, `clear_all`, finalizers, or object
 destruction. Existing weak-maintenance scanners now use managed Proto roots
-and checked metadata reads, but have not yet been replaced by this Runtime-only
-safe-point API. Destructive sweep remains blocked on broader scoped non-string
-borrows, unreachable-state integration, mutation/weak behavior, and complete
-finalizer/shutdown semantics.
+and checked metadata reads. The later internal STW safe point consumes this
+exact report, rejects every reported gap/invalid edge, and refuses weak or
+finalizer work. Public and incremental sweep remain blocked on broader scoped
+non-string borrows, mutation/weak behavior, and complete finalizer/shutdown
+semantics.
 
 #### D.2 Implemented temporary-object root foundation (partial)
 
@@ -887,11 +890,10 @@ Coroutine create/wrap, compiler, library/package, IO, VM/app, synchronous
 result publication, and the production string identity/access boundary are
 migrated. Protected-call and top-level result callbacks are unit-returning, so
 collectable results cannot escape the rooted callback as Rust return values.
-The unique Heap, fixed strings, pending-finalizer root seed, and Runtime tracer
-are now implemented. Allocation-triggered collection remains disabled until a
-Runtime-only destructive entry point consumes that tracer and the broader
-non-string access, mutation, weak/finalizer, and unreachable-state contracts
-are closed.
+The unique Heap, fixed strings, pending-finalizer root seed, Runtime tracer, and
+crate-private strong-graph STW consumer are now implemented.
+Allocation-triggered collection remains disabled until broader non-string
+access, mutation, and weak/finalizer contracts are closed.
 
 #### D.3 Implemented temporary-state root transaction (local-complete slice)
 
@@ -923,9 +925,9 @@ shutdown leave both at zero.
 This closes the inventory entry for coroutine state publication. Compiler
 Proto→Function builders, library/package, IO, VM/app, synchronous result
 construction, string identity/scoped access, unique Heap ownership, fixed
-strings, and pending-finalizer roots are now migrated. The Runtime-only
-destructive collection entry point and broader non-string/mutation/finalizer
-contracts remain blockers for live destructive collection.
+strings, pending-finalizer roots, and Runtime-only state pre-sweep are now
+migrated. Broader non-string/mutation/finalizer contracts remain blockers for
+Lua-visible and allocation-triggered collection.
 
 ### E. Shutdown substrate — M1.8
 
@@ -994,17 +996,37 @@ Tests cover all seven concrete GC dispatch layouts, non-fixed Thread-first and
 fixed-last order, ordinary/fixed byte DropProbes, stale Upvalue rejection,
 main/coroutine Upvalue closure, idempotence, Drop delegation, zeroed reports,
 and 1,000 Runtime/coroutine close cycles. This path never calls `collect`,
-`sweep`, `clear_all`, weak reconciliation, or Lua callback dispatch. Live-VM
-destructive collection remains gated on phase G and the rest of section 10.
+`sweep`, `clear_all`, weak reconciliation, or Lua callback dispatch.
+Lua-visible/all-graph live-VM destructive collection remains gated on phase G
+and the rest of section 10.
 
-### F. Internal stop-the-world collection — M1.9
+### F. Internal stop-the-world collection — M1.9 (implemented slice)
 
-- implement a Runtime-only full cycle and state pre-sweep;
-- replace fake object/memory counters with actual accounting;
-- keep the Lua-visible destructive route gated while G is incomplete.
+`Runtime::collect_full_stw` is crate-private and accepts only the Runtime owner
+thread in `Running` phase with zero active executions. It:
+
+1. invokes `Runtime::trace_roots_mark_only` and refuses sweep if any state
+   handle, object edge, explicit root, stack/frame invariant, or gray work is
+   unresolved;
+2. refuses active weak tables and pending/newly discovered finalizers instead
+   of silently applying incomplete semantics;
+3. preflights the complete unreachable owned-state set and free-list capacity;
+4. closes every unreachable state's open Upvalues while its current
+   `StateHandle` is valid, then advances or retires the slot generation and
+   drops the state Box;
+5. sweeps white non-fixed objects through the Heap-owned StringPool and reports
+   before/after object, accounted-byte, interned-string, and state counts.
 
 Acceptance: unreachable probes are destroyed and reachable probes survive;
-object and byte counts decrease without stale-handle access.
+object and byte counts decrease without stale-handle access. Two consecutive
+cycles, typed Userdata Drop, reachable/unreachable coroutine separation,
+open-Upvalue close ordering, cross-collector rejection, unsafe root gaps,
+weak-table refusal, finalizer refusal, phase, and active-execution gates have
+focused regressions.
+
+The Lua-visible route and allocation-triggered collection remain gated while
+phase G/H are incomplete; existing `gcinfo`/`collectgarbage` compatibility
+counters are not claimed as real accounting yet.
 
 ### G. Weak tables, finalizers, and public full collection — M1.9/M1.12
 
@@ -1067,14 +1089,16 @@ update.
 | U-11 | States/upvalues and services are closed while the GC objects they need are still alive. | Explicit close phase and thread-first heap teardown. |
 | U-12 | Every published edge preserves heap provenance, tri-color, and memory-accounting invariants. | Private mutation fields and mandatory `MutationContext`. |
 
-## 10. Hard gate before destructive sweep
+## 10. Hard gate before Lua-visible/all-graph destructive sweep
 
-All boxes are required before a sweep can run against a live VM:
+All boxes are required before arbitrary Lua graphs may use public or automatic
+sweep. The internal M1.9 prototype is narrower and fails closed when an
+unchecked box is relevant:
 
 - [x] one unique `Runtime`/`Heap` owner and verified dependency lifetime;
 - [x] no standalone collector drop path that lacks a live string pool and
       allocator;
-- [ ] main and coroutine states have a single, reclaiming owner;
+- [x] main and coroutine states have a single, reclaiming owner;
 - [ ] no `Box::into_raw(LuaState)` ownership transfer and no runtime
       `&'static mut` helper;
 - [x] the thread-local dump Proto registry is removed and pseudo-dump loading is rejected;
@@ -1085,7 +1109,7 @@ All boxes are required before a sweep can run against a live VM:
       placeholders;
 - [ ] temporary allocation/publication roots are enforced by API shape;
 - [x] pending finalizers are roots and all work queues are pruned on destroy;
-- [ ] unreachable coroutine states close before Thread/object sweep;
+- [x] unreachable coroutine states close before Thread/object sweep;
 - [x] ordinary and fixed objects have a deterministic shutdown destruction route;
 - [x] mark-only root tests, shutdown Drop probes, and inventory validation pass.
 

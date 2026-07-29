@@ -120,6 +120,35 @@ Assert-Contains "Runtime root tracer" $rootTraceSource `
 Assert-Contains "Runtime root tracer" $rootTraceSource `
     'RuntimeRootKind::FixedStrings'
 
+$fullCollectionSource =
+    Read-RequiredSource "crates/lua_vm/src/runtime/full_collection.rs"
+Assert-Contains "Runtime full collection" $fullCollectionSource `
+    'pub\(crate\)\s+fn\s+collect_full_stw\s*\('
+Assert-Contains "Runtime full collection" $fullCollectionSource `
+    'self\.trace_roots_mark_only\s*\(\s*\)'
+Assert-Contains "Runtime full collection" $fullCollectionSource `
+    'sweep_unreachable_owned\s*\('
+Assert-Contains "Runtime full collection" $fullCollectionSource `
+    'collector\.sweep\s*\(\s*strings\s*\)'
+Assert-Contains "Runtime full collection" $fullCollectionSource `
+    'WeakTablesUnsupported'
+Assert-Contains "Runtime full collection" $fullCollectionSource `
+    'FinalizersUnsupported'
+if ($fullCollectionSource -match 'pub\s+fn\s+collect_full_stw\s*\(') {
+    $violations.Add(
+        "Runtime full collection became public before weak/finalizer semantics closed"
+    )
+}
+
+$baseSource = Get-ProductionPrefix (
+    Resolve-RootedPath "crates/lua_stdlib/src/base.rs"
+)
+if ($baseSource -match '\bcollect_full_stw\s*\(') {
+    $violations.Add(
+        "Lua-visible collectgarbage is wired to the internal STW collector"
+    )
+}
+
 $productionRoots = @(
     "crates/lua_app/src",
     "crates/lua_bytecode/src",
