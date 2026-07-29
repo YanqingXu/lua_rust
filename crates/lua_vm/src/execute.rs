@@ -18,8 +18,9 @@ use lua_core::value::Value;
 use std::cmp::Ordering;
 
 use crate::native::{
-    DeferredNativeCall, DeferredVmContinuation, NativeRequestId, NativeRequestPublishError,
-    ResumeEnvelope, ResumeResponse, UpvalueAccessOperation, UpvalueAccessRequest,
+    DeferredNativeCall, DeferredVmContinuation, FullCollectionResult, NativeRequestId,
+    NativeRequestPublishError, ResumeEnvelope, ResumeResponse, UpvalueAccessOperation,
+    UpvalueAccessRequest,
 };
 use crate::state::{LUA_MULTRET, LuaState, ThreadStatus};
 
@@ -1622,6 +1623,88 @@ pub fn start_lua_call_at_stack(
     Ok(())
 }
 
+pub(crate) fn start_finalizer_callback(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    function: Value,
+    userdata: GcRef<lua_core::userdata::Userdata>,
+    stop_ci: usize,
+) -> Result<VmExit, RuntimeError> {
+    if l.current_ci != stop_ci {
+        return Err(RuntimeError::new(
+            "VM: finalizer callback started at an unexpected frame depth",
+        ));
+    }
+    // The deferred collectgarbage native frame may have lowered logical `top`
+    // into the caller's register window. Use the frame's reserved boundary as
+    // scratch space so callback arguments cannot overwrite still-live caller
+    // locals. Runtime restores the original logical top after the callback.
+    let func_pos = l.current_call_info().top.max(l.top);
+    l.top = func_pos;
+    l.push_value(function.clone());
+    l.push_value(Value::Userdata(userdata));
+    let Value::Function(function_ref) = function else {
+        return Err(RuntimeError::new(
+            "attempt to call a non-function __gc value",
+        ));
+    };
+    let callable = gc
+        .with_ref(function_ref, native_callable)
+        .map_err(|error| RuntimeError::new(format!("invalid __gc function: {error}")))?;
+    match callable {
+        Some(callable) => call_native_function(l, gc, func_pos, 1, Some(0), callable),
+        None => {
+            start_lua_call_at_stack(l, gc, func_pos, 1, Some(0))?;
+            resume_finalizer_callback(l, gc, stop_ci)
+        }
+    }
+}
+
+pub(crate) fn resume_finalizer_callback(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    stop_ci: usize,
+) -> Result<VmExit, RuntimeError> {
+    loop {
+        if l.current_ci <= stop_ci {
+            return Ok(VmExit::Complete(ExecResult::Returned));
+        }
+        let proto = l
+            .current_call_info()
+            .proto
+            .or_else(|| current_lua_function(l).and_then(Function::proto))
+            .ok_or_else(|| RuntimeError::new("finalizer frame has no Lua proto"))?;
+        // The callback may be resuming after a nested Lua return or a sealed
+        // Runtime-native request. Reuse the VM's saved-PC continuation path
+        // instead of restarting the current Proto at PC 0.
+        l.status = ThreadStatus::Yield;
+        match execute_proto(l, proto, gc) {
+            Ok(VmExit::Complete(ExecResult::Returned)) => {}
+            Ok(VmExit::Complete(ExecResult::Yielded)) => {
+                unwind_lua_frames_to(l, gc, stop_ci)?;
+                return Err(RuntimeError::new("attempt to yield from a __gc metamethod"));
+            }
+            Ok(VmExit::NativeRequest(id)) => return Ok(VmExit::NativeRequest(id)),
+            Ok(VmExit::UpvalueAccess(request)) => return Ok(VmExit::UpvalueAccess(request)),
+            Err(error) => {
+                unwind_lua_frames_to(l, gc, stop_ci)?;
+                return Err(error);
+            }
+        }
+    }
+}
+
+pub(crate) fn abort_finalizer_callback(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    stop_ci: usize,
+    saved_top: usize,
+) -> Result<(), RuntimeError> {
+    unwind_lua_frames_to(l, gc, stop_ci)?;
+    l.top = saved_top;
+    Ok(())
+}
+
 pub fn resume_lua_thread(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
@@ -2559,6 +2642,61 @@ pub(crate) fn finish_deferred_native_values(
     }
 }
 
+pub(crate) fn finish_deferred_full_collection(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+    protected: bool,
+    response: Result<Vec<Value>, Value>,
+) -> Result<(), RuntimeError> {
+    validate_deferred_native_call(l, deferred)?;
+    l.top = deferred.func_pos + 1 + deferred.nargs;
+    let nret = match (protected, response) {
+        (false, Ok(values)) => {
+            let count = values.len();
+            for value in values {
+                l.push_value(value);
+            }
+            count as i32
+        }
+        (false, Err(error)) => {
+            l.push_value(error);
+            -1
+        }
+        (true, Ok(values)) => {
+            l.push_boolean(true);
+            let count = values.len() + 1;
+            for value in values {
+                l.push_value(value);
+            }
+            count as i32
+        }
+        (true, Err(error)) => {
+            l.push_boolean(false);
+            l.push_value(error);
+            2
+        }
+    };
+    let frame = NativeCallFrame {
+        func_pos: deferred.func_pos,
+        nargs: deferred.nargs,
+        wanted_results: deferred.wanted_results,
+        saved_ci: deferred.saved_ci,
+        saved_top: deferred.saved_top,
+    };
+    match finish_native_call(l, gc, frame, nret)? {
+        VmExit::Complete(ExecResult::Returned) => {
+            apply_deferred_vm_continuation(l, deferred)?;
+            Ok(())
+        }
+        VmExit::Complete(ExecResult::Yielded)
+        | VmExit::NativeRequest(_)
+        | VmExit::UpvalueAccess(_) => Err(RuntimeError::new(
+            "VM: full collection completion produced a second suspension",
+        )),
+    }
+}
+
 pub(crate) fn resume_after_deferred_native_call(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
@@ -2571,7 +2709,16 @@ pub(crate) fn resume_after_deferred_native_call(
             .ok_or_else(|| RuntimeError::new("VM: deferred root call lost its Proto"))?;
         execute_proto(l, proto, gc)
     } else {
-        resume_lua_thread(l, gc)
+        let result = resume_lua_thread(l, gc)?;
+        if l.current_thread.is_none()
+            && matches!(result, VmExit::Complete(ExecResult::Returned))
+            && l.current_ci == 0
+            && let Some(root_proto) = l.current_call_info().proto
+        {
+            l.status = ThreadStatus::Yield;
+            return execute_proto(l, root_proto, gc);
+        }
+        Ok(result)
     }
 }
 
@@ -2628,6 +2775,10 @@ fn invoke_runtime_native(
     gc: &mut GarbageCollector,
     operation: RuntimeNativeFunction,
 ) -> i32 {
+    if operation == RuntimeNativeFunction::CollectGarbage {
+        return invoke_collectgarbage_runtime_native(l, gc);
+    }
+
     let (thread_ref, args, envelope) = match operation {
         RuntimeNativeFunction::CoroutineResume => {
             let Value::Thread(thread_ref) = l.at(1).cloned().unwrap_or(Value::Nil) else {
@@ -2651,6 +2802,7 @@ fn invoke_runtime_native(
             };
             (thread_ref, native_args_from(l, 1), ResumeEnvelope::Wrap)
         }
+        RuntimeNativeFunction::CollectGarbage => unreachable!("handled above"),
     };
 
     let (status, target) = match gc.with_ref(thread_ref, |thread: &Thread| {
@@ -2686,6 +2838,98 @@ fn invoke_runtime_native(
             };
             publish_runtime_native_error(l, gc, envelope, message)
         }
+    }
+}
+
+fn invoke_collectgarbage_runtime_native(l: &mut LuaState, gc: &mut GarbageCollector) -> i32 {
+    let option = match l.at(1) {
+        Some(Value::String(value)) => l.copy_string_bytes(*value).ok(),
+        _ => None,
+    };
+    match option.as_deref().unwrap_or(b"collect") {
+        b"count" => {
+            l.push_number(gc.total_memory() as f64 / 1024.0);
+            1
+        }
+        b"collect" => publish_full_collection_request(l, gc, FullCollectionResult::Collect),
+        b"step" => {
+            let size = match l.at(2) {
+                Some(Value::Number(value)) => *value,
+                _ => 0.0,
+            };
+            if collection_step_completed(l, size) {
+                publish_full_collection_request(l, gc, FullCollectionResult::StepComplete)
+            } else {
+                l.push_boolean(false);
+                1
+            }
+        }
+        b"stop" => {
+            l.gc_stopped = true;
+            l.push_number(0.0);
+            1
+        }
+        b"restart" => {
+            l.gc_stopped = false;
+            l.gc_step_remaining = 0;
+            l.push_number(0.0);
+            1
+        }
+        b"setpause" | b"setstepmul" => {
+            l.push_number(0.0);
+            1
+        }
+        _ => publish_runtime_native_error(
+            l,
+            gc,
+            ResumeEnvelope::Wrap,
+            b"bad argument #1 to 'collectgarbage' (invalid option)",
+        ),
+    }
+}
+
+fn publish_full_collection_request(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    result: FullCollectionResult,
+) -> i32 {
+    match l.publish_full_collection_request(result) {
+        Ok(_) => 0,
+        Err(error) => {
+            let message = match error {
+                NativeRequestPublishError::ScopeUnavailable => {
+                    b"runtime-native dispatcher unavailable".as_slice()
+                }
+                NativeRequestPublishError::MailboxOccupied => {
+                    b"runtime-native mailbox already occupied".as_slice()
+                }
+                NativeRequestPublishError::IdExhausted => {
+                    b"runtime-native request id exhausted".as_slice()
+                }
+            };
+            publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message)
+        }
+    }
+}
+
+fn collection_step_completed(l: &mut LuaState, size: f64) -> bool {
+    if l.gc_step_remaining <= 0 {
+        l.gc_step_remaining = if size >= 10_000.0 {
+            1
+        } else if size >= 6.0 {
+            3
+        } else if size >= 2.0 {
+            8
+        } else {
+            12
+        };
+    }
+    l.gc_step_remaining -= 1;
+    if l.gc_step_remaining <= 0 {
+        l.gc_stopped = false;
+        true
+    } else {
+        false
     }
 }
 

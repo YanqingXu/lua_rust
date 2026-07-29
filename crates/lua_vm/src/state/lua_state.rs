@@ -20,8 +20,8 @@ use lua_core::value::Value;
 use super::call_info::CallInfo;
 use super::stack::Stack;
 use crate::native::{
-    DeferredNativeCall, DeferredVmContinuation, NativeRequestId, NativeRequestPublishError,
-    ResumeEnvelope, ResumeRequest,
+    DeferredNativeCall, DeferredVmContinuation, FullCollectionRequest, FullCollectionResult,
+    NativeRequestId, NativeRequestPublishError, ResumeEnvelope, ResumeRequest, RuntimeRequest,
 };
 use crate::runtime::StateArena;
 use thiserror::Error;
@@ -120,7 +120,7 @@ pub struct LuaState {
     /// Next per-state request identifier. Zero is permanently reserved.
     next_native_request_id: u64,
     /// Request published by the current sealed Runtime-native operation.
-    pending_native_request: Option<ResumeRequest>,
+    pending_native_request: Option<RuntimeRequest>,
     /// Active debug hook function configured through debug.sethook.
     pub debug_hook: Option<Value>,
     /// Debug hook event mask, e.g. "crl".
@@ -154,12 +154,8 @@ pub struct LuaState {
     pub yield_wanted_results: Option<usize>,
     /// Last runtime error value that terminated this coroutine.
     pub last_error: Option<Value>,
-    /// Compatibility counter used by Lua 5.1 gcinfo/collectgarbage probes.
-    pub gcinfo_kb: f64,
     /// Whether automatic GC progress is stopped by collectgarbage("stop").
     pub gc_stopped: bool,
-    /// Poll count for simulated automatic GC progress.
-    pub gcinfo_polls: usize,
     /// Remaining steps in the current collectgarbage("step") cycle.
     pub gc_step_remaining: i32,
     /// Countdown for lightweight automatic weak-table cleanup.
@@ -206,9 +202,7 @@ impl LuaState {
             yield_result_base: None,
             yield_wanted_results: None,
             last_error: None,
-            gcinfo_kb: 128.0,
             gc_stopped: false,
-            gcinfo_polls: 0,
             gc_step_remaining: 0,
             auto_gc_countdown: 0,
         }
@@ -597,21 +591,43 @@ impl LuaState {
             .next_native_request_id
             .checked_add(1)
             .ok_or(NativeRequestPublishError::IdExhausted)?;
-        self.pending_native_request = Some(ResumeRequest {
+        self.pending_native_request = Some(RuntimeRequest::Resume(ResumeRequest {
             id,
             thread,
             target,
             args,
             envelope,
             deferred: None,
-        });
+        }));
+        Ok(id)
+    }
+
+    pub(crate) fn publish_full_collection_request(
+        &mut self,
+        result: FullCollectionResult,
+    ) -> Result<NativeRequestId, NativeRequestPublishError> {
+        if !self.native_request_scope {
+            return Err(NativeRequestPublishError::ScopeUnavailable);
+        }
+        if self.pending_native_request.is_some() {
+            return Err(NativeRequestPublishError::MailboxOccupied);
+        }
+        let id = NativeRequestId::new(self.next_native_request_id);
+        self.next_native_request_id = self
+            .next_native_request_id
+            .checked_add(1)
+            .ok_or(NativeRequestPublishError::IdExhausted)?;
+        self.pending_native_request = Some(RuntimeRequest::FullCollection(FullCollectionRequest {
+            id,
+            result,
+            protected: false,
+            deferred: None,
+        }));
         Ok(id)
     }
 
     pub(crate) fn pending_native_request_id(&self) -> Option<NativeRequestId> {
-        self.pending_native_request
-            .as_ref()
-            .map(|request| request.id)
+        self.pending_native_request.as_ref().map(RuntimeRequest::id)
     }
 
     pub(crate) fn seal_native_request(
@@ -622,18 +638,18 @@ impl LuaState {
         let Some(request) = self.pending_native_request.as_mut() else {
             return false;
         };
-        if request.id != id || deferred.request_id != id || request.deferred.is_some() {
+        if request.id() != id || deferred.request_id != id || request.deferred().is_some() {
             return false;
         }
-        request.deferred = Some(deferred);
+        *request.deferred_mut() = Some(deferred);
         true
     }
 
-    pub(crate) fn take_native_request(&mut self, id: NativeRequestId) -> Option<ResumeRequest> {
+    pub(crate) fn take_native_request(&mut self, id: NativeRequestId) -> Option<RuntimeRequest> {
         if self
             .pending_native_request
             .as_ref()
-            .is_some_and(|request| request.id == id && request.deferred.is_some())
+            .is_some_and(|request| request.id() == id && request.deferred().is_some())
         {
             self.pending_native_request.take()
         } else {
@@ -649,10 +665,11 @@ impl LuaState {
         let Some(request) = self.pending_native_request.as_mut() else {
             return false;
         };
-        let Some(deferred) = request.deferred.as_mut() else {
+        let request_id = request.id();
+        let Some(deferred) = request.deferred_mut().as_mut() else {
             return false;
         };
-        if request.id != id || deferred.request_id != id {
+        if request_id != id || deferred.request_id != id {
             return false;
         }
         deferred.continuation = continuation;
@@ -666,15 +683,28 @@ impl LuaState {
         let Some(request) = self.pending_native_request.as_mut() else {
             return false;
         };
-        if request.id != id {
+        if request.id() != id {
             return false;
         }
-        request.envelope = match request.envelope {
-            ResumeEnvelope::Resume => ResumeEnvelope::ProtectedResume,
-            ResumeEnvelope::Wrap => ResumeEnvelope::ProtectedWrap,
-            ResumeEnvelope::ProtectedResume | ResumeEnvelope::ProtectedWrap => return false,
-        };
-        request.deferred = None;
+        match request {
+            RuntimeRequest::Resume(request) => {
+                request.envelope = match request.envelope {
+                    ResumeEnvelope::Resume => ResumeEnvelope::ProtectedResume,
+                    ResumeEnvelope::Wrap => ResumeEnvelope::ProtectedWrap,
+                    ResumeEnvelope::ProtectedResume | ResumeEnvelope::ProtectedWrap => {
+                        return false;
+                    }
+                };
+                request.deferred = None;
+            }
+            RuntimeRequest::FullCollection(request) => {
+                if request.protected {
+                    return false;
+                }
+                request.protected = true;
+                request.deferred = None;
+            }
+        }
         true
     }
 }

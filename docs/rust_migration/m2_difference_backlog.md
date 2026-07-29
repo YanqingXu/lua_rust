@@ -404,18 +404,22 @@ chunk-id、line、CLI program prefix 和 exit code。
 - Rust before/after/after-GC 为 `40/48/24 KB`；
 - C++ 为约 `74.30/74.40/74.15 KB`。
 
-这不是可安全归一化的 allocator noise。Rust
-`crates/lua_stdlib/src/base.rs` 的 `poll_gcinfo_kb` 仍以 `+8/+24` 和固定
-cycle 模拟；`setpause`/`setstepmul` 也固定返回 0。固定 C++
+这不是可安全归一化的 allocator noise。上述差异来自旧 baseline artifact；
+当前 Rust 已删除 `poll_gcinfo_kb`/`gcinfo_kb` 模拟字段，
+`collectgarbage("collect")` 会运行真实 full STW，`gcinfo/count` 读取 collector
+accounted bytes。尚未刷新的差异包括：`step` 仍以固定 cycle 决定何时触发
+full STW，`setpause`/`setstepmul` 也固定返回 0。固定 C++
 `luaB_gcinfo`/`luaB_collectgarbage` 读取 collector 的 total memory，并返回
 真实旧参数。
 
 建议 P0，但依赖 M1 的 sweep/root/barrier/shutdown 闭环：
 
-1. 删除 Lua-visible 的模拟 `gcinfo_kb` 与倒计时；
-2. collector 暴露 object count、logical accounted bytes、allocator
+1. `completed-local`：删除 Lua-visible 的模拟 `gcinfo_kb`，让 explicit collect
+   执行真实 full STW；
+2. collector 已暴露 object count 与 accounted bytes；继续补 allocator
    live/peak bytes；
-3. 实现 collect/stop/restart/step/setpause/setstepmul 的真实状态机和旧值返回；
+3. 用 incremental work unit 删除剩余 step 倒计时，并实现
+   stop/restart/step/setpause/setstepmul 的真实状态机和旧值返回；
 4. 若 Rust/C++ 对象布局不同，使用明确的 Lua logical allocation accounting
    对齐 oracle，不得硬编码某次运行的 `67`；
 5. acceptance 同时检查：返回类型、旧参数、step completion、collect 后

@@ -594,24 +594,19 @@ try {
 
 $openDebts = @(
     [ordered]@{
-        id = "weak-finalizer-resurrection"
-        blocks = "M1.12 and all-graph sweep"
-        detail = "The crate-private owner-thread/Running/zero-active Runtime STW consumes the canonical tracer, pre-closes unreachable states, and sweeps strong graphs. Weak-table reconciliation, protected finalizer delivery, resurrection, exactly-once behavior, and close drain remain gated."
-    },
-    [ordered]@{
         id = "deterministic-runtime-shutdown"
         blocks = "M1.8"
-        detail = "Deterministic state -> Thread -> ordinary -> fixed teardown and zero object/root/string/queue/state accounting are implemented; Lua-visible __gc drain, explicit service drain, and allocator live-byte proof remain open."
+        detail = "Deterministic Lua __gc drain plus state -> Thread -> ordinary -> fixed teardown and zero object/root/string/queue/state accounting are implemented; explicit service drain and allocator live-byte proof remain open."
     },
     [ordered]@{
-        id = "public-full-and-incremental-gc"
-        blocks = "M1.9-M1.11"
-        detail = "Lua-visible full sweep integration, real gcinfo accounting, complete mutation barriers, and incremental phases/debt/step remain gated; the internal strong-graph STW is not exposed."
+        id = "incremental-gc-and-barriers"
+        blocks = "M1.10-M1.11"
+        detail = "Lua-visible full sweep, weak/finalizer/resurrection, and collector-backed gcinfo/count are implemented; complete mutation barriers, allocator accounting, allocation-triggered collection, and incremental phases/debt/step remain gated."
     },
     [ordered]@{
         id = "generational-gc-handles-and-publication-roots"
-        blocks = "public/automatic sweep"
-        detail = "GcRef carries non-reused ObjectId provenance, StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement, lexical publication roots and HeapId service pairing are implemented, production string Eq/Hash is identity-only with scoped byte access, and internal strong-graph sweep is integrated. Broader non-string object contexts plus weak/finalizer/public/incremental collector integration remain open."
+        blocks = "automatic/incremental sweep"
+        detail = "GcRef carries non-reused ObjectId provenance, StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement, lexical publication roots and HeapId service pairing are implemented, production string Eq/Hash is identity-only with scoped byte access, and public full-graph STW is integrated. Broader non-string object contexts plus mutation-barrier, automatic, and incremental collector integration remain open."
     }
 )
 
@@ -623,7 +618,7 @@ $result = [ordered]@{
         "m1-foundation-gate"
     }
     mode = if ($Smoke) { "smoke" } else { "full" }
-    scope = "ByteString and canonical/scoped production string access, unique Heap/service ownership and HeapId pairing, fixed/pending-finalizer/runtime-service roots, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, compiler, library/package, IO, VM/app, and synchronous result publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, crate-private Runtime-only strong-graph STW, and byte differential"
+    scope = "ByteString and canonical/scoped production string access, unique Heap/service ownership and HeapId pairing, fixed/pending-finalizer/runtime-service roots, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, compiler, library/package, IO, VM/app, and synchronous result publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, Lua-visible full-graph STW with weak/finalizer/resurrection, and byte differential"
     checksPassed = $failures.Count -eq 0
     foundationPassed = (
         $failures.Count -eq 0 -and

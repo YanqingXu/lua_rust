@@ -136,7 +136,6 @@ impl GarbageCollector {
                 }
             }
         }
-
         report
     }
 

@@ -461,14 +461,13 @@ That gate rejects production raw constructors, common unscoped string
 dereferences, compiler no-pool fallbacks, and regressions in the `Value`
 identity trait implementation.
 
-This still does **not** authorize Lua-visible, allocation-triggered, or
-all-graph sweep. The unique Runtime/Heap lifetime, fixed strings,
-pending-finalizer root seed, canonical tracer, and one crate-private
-stop-the-world strong-graph cycle are implemented. That cycle refuses every
-trace gap/rejection plus all active weak-table and finalizer work. General
-non-string `GcRef::as_ref` migration, allocator live/peak accounting, mutation
-barriers, and full weak/finalizer/resurrection semantics remain broader M1
-work.
+This still does **not** authorize allocation-triggered or incremental sweep.
+The unique Runtime/Heap lifetime, fixed strings, pending-finalizer root seed,
+canonical tracer, Runtime safe-point full collection, weak reconciliation,
+protected finalizers and Lua-visible `collectgarbage("collect")` are
+implemented. Full STW refuses every trace gap/rejection. General non-string
+`GcRef::as_ref` migration, allocator live/peak accounting and production
+mutation barriers remain broader M1 work.
 
 ## 5. Root tracing contract
 
@@ -689,8 +688,9 @@ This is a completed local trampoline slice, not completion of Phase B:
 - deep-chain and broader fault-injection matrices remain open;
 - main-state external ownership remains;
 - raw GC/StringPool backpointers are removed and the activation buffer is a
-  canonical Runtime root provider. Internal STW requires zero active
-  executions; reentrant/public/incremental collection remains prohibited.
+  canonical Runtime root provider. Lua-visible full STW now runs at released
+  state-turn safe points and supports nested collection during finalization;
+  automatic/incremental collection remains prohibited.
 
 #### B.4 Implemented checked open-Upvalue ownership (local-complete slice)
 
@@ -807,11 +807,12 @@ unsafe-gap variant.
 
 No path in this API calls `collect`, `sweep`, `clear_all`, finalizers, or object
 destruction. Existing weak-maintenance scanners now use managed Proto roots
-and checked metadata reads. The later internal STW safe point consumes this
-exact report, rejects every reported gap/invalid edge, and refuses weak or
-finalizer work. Public and incremental sweep remain blocked on broader scoped
-non-string borrows, mutation/weak behavior, and complete finalizer/shutdown
-semantics.
+and checked metadata reads. Runtime full STW consumes this exact report at a
+released state-turn safe point and rejects every reported gap/invalid edge
+before weak reconciliation, sweep, or protected callback delivery.
+Automatic/incremental sweep remains blocked on broader scoped non-string
+borrows, production mutation barriers, allocator accounting, and the
+remaining shutdown semantics.
 
 #### D.2 Implemented temporary-object root foundation (partial)
 
@@ -890,10 +891,11 @@ Coroutine create/wrap, compiler, library/package, IO, VM/app, synchronous
 result publication, and the production string identity/access boundary are
 migrated. Protected-call and top-level result callbacks are unit-returning, so
 collectable results cannot escape the rooted callback as Rust return values.
-The unique Heap, fixed strings, pending-finalizer root seed, Runtime tracer, and
-crate-private strong-graph STW consumer are now implemented.
-Allocation-triggered collection remains disabled until broader non-string
-access, mutation, and weak/finalizer contracts are closed.
+The unique Heap, fixed strings, pending-finalizer root seed, Runtime tracer,
+full STW consumer, weak/finalizer/resurrection semantics, and Lua-visible
+explicit full collection are now implemented. Allocation-triggered collection
+remains disabled until broader non-string access, mutation barriers, and
+incremental phase/debt contracts are closed.
 
 #### D.3 Implemented temporary-state root transaction (local-complete slice)
 
@@ -925,9 +927,9 @@ shutdown leave both at zero.
 This closes the inventory entry for coroutine state publication. Compiler
 Proto→Function builders, library/package, IO, VM/app, synchronous result
 construction, string identity/scoped access, unique Heap ownership, fixed
-strings, pending-finalizer roots, and Runtime-only state pre-sweep are now
-migrated. Broader non-string/mutation/finalizer contracts remain blockers for
-Lua-visible and allocation-triggered collection.
+strings, pending-finalizer roots, and Runtime state pre-sweep are now
+migrated. Broader non-string/mutation contracts remain blockers for
+allocation-triggered and incremental collection.
 
 ### E. Shutdown substrate — M1.8
 
@@ -952,23 +954,27 @@ freed. The relevant oracle paths are
 `lua_cpp/src/vm/state/lua_state.cpp:357-374,459-466`, and
 `lua_cpp/src/gc/garbage_collector.cpp:102-118,852-896,933-988`.
 
-The current Rust partial deliberately omits the C++ `finalizeAll` step and
-therefore does not claim complete M1.8 or Lua-compatible close semantics.
-`Runtime::close` now performs this non-collecting order:
+The current Rust partial implements the C++-style remaining-finalizer drain,
+including callbacks that allocate more finalizable userdata and error
+isolation. Explicit IO/module service drain and allocator live/peak proof still
+prevent a complete M1.8 claim. `Runtime::close` now performs this terminal
+order:
 
 1. validate owner thread, zero active executions, the main external arena slot,
    and every owned arena slot before mutation;
-2. drain owned coroutine states in deterministic slot order, close only
+2. prepare and drain all not-yet-finalized Lua userdata, acknowledge each
+   callback exactly once, isolate errors, and discover callback allocations;
+3. drain owned coroutine states in deterministic slot order, close only
    collector-validated open Upvalues, advance or permanently retire each
    generation without wrap, and drop the state;
-3. close validated main-state Upvalues, detach and advance/retire its external
+4. close validated main-state Upvalues, detach and advance/retire its external
    slot, and drop the main Box;
-4. clear Runtime global/registry handles and collector roots;
-5. call `GarbageCollector::destroy_all` with the live StringPool;
-6. destroy non-fixed Threads, other non-fixed objects, and fixed objects in
+5. clear Runtime global/registry handles and collector roots;
+6. call `GarbageCollector::destroy_all` with the live StringPool;
+7. destroy non-fixed Threads, other non-fixed objects, and fixed objects in
    three passes, removing every object from roots, gray, weak, pending
    finalizer, and external queues before concrete Box destruction;
-7. clear the pool and verify state/object/root/string/estimated-byte/work-queue
+8. clear the pool and verify state/object/root/string/estimated-byte/work-queue
    counts are zero before transitioning to `Closed`.
 
 Owner-thread `Drop` calls the same close implementation. Successful explicit
@@ -979,10 +985,10 @@ uses a no-callback leak-protection fallback; explicit foreign or busy close is
 rejected before mutation.
 
 `RuntimeCloseReport` exposes rejected open-Upvalue edges, checked owner-handle
-mismatches, missing active stack values, pending finalizer entries discarded,
-and two unconditional capability debts:
+mismatches, missing active stack values, attempted/failed Lua finalizers,
+pending entries discarded after the drain, and the remaining unconditional
+capability debt:
 
-- close-time Lua-visible `__gc` callbacks are not run;
 - library-specific IO/resource drain hooks are not run.
 
 Rust typed Userdata payload destructors still run exactly once during concrete
@@ -994,41 +1000,45 @@ aliasing contract, including the `IoFileData` payload.
 
 Tests cover all seven concrete GC dispatch layouts, non-fixed Thread-first and
 fixed-last order, ordinary/fixed byte DropProbes, stale Upvalue rejection,
-main/coroutine Upvalue closure, idempotence, Drop delegation, zeroed reports,
-and 1,000 Runtime/coroutine close cycles. This path never calls `collect`,
-`sweep`, `clear_all`, weak reconciliation, or Lua callback dispatch.
-Lua-visible/all-graph live-VM destructive collection remains gated on phase G
-and the rest of section 10.
+main/coroutine Upvalue closure, finalizer error/continue, idempotence, Drop
+delegation, zeroed reports, and 1,000 Runtime/coroutine close cycles. The
+terminal destruction path never calls `collect`, `sweep`, `clear_all`, or weak
+reconciliation; Runtime drains Lua callbacks before entering that path.
 
-### F. Internal stop-the-world collection — M1.9 (implemented slice)
+### F. Runtime stop-the-world collection — M1.9 (implemented)
 
-`Runtime::collect_full_stw` is crate-private and accepts only the Runtime owner
-thread in `Running` phase with zero active executions. It:
+`Runtime::collect_full_stw` is a direct crate-private entry requiring the
+Runtime owner thread in `Running` phase with zero active executions.
+Lua-visible requests use the same atomic implementation after the scheduler
+releases its current StateArena turn borrow. The implementation:
 
 1. invokes `Runtime::trace_roots_mark_only` and refuses sweep if any state
    handle, object edge, explicit root, stack/frame invariant, or gray work is
    unresolved;
-2. refuses active weak tables and pending/newly discovered finalizers instead
-   of silently applying incomplete semantics;
+2. prepares finalizer candidates, retraces the resurrected graph, and
+   reconciles weak key/value/kv tables before sweep;
 3. preflights the complete unreachable owned-state set and free-list capacity;
 4. closes every unreachable state's open Upvalues while its current
    `StateHandle` is valid, then advances or retires the slot generation and
    drops the state Box;
 5. sweeps white non-fixed objects through the Heap-owned StringPool and reports
-   before/after object, accounted-byte, interned-string, and state counts.
+   before/after object, accounted-byte, interned-string, and state counts;
+6. delivers pending Lua `__gc` callbacks through protected Runtime activation
+   frames with exactly-once acknowledgement and reentrant-collection control.
 
 Acceptance: unreachable probes are destroyed and reachable probes survive;
 object and byte counts decrease without stale-handle access. Two consecutive
 cycles, typed Userdata Drop, reachable/unreachable coroutine separation,
 open-Upvalue close ordering, cross-collector rejection, unsafe root gaps,
-weak-table refusal, finalizer refusal, phase, and active-execution gates have
-focused regressions.
+weak v/k/kv, pending/finalized userdata, protected errors, queue retention,
+nested collect, resurrection/second death, close drain, phase and
+active-execution gates have focused regressions.
 
-The Lua-visible route and allocation-triggered collection remain gated while
-phase G/H are incomplete; existing `gcinfo`/`collectgarbage` compatibility
-counters are not claimed as real accounting yet.
+Lua `collectgarbage("collect")` now uses this route, and `gcinfo/count` read
+collector accounted bytes. Allocation-triggered collection and true
+incremental step semantics remain gated while phase H is incomplete.
 
-### G. Weak tables, finalizers, and public full collection — M1.9/M1.12
+### G. Weak tables, finalizers, and public full collection — M1.9/M1.12 (implemented)
 
 - use the order mark, prepare finalizers, propagate resurrected graphs,
   reconcile/clear weak tables, pre-close unreachable states, sweep, run
@@ -1037,6 +1047,12 @@ counters are not claimed as real accounting yet.
 - isolate callback errors, restore stacks, enforce exactly-once finalization,
   resurrection, and close drain;
 - expose real `collectgarbage("collect")` only after this phase passes.
+
+This phase now passes locally. Runtime callback delivery supports nested full
+collection without recursively draining the outer finalizer queue, preserves
+remaining queue entries after an ordinary error, and isolates errors under
+`pcall` and close. Cross-state resume/open-Upvalue access from a finalizer and
+close-time Runtime-native reentry remain explicit fail-closed boundaries.
 
 Weak-key/value behavior follows the pinned C++/Lua 5.1 oracle; Lua 5.2+
 ephemeron assumptions must not be imported without a differential test.
@@ -1089,11 +1105,11 @@ update.
 | U-11 | States/upvalues and services are closed while the GC objects they need are still alive. | Explicit close phase and thread-first heap teardown. |
 | U-12 | Every published edge preserves heap provenance, tri-color, and memory-accounting invariants. | Private mutation fields and mandatory `MutationContext`. |
 
-## 10. Hard gate before Lua-visible/all-graph destructive sweep
+## 10. Hard gate before automatic/incremental destructive sweep
 
-All boxes are required before arbitrary Lua graphs may use public or automatic
-sweep. The internal M1.9 prototype is narrower and fails closed when an
-unchecked box is relevant:
+All boxes are required before mutation-interleaved automatic or incremental
+sweep. The explicit Runtime safe-point full collector is narrower and fails
+closed when an unchecked root/provenance box is relevant:
 
 - [x] one unique `Runtime`/`Heap` owner and verified dependency lifetime;
 - [x] no standalone collector drop path that lacks a live string pool and
@@ -1113,10 +1129,10 @@ unchecked box is relevant:
 - [x] ordinary and fixed objects have a deterministic shutdown destruction route;
 - [x] mark-only root tests, shutdown Drop probes, and inventory validation pass.
 
-Complete write barriers are not required for a strictly non-reentrant,
-stop-the-world *internal* collector prototype. They are an absolute prerequisite
-for incremental collection. Complete weak/finalizer behavior is required
-before destructive full collection becomes Lua-visible.
+Complete write barriers are not required for the stop-the-world Runtime
+safe-point collector. They are an absolute prerequisite for incremental and
+allocation-triggered collection. Complete weak/finalizer behavior is now
+implemented for Lua-visible explicit full collection.
 
 ## 11. Acceptance commands
 

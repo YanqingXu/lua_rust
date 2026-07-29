@@ -16,19 +16,20 @@
 //! only owned `StateHandle`/result values between turns. Coroutine status,
 //! result delivery, and VM continuation semantics remain a later integration.
 //!
-//! M1.8 adds explicit deterministic reclamation for shutdown only.
-//! `Runtime::close` drains coroutine states, closes collector-validated open
-//! Upvalues while their stacks are alive, detaches the main state, clears
-//! Runtime roots, and calls the collector's non-collecting `destroy_all` path.
-//! That path destroys non-fixed Threads first, other non-fixed objects second,
-//! and fixed objects last while a live StringPool removes every String index.
-//! Owner-thread `Drop` uses the same implementation.
+//! M1.8 adds explicit deterministic reclamation for shutdown. `Runtime::close`
+//! drains remaining Lua `__gc` callbacks with error isolation, drains
+//! coroutine states, closes collector-validated open Upvalues while their
+//! stacks are alive, detaches the main state, clears Runtime roots, and calls
+//! the collector's non-collecting `destroy_all` path. That path destroys
+//! non-fixed Threads first, other non-fixed objects second, and fixed objects
+//! last while a live StringPool removes every String index. Owner-thread
+//! `Drop` uses the same implementation.
 //!
-//! This remains a partial shutdown substrate: close-time Lua `__gc`,
-//! library-specific IO/resource hooks, native-module ordering, and allocator
-//! live-byte accounting are explicit report/RFC debt. No shutdown path calls
-//! `collect`, `sweep`, or the legacy fixed-preserving `clear_all`, and live-VM
-//! destructive collection remains disabled.
+//! This remains a partial shutdown substrate: library-specific IO/resource
+//! hooks, native-module ordering, and allocator live-byte accounting are
+//! explicit report/RFC debt. Live execution can request a stop-the-world full
+//! collection at Runtime safe points; allocation-triggered and incremental
+//! collection remain disabled.
 
 use std::collections::HashSet;
 use std::marker::{PhantomData, PhantomPinned};
@@ -53,16 +54,19 @@ use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
 use lua_core::thread::{CoroutineStatus, Thread};
 use lua_core::upvalue::Upvalue;
+use lua_core::userdata::Userdata;
 use lua_core::value::Value;
 use thiserror::Error;
 
 use crate::execute::{
-    ExecResult, RuntimeError, VmExit, execute_proto, finish_deferred_native_call,
-    finish_deferred_native_values, resume_after_deferred_native_call, resume_lua_thread,
-    start_lua_call_at_stack,
+    ExecResult, RuntimeError, VmExit, abort_finalizer_callback, call_value_with_results,
+    execute_proto, finish_deferred_full_collection, finish_deferred_native_call,
+    finish_deferred_native_values, resume_after_deferred_native_call, resume_finalizer_callback,
+    resume_lua_thread, start_finalizer_callback, start_lua_call_at_stack,
 };
 use crate::native::{
-    DeferredNativeCall, ResumeRequest, ResumeResponse, UpvalueAccessOperation, UpvalueAccessRequest,
+    DeferredNativeCall, FullCollectionRequest, ResumeRequest, ResumeResponse, RuntimeRequest,
+    UpvalueAccessOperation, UpvalueAccessRequest,
 };
 use crate::state::lua_state::LuaStateShutdownReport;
 use crate::state::{
@@ -71,6 +75,8 @@ use crate::state::{
 
 mod full_collection;
 mod root_trace;
+use full_collection::collect_full_stw_at_safe_point;
+use root_trace::RuntimeRootSet;
 pub use root_trace::{
     MarkOnlyReport, RootEdgeCount, RuntimeRootKind, StateTraceFailure, UnresolvedObjectEdge,
     UnsafeTraceGap, UnsafeTraceGapKind,
@@ -179,6 +185,7 @@ struct NativeActivationFrame {
 struct NativeActivationStack {
     frames: Vec<NativeActivationFrame>,
     upvalue_transfers: Vec<UpvalueTransferFrame>,
+    gc_frames: Vec<GcActivationFrame>,
 }
 
 impl NativeActivationStack {
@@ -198,8 +205,26 @@ impl NativeActivationStack {
                 response.seed_roots(gc);
             }
         }
-        gc.propagate_marks();
+        for frame in &self.gc_frames {
+            frame.request.seed_roots(gc);
+            if let Some((userdata, callback)) = &frame.current_finalizer {
+                gc.mark_value(&Value::Userdata(*userdata));
+                gc.mark_value(callback);
+            }
+            if let Some(response) = &frame.response {
+                response.seed_roots(gc);
+            }
+        }
     }
+}
+
+#[derive(Clone, Debug)]
+struct GcActivationFrame {
+    requester: StateHandle,
+    request: FullCollectionRequest,
+    draining_finalizers: bool,
+    current_finalizer: Option<(GcRef<Userdata>, Value)>,
+    response: Option<CollectionResponse>,
 }
 
 #[derive(Clone, Debug)]
@@ -235,15 +260,70 @@ enum NativeDriverAction {
         replay_dead_ancestor: bool,
     },
     DeliverUpvalue(UpvalueTransferFrame),
+    DeliverCollection {
+        request: FullCollectionRequest,
+        response: CollectionResponse,
+        resume: NativeDriverRole,
+    },
+    StartFinalizer {
+        callback: Value,
+        userdata: GcRef<Userdata>,
+        stop_ci: usize,
+    },
+    FailFinalizer {
+        message: String,
+        stop_ci: usize,
+        saved_top: usize,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum CollectionResponse {
+    Success(Vec<Value>),
+    ErrorMessage(String),
+    ErrorValue(Value),
+}
+
+impl CollectionResponse {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        match self {
+            Self::Success(values) => {
+                for value in values {
+                    gc.mark_value(value);
+                }
+            }
+            Self::ErrorValue(error) => gc.mark_value(error),
+            Self::ErrorMessage(_) => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeDriverRole {
+    Program,
+    Finalizer { stop_ci: usize },
+}
+
+impl NativeDriverAction {
+    fn role(&self) -> NativeDriverRole {
+        match self {
+            Self::StartFinalizer { stop_ci, .. } | Self::FailFinalizer { stop_ci, .. } => {
+                NativeDriverRole::Finalizer { stop_ci: *stop_ci }
+            }
+            Self::DeliverCollection { resume, .. } => *resume,
+            _ => NativeDriverRole::Program,
+        }
+    }
 }
 
 enum NativeTurnEvent {
     Request {
-        request: Box<ResumeRequest>,
+        request: Box<RuntimeRequest>,
         caller_thread: Option<GcRef<Thread>>,
     },
     UpvalueAccess(Box<UpvalueAccessRequest>),
     Main(Result<ExecResult, RuntimeError>),
+    Finalizer(Result<(), RuntimeError>),
     Coroutine {
         thread: GcRef<Thread>,
         response: ResumeResponse,
@@ -252,10 +332,9 @@ enum NativeTurnEvent {
 
 /// Result of explicit Runtime teardown.
 ///
-/// M1.8 reclaims Rust-owned states and collector allocations, but deliberately
-/// does not invoke Lua-visible `__gc` or library-specific close callbacks.
-/// Those semantic gaps are exposed as debt fields rather than hidden behind
-/// successful memory reclamation.
+/// M1.8 reclaims Rust-owned states and collector allocations. Close drains
+/// Lua-visible `__gc` callbacks with error isolation before destroying the
+/// heap; library-specific close callbacks remain an explicit capability debt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeCloseReport {
     /// Runtime that produced the report.
@@ -296,9 +375,13 @@ pub struct RuntimeCloseReport {
     pub destroyed_threads: usize,
     /// Fixed allocations destroyed in the final GC teardown pass.
     pub destroyed_fixed_objects: usize,
-    /// Pending-finalizer queue entries discarded without Lua callback.
+    /// Pending-finalizer queue entries discarded after the close drain.
     pub pending_lua_finalizers_discarded: usize,
-    /// Capability debt: close-time Lua `__gc` callbacks are not implemented.
+    /// Lua `__gc` callbacks attempted during the close drain.
+    pub lua_finalizers_attempted: usize,
+    /// Close-time Lua `__gc` errors isolated while continuing the drain.
+    pub lua_finalizer_errors_ignored: usize,
+    /// Whether close-time Lua `__gc` callback delivery remains unavailable.
     pub lua_gc_callback_debt: bool,
     /// Capability debt: library-specific IO/resource drain hooks are not run.
     pub io_resource_drain_debt: bool,
@@ -312,6 +395,8 @@ struct RuntimeShutdownSummary {
     destroyed_threads: usize,
     destroyed_fixed_objects: usize,
     pending_lua_finalizers_discarded: usize,
+    lua_finalizers_attempted: usize,
+    lua_finalizer_errors_ignored: usize,
 }
 
 /// Failure to resolve a generational Lua state handle.
@@ -2003,12 +2088,13 @@ impl Runtime {
         let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
         if !heap.native_activations.frames.is_empty()
             || !heap.native_activations.upvalue_transfers.is_empty()
+            || !heap.native_activations.gc_frames.is_empty()
         {
             return Err(RuntimeExecutionError::Protocol(
                 "activation stack was not empty at execution entry".to_string(),
             ));
         }
-        let arena = NonNull::from(&mut heap.state_arena);
+        let mut arena = NonNull::from(&mut heap.state_arena);
         let (gc, string_pool) = heap.heap.parts_mut();
         let activations = &mut heap.native_activations;
         let _activation_cleanup = NativeActivationSessionGuard {
@@ -2021,6 +2107,7 @@ impl Runtime {
         let mut pending_native_delivery = None;
         loop {
             activations.seed_roots(gc);
+            let driver_role = action.role();
             let completed_activation = match &action {
                 NativeDriverAction::Deliver {
                     frame,
@@ -2036,12 +2123,14 @@ impl Runtime {
             };
             let completed_upvalue_transfer =
                 matches!(&action, NativeDriverAction::DeliverUpvalue(_));
+            let completed_collection =
+                matches!(&action, NativeDriverAction::DeliverCollection { .. });
             let mut event = StateArena::with_turn_state_mut(arena, current, |state| {
                 with_vm_context_parts(state, gc, string_pool, |state, gc, _| {
                     state
                         .with_native_request_scope(|state| {
                             let vm_result = execute_native_driver_action(state, gc, action);
-                            classify_native_turn(state, gc, vm_result)
+                            classify_native_turn(state, gc, vm_result, driver_role)
                         })
                         .map_err(|error| {
                             RuntimeError::new(format!(
@@ -2056,6 +2145,13 @@ impl Runtime {
                 activations.upvalue_transfers.pop().ok_or_else(|| {
                     RuntimeExecutionError::Protocol(
                         "Upvalue delivery lost its rooted transfer frame".to_string(),
+                    )
+                })?;
+            }
+            if completed_collection {
+                activations.gc_frames.pop().ok_or_else(|| {
+                    RuntimeExecutionError::Protocol(
+                        "full collection delivery lost its rooted activation frame".to_string(),
                     )
                 })?;
             }
@@ -2104,7 +2200,83 @@ impl Runtime {
                     request,
                     caller_thread,
                 } => {
-                    let request = *request;
+                    let request = match *request {
+                        RuntimeRequest::FullCollection(request) => {
+                            if request.deferred.is_none() {
+                                return Err(RuntimeExecutionError::Protocol(
+                                    "full collection request reached Runtime without deferred metadata"
+                                        .to_string(),
+                                ));
+                            }
+                            let resume = active_finalizer_role(activations, current)
+                                .unwrap_or(NativeDriverRole::Program);
+                            activations.gc_frames.push(GcActivationFrame {
+                                requester: current,
+                                request: request.clone(),
+                                draining_finalizers: false,
+                                current_finalizer: None,
+                                response: None,
+                            });
+                            let response = collect_full_stw_at_safe_point(
+                                RuntimeRootSet {
+                                    runtime_id: self.id,
+                                    main_handle: initial,
+                                    global_root: self.global_root,
+                                    registry_root: self.registry_root,
+                                    fixed_strings: &self.fixed_strings,
+                                },
+                                // SAFETY: the state turn ended before this match
+                                // and the arena remains pinned for the session.
+                                unsafe { arena.as_mut() },
+                                activations,
+                                gc,
+                                string_pool,
+                            )
+                            .map(|_| CollectionResponse::Success(request.result.values()))
+                            .unwrap_or_else(|error| {
+                                CollectionResponse::ErrorMessage(error.to_string())
+                            });
+                            if matches!(response, CollectionResponse::Success(_))
+                                && matches!(resume, NativeDriverRole::Program)
+                                && gc.pending_finalizer_count() != 0
+                                && gc.begin_finalizer_drain()
+                            {
+                                activations
+                                    .gc_frames
+                                    .last_mut()
+                                    .expect("just-pushed collection frame")
+                                    .draining_finalizers = true;
+                                if let Some(next) = next_finalizer_action(activations, gc)? {
+                                    action = next;
+                                    continue;
+                                }
+                            }
+                            let frame = activations
+                                .gc_frames
+                                .last_mut()
+                                .expect("just-pushed collection frame");
+                            frame.response = Some(response.clone());
+                            action = NativeDriverAction::DeliverCollection {
+                                request,
+                                response,
+                                resume,
+                            };
+                            continue;
+                        }
+                        RuntimeRequest::Resume(request) => request,
+                    };
+                    if let Some(NativeDriverRole::Finalizer { stop_ci }) =
+                        active_finalizer_role(activations, current)
+                    {
+                        action = NativeDriverAction::FailFinalizer {
+                            message: "coroutine.resume is not supported from a __gc metamethod"
+                                .to_string(),
+                            stop_ci,
+                            saved_top: active_finalizer_saved_top(activations, current)
+                                .expect("active finalizer has a caller snapshot"),
+                        };
+                        continue;
+                    };
                     let target = request.target;
                     let frame = prepare_native_activation(gc, current, caller_thread, request)?;
                     let normal_deferred = if frame.previous_target_status == CoroutineStatus::Normal
@@ -2137,6 +2309,19 @@ impl Runtime {
                     current = target;
                 }
                 NativeTurnEvent::UpvalueAccess(request) => {
+                    if let Some(NativeDriverRole::Finalizer { stop_ci }) =
+                        active_finalizer_role(activations, current)
+                    {
+                        action = NativeDriverAction::FailFinalizer {
+                            message:
+                                "cross-state open Upvalue access is not supported from a __gc metamethod"
+                                    .to_string(),
+                            stop_ci,
+                            saved_top: active_finalizer_saved_top(activations, current)
+                                .expect("active finalizer has a caller snapshot"),
+                        };
+                        continue;
+                    }
                     let request = *request;
                     if request.requester != current {
                         return Err(RuntimeExecutionError::Protocol(
@@ -2217,8 +2402,94 @@ impl Runtime {
                         replay_dead_ancestor,
                     };
                 }
+                NativeTurnEvent::Finalizer(result) => {
+                    let frame = activations.gc_frames.last().ok_or_else(|| {
+                        RuntimeExecutionError::Protocol(
+                            "finalizer stopped without a collection activation".to_string(),
+                        )
+                    })?;
+                    if !frame.draining_finalizers || frame.requester != current {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "finalizer stopped outside its owning collection activation"
+                                .to_string(),
+                        ));
+                    }
+                    let (userdata, _) = frame.current_finalizer.clone().ok_or_else(|| {
+                        RuntimeExecutionError::Protocol(
+                            "finalizer completion lost its pending userdata".to_string(),
+                        )
+                    })?;
+                    let callback_top = frame
+                        .request
+                        .deferred
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeExecutionError::Protocol(
+                                "finalizer activation lost its caller snapshot".to_string(),
+                            )
+                        })?
+                        .snapshot
+                        .top();
+                    let callback_error = StateArena::with_turn_state_mut(arena, current, |state| {
+                        with_vm_context_parts(state, gc, string_pool, |state, gc, _| {
+                            let error = result
+                                .as_ref()
+                                .err()
+                                .map(|error| runtime_error_value(state, gc, error));
+                            let scratch_start = state.current_call_info().top;
+                            let initialized = state.stack.size();
+                            for index in scratch_start..initialized {
+                                if let Some(slot) = state.stack.at_mut(index) {
+                                    *slot = Value::Nil;
+                                }
+                            }
+                            state.stack.set_top(scratch_start);
+                            state.top = callback_top;
+                            error
+                        })
+                    })
+                    .map_err(|source| RuntimeAccessError::StateArena { runtime_id, source })?;
+                    if !gc.acknowledge_pending_finalizer(userdata) {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "finalizer acknowledgement lost its pending userdata".to_string(),
+                        ));
+                    }
+                    let frame = activations
+                        .gc_frames
+                        .last_mut()
+                        .expect("validated collection activation remains");
+                    frame.current_finalizer = None;
+                    if let Some(error) = callback_error {
+                        gc.end_finalizer_drain();
+                        frame.draining_finalizers = false;
+                        let response = CollectionResponse::ErrorValue(error);
+                        frame.response = Some(response.clone());
+                        action = NativeDriverAction::DeliverCollection {
+                            request: frame.request.clone(),
+                            response,
+                            resume: NativeDriverRole::Program,
+                        };
+                    } else if let Some(next) = next_finalizer_action(activations, gc)? {
+                        action = next;
+                    } else {
+                        let frame = activations
+                            .gc_frames
+                            .last_mut()
+                            .expect("collection activation remains after drain");
+                        let response = CollectionResponse::Success(frame.request.result.values());
+                        frame.response = Some(response.clone());
+                        action = NativeDriverAction::DeliverCollection {
+                            request: frame.request.clone(),
+                            response,
+                            resume: NativeDriverRole::Program,
+                        };
+                    }
+                }
                 NativeTurnEvent::Main(result) => {
-                    if !activations.frames.is_empty() || !activations.upvalue_transfers.is_empty() {
+                    if !activations.frames.is_empty()
+                        || !activations.upvalue_transfers.is_empty()
+                        || !activations.gc_frames.is_empty()
+                    {
                         return Err(RuntimeExecutionError::Protocol(
                             "main state stopped while coroutine activations remain".to_string(),
                         ));
@@ -2289,12 +2560,12 @@ impl Runtime {
 
     /// Deterministically reclaim Runtime-owned Rust states and GC allocations.
     ///
-    /// Close is idempotent after the first successful call. This M1.8 partial
-    /// substrate closes validated open Upvalues, invalidates every StateArena
+    /// Close is idempotent after the first successful call. It drains pending
+    /// and newly allocated Lua `__gc` callbacks while isolating callback
+    /// errors, closes validated open Upvalues, invalidates every StateArena
     /// slot, destroys non-fixed Threads before other non-fixed objects and
-    /// fixed objects last, and empties the live StringPool. It deliberately
-    /// does not run Lua-visible `__gc` or library-specific resource callbacks;
-    /// those capability debts are explicit in the returned report.
+    /// fixed objects last, and empties the live StringPool. Library-specific
+    /// resource callbacks remain an explicit capability debt in the report.
     pub fn close(&mut self) -> Result<RuntimeCloseReport, RuntimeAccessError> {
         self.check_owner()?;
         if self.active_executions != 0 {
@@ -2321,8 +2592,15 @@ impl Runtime {
                         source,
                     }
                 })?;
+                let close_finalizers = self.drain_finalizers_for_close();
+                self.validate_shutdown_state().map_err(|source| {
+                    RuntimeAccessError::StateArena {
+                        runtime_id: self.id,
+                        source,
+                    }
+                })?;
                 self.phase = RuntimePhase::Closing;
-                let summary = match self.shutdown_contents() {
+                let summary = match self.shutdown_contents(close_finalizers) {
                     Ok(summary) => summary,
                     Err(source) => {
                         // All fallible arena ownership checks are preflighted
@@ -2341,6 +2619,47 @@ impl Runtime {
         }
     }
 
+    fn drain_finalizers_for_close(&mut self) -> (usize, usize) {
+        let Some(state) = self.main_state.as_deref_mut() else {
+            return (0, 0);
+        };
+        // SAFETY: close holds exclusive owner-thread Runtime access, there is
+        // no active execution, and RuntimeStorage remains pinned.
+        let storage = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
+        let (gc, strings) = storage.heap.parts_mut();
+        gc.prepare_all_finalizable_userdata();
+        if gc.pending_finalizer_count() == 0 || !gc.begin_finalizer_drain() {
+            return (0, 0);
+        }
+
+        let mut attempted = 0usize;
+        let mut errors = 0usize;
+        while let Some(userdata) = gc.next_pending_finalizer() {
+            let callback = gc.pending_finalizer_callback(userdata);
+            if let Some(callback) = callback {
+                attempted = attempted.saturating_add(1);
+                let result = with_vm_context_parts(state, gc, strings, |state, gc, _| {
+                    call_value_with_results(
+                        state,
+                        gc,
+                        callback,
+                        &[Value::Userdata(userdata)],
+                        Some(0),
+                        |_, _, _| (),
+                    )
+                });
+                if result.is_err() {
+                    errors = errors.saturating_add(1);
+                }
+            }
+            let _ = gc.acknowledge_pending_finalizer(userdata);
+            // A close callback may allocate another finalizable userdata.
+            gc.prepare_all_finalizable_userdata();
+        }
+        gc.end_finalizer_drain();
+        (attempted, errors)
+    }
+
     fn validate_shutdown_state(&self) -> Result<(), StateResolveError> {
         let state = self
             .main_state
@@ -2353,6 +2672,7 @@ impl Runtime {
         let heap = self.heap.as_ref().get_ref();
         if !heap.native_activations.frames.is_empty()
             || !heap.native_activations.upvalue_transfers.is_empty()
+            || !heap.native_activations.gc_frames.is_empty()
         {
             return Err(StateResolveError::ArenaInvariant {
                 reason: "native activation stack is not empty at shutdown",
@@ -2363,7 +2683,10 @@ impl Runtime {
         heap.state_arena.validate_owned_drain()
     }
 
-    fn shutdown_contents(&mut self) -> Result<RuntimeShutdownSummary, StateResolveError> {
+    fn shutdown_contents(
+        &mut self,
+        close_finalizers: (usize, usize),
+    ) -> Result<RuntimeShutdownSummary, StateResolveError> {
         let arena_report = {
             // SAFETY: RuntimeStorage remains pinned and shutdown has exclusive
             // owner-thread access with no execution guard.
@@ -2396,6 +2719,8 @@ impl Runtime {
             destroyed_threads: gc_report.destroyed_threads,
             destroyed_fixed_objects: gc_report.destroyed_fixed,
             pending_lua_finalizers_discarded: gc_report.pending_finalizers_discarded,
+            lua_finalizers_attempted: close_finalizers.0,
+            lua_finalizer_errors_ignored: close_finalizers.1,
         })
     }
 
@@ -2436,7 +2761,9 @@ impl Runtime {
             destroyed_threads: summary.destroyed_threads,
             destroyed_fixed_objects: summary.destroyed_fixed_objects,
             pending_lua_finalizers_discarded: summary.pending_lua_finalizers_discarded,
-            lua_gc_callback_debt: true,
+            lua_finalizers_attempted: summary.lua_finalizers_attempted,
+            lua_finalizer_errors_ignored: summary.lua_finalizer_errors_ignored,
+            lua_gc_callback_debt: false,
             io_resource_drain_debt: true,
         }
     }
@@ -2502,6 +2829,85 @@ impl Drop for Runtime {
         // owner-thread path delegates to the same deterministic teardown used
         // by explicit close.
         self.close_for_drop();
+    }
+}
+
+fn active_finalizer_role(
+    activations: &NativeActivationStack,
+    requester: StateHandle,
+) -> Option<NativeDriverRole> {
+    activations.gc_frames.iter().rev().find_map(|frame| {
+        if !frame.draining_finalizers || frame.requester != requester {
+            return None;
+        }
+        frame
+            .request
+            .deferred
+            .as_ref()
+            .map(|deferred| NativeDriverRole::Finalizer {
+                stop_ci: deferred.saved_ci + 1,
+            })
+    })
+}
+
+fn active_finalizer_saved_top(
+    activations: &NativeActivationStack,
+    requester: StateHandle,
+) -> Option<usize> {
+    activations.gc_frames.iter().rev().find_map(|frame| {
+        (frame.draining_finalizers && frame.requester == requester)
+            .then(|| {
+                frame
+                    .request
+                    .deferred
+                    .as_ref()
+                    .map(|deferred| deferred.snapshot.top())
+            })
+            .flatten()
+    })
+}
+
+fn next_finalizer_action(
+    activations: &mut NativeActivationStack,
+    gc: &mut GarbageCollector,
+) -> Result<Option<NativeDriverAction>, RuntimeExecutionError> {
+    loop {
+        let frame = activations.gc_frames.last_mut().ok_or_else(|| {
+            RuntimeExecutionError::Protocol(
+                "finalizer drain has no collection activation".to_string(),
+            )
+        })?;
+        if !frame.draining_finalizers {
+            return Err(RuntimeExecutionError::Protocol(
+                "finalizer scheduling requested outside a drain".to_string(),
+            ));
+        }
+        let Some(userdata) = gc.next_pending_finalizer() else {
+            gc.end_finalizer_drain();
+            frame.draining_finalizers = false;
+            frame.current_finalizer = None;
+            return Ok(None);
+        };
+        let Some(callback) = gc.pending_finalizer_callback(userdata) else {
+            if !gc.acknowledge_pending_finalizer(userdata) {
+                return Err(RuntimeExecutionError::Protocol(
+                    "missing finalizer callback could not be acknowledged".to_string(),
+                ));
+            }
+            continue;
+        };
+        let deferred = frame.request.deferred.as_ref().ok_or_else(|| {
+            RuntimeExecutionError::Protocol(
+                "finalizer scheduling lost its deferred collector call".to_string(),
+            )
+        })?;
+        let stop_ci = deferred.saved_ci + 1;
+        frame.current_finalizer = Some((userdata, callback.clone()));
+        return Ok(Some(NativeDriverAction::StartFinalizer {
+            callback,
+            userdata,
+            stop_ci,
+        }));
     }
 }
 
@@ -2598,6 +3004,42 @@ fn execute_native_driver_action(
             }
             resume_after_upvalue_access(state, gc)
         }
+        NativeDriverAction::DeliverCollection {
+            request,
+            response,
+            resume,
+        } => {
+            let deferred = request.deferred.as_ref().ok_or_else(|| {
+                RuntimeError::new("full collection activation lost its deferred call")
+            })?;
+            let response = match response {
+                CollectionResponse::Success(values) => Ok(values),
+                CollectionResponse::ErrorMessage(message) => {
+                    Err(runtime_error_value(state, gc, &RuntimeError::new(message)))
+                }
+                CollectionResponse::ErrorValue(error) => Err(error),
+            };
+            finish_deferred_full_collection(state, gc, deferred, request.protected, response)?;
+            match resume {
+                NativeDriverRole::Program => resume_after_deferred_native_call(state, gc, deferred),
+                NativeDriverRole::Finalizer { stop_ci } => {
+                    resume_finalizer_callback(state, gc, stop_ci)
+                }
+            }
+        }
+        NativeDriverAction::StartFinalizer {
+            callback,
+            userdata,
+            stop_ci,
+        } => start_finalizer_callback(state, gc, callback, userdata, stop_ci),
+        NativeDriverAction::FailFinalizer {
+            message,
+            stop_ci,
+            saved_top,
+        } => {
+            abort_finalizer_callback(state, gc, stop_ci, saved_top)?;
+            Err(RuntimeError::new(message))
+        }
     }
 }
 
@@ -2673,6 +3115,7 @@ fn classify_native_turn(
     state: &mut LuaState,
     gc: &mut GarbageCollector,
     result: Result<VmExit, RuntimeError>,
+    role: NativeDriverRole,
 ) -> Result<NativeTurnEvent, RuntimeError> {
     match result {
         Ok(VmExit::NativeRequest(id)) => {
@@ -2685,6 +3128,18 @@ fn classify_native_turn(
             })
         }
         Ok(VmExit::UpvalueAccess(request)) => Ok(NativeTurnEvent::UpvalueAccess(request)),
+        Ok(VmExit::Complete(ExecResult::Returned))
+            if matches!(role, NativeDriverRole::Finalizer { .. }) =>
+        {
+            Ok(NativeTurnEvent::Finalizer(Ok(())))
+        }
+        Ok(VmExit::Complete(ExecResult::Yielded))
+            if matches!(role, NativeDriverRole::Finalizer { .. }) =>
+        {
+            Ok(NativeTurnEvent::Finalizer(Err(RuntimeError::new(
+                "attempt to yield from a __gc metamethod",
+            ))))
+        }
         Ok(VmExit::Complete(result)) => {
             let Some(thread) = state.current_thread else {
                 return Ok(NativeTurnEvent::Main(Ok(result)));
@@ -2716,6 +3171,9 @@ fn classify_native_turn(
             Ok(NativeTurnEvent::Coroutine { thread, response })
         }
         Err(error) => {
+            if matches!(role, NativeDriverRole::Finalizer { .. }) {
+                return Ok(NativeTurnEvent::Finalizer(Err(error)));
+            }
             let Some(thread) = state.current_thread else {
                 return Ok(NativeTurnEvent::Main(Err(error)));
             };
@@ -2929,6 +3387,14 @@ impl Drop for NativeActivationSessionGuard {
             });
         }
         activations.upvalue_transfers.clear();
+        if activations
+            .gc_frames
+            .iter()
+            .any(|frame| frame.draining_finalizers)
+        {
+            gc.end_finalizer_drain();
+        }
+        activations.gc_frames.clear();
     }
 }
 
@@ -3576,7 +4042,9 @@ mod tests {
         assert_eq!(first.rejected_temporary_state_root_releases, 0);
         assert_eq!(first.remaining_collector_queue_entries, 0);
         assert!(first.destroyed_objects >= 2);
-        assert!(first.lua_gc_callback_debt);
+        assert!(!first.lua_gc_callback_debt);
+        assert_eq!(first.lua_finalizers_attempted, 0);
+        assert_eq!(first.lua_finalizer_errors_ignored, 0);
         assert!(first.io_resource_drain_debt);
         assert_eq!(runtime.phase(), RuntimePhase::Closed);
         assert!(runtime.main_state.is_none());

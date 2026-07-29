@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::pin::Pin;
 
+use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::gc_string::GcString;
 use lua_core::proto::Proto;
 use lua_core::state_handle::{RuntimeId, StateHandle};
 use lua_core::table::Table;
@@ -16,7 +18,9 @@ use lua_core::value::Value;
 
 use crate::state::LuaState;
 
-use super::{Runtime, RuntimeAccessError, RuntimePhase, StateResolveError};
+use super::{
+    NativeActivationStack, Runtime, RuntimeAccessError, RuntimePhase, StateArena, StateResolveError,
+};
 
 /// Inventory-aligned root kinds covered by this mark-only slice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -286,149 +290,186 @@ impl Runtime {
         let state_arena = &mut heap.state_arena;
         let native_activations = &mut heap.native_activations;
         let gc = heap.heap.collector_mut();
-        let total_objects = gc.object_count();
-        let seed_report = gc.begin_mark_only();
-
-        let mut root_counts = BTreeMap::new();
-        increment(
-            &mut root_counts,
-            RuntimeRootKind::CollectorExplicitRoot,
-            seed_report
-                .seeded
-                .saturating_sub(seed_report.temporary_seeded)
-                .saturating_sub(seed_report.pending_finalizers_seeded),
-        );
-        increment(
-            &mut root_counts,
-            RuntimeRootKind::TemporaryProtectedRoots,
-            seed_report.temporary_seeded,
-        );
-        increment(
-            &mut root_counts,
-            RuntimeRootKind::PendingFinalizers,
-            seed_report.pending_finalizers_seeded,
-        );
-        let fixed_strings_seeded = fixed_strings
-            .into_iter()
-            .filter(|string| gc.mark_registered(*string))
-            .count();
-        increment(
-            &mut root_counts,
-            RuntimeRootKind::FixedStrings,
-            fixed_strings_seeded,
-        );
-        increment(
-            &mut root_counts,
-            RuntimeRootKind::CoroutineActivationBuffer,
-            native_activations.frames.len() + native_activations.upvalue_transfers.len(),
-        );
-        native_activations.seed_roots(gc);
-        let mut unresolved_object_edges = Vec::new();
-        mark_runtime_table(
+        Ok(trace_roots_mark_only_at_safe_point(
+            RuntimeRootSet {
+                runtime_id: self.id,
+                main_handle,
+                global_root,
+                registry_root,
+                fixed_strings: &fixed_strings,
+            },
+            state_arena,
+            native_activations,
             gc,
-            global_root,
-            RuntimeRootKind::GlobalTable,
-            &mut root_counts,
-            &mut unresolved_object_edges,
-        );
-        mark_runtime_table(
-            gc,
-            registry_root,
-            RuntimeRootKind::Registry,
-            &mut root_counts,
-            &mut unresolved_object_edges,
-        );
+        ))
+    }
+}
 
-        let temporary_state_roots = state_arena.temporary_state_roots();
-        increment(
-            &mut root_counts,
-            RuntimeRootKind::TemporaryStateRoots,
-            temporary_state_roots.len(),
-        );
-        let mut state_queue = VecDeque::from([main_handle]);
-        state_queue.extend(temporary_state_roots);
-        increment(&mut root_counts, RuntimeRootKind::MainStateEntry, 1);
-        let mut attempted_states = HashSet::new();
-        let mut traced_states = Vec::new();
-        let mut failed_state_handles = Vec::new();
-        let mut unsafe_gaps = Vec::new();
-        let mut object_trace_steps = 0;
+/// Immutable Runtime-owned roots consumed by one stop-the-world trace.
+#[derive(Clone, Copy)]
+pub(super) struct RuntimeRootSet<'a> {
+    pub(super) runtime_id: RuntimeId,
+    pub(super) main_handle: StateHandle,
+    pub(super) global_root: Option<GcRef<Table>>,
+    pub(super) registry_root: Option<GcRef<Table>>,
+    pub(super) fixed_strings: &'a [GcRef<GcString>],
+}
 
-        while !state_queue.is_empty() || gc.pending_mark_count() != 0 {
-            while let Some(handle) = state_queue.pop_front() {
-                if !attempted_states.insert(handle) {
+/// Canonical Runtime root traversal while the scheduler has released every
+/// StateArena turn borrow. The caller owns the stop-the-world invariant.
+pub(super) fn trace_roots_mark_only_at_safe_point(
+    roots: RuntimeRootSet<'_>,
+    state_arena: &mut StateArena,
+    native_activations: &mut NativeActivationStack,
+    gc: &mut GarbageCollector,
+) -> MarkOnlyReport {
+    debug_assert!(state_arena.turn_borrow.is_none());
+    let total_objects = gc.object_count();
+    let seed_report = gc.begin_mark_only();
+
+    let mut root_counts = BTreeMap::new();
+    increment(
+        &mut root_counts,
+        RuntimeRootKind::CollectorExplicitRoot,
+        seed_report
+            .seeded
+            .saturating_sub(seed_report.temporary_seeded)
+            .saturating_sub(seed_report.pending_finalizers_seeded),
+    );
+    increment(
+        &mut root_counts,
+        RuntimeRootKind::TemporaryProtectedRoots,
+        seed_report.temporary_seeded,
+    );
+    increment(
+        &mut root_counts,
+        RuntimeRootKind::PendingFinalizers,
+        seed_report.pending_finalizers_seeded,
+    );
+    let fixed_strings_seeded = roots
+        .fixed_strings
+        .iter()
+        .copied()
+        .filter(|string| gc.mark_registered(*string))
+        .count();
+    increment(
+        &mut root_counts,
+        RuntimeRootKind::FixedStrings,
+        fixed_strings_seeded,
+    );
+    increment(
+        &mut root_counts,
+        RuntimeRootKind::CoroutineActivationBuffer,
+        native_activations.frames.len()
+            + native_activations.upvalue_transfers.len()
+            + native_activations.gc_frames.len(),
+    );
+    native_activations.seed_roots(gc);
+    let mut unresolved_object_edges = Vec::new();
+    mark_runtime_table(
+        gc,
+        roots.global_root,
+        RuntimeRootKind::GlobalTable,
+        &mut root_counts,
+        &mut unresolved_object_edges,
+    );
+    mark_runtime_table(
+        gc,
+        roots.registry_root,
+        RuntimeRootKind::Registry,
+        &mut root_counts,
+        &mut unresolved_object_edges,
+    );
+
+    let temporary_state_roots = state_arena.temporary_state_roots();
+    increment(
+        &mut root_counts,
+        RuntimeRootKind::TemporaryStateRoots,
+        temporary_state_roots.len(),
+    );
+    let mut state_queue = VecDeque::from([roots.main_handle]);
+    state_queue.extend(temporary_state_roots);
+    increment(&mut root_counts, RuntimeRootKind::MainStateEntry, 1);
+    let mut attempted_states = HashSet::new();
+    let mut traced_states = Vec::new();
+    let mut failed_state_handles = Vec::new();
+    let mut unsafe_gaps = Vec::new();
+    let mut object_trace_steps = 0;
+
+    while !state_queue.is_empty() || gc.pending_mark_count() != 0 {
+        while let Some(handle) = state_queue.pop_front() {
+            if !attempted_states.insert(handle) {
+                continue;
+            }
+
+            let state_pointer = match state_arena.resolve_for_trace(handle) {
+                Ok(state) => state,
+                Err(error) => {
+                    failed_state_handles.push(StateTraceFailure { handle, error });
                     continue;
                 }
-
-                let state_pointer = match state_arena.resolve_for_trace(handle) {
-                    Ok(state) => state,
-                    Err(error) => {
-                        failed_state_handles.push(StateTraceFailure { handle, error });
-                        continue;
-                    }
-                };
-
-                // SAFETY: StateArena validated runtime, slot, generation,
-                // occupancy and borrow state (U-04). Runtime is exclusively
-                // borrowed with zero active executions (U-03). The reference
-                // exists only while copying a root snapshot and is dropped
-                // before the collector is mutated.
-                let snapshot = unsafe {
-                    snapshot_state(state_pointer.as_ref(), handle, handle == main_handle)
-                };
-                traced_states.push(handle);
-                unsafe_gaps.extend(snapshot.gaps);
-                mark_snapshot(
-                    gc,
-                    handle,
-                    snapshot.edges,
-                    &mut root_counts,
-                    &mut unresolved_object_edges,
-                );
-            }
-
-            let Some(step) = gc.propagate_one_marked_object() else {
-                continue;
             };
-            object_trace_steps += 1;
-            if step.traced_thread_caller {
-                increment(&mut root_counts, RuntimeRootKind::ThreadCallerChain, 1);
-            }
-            if let Some(handle) = step.thread_state_handle {
-                increment(&mut root_counts, RuntimeRootKind::CoroutineStack, 1);
-                state_queue.push_back(handle);
-            }
-            if let Some(handle) = step.upvalue_state_handle {
-                increment(&mut root_counts, RuntimeRootKind::OpenUpvalues, 1);
-                state_queue.push_back(handle);
-            }
+
+            // SAFETY: StateArena validated runtime, slot, generation,
+            // occupancy and borrow state (U-04). The Runtime scheduler has
+            // released the current turn borrow at this stop-the-world safe
+            // point (U-03). The reference exists only while copying a root
+            // snapshot and is dropped before the collector is mutated.
+            let snapshot = unsafe {
+                snapshot_state(state_pointer.as_ref(), handle, handle == roots.main_handle)
+            };
+            traced_states.push(handle);
+            unsafe_gaps.extend(snapshot.gaps);
+            mark_snapshot(
+                gc,
+                handle,
+                snapshot.edges,
+                &mut root_counts,
+                &mut unresolved_object_edges,
+            );
         }
 
-        traced_states.sort_unstable();
-        failed_state_handles.sort_by_key(|failure| failure.handle);
-        unsafe_gaps.sort_unstable();
-        unresolved_object_edges.sort_unstable();
+        let Some(step) = gc.propagate_one_marked_object() else {
+            continue;
+        };
+        object_trace_steps += 1;
+        if step.traced_thread_caller {
+            increment(&mut root_counts, RuntimeRootKind::ThreadCallerChain, 1);
+        }
+        if let Some(handle) = step.thread_state_handle {
+            increment(&mut root_counts, RuntimeRootKind::CoroutineStack, 1);
+            state_queue.push_back(handle);
+        }
+        if let Some(handle) = step.upvalue_state_handle {
+            increment(&mut root_counts, RuntimeRootKind::OpenUpvalues, 1);
+            state_queue.push_back(handle);
+        }
+    }
 
-        let marked_objects = gc.marked_object_count();
-        debug_assert_eq!(gc.object_count(), total_objects);
-        Ok(MarkOnlyReport {
-            runtime_id: self.id,
-            total_objects,
-            marked_objects,
-            object_trace_steps,
-            traced_states,
-            failed_state_handles,
-            collector_roots_seeded: seed_report.seeded,
-            collector_roots_rejected: seed_report.rejected,
-            rejected_child_edges: gc.rejected_mark_edge_count(),
-            root_edges: root_counts
-                .into_iter()
-                .map(|(kind, edges)| RootEdgeCount { kind, edges })
-                .collect(),
-            unsafe_gaps,
-            unresolved_object_edges,
-            pending_objects: gc.pending_mark_count(),
-        })
+    traced_states.sort_unstable();
+    failed_state_handles.sort_by_key(|failure| failure.handle);
+    unsafe_gaps.sort_unstable();
+    unresolved_object_edges.sort_unstable();
+
+    let marked_objects = gc.marked_object_count();
+    debug_assert_eq!(gc.object_count(), total_objects);
+    MarkOnlyReport {
+        runtime_id: roots.runtime_id,
+        total_objects,
+        marked_objects,
+        object_trace_steps,
+        traced_states,
+        failed_state_handles,
+        collector_roots_seeded: seed_report.seeded,
+        collector_roots_rejected: seed_report.rejected,
+        rejected_child_edges: gc.rejected_mark_edge_count(),
+        root_edges: root_counts
+            .into_iter()
+            .map(|(kind, edges)| RootEdgeCount { kind, edges })
+            .collect(),
+        unsafe_gaps,
+        unresolved_object_edges,
+        pending_objects: gc.pending_mark_count(),
     }
 }
 

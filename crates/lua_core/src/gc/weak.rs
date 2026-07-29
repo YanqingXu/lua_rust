@@ -53,6 +53,13 @@ impl GarbageCollector {
             };
             let table_header = table_pointer.as_ptr().cast::<GcObjectHeader>();
 
+            // Only live weak tables can expose entries after this cycle.
+            // Stale WEAKBITS on an unreachable table must not keep scanning
+            // or mutating a table that sweep is about to destroy.
+            if self.is_object_dead(table_ref) {
+                continue;
+            }
+
             // 读取弱模式标志位
             let (weak_keys, weak_values) = {
                 // SAFETY: the side table matched address, identity, and Table
@@ -98,19 +105,8 @@ impl GarbageCollector {
                 Value::Userdata(userdata)
                     if gc.pending_finalizers.contains(userdata)
             );
-            let key_finalized_userdata = matches!(
-                &k,
-                Value::Userdata(userdata) if {
-                    gc.validate_ref(*userdata).is_ok_and(|pointer| {
-                        let header = pointer.as_ptr().cast::<GcObjectHeader>();
-                        // SAFETY: validation matched allocation identity and
-                        // the Userdata tag before this header read.
-                        unsafe { (*header).is_finalized() }
-                    })
-                } && !key_pending_finalizer
-            );
             if weak_keys
-                && (gc.is_value_dead(&k) || key_finalized_userdata)
+                && gc.is_value_dead(&k)
                 && !key_kept_alive_by_strong_value
                 && !key_pending_finalizer
             {

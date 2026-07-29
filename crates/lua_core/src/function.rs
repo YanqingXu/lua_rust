@@ -47,6 +47,9 @@ pub enum RuntimeNativeFunction {
     CoroutineResume = 0,
     /// The closure returned by `coroutine.wrap`.
     CoroutineWrapRunner = 1,
+    /// Base-library `collectgarbage`, whose destructive modes must suspend at
+    /// a Runtime-owned stop-the-world safe point.
+    CollectGarbage = 2,
 }
 
 // =====================================================================

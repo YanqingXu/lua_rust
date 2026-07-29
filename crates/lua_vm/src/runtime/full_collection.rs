@@ -1,19 +1,25 @@
-//! Runtime-only stop-the-world full collection.
+//! Runtime-owned stop-the-world full collection.
 //!
-//! This module deliberately exposes no Lua-visible or allocation-triggered
-//! entry point. It consumes the canonical Runtime root tracer, closes
-//! unreachable coroutine states before object destruction, and sweeps only
-//! when every currently unsupported edge family is absent.
+//! Lua-visible `collectgarbage` requests enter here only after the scheduler
+//! releases its current state turn. The atomic phase consumes the canonical
+//! Runtime root tracer, prepares finalizers, propagates resurrected graphs,
+//! reconciles weak tables, closes unreachable coroutine states before object
+//! destruction, and then sweeps. Allocation-triggered and incremental entry
+//! points remain disabled.
 
-use std::collections::HashSet;
-use std::pin::Pin;
-
+use lua_core::gc::collector::GarbageCollector;
 use lua_core::state_handle::{RuntimeId, StateHandle};
+use lua_core::string_pool::StringPool;
+use std::collections::HashSet;
 use thiserror::Error;
 
-use super::{MarkOnlyReport, Runtime, RuntimeAccessError, StateResolveError};
+use super::root_trace::{RuntimeRootSet, trace_roots_mark_only_at_safe_point};
+use super::{
+    MarkOnlyReport, NativeActivationStack, Runtime, RuntimeAccessError, StateArena,
+    StateResolveError,
+};
 
-/// Result of one internal Runtime-only stop-the-world collection.
+/// Result of one Runtime-owned stop-the-world full collection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeFullCollectionReport {
     pub(crate) runtime_id: RuntimeId,
@@ -28,6 +34,8 @@ pub(crate) struct RuntimeFullCollectionReport {
     pub(crate) interned_strings_after: usize,
     pub(crate) coroutine_states_before: usize,
     pub(crate) coroutine_states_after: usize,
+    pub(crate) newly_discovered_finalizers: usize,
+    pub(crate) pending_finalizers_after: usize,
     pub(crate) swept_state_handles: Vec<StateHandle>,
     pub(crate) closed_open_upvalues: usize,
     pub(crate) rejected_open_upvalue_edges: usize,
@@ -54,16 +62,6 @@ pub(crate) enum RuntimeFullCollectionError {
         rejected_child_edges: usize,
         pending_mark_work: usize,
     },
-    #[error("internal full collection does not yet support {active_tables} active weak table(s)")]
-    WeakTablesUnsupported { active_tables: usize },
-    #[error(
-        "internal full collection does not yet deliver Lua finalizers \
-         (pending={pending}, newly discovered={newly_discovered})"
-    )]
-    FinalizersUnsupported {
-        pending: usize,
-        newly_discovered: usize,
-    },
     #[error("coroutine state pre-sweep failed: {source}")]
     StatePrepass {
         #[source]
@@ -72,122 +70,157 @@ pub(crate) enum RuntimeFullCollectionError {
 }
 
 impl Runtime {
-    /// Run one internal, non-reentrant stop-the-world full collection.
+    /// Run one direct, non-reentrant stop-the-world full collection.
     ///
     /// The Runtime must be running on its owner thread with no active
-    /// execution guard. This method is intentionally crate-private until weak
-    /// tables, protected finalizer delivery, resurrection, and the public
-    /// `collectgarbage` contract are complete.
-    #[allow(
-        dead_code,
-        reason = "M1.9 internal collector is gated before Lua-visible integration"
-    )]
+    /// execution guard. Runtime-native `collectgarbage` requests use
+    /// `collect_full_stw_at_safe_point` instead so the activation snapshot
+    /// remains part of the canonical root set.
+    #[allow(dead_code, reason = "direct collector entry is exercised by VM tests")]
     pub(crate) fn collect_full_stw(
         &mut self,
     ) -> Result<RuntimeFullCollectionReport, RuntimeFullCollectionError> {
-        let mark = self.trace_roots_mark_only()?;
-        let failed_states = mark.failed_state_handles.len();
-        let unsafe_gaps = mark.unsafe_gaps.len();
-        let unresolved_edges = mark.unresolved_object_edges.len();
-        if failed_states != 0
-            || unsafe_gaps != 0
-            || unresolved_edges != 0
-            || mark.collector_roots_rejected != 0
-            || mark.rejected_child_edges != 0
-            || mark.pending_objects != 0
-        {
-            return Err(RuntimeFullCollectionError::UnsafeRootTrace {
-                failed_states,
-                unsafe_gaps,
-                unresolved_edges,
-                rejected_roots: mark.collector_roots_rejected,
-                rejected_child_edges: mark.rejected_child_edges,
-                pending_mark_work: mark.pending_objects,
-            });
+        self.check_owner()?;
+        if self.phase != super::RuntimePhase::Running {
+            return Err(RuntimeAccessError::NotRunning {
+                runtime_id: self.id,
+                phase: self.phase,
+            }
+            .into());
         }
-
-        let reachable_states: HashSet<_> = mark.traced_states.iter().copied().collect();
-
-        // SAFETY: trace_roots_mark_only established owner thread, Running
-        // phase, and zero active executions. Runtime remains exclusively
-        // borrowed and RuntimeStorage remains pinned for the complete cycle.
-        let storage = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
-        let objects_before = storage.heap.object_count();
-        let accounted_bytes_before = storage.heap.accounted_bytes();
-        let interned_strings_before = storage.heap.interned_string_count();
-        let coroutine_states_before = storage.state_arena.live_owned_state_count();
-
-        let active_weak_tables = storage.heap.collector().active_weak_table_count();
-        if active_weak_tables != 0 {
-            return Err(RuntimeFullCollectionError::WeakTablesUnsupported {
-                active_tables: active_weak_tables,
-            });
+        if self.active_executions != 0 {
+            return Err(RuntimeAccessError::ActiveExecutions {
+                runtime_id: self.id,
+                count: self.active_executions,
+            }
+            .into());
         }
-
-        let pending_finalizers = storage.heap.collector().pending_finalizer_count();
-        if pending_finalizers != 0 {
-            return Err(RuntimeFullCollectionError::FinalizersUnsupported {
-                pending: pending_finalizers,
-                newly_discovered: 0,
-            });
-        }
-        let newly_discovered = storage
-            .heap
-            .collector_mut()
-            .prepare_finalizable_userdata()
-            .len();
-        if newly_discovered != 0 {
-            return Err(RuntimeFullCollectionError::FinalizersUnsupported {
-                pending: storage.heap.collector().pending_finalizer_count(),
-                newly_discovered,
-            });
-        }
-
-        let state_report = storage
-            .state_arena
-            .sweep_unreachable_owned(&reachable_states, storage.heap.collector_mut())
-            .map_err(|source| RuntimeFullCollectionError::StatePrepass { source })?;
-
-        let collected_objects = storage
-            .heap
-            .with_parts_mut(|collector, strings| collector.sweep(strings));
-        let objects_after = storage.heap.object_count();
-        let accounted_bytes_after = storage.heap.accounted_bytes();
-        let interned_strings_after = storage.heap.interned_string_count();
-        let coroutine_states_after = storage.state_arena.live_owned_state_count();
-
-        debug_assert_eq!(
-            objects_before.saturating_sub(objects_after),
-            collected_objects
-        );
-        debug_assert_eq!(storage.heap.collector().pending_mark_count(), 0);
-        debug_assert_eq!(storage.heap.collector().active_weak_table_count(), 0);
-        debug_assert_eq!(storage.heap.collector().pending_finalizer_count(), 0);
-
-        Ok(RuntimeFullCollectionReport {
-            runtime_id: self.id,
-            mark,
-            objects_before,
-            objects_after,
-            collected_objects,
-            accounted_bytes_before,
-            accounted_bytes_after,
-            reclaimed_accounted_bytes: accounted_bytes_before.saturating_sub(accounted_bytes_after),
-            interned_strings_before,
-            interned_strings_after,
-            coroutine_states_before,
-            coroutine_states_after,
-            swept_state_handles: state_report.swept_state_handles,
-            closed_open_upvalues: state_report.state_shutdown.closed_open_upvalues,
-            rejected_open_upvalue_edges: state_report.state_shutdown.rejected_open_upvalue_edges,
-            open_upvalue_owner_mismatches: state_report
-                .state_shutdown
-                .open_upvalue_owner_mismatches,
-            open_upvalue_stack_values_missing: state_report
-                .state_shutdown
-                .open_upvalue_stack_values_missing,
-        })
+        let main_handle =
+            self.main_state_handle
+                .ok_or(RuntimeAccessError::MainStateUnavailable {
+                    runtime_id: self.id,
+                })?;
+        // SAFETY: RuntimeStorage is pinned and the access checks above prove
+        // there is no active state turn.
+        let storage = unsafe { std::pin::Pin::get_unchecked_mut(self.heap.as_mut()) };
+        let (gc, strings) = storage.heap.parts_mut();
+        collect_full_stw_at_safe_point(
+            RuntimeRootSet {
+                runtime_id: self.id,
+                main_handle,
+                global_root: self.global_root,
+                registry_root: self.registry_root,
+                fixed_strings: &self.fixed_strings,
+            },
+            &mut storage.state_arena,
+            &mut storage.native_activations,
+            gc,
+            strings,
+        )
     }
+}
+
+/// Run the destructive atomic phase after the Runtime scheduler has released
+/// its current StateArena turn borrow.
+pub(super) fn collect_full_stw_at_safe_point(
+    roots: RuntimeRootSet<'_>,
+    state_arena: &mut StateArena,
+    native_activations: &mut NativeActivationStack,
+    gc: &mut GarbageCollector,
+    strings: &mut StringPool,
+) -> Result<RuntimeFullCollectionReport, RuntimeFullCollectionError> {
+    debug_assert!(state_arena.turn_borrow.is_none());
+    let initial_mark =
+        trace_roots_mark_only_at_safe_point(roots, state_arena, native_activations, gc);
+    ensure_sweep_safe(&initial_mark)?;
+
+    let objects_before = gc.object_count();
+    let accounted_bytes_before = gc.total_memory();
+    let interned_strings_before = strings.len();
+    let coroutine_states_before = state_arena.live_owned_state_count();
+
+    let newly_discovered = gc.prepare_finalizable_userdata().len();
+
+    // Pending finalizers are canonical collector roots, so this second
+    // Runtime fixed point both
+    // propagates their resurrection graph and discovers any Thread or
+    // open-Upvalue StateHandle edges introduced by that graph. It also
+    // re-reads weak modes before atomic weak cleanup.
+    let mark = if newly_discovered == 0 {
+        initial_mark
+    } else {
+        let finalizer_mark =
+            trace_roots_mark_only_at_safe_point(roots, state_arena, native_activations, gc);
+        ensure_sweep_safe(&finalizer_mark)?;
+        finalizer_mark
+    };
+    let reachable_states: HashSet<_> = mark.traced_states.iter().copied().collect();
+
+    gc.clear_weak_table_entries();
+
+    let state_report = state_arena
+        .sweep_unreachable_owned(&reachable_states, gc)
+        .map_err(|source| RuntimeFullCollectionError::StatePrepass { source })?;
+
+    let collected_objects = gc.sweep(strings);
+    let objects_after = gc.object_count();
+    let accounted_bytes_after = gc.total_memory();
+    let interned_strings_after = strings.len();
+    let coroutine_states_after = state_arena.live_owned_state_count();
+    let pending_finalizers_after = gc.pending_finalizer_count();
+
+    debug_assert_eq!(
+        objects_before.saturating_sub(objects_after),
+        collected_objects
+    );
+    debug_assert_eq!(gc.pending_mark_count(), 0);
+
+    Ok(RuntimeFullCollectionReport {
+        runtime_id: roots.runtime_id,
+        mark,
+        objects_before,
+        objects_after,
+        collected_objects,
+        accounted_bytes_before,
+        accounted_bytes_after,
+        reclaimed_accounted_bytes: accounted_bytes_before.saturating_sub(accounted_bytes_after),
+        interned_strings_before,
+        interned_strings_after,
+        coroutine_states_before,
+        coroutine_states_after,
+        newly_discovered_finalizers: newly_discovered,
+        pending_finalizers_after,
+        swept_state_handles: state_report.swept_state_handles,
+        closed_open_upvalues: state_report.state_shutdown.closed_open_upvalues,
+        rejected_open_upvalue_edges: state_report.state_shutdown.rejected_open_upvalue_edges,
+        open_upvalue_owner_mismatches: state_report.state_shutdown.open_upvalue_owner_mismatches,
+        open_upvalue_stack_values_missing: state_report
+            .state_shutdown
+            .open_upvalue_stack_values_missing,
+    })
+}
+
+fn ensure_sweep_safe(mark: &MarkOnlyReport) -> Result<(), RuntimeFullCollectionError> {
+    let failed_states = mark.failed_state_handles.len();
+    let unsafe_gaps = mark.unsafe_gaps.len();
+    let unresolved_edges = mark.unresolved_object_edges.len();
+    if failed_states != 0
+        || unsafe_gaps != 0
+        || unresolved_edges != 0
+        || mark.collector_roots_rejected != 0
+        || mark.rejected_child_edges != 0
+        || mark.pending_objects != 0
+    {
+        return Err(RuntimeFullCollectionError::UnsafeRootTrace {
+            failed_states,
+            unsafe_gaps,
+            unresolved_edges,
+            rejected_roots: mark.collector_roots_rejected,
+            rejected_child_edges: mark.rejected_child_edges,
+            pending_mark_work: mark.pending_objects,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -423,9 +456,9 @@ mod tests {
     }
 
     #[test]
-    fn full_collection_rejects_weak_tables_until_semantics_are_complete() {
+    fn full_collection_clears_and_sweeps_an_unreachable_weak_value() {
         let mut runtime = Runtime::new();
-        let weak_table = {
+        let (weak_table, weak_value) = {
             let mut parts = runtime.parts_mut().expect("Runtime parts are available");
             let (state, collector, strings) = parts.split_mut();
             let mode_key = strings.intern_bytes(collector, b"__mode");
@@ -442,21 +475,33 @@ mod tests {
                     table.set_metatable(Some(metatable));
                 })
                 .expect("weak table remains registered");
+            let weak_value = collector.create(Table::new());
+            collector
+                .with_mut(weak_table, |table| {
+                    table.set(&Value::Number(1.0), &Value::Table(weak_value));
+                })
+                .expect("weak table remains registered");
             state.push_value(Value::Table(weak_table));
-            weak_table
+            (weak_table, weak_value)
         };
 
-        assert!(matches!(
-            runtime.collect_full_stw(),
-            Err(RuntimeFullCollectionError::WeakTablesUnsupported { active_tables: 1 })
-        ));
+        runtime
+            .collect_full_stw()
+            .expect("weak-value cleanup is part of the atomic phase");
         let mut parts = runtime.parts_mut().expect("Runtime remains usable");
         let (_, collector, _) = parts.split_mut();
         assert!(collector.contains_registered(weak_table));
+        assert!(!collector.contains_registered(weak_value));
+        assert_eq!(
+            collector
+                .with_ref(weak_table, |table| table.get(&Value::Number(1.0)))
+                .expect("weak table remains registered"),
+            Value::Nil
+        );
     }
 
     #[test]
-    fn full_collection_discovers_but_does_not_run_or_sweep_finalizers() {
+    fn full_collection_retraces_and_retains_new_finalizers_for_delivery() {
         let mut runtime = Runtime::new();
         let finalizable = {
             let mut parts = runtime.parts_mut().expect("Runtime parts are available");
@@ -477,17 +522,294 @@ mod tests {
             finalizable
         };
 
-        assert!(matches!(
-            runtime.collect_full_stw(),
-            Err(RuntimeFullCollectionError::FinalizersUnsupported {
-                pending: 1,
-                newly_discovered: 1,
-            })
-        ));
+        let report = runtime
+            .collect_full_stw()
+            .expect("new finalizer graph is retraced before sweep");
+        assert_eq!(report.newly_discovered_finalizers, 1);
+        assert_eq!(report.pending_finalizers_after, 1);
         let mut parts = runtime.parts_mut().expect("Runtime remains usable");
         let (_, collector, _) = parts.split_mut();
         assert!(collector.contains_registered(finalizable));
         assert_eq!(collector.pending_finalizer_count(), 1);
+    }
+
+    #[test]
+    fn pending_finalizer_is_removed_as_a_weak_value_before_delivery() {
+        let mut runtime = Runtime::new();
+        let (weak_table, finalizable) = {
+            let mut parts = runtime.parts_mut().expect("Runtime parts are available");
+            let (state, collector, strings) = parts.split_mut();
+            let mode_key = strings.intern_bytes(collector, b"__mode");
+            let weak_value_mode = strings.intern_bytes(collector, b"v");
+            let gc_key = strings.intern_bytes(collector, b"__gc");
+            let weak_metatable = collector.create(Table::new());
+            collector
+                .with_mut(weak_metatable, |table| {
+                    table.set(&Value::String(mode_key), &Value::String(weak_value_mode));
+                })
+                .expect("weak metatable remains registered");
+            let weak_table = collector.create(Table::new());
+            collector
+                .with_mut(weak_table, |table| {
+                    table.set_metatable(Some(weak_metatable));
+                })
+                .expect("weak table remains registered");
+            state.push_value(Value::Table(weak_table));
+
+            let finalizer_metatable = collector.create(Table::new());
+            collector
+                .with_mut(finalizer_metatable, |table| {
+                    table.set(&Value::String(gc_key), &Value::Boolean(true));
+                })
+                .expect("finalizer metatable remains registered");
+            let finalizable = collector.create(Userdata::new(0));
+            collector
+                .with_mut(finalizable, |userdata| {
+                    userdata.set_metatable(Some(finalizer_metatable));
+                })
+                .expect("finalizable userdata remains registered");
+            collector
+                .with_mut(weak_table, |table| {
+                    table.set(&Value::Number(1.0), &Value::Userdata(finalizable));
+                })
+                .expect("weak table remains registered");
+            (weak_table, finalizable)
+        };
+
+        let report = runtime
+            .collect_full_stw()
+            .expect("pending finalizer is rooted but weak-value-dead");
+        assert_eq!(report.newly_discovered_finalizers, 1);
+        let mut parts = runtime.parts_mut().expect("Runtime remains usable");
+        let (_, collector, _) = parts.split_mut();
+        assert!(collector.contains_registered(finalizable));
+        assert_eq!(
+            collector
+                .with_ref(weak_table, |table| table.get(&Value::Number(1.0)))
+                .expect("weak table remains registered"),
+            Value::Nil
+        );
+    }
+
+    #[test]
+    fn weak_key_cleanup_removes_the_key_but_marks_the_strong_value() {
+        let mut runtime = Runtime::new();
+        let (weak_table, weak_key, strong_value) = {
+            let mut parts = runtime.parts_mut().expect("Runtime parts are available");
+            let (state, collector, strings) = parts.split_mut();
+            let mode_key = strings.intern_bytes(collector, b"__mode");
+            let weak_key_mode = strings.intern_bytes(collector, b"k");
+            let metatable = collector.create(Table::new());
+            collector
+                .with_mut(metatable, |table| {
+                    table.set(&Value::String(mode_key), &Value::String(weak_key_mode));
+                })
+                .expect("weak metatable remains registered");
+            let weak_table = collector.create(Table::new());
+            let weak_key = collector.create(Table::new());
+            let strong_value = collector.create(Table::new());
+            collector
+                .with_mut(weak_table, |table| {
+                    table.set_metatable(Some(metatable));
+                    table.set(&Value::Table(weak_key), &Value::Table(strong_value));
+                })
+                .expect("weak table remains registered");
+            state.push_value(Value::Table(weak_table));
+            (weak_table, weak_key, strong_value)
+        };
+
+        runtime
+            .collect_full_stw()
+            .expect("weak-key cleanup is sweep-safe");
+        let mut parts = runtime.parts_mut().expect("Runtime remains usable");
+        let (_, collector, _) = parts.split_mut();
+        assert!(collector.contains_registered(weak_table));
+        assert!(!collector.contains_registered(weak_key));
+        assert!(collector.contains_registered(strong_value));
+        assert_eq!(
+            collector
+                .with_ref(weak_table, |table| table.get(&Value::Table(weak_key)))
+                .expect("weak table remains registered"),
+            Value::Nil
+        );
+    }
+
+    #[test]
+    fn weak_key_and_value_mode_does_not_retain_either_side() {
+        let mut runtime = Runtime::new();
+        let (weak_table, weak_key, weak_value) = {
+            let mut parts = runtime.parts_mut().expect("Runtime parts are available");
+            let (state, collector, strings) = parts.split_mut();
+            let mode_key = strings.intern_bytes(collector, b"__mode");
+            let weak_mode = strings.intern_bytes(collector, b"kv");
+            let metatable = collector.create(Table::new());
+            collector
+                .with_mut(metatable, |table| {
+                    table.set(&Value::String(mode_key), &Value::String(weak_mode));
+                })
+                .expect("weak metatable remains registered");
+            let weak_table = collector.create(Table::new());
+            let weak_key = collector.create(Table::new());
+            let weak_value = collector.create(Table::new());
+            collector
+                .with_mut(weak_table, |table| {
+                    table.set_metatable(Some(metatable));
+                    table.set(&Value::Table(weak_key), &Value::Table(weak_value));
+                })
+                .expect("weak table remains registered");
+            state.push_value(Value::Table(weak_table));
+            (weak_table, weak_key, weak_value)
+        };
+
+        runtime
+            .collect_full_stw()
+            .expect("weak key/value cleanup is sweep-safe");
+        let mut parts = runtime.parts_mut().expect("Runtime remains usable");
+        let (_, collector, _) = parts.split_mut();
+        assert!(collector.contains_registered(weak_table));
+        assert!(!collector.contains_registered(weak_key));
+        assert!(!collector.contains_registered(weak_value));
+    }
+
+    #[test]
+    fn finalized_weak_key_survives_resurrection_then_dies_after_root_removal() {
+        let mut runtime = Runtime::new();
+        let (weak_table, finalizable) = {
+            let mut parts = runtime.parts_mut().expect("Runtime parts are available");
+            let (state, collector, strings) = parts.split_mut();
+            let mode_key = strings.intern_bytes(collector, b"__mode");
+            let weak_key_mode = strings.intern_bytes(collector, b"k");
+            let gc_key = strings.intern_bytes(collector, b"__gc");
+            let weak_metatable = collector.create(Table::new());
+            collector
+                .with_mut(weak_metatable, |table| {
+                    table.set(&Value::String(mode_key), &Value::String(weak_key_mode));
+                })
+                .expect("weak metatable remains registered");
+            let weak_table = collector.create(Table::new());
+            collector
+                .with_mut(weak_table, |table| {
+                    table.set_metatable(Some(weak_metatable));
+                })
+                .expect("weak table remains registered");
+            state.push_value(Value::Table(weak_table));
+
+            let finalizer_metatable = collector.create(Table::new());
+            collector
+                .with_mut(finalizer_metatable, |table| {
+                    table.set(&Value::String(gc_key), &Value::Boolean(true));
+                })
+                .expect("finalizer metatable remains registered");
+            let finalizable = collector.create(Userdata::new(0));
+            collector
+                .with_mut(finalizable, |userdata| {
+                    userdata.set_metatable(Some(finalizer_metatable));
+                })
+                .expect("finalizable userdata remains registered");
+            collector
+                .with_mut(weak_table, |table| {
+                    table.set(&Value::Userdata(finalizable), &Value::Boolean(true));
+                })
+                .expect("weak table remains registered");
+            (weak_table, finalizable)
+        };
+
+        runtime
+            .collect_full_stw()
+            .expect("pending finalizer remains a live weak key");
+        {
+            let mut parts = runtime.parts_mut().expect("Runtime remains usable");
+            let (state, collector, _) = parts.split_mut();
+            assert_eq!(
+                collector
+                    .with_ref(weak_table, |table| {
+                        table.get(&Value::Userdata(finalizable))
+                    })
+                    .expect("weak table remains registered"),
+                Value::Boolean(true)
+            );
+            collector.clear_pending_finalizers();
+            state.push_value(Value::Userdata(finalizable));
+        }
+
+        runtime
+            .collect_full_stw()
+            .expect("a reachable finalized userdata follows its live color");
+        {
+            let mut parts = runtime.parts_mut().expect("Runtime remains usable");
+            let (state, collector, _) = parts.split_mut();
+            assert!(collector.contains_registered(finalizable));
+            assert_eq!(
+                collector
+                    .with_ref(weak_table, |table| {
+                        table.get(&Value::Userdata(finalizable))
+                    })
+                    .expect("weak table remains registered"),
+                Value::Boolean(true)
+            );
+            state.set_top(1);
+        }
+
+        runtime
+            .collect_full_stw()
+            .expect("a later unreachable finalized userdata is reclaimed");
+        let mut parts = runtime.parts_mut().expect("Runtime remains usable");
+        let (_, collector, _) = parts.split_mut();
+        assert!(!collector.contains_registered(finalizable));
+        assert_eq!(
+            collector
+                .with_ref(weak_table, |table| {
+                    table.get(&Value::Userdata(finalizable))
+                })
+                .expect("weak table remains registered"),
+            Value::Nil
+        );
+    }
+
+    #[test]
+    fn finalizer_resurrection_graph_retraces_thread_state_edges() {
+        let mut runtime = Runtime::new();
+        let (child_handle, child_thread, finalizable) = {
+            let mut parts = runtime.parts_mut().expect("Runtime parts are available");
+            let (main, collector, strings) = parts.split_mut();
+            let child_handle = main
+                .insert_coroutine_state(LuaState::new())
+                .expect("child state is inserted");
+            let child_thread = collector.create(Thread::new());
+            collector
+                .with_mut(child_thread, |thread| {
+                    thread.set_state_handle(child_handle);
+                })
+                .expect("child Thread remains registered");
+
+            let gc_key = strings.intern_bytes(collector, b"__gc");
+            let thread_key = strings.intern_bytes(collector, b"thread");
+            let metatable = collector.create(Table::new());
+            collector
+                .with_mut(metatable, |table| {
+                    table.set(&Value::String(gc_key), &Value::Boolean(true));
+                    table.set(&Value::String(thread_key), &Value::Thread(child_thread));
+                })
+                .expect("finalizer metatable remains registered");
+            let finalizable = collector.create(Userdata::new(0));
+            collector
+                .with_mut(finalizable, |userdata| {
+                    userdata.set_metatable(Some(metatable));
+                })
+                .expect("finalizable userdata remains registered");
+            (child_handle, child_thread, finalizable)
+        };
+        let report = runtime
+            .collect_full_stw()
+            .expect("the second canonical trace follows finalizer state edges");
+        assert!(report.mark.traced_states.contains(&child_handle));
+        assert!(!report.swept_state_handles.contains(&child_handle));
+        let mut parts = runtime.parts_mut().expect("Runtime remains usable");
+        let (main, collector, _) = parts.split_mut();
+        assert!(collector.contains_registered(finalizable));
+        assert!(collector.contains_registered(child_thread));
+        main.with_resolved_state_mut(child_handle, |_| ())
+            .expect("state reachable through the finalizer graph remains valid");
     }
 
     #[test]

@@ -8,11 +8,10 @@
 
 use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::parser::Parser;
-use lua_core::function::Function;
+use lua_core::function::{Function, RuntimeNativeFunction};
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::table::Table;
-use lua_core::upvalue::Upvalue;
 use lua_core::userdata::Userdata;
 use lua_core::value::Value;
 use lua_vm::execute::call_value_with_results;
@@ -32,13 +31,14 @@ pub fn open_base(l: &mut LuaState, gc: &mut GarbageCollector) {
 
         // Register core functions
         register(l, gc, global_table, "assert", lua_b_assert_raw);
-        register(
+        crate::registration::register_runtime_native(
             l,
             gc,
             global_table,
-            "collectgarbage",
-            lua_b_collectgarbage_raw,
-        );
+            b"collectgarbage",
+            RuntimeNativeFunction::CollectGarbage,
+        )
+        .expect("collectgarbage Runtime-native publication must remain collector-valid");
         register(l, gc, global_table, "error", lua_b_error_raw);
         register(l, gc, global_table, "gcinfo", lua_b_gcinfo_raw);
         register(l, gc, global_table, "getfenv", lua_b_getfenv_raw);
@@ -311,222 +311,17 @@ unsafe extern "C" fn lua_b_error_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     -1
 }
 
-unsafe extern "C" fn lua_b_collectgarbage_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: _l_ptr is the LuaState pointer passed by the VM CALL handler.
-    let l: &mut LuaState = unsafe { &mut *(_l_ptr as *mut LuaState) };
-    let option = match l.at(1) {
-        Some(Value::String(s)) => l.copy_string_bytes(*s).ok(),
-        _ => None,
-    };
-
-    match option.as_deref().unwrap_or(b"collect") {
-        b"count" => {
-            let kb = poll_gcinfo_kb(l);
-            l.push_value(Value::Number(kb));
-        }
-        b"collect" => {
-            if let Err(error) = run_gc_compat_cycle(l) {
-                push_runtime_error_value(l, &error);
-                return -1;
-            }
-            finish_gcinfo_cycle(l);
-            l.push_value(Value::Number(0.0));
-        }
-        b"step" => {
-            let size = match l.at(2) {
-                Some(Value::Number(n)) => *n,
-                _ => 0.0,
-            };
-            let done = step_gcinfo_cycle(l, size);
-            if done {
-                if let Err(error) = run_gc_compat_cycle(l) {
-                    push_runtime_error_value(l, &error);
-                    return -1;
-                }
-            }
-            l.push_value(Value::Boolean(done));
-        }
-        b"stop" => {
-            l.gc_stopped = true;
-            l.push_value(Value::Number(0.0));
-        }
-        b"restart" => {
-            l.gc_stopped = false;
-            l.gc_step_remaining = 0;
-            l.push_value(Value::Number(0.0));
-        }
-        b"setpause" | b"setstepmul" => {
-            l.push_value(Value::Number(0.0));
-        }
-        _ => {
-            if !push_lua_string(l, "bad argument #1 to 'collectgarbage' (invalid option)") {
-                return -1;
-            }
-            return -1;
-        }
-    }
-    1
-}
-
 unsafe extern "C" fn lua_b_gcinfo_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: _l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l: &mut LuaState = unsafe { &mut *(_l_ptr as *mut LuaState) };
-    let kb = poll_gcinfo_kb(l).floor();
+    let kb = l
+        .active_gc_ptr()
+        // SAFETY: the VM context owns this collector for the current C call.
+        .map(|gc| unsafe { (&*gc).total_memory() as f64 / 1024.0 })
+        .unwrap_or(0.0)
+        .floor();
     l.push_value(Value::Number(kb));
     1
-}
-
-fn run_gc_compat_cycle(l: &mut LuaState) -> Result<(), lua_vm::RuntimeError> {
-    if let Some(gc_ptr) = l.active_gc_ptr() {
-        // SAFETY: LuaState::gc is installed by the VM before calling C functions.
-        let gc = unsafe { &mut *gc_ptr };
-        gc.reset_marks();
-        mark_lua_roots_for_weak_cleanup(l, gc);
-        gc.propagate_marks();
-        let finalizers = gc.prepare_finalizable_userdata();
-        gc.propagate_marks();
-        gc.clear_registered_weak_tables();
-        for userdata in finalizers {
-            run_userdata_finalizer(l, gc, userdata)?;
-        }
-        gc.clear_pending_finalizers();
-    }
-    Ok(())
-}
-
-fn mark_lua_roots_for_weak_cleanup(l: &LuaState, gc: &mut GarbageCollector) {
-    if let Some(global_table) = l.global_table {
-        gc.mark_value(&Value::Table(global_table));
-    }
-    if let Some(thread_env) = l.thread_env {
-        gc.mark_value(&Value::Table(thread_env));
-    }
-    if let Some(chunk_env) = l.chunk_env {
-        gc.mark_value(&Value::Table(chunk_env));
-    }
-    if let Some(thread) = l.current_thread {
-        gc.mark_value(&Value::Thread(thread));
-    }
-    if let Some(hook) = &l.debug_hook {
-        gc.mark_value(hook);
-    }
-    if let Some(skip_proto) = l.debug_hook_skip_proto {
-        gc.mark_registered(skip_proto);
-    }
-
-    mark_open_upvalues(l, gc);
-
-    for ci in l.call_stack.iter().take(l.current_ci + 1) {
-        if let Some(value) = l.stack.at(ci.func) {
-            gc.mark_value(value);
-        }
-        for value in &ci.varargs {
-            gc.mark_value(value);
-        }
-
-        let Some(proto_ref) = ci.proto else {
-            continue;
-        };
-        gc.mark_registered(proto_ref);
-        let pc = ci.savedpc.unwrap_or(0) as i32;
-        let local_slots = gc
-            .with_ref(proto_ref, |proto| {
-                (0..proto.loc_var_count())
-                    .filter_map(|idx| {
-                        let loc = proto.loc_var(idx);
-                        (loc.startpc <= pc && pc < loc.endpc && loc.reg >= 0)
-                            .then_some(ci.base + loc.reg as usize)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for stack_index in local_slots {
-            if let Some(value) = l.stack.at(stack_index) {
-                gc.mark_value(value);
-            }
-        }
-    }
-}
-
-fn mark_open_upvalues(l: &LuaState, gc: &mut GarbageCollector) {
-    for &upvalue_ref in &l.open_upvalues {
-        let location = gc
-            .with_ref(upvalue_ref, Upvalue::open_location)
-            .ok()
-            .flatten();
-        gc.mark_registered(upvalue_ref);
-        if let Some((owner, stack_index)) = location
-            && l.state_handle() == Some(owner)
-            && let Some(value) = l.stack.at(stack_index)
-        {
-            gc.mark_value(value);
-        }
-    }
-}
-
-fn run_userdata_finalizer(
-    l: &mut LuaState,
-    gc: &mut GarbageCollector,
-    userdata: GcRef<Userdata>,
-) -> Result<(), lua_vm::RuntimeError> {
-    // SAFETY: userdata is held in the pending-finalizer list and remains live
-    // until the finalizer call path has finished.
-    let finalizer = unsafe { userdata.as_ref() }
-        .and_then(|userdata| userdata.metatable())
-        .and_then(|metatable| metatable_field(l, metatable, "__gc"));
-    let Some(finalizer) = finalizer else {
-        return Ok(());
-    };
-
-    call_value_with_results(
-        l,
-        gc,
-        finalizer,
-        &[Value::Userdata(userdata)],
-        Some(0),
-        |_, _, _| (),
-    )
-}
-
-fn poll_gcinfo_kb(l: &mut LuaState) -> f64 {
-    l.gcinfo_polls = l.gcinfo_polls.saturating_add(1);
-    if l.gc_stopped {
-        l.gcinfo_kb += 24.0;
-    } else if l.gcinfo_polls.is_multiple_of(8) {
-        finish_gcinfo_cycle(l);
-    } else {
-        l.gcinfo_kb += 8.0;
-    }
-    l.gcinfo_kb
-}
-
-fn finish_gcinfo_cycle(l: &mut LuaState) {
-    l.gcinfo_kb = 16.0;
-    l.gcinfo_polls = 0;
-}
-
-fn step_gcinfo_cycle(l: &mut LuaState, size: f64) -> bool {
-    if l.gc_step_remaining <= 0 {
-        l.gc_step_remaining = if size >= 10_000.0 {
-            1
-        } else if size >= 6.0 {
-            3
-        } else if size >= 2.0 {
-            8
-        } else {
-            12
-        };
-    }
-
-    l.gc_step_remaining -= 1;
-    if l.gc_step_remaining <= 0 {
-        finish_gcinfo_cycle(l);
-        l.gc_stopped = false;
-        true
-    } else {
-        l.gcinfo_kb += 8.0;
-        false
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════

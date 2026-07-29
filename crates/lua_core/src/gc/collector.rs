@@ -835,24 +835,17 @@ impl GarbageCollector {
     /// 检查弱值槽位是否应被清理
     ///
     /// 字符串永远不会被清理；userdata 在 pending_finalizers 中时视为已死。
+    /// 已完成终结且在本轮重新可达的 userdata 遵循正常颜色，不会仅因
+    /// FINALIZED 位而从弱值槽位中删除。
     ///
     pub fn is_weak_value_dead(&self, value: &crate::value::Value) -> bool {
         match value {
             crate::value::Value::String(value) => !self.contains_registered(*value),
             crate::value::Value::Userdata(u) => {
-                let Ok(pointer) = self.validate_ref(*u) else {
-                    return true;
-                };
-                let ptr = pointer.as_ptr().cast::<GcObjectHeader>();
-                if self.pending_finalizers.contains(u) {
+                if self.validate_ref(*u).is_err() {
                     return true;
                 }
-                // Once a userdata finalizer has run, weak-value slots should be
-                // cleared on the next GC cycle even though this compatibility
-                // collector does not immediately sweep the userdata object.
-                // SAFETY: validation matched allocation identity and Userdata
-                // tag before the header is read.
-                if unsafe { (*ptr).is_finalized() } {
+                if self.pending_finalizers.contains(u) {
                     return true;
                 }
                 self.is_value_dead(value)

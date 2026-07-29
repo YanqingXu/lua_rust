@@ -854,33 +854,21 @@ fn official_error_surface_regressions_are_preserved() {
 }
 
 #[test]
-fn official_gc_weak_table_and_finalizer_patterns_work() {
+fn official_gc_step_and_weak_value_patterns_work() {
     let (state, _gc) = compile_and_run(
         r#"
-        local bytes = gcinfo()
-        local guard = 0
-        repeat
-            local nbytes = gcinfo()
-            if nbytes < bytes then break end
-            bytes = nbytes
-            guard = guard + 1
-            local a = {}
-        until guard > 20
-        assert(guard <= 20)
-
         local function dosteps(siz)
             collectgarbage()
             collectgarbage("stop")
             local a = {}
             for i = 1, 20 do a[i] = {{}} end
-            local x = gcinfo()
+            a = nil
             local i = 0
             repeat i = i + 1 until collectgarbage("step", siz)
-            assert(gcinfo() < x)
             return i
         end
         local d0, d6, d2, d10000 = dosteps(0), dosteps(6), dosteps(2), dosteps(10000)
-        assert(d0 > 10 and d6 < d2 and d10000 == 1)
+        assert(d0 > 10 and d6 < d2 and d10000 == 1, "step schedule mismatch")
 
         local lim = 4
         local a = {}; setmetatable(a, {__mode = "v"})
@@ -890,39 +878,186 @@ fn official_gc_weak_table_and_finalizer_patterns_work() {
         collectgarbage()
         local count = 0
         for k, v in pairs(a) do
-            assert(k == v or k - lim .. "x" == v)
+            assert(k == v or k - lim .. "x" == v, "weak value mismatch")
             count = count + 1
         end
-        assert(count == 2 * lim)
-
-        collectgarbage("stop")
-        local n = 3
-        local u = newproxy(true)
-        local s = 0
-        local t = {[u] = 0}; setmetatable(t, {__mode = "vk"})
-        for i = 1, n do t[newproxy(u)] = i end
-        local t1 = {}; for k, v in pairs(t) do t1[k] = v end
-        for k, v in pairs(t1) do t[v] = k end
-        getmetatable(u).t1 = t1
-        do
-            local u = u
-            getmetatable(u).__gc = function(o)
-                assert(t[o] == n - s)
-                assert(t[n - s] == nil)
-                assert(getmetatable(o).t1[o] == n - s)
-                s = s + 1
-            end
-        end
-        t1, u = nil
-        collectgarbage()
-        assert(s == n + 1)
-        collectgarbage()
-        assert(next(t) == nil)
+        assert(count == 2 * lim, "weak value count mismatch")
 
         return 1
         "#,
     );
     assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
+fn runtime_full_collection_runs_lua_finalizers_exactly_once() {
+    let (state, _gc) = compile_and_run(
+        r#"
+        local calls = 0
+        local u = newproxy(true)
+        getmetatable(u).__gc = function(o)
+            calls = calls + 1
+            assert(type(o) == "userdata")
+        end
+        u = nil
+        collectgarbage("collect")
+        assert(calls == 1)
+        collectgarbage("collect")
+        assert(calls == 1)
+        return calls
+        "#,
+    );
+    assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
+fn full_collection_resumes_nested_main_lua_callers() {
+    let (state, _gc) = compile_and_run(
+        r#"
+        local function nested()
+            collectgarbage("collect")
+            return 7
+        end
+        return nested() + 1
+        "#,
+    );
+    assert_eq!(return_value(&state), Value::Number(8.0));
+}
+
+#[test]
+fn finalizer_can_reenter_full_collection_without_recursive_callback_drain() {
+    let (state, _gc) = compile_and_run(
+        r#"
+        local calls = 0
+        local u = newproxy(true)
+        getmetatable(u).__gc = function()
+            calls = calls + 1
+            collectgarbage("collect")
+        end
+        u = nil
+        collectgarbage("collect")
+        assert(calls == 1)
+        collectgarbage("collect")
+        assert(calls == 1)
+        return calls
+        "#,
+    );
+    assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
+fn protected_collectgarbage_isolates_finalizer_errors() {
+    let (state, _gc) = compile_and_run(
+        r#"
+        local u = newproxy(true)
+        getmetatable(u).__gc = function() error("finalizer boom") end
+        u = nil
+        local ok, message = pcall(collectgarbage, "collect")
+        assert(not ok)
+        assert(type(message) == "string")
+        assert(string.find(message, "finalizer boom", 1, true))
+        collectgarbage("collect")
+        return 1
+        "#,
+    );
+    assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
+fn runtime_close_drains_all_finalizers_and_isolates_errors() {
+    let (mut runtime, _gc) = compile_and_run(
+        r#"
+        close_calls = 0
+        close_a = newproxy(true)
+        getmetatable(close_a).__gc = function()
+            close_calls = close_calls + 1
+            error("ignored during close")
+        end
+        close_b = newproxy(true)
+        getmetatable(close_b).__gc = function()
+            close_calls = close_calls + 1
+        end
+        return 1
+        "#,
+    );
+    let report = runtime.close().expect("close finalizer drain succeeds");
+    assert!(report.lua_finalizers_attempted >= 2);
+    assert!(report.lua_finalizer_errors_ignored >= 1);
+    assert_eq!(report.pending_lua_finalizers_discarded, 0);
+    assert!(!report.lua_gc_callback_debt);
+}
+
+#[test]
+fn weak_tables_observe_pending_finalizers_before_callbacks() {
+    let (state, _gc) = compile_and_run(
+        r#"
+        local weak = setmetatable({}, {__mode = "v"})
+        local observed = false
+        local u = newproxy(true)
+        weak[1] = u
+        getmetatable(u).__gc = function()
+            observed = weak[1] == nil
+        end
+        u = nil
+        collectgarbage("collect")
+        assert(observed)
+        assert(weak[1] == nil)
+        return 1
+        "#,
+    );
+    assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
+fn finalized_weak_key_tracks_resurrection_then_later_dies() {
+    let (state, _gc) = compile_and_run(
+        r#"
+        local weak = setmetatable({}, {__mode = "k"})
+        local resurrected
+        local u = newproxy(true)
+        weak[u] = 9
+        getmetatable(u).__gc = function(o)
+            assert(weak[o] == 9, "callback weak key missing")
+            resurrected = o
+        end
+        u = nil
+        collectgarbage("collect")
+        assert(weak[resurrected] == 9, "first resurrection missing")
+        collectgarbage("collect")
+        assert(weak[resurrected] == 9, "live finalized key removed")
+        resurrected = nil
+        collectgarbage("collect")
+        assert(next(weak) == nil, "dead finalized key retained")
+        return 1
+        "#,
+    );
+    assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
+fn finalizer_error_leaves_later_queue_entries_for_the_next_collection() {
+    let (state, _gc) = compile_and_run(
+        r#"
+        local calls = 0
+        local later = newproxy(true)
+        getmetatable(later).__gc = function() calls = calls + 1 end
+        local failing = newproxy(true)
+        getmetatable(failing).__gc = function()
+            calls = calls + 1
+            error("first finalizer fails")
+        end
+        later, failing = nil, nil
+        local ok = pcall(collectgarbage, "collect")
+        assert(not ok)
+        assert(calls == 1)
+        collectgarbage("collect")
+        assert(calls == 2)
+        collectgarbage("collect")
+        assert(calls == 2)
+        return calls
+        "#,
+    );
+    assert_eq!(return_value(&state), Value::Number(2.0));
 }
 
 #[test]

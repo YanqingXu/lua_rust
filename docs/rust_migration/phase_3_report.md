@@ -16,8 +16,9 @@ cpp_oracle: 87c15e69ceb94eb74e28226ccbefb7e196635711
 Runtime coroutine activation trampoline 已移除 resume/wrap 的递归跨 state
 借用，并对齐固定 C++ 的 `Normal` 祖先重入。open Upvalue 已使用 checked
 `StateHandle + stack index`，跨 state GET/SET 经 Runtime turns 调度，GC
-可从 reachable Upvalue 追到 owner state。尚无 38 opcode 全量
-bytecode/trace parity，GC 与剩余 state 所有权仍会影响
+可从 reachable Upvalue 追到 owner state。Runtime-native
+`collectgarbage("collect")` 已在 safe point 执行真实 weak/finalizer 全图 STW；
+尚无 38 opcode 全量 bytecode/trace parity，incremental GC 与剩余 state 所有权仍会影响
 可观察语义，因此不能标记 completed。
 
 | 分类 | 本阶段内容 |
@@ -45,7 +46,7 @@ bytecode/trace parity，GC 与剩余 state 所有权仍会影响
 | 调用/返回和错误边界未全面差分 | 现有 tests 主要验证 Rust 自身期望 | M2.4 |
 | 剩余 state 生命周期与跨 helper 调度未证明 | coroutine state 与 open-Upvalue owner 已由 StateArena/StateHandle 管理，resume/wrap 与远端 GET/SET 使用 Runtime trampoline；main state 仍为 external slot，debug/protected-helper 跨 state 仍显式拒绝 | [NOTE-009](deviation_log.md#note-009-runtime-与-coroutine-所有权未闭环)，M1.5、M2.5、M2.7 |
 | Metamethod 与 debug 细节未完成 | 缺少循环限制、source line、hook event、tail event 的 oracle matrix | M2.6、M2.7 |
-| VM 内运行 GC 不执行真实回收 | `collectgarbage` 路径未 sweep，barrier 未接入全部 mutation sites | [NOTE-002](deviation_log.md#note-002-gc-可观察行为尚未形成真实回收闭环)，M1.9–M1.12 |
+| VM 内没有真实 incremental GC | `collectgarbage("collect")` 已真实 sweep；`step` 仍以 compatibility 倒计时触发 full STW，且 barrier 未接入全部 mutation sites | [NOTE-002](deviation_log.md#note-002-gc-增量与-allocator-可观察行为尚未闭环)，M1.10–M1.13 |
 | Host ABI 不存在 | 内部 C-function pointer 不是 Lua C API | [NOTE-008](deviation_log.md#note-008-lua-51-c-apiabi-尚不存在)，M3.4–M3.8 |
 
 ## Oracle 与验收

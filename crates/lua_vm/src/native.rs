@@ -109,8 +109,22 @@ impl StateContinuationSnapshot {
         state.last_error.clone_from(&self.last_error);
     }
 
-    fn seed_roots(&self, gc: &mut GarbageCollector) {
-        for value in self.stack.initialized_values() {
+    pub(crate) fn top(&self) -> usize {
+        self.top
+    }
+
+    pub(crate) fn seed_roots(&self, gc: &mut GarbageCollector) {
+        let initialized = self.stack.initialized_values();
+        let active_limit = self
+            .call_stack
+            .iter()
+            .take(self.current_ci + 1)
+            .map(|call| call.top)
+            .max()
+            .unwrap_or(self.top)
+            .max(self.top)
+            .min(initialized.len());
+        for value in &initialized[..active_limit] {
             gc.mark_value(value);
         }
         for call in self.call_stack.iter().take(self.current_ci + 1) {
@@ -152,6 +166,72 @@ impl ResumeRequest {
                 gc.mark_registered(proto);
             }
             deferred.snapshot.seed_roots(gc);
+        }
+    }
+}
+
+/// Lua-visible result shape for a completed full collection request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FullCollectionResult {
+    Collect,
+    StepComplete,
+}
+
+impl FullCollectionResult {
+    pub(crate) fn values(self) -> Vec<Value> {
+        match self {
+            Self::Collect => vec![Value::Number(0.0)],
+            Self::StepComplete => vec![Value::Boolean(true)],
+        }
+    }
+}
+
+/// Owned transfer published by a destructive `collectgarbage` mode.
+#[derive(Clone, Debug)]
+pub(crate) struct FullCollectionRequest {
+    pub id: NativeRequestId,
+    pub result: FullCollectionResult,
+    pub protected: bool,
+    pub deferred: Option<DeferredNativeCall>,
+}
+
+impl FullCollectionRequest {
+    pub(crate) fn seed_roots(&self, gc: &mut GarbageCollector) {
+        if let Some(deferred) = &self.deferred {
+            if let Some(proto) = deferred.caller_proto {
+                gc.mark_registered(proto);
+            }
+            deferred.snapshot.seed_roots(gc);
+        }
+    }
+}
+
+/// One sealed Runtime-native mailbox payload.
+#[derive(Clone, Debug)]
+pub(crate) enum RuntimeRequest {
+    Resume(ResumeRequest),
+    FullCollection(FullCollectionRequest),
+}
+
+impl RuntimeRequest {
+    pub(crate) fn id(&self) -> NativeRequestId {
+        match self {
+            Self::Resume(request) => request.id,
+            Self::FullCollection(request) => request.id,
+        }
+    }
+
+    pub(crate) fn deferred(&self) -> Option<&DeferredNativeCall> {
+        match self {
+            Self::Resume(request) => request.deferred.as_ref(),
+            Self::FullCollection(request) => request.deferred.as_ref(),
+        }
+    }
+
+    pub(crate) fn deferred_mut(&mut self) -> &mut Option<DeferredNativeCall> {
+        match self {
+            Self::Resume(request) => &mut request.deferred,
+            Self::FullCollection(request) => &mut request.deferred,
         }
     }
 }

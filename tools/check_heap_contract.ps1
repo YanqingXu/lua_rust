@@ -125,29 +125,35 @@ $fullCollectionSource =
 Assert-Contains "Runtime full collection" $fullCollectionSource `
     'pub\(crate\)\s+fn\s+collect_full_stw\s*\('
 Assert-Contains "Runtime full collection" $fullCollectionSource `
-    'self\.trace_roots_mark_only\s*\(\s*\)'
+    'trace_roots_mark_only_at_safe_point\s*\('
 Assert-Contains "Runtime full collection" $fullCollectionSource `
     'sweep_unreachable_owned\s*\('
 Assert-Contains "Runtime full collection" $fullCollectionSource `
-    'collector\.sweep\s*\(\s*strings\s*\)'
+    'gc\.sweep\s*\(\s*strings\s*\)'
 Assert-Contains "Runtime full collection" $fullCollectionSource `
-    'WeakTablesUnsupported'
+    'prepare_finalizable_userdata\s*\(\s*\)'
 Assert-Contains "Runtime full collection" $fullCollectionSource `
-    'FinalizersUnsupported'
+    'clear_weak_table_entries\s*\(\s*\)'
 if ($fullCollectionSource -match 'pub\s+fn\s+collect_full_stw\s*\(') {
     $violations.Add(
-        "Runtime full collection became public before weak/finalizer semantics closed"
+        "Runtime full collection bypasses the sealed Runtime-native safe-point route"
     )
 }
 
 $baseSource = Get-ProductionPrefix (
     Resolve-RootedPath "crates/lua_stdlib/src/base.rs"
 )
-if ($baseSource -match '\bcollect_full_stw\s*\(') {
+if ($baseSource -match '\bcollect_full_stw(?:_at_safe_point)?\s*\(') {
     $violations.Add(
-        "Lua-visible collectgarbage is wired to the internal STW collector"
+        "Lua-visible collectgarbage bypasses the sealed Runtime-native request"
     )
 }
+Assert-Contains "Lua-visible collectgarbage" $baseSource `
+    'RuntimeNativeFunction::CollectGarbage'
+Assert-Contains "Runtime full collection scheduler" $runtimeSource `
+    'RuntimeRequest::FullCollection'
+Assert-Contains "Runtime finalizer drain" $runtimeSource `
+    'begin_finalizer_drain\s*\(\s*\)'
 
 $productionRoots = @(
     "crates/lua_app/src",

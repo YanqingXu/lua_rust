@@ -37,6 +37,21 @@ impl GarbageCollector {
     /// It marks selected userdata as finalized and keeps their pointers in
     /// `pending_finalizers` so weak values can be cleared before `__gc` runs.
     pub fn prepare_finalizable_userdata(&mut self) -> Vec<GcRef<Userdata>> {
+        self.prepare_finalizable_userdata_matching(true)
+    }
+
+    /// Queue every not-yet-finalized userdata that currently has `__gc`.
+    ///
+    /// Runtime close uses this after execution has stopped, when reachability
+    /// no longer suppresses finalization.
+    pub fn prepare_all_finalizable_userdata(&mut self) -> Vec<GcRef<Userdata>> {
+        self.prepare_finalizable_userdata_matching(false)
+    }
+
+    fn prepare_finalizable_userdata_matching(
+        &mut self,
+        require_white: bool,
+    ) -> Vec<GcRef<Userdata>> {
         let mut pending = Vec::new();
         let mut current = self.all_objects;
 
@@ -52,7 +67,7 @@ impl GarbageCollector {
             // checked before reading header mark bits.
             let is_candidate = unsafe {
                 live.object_type == GcObjectType::Userdata
-                    && (*current).is_white()
+                    && (!require_white || (*current).is_white())
                     && !(*current).is_finalized()
             };
             let userdata = is_candidate
@@ -61,16 +76,21 @@ impl GarbageCollector {
             let should_finalize = userdata.is_some_and(|userdata| userdata_has_gc(self, userdata));
 
             if should_finalize {
+                let userdata = userdata.expect("validated finalizer candidate");
+
+                // Publish the candidate before committing FINALIZED. If queue
+                // growth panics, the userdata remains eligible for a later
+                // cycle instead of becoming permanently finalized without a
+                // corresponding delivery record.
+                pending.push(userdata);
+                if !self.pending_finalizers.contains(&userdata) {
+                    self.pending_finalizers.push(userdata);
+                }
                 // SAFETY: current is a valid userdata object from the GC list.
                 unsafe {
                     (*current).mark_finalized();
                 }
                 self.mark_live_object(current);
-                let userdata = userdata.expect("validated finalizer candidate");
-                pending.push(userdata);
-                if !self.pending_finalizers.contains(&userdata) {
-                    self.pending_finalizers.push(userdata);
-                }
             }
 
             current = next;
@@ -83,21 +103,48 @@ impl GarbageCollector {
         self.pending_finalizers.clear();
     }
 
-    /// 运行待终结队列中的终结器
-    ///
-    /// 在 sweep 完成后调用。逐个执行 pendingFinalizers_ 中 userdata
-    /// 的 `__gc` 元方法。防止终结器递归执行。
-    ///
-    /// Phase 1.3: 骨架实现 — 需要 LuaState 和 VM 支持。
-    ///
-    #[allow(unused_variables)]
-    pub fn run_finalizers(&mut self) {
-        // Phase 3+: 需要 LuaState 来调用 __gc 函数
-        // 将 pendingFinalizers_ swap 到局部列表
-        // 对每个 userdata 调用 __gc 元方法
-        // 处理异常（保存后续终结器）
-        //
-        // 当前骨架：无操作
+    /// Return the oldest still-live pending finalizer.
+    pub fn next_pending_finalizer(&self) -> Option<GcRef<Userdata>> {
+        self.pending_finalizers
+            .iter()
+            .copied()
+            .find(|userdata| self.validate_ref(*userdata).is_ok())
+    }
+
+    /// Resolve the current `__gc` callback without exposing managed borrows.
+    pub fn pending_finalizer_callback(&self, userdata: GcRef<Userdata>) -> Option<Value> {
+        let metatable = self
+            .with_ref(userdata, Userdata::metatable)
+            .ok()
+            .flatten()?;
+        metatable_field(self, metatable, "__gc").filter(|value| !value.is_nil())
+    }
+
+    /// Remove one exact userdata after its callback was attempted.
+    pub fn acknowledge_pending_finalizer(&mut self, userdata: GcRef<Userdata>) -> bool {
+        let Some(index) = self
+            .pending_finalizers
+            .iter()
+            .position(|pending| *pending == userdata)
+        else {
+            return false;
+        };
+        self.pending_finalizers.remove(index);
+        true
+    }
+
+    /// Enter the non-reentrant callback drain.
+    pub fn begin_finalizer_drain(&mut self) -> bool {
+        if self.finalizers_running {
+            return false;
+        }
+        self.finalizers_running = true;
+        true
+    }
+
+    /// Leave the callback drain after success or error.
+    pub fn end_finalizer_drain(&mut self) {
+        self.finalizers_running = false;
     }
 }
 
@@ -112,21 +159,25 @@ fn userdata_has_gc(gc: &GarbageCollector, userdata: GcRef<Userdata>) -> bool {
 }
 
 fn metatable_has_field(gc: &GarbageCollector, metatable: GcRef<Table>, name: &str) -> bool {
+    metatable_field(gc, metatable, name).is_some_and(|value| !value.is_nil())
+}
+
+fn metatable_field(gc: &GarbageCollector, metatable: GcRef<Table>, name: &str) -> Option<Value> {
     let Ok(table) = gc.validate_ref(metatable) else {
-        return false;
+        return None;
     };
     // SAFETY: validation matched collector, identity, and Table tag.
     let table = unsafe { table.as_ref() };
-    table.hash_entries().any(|(key, value)| {
-        !value.is_nil()
-            && matches!(
-                key,
-                Value::String(key_ref) if {
-                    gc.with_ref(*key_ref, |key_string: &GcString| {
-                        key_string.as_bytes() == name.as_bytes()
-                    })
-                    .unwrap_or(false)
-                }
-            )
+    table.hash_entries().find_map(|(key, value)| {
+        matches!(
+            key,
+            Value::String(key_ref) if {
+                gc.with_ref(*key_ref, |key_string: &GcString| {
+                    key_string.as_bytes() == name.as_bytes()
+                })
+                .unwrap_or(false)
+            }
+        )
+        .then(|| value.clone())
     })
 }

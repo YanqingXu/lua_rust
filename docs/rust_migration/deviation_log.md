@@ -41,38 +41,40 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 - **处置状态：** `approved`。项目兼容优先级选择 `lua_cpp` 值；官方 Lua
   differential 必须把该差异标为 `NOTE-001`，不得归一化或静默忽略。
 
-### NOTE-002: GC 可观察行为尚未形成真实回收闭环
+### NOTE-002: GC 增量与 allocator 可观察行为尚未闭环
 
-- **日期：** 2026-07-26
+- **日期：** 2026-07-29
 - **范围：** `collectgarbage`、`gcinfo`、增量 step、弱表、终结器、内存计账和
   collector shutdown。
 - **Rust 位置：** `crates/lua_stdlib/src/base.rs`；
   `crates/lua_vm/src/runtime/full_collection.rs`；
   `crates/lua_vm/src/state/lua_state.rs`；`crates/lua_core/src/gc/`。
-- **当前行为：** crate-private `Runtime::collect_full_stw` 已在 owner
-  thread/Running/零 active execution safe point 消费 canonical tracer，关闭
-  不可达 coroutine state，失效 handle 并执行类型感知 sweep；object 与
-  accounted-byte 确实下降，Heap/collector Drop 也析构对象。该内部入口对任何
-  root gap/foreign edge fail-closed，并显式拒绝 active weak table 或
-  pending/new finalizer。Lua `collectgarbage("collect")` 尚未调用它；
-  `gcinfo` 和 step 仍由 `+8/+24`、固定倒计时和常量回落值模拟，增量策略仍是
-  占位实现。
+- **当前行为：** Runtime safe-point full STW 已消费 canonical tracer，按
+  mark→finalizer prepare/resurrection propagation→weak reconciliation→state
+  prepass→sweep→protected callback 执行，对任何 root gap/foreign edge
+  fail-closed。Lua `collectgarbage("collect")` 已调用真实回收，`gcinfo/count`
+  读取 collector accounted bytes，weak v/k/kv、exactly-once、异常隔离、
+  reentrant collect、resurrection/再次死亡和 close drain 均有回归。
+  `collectgarbage("step")` 仍由固定倒计时决定何时触发一次 full STW，尚无
+  incremental phase/debt/work-unit；allocator live/peak 也未实现。
 - **Oracle：** stock Lua 5.1 的可达性和 GC API；`lua_cpp@87c15e6` 的
   `tests/unit/gc/test_gc.cpp`、official suite GC probe 与 shutdown/lifecycle
   行为。
 - **测试与任务：** `tests/lua/differential/gc-weak-value.lua`；
-  internal STW 的两轮 strong graph、typed Drop、state/upvalue prepass、
-  stale handle、cross-collector/root-gap/weak/finalizer/phase 回归；
-  M1.7–M1.13，尤其 M1.9–M1.12。
-- **当前最小证据：** M0 的 weak-value probe 在本地对官方 Lua 与 C++ oracle
-  均通过；该 probe 只覆盖一次可观察弱值清理，不证明 sweep、计账、增量阶段、
-  shutdown 或完整 weak/finalizer 语义。
-- **影响：** 受审计的内部 strong graph 已真实释放不可达对象；但 Lua 脚本
-  仍看不到该能力，weak、`__gc`、resurrection、公开内存数字和 step 完成时机
-  不能视为兼容，长生命周期公开运行路径仍可能积累对象。
-- **处置状态：** `open`。内部 STW 子项已关闭；weak/finalizer/resurrection、
-  public/automatic/incremental integration、barrier、真实 gcinfo 与 shutdown
-  验收全部通过前，Phase 1 与 GC 相关的 Phase 3/4 能力保持 partial。
+  full STW 的两轮全图、weak/finalizer/resurrection、typed Drop、
+  state/upvalue prepass、stale handle、cross-collector/root-gap/phase 回归；
+  M1.7–M1.13，当前重点为 M1.10/M1.11/M1.13。
+- **当前最小证据：** M0 weak-value probe 在官方 Lua 与 C++ oracle 两条 lane
+  均通过；Rust 另有 13 项新增 workspace 回归覆盖公开 full collection 和上述
+  weak/finalizer 生命周期。它们不证明 incremental、automatic collection 或
+  allocator live/peak 合同。
+- **影响：** Lua 脚本已能显式触发真实 full STW 并观察实际 collector
+  accounted bytes；但 step 完成时机、pause/stepmul、自动回收和 allocator
+  指标仍不能视为兼容，长生命周期自动运行路径仍可能积累对象。
+- **处置状态：** `open`。full STW、weak/finalizer/resurrection、public
+  `collectgarbage("collect")`、实际 `gcinfo/count` 和 close drain 子项已关闭；
+  automatic/incremental integration、barrier、allocator 与完整 shutdown 验收
+  全部通过前，Phase 1 与 GC 相关的 Phase 3/4 能力保持 partial。
 
 ### NOTE-003: `string.dump` 不是 Lua 5.1 binary chunk
 
@@ -257,14 +259,15 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   service scope。固定字符串、pending-finalizer root seed 与 activation
   service 已由 canonical Runtime tracer 标记，53-path heap contract 防止生产
   路径恢复 standalone 构造或提前公开/接线 STW。
-  crate-private `Runtime::collect_full_stw` 现消费该 tracer；对 gap/foreign
-  edge fail-closed，在 object sweep 前关闭不可达 state 的 open Upvalue 并使
-  handle generation 失效，再通过 Heap/StringPool sweep 强图。
+  Runtime full STW 现消费该 tracer；对 gap/foreign edge fail-closed，在
+  object sweep 前完成 finalizer prepare/resurrection propagation、weak
+  reconciliation，并关闭不可达 state 的 open Upvalue/失效 handle generation，
+  再通过 Heap/StringPool sweep 全图和 protected callback delivery。
   但 main state 仍是 external arena slot，debug/protected-helper 跨 state
-  open-Upvalue 访问尚未纳入同一调度协议；Lua `__gc`、IO/module service
-  drain、allocator live/peak、weak/finalizer/resurrection 与 Lua-visible
-  collection 合同也未闭环。生产字符串 Eq/Hash/canonical/scoped access 已由
-  独立 inventory 和静态门本地闭合。
+  open-Upvalue 访问尚未纳入同一调度协议；IO/module service drain、
+  allocator live/peak、production barrier 与 automatic/incremental collection
+  合同也未闭环。生产字符串 Eq/Hash/canonical/scoped access 已由独立
+  inventory 和静态门本地闭合。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
   close、coroutine lifecycle 和 allocator live-byte 合同。
 - **测试与任务：** 1000 轮 state/coroutine create-close、fixed/ordinary
@@ -285,23 +288,25 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   handoff；目标生产文件直接 `gc.create` 静态命中为 0。
   Heap/VM 回归覆盖同 Heap canonical identity、跨 Heap service 错配拒绝、
   nested/panic service scope、固定字符串 root/close 和 standalone collector
-  Drop reclaim；internal STW 回归另覆盖两轮 strong sweep、typed Userdata
-  Drop、reachable/unreachable state、Upvalue close-before-handle-invalid、
-  cross-collector/root-gap/weak/finalizer/phase gates；heap contract 已接入 M1
-  foundation gate。
-  allocator live/peak、真实 finalizer/service close、Miri/ASan 等仍在
-  M1.4、M1.5、M1.7、M1.8、M1.13。
+  Drop reclaim；full STW 回归另覆盖两轮全图 sweep、weak v/k/kv、
+  protected/reentrant finalizer、queue retention、resurrection/再次死亡、
+  typed Userdata Drop、reachable/unreachable state、Upvalue
+  close-before-handle-invalid、cross-collector/root-gap/phase gates；heap
+  contract 已接入 M1 foundation gate。
+  allocator live/peak、service close、Miri/ASan 等仍在
+  M1.4、M1.5、M1.7、M1.8、M1.10、M1.11、M1.13。
 - **影响：** 已移除 resume/wrap 递归跨 state 借用和 raw open-Upvalue
   owner 风险，并能声称当前 Rust-owned 对象的 deterministic shutdown
-  substrate；当前 production publication、唯一 Heap/service owner 与 internal
-  strong-graph STW 切片已关闭，但剩余 main-state、allocator/service drain、
-  weak/finalizer 与 public collector 风险仍不允许声称完整 Lua close 或
-  Lua-visible collection。
+  substrate；当前 production publication、唯一 Heap/service owner、full STW、
+  weak/finalizer/resurrection 与 public collector 切片已关闭，但剩余
+  main-state、allocator/service drain、barrier 与 incremental 风险仍不允许
+  声称完整 Lua lifecycle。
 - **处置状态：** `open`。temporary state、compiler Proto→Function、
   library/package、IO、VM/app/result publication、字符串 identity/access 与
-  唯一 Heap/service owner、Runtime-only strong-graph collection 子项已关闭；
-  debug/protected-helper 跨 state、weak/finalizer/public collection、
-  Lua-visible close 与 lifecycle 验收全部完成前保持开放。
+  唯一 Heap/service owner、全图 collection、weak/finalizer/resurrection、
+  public collection 与 Lua `__gc` close drain 子项已关闭；debug/protected-helper
+  跨 state、service/allocator close、barrier/incremental 与完整 lifecycle 验收
+  全部完成前保持开放。
 
 ### NOTE-010: Lua 字符串 intern hash 选择固定 C++ 的前向采样
 
