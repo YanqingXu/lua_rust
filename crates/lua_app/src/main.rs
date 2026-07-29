@@ -228,21 +228,21 @@ fn run_app_with_runtime(
     execute_startup_actions(runtime, options)?;
 
     if let (Some(script), Some(script_index)) = (&options.script_file, options.script_index) {
-        let script_args = {
+        {
             let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
             let (state, gc, _) = parts.split_mut();
-            install_arg_table(state, gc, args, script_index);
-            lua_script_args(gc, args, script_index)
-        };
+            install_arg_table(state, gc, args, script_index)?;
+        }
+        let script_args = &args[script_index + 1..];
         let result = if script == "-" {
             let mut source = Vec::new();
             if let Err(err) = io::stdin().read_to_end(&mut source) {
                 Err(err.to_string())
             } else {
-                execute_source(runtime, &source, "=stdin", &script_args, None).map(|_| ())
+                execute_source(runtime, &source, "=stdin", script_args, None, false)
             }
         } else {
-            execute_file(runtime, script, &script_args).map(|_| ())
+            execute_file(runtime, script, script_args, false)
         };
         result?;
     }
@@ -266,14 +266,22 @@ fn execute_startup_actions(runtime: &mut Runtime, options: &AppOptions) -> Resul
                     "=(command line)",
                     &[],
                     None,
+                    false,
                 )?;
             }
             StartupActionKind::RequireModule => {
                 if Path::new(&action.argument).exists() {
-                    execute_file(runtime, &action.argument, &[])?;
+                    execute_file(runtime, &action.argument, &[], false)?;
                 } else {
                     let source = format!("require({})", lua_string_literal(&action.argument));
-                    execute_source(runtime, source.as_bytes(), "=(command line)", &[], None)?;
+                    execute_source(
+                        runtime,
+                        source.as_bytes(),
+                        "=(command line)",
+                        &[],
+                        None,
+                        false,
+                    )?;
                 }
             }
         }
@@ -284,20 +292,29 @@ fn execute_startup_actions(runtime: &mut Runtime, options: &AppOptions) -> Resul
 fn execute_file(
     runtime: &mut Runtime,
     filename: &str,
-    args: &[Value],
-) -> Result<Vec<Value>, String> {
+    args: &[String],
+    display_results: bool,
+) -> Result<(), String> {
     let bytes = fs::read(filename).map_err(|err| format!("cannot open {filename}: {err}"))?;
     let chunk_name = format!("@{filename}");
-    execute_source(runtime, &bytes, &chunk_name, args, Some(filename))
+    execute_source(
+        runtime,
+        &bytes,
+        &chunk_name,
+        args,
+        Some(filename),
+        display_results,
+    )
 }
 
 fn execute_source(
     runtime: &mut Runtime,
     source: &[u8],
     chunk_name: &str,
-    args: &[Value],
+    args: &[String],
     script_path: Option<&str>,
-) -> Result<Vec<Value>, String> {
+    display_results: bool,
+) -> Result<(), String> {
     let proto = {
         let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
         let (state, gc, string_pool) = parts.split_mut();
@@ -306,12 +323,36 @@ fn execute_source(
         }
         compile_or_load_proto(gc, string_pool, source, chunk_name)?
     };
+    let (argument_values, argument_roots) = {
+        let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
+        let (_, gc, _) = parts.split_mut();
+        gc.with_publication(|transaction| {
+            let mut values = Vec::with_capacity(args.len());
+            let mut roots = Vec::with_capacity(args.len());
+            for argument in args {
+                let string = transaction.alloc(GcString::from_utf8_text(argument));
+                let string = transaction
+                    .publish_as_explicit_root(string)
+                    .expect("new CLI argument remains registered during root promotion");
+                values.push(Value::String(string));
+                roots.push(string);
+            }
+            (values, roots)
+        })
+    };
     let execution = runtime
-        .execute_proto_with_args(proto, args.to_vec())
+        .execute_proto_with_args(proto, argument_values, |results| {
+            if display_results {
+                print_values(results);
+            }
+        })
         .map_err(|error| error.to_string());
     {
         let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
         let (_, gc, _) = parts.split_mut();
+        for argument_root in argument_roots {
+            gc.remove_root(argument_root);
+        }
         gc.remove_root(proto);
     }
     execution
@@ -344,39 +385,37 @@ fn install_arg_table(
     gc: &mut GarbageCollector,
     args: &[String],
     script_index: usize,
-) {
-    let mut table = Table::new();
-    for (idx, arg) in args.iter().enumerate() {
-        let mut text = arg.clone();
-        if idx == 0 {
-            text = text.replace('\\', "/");
-        } else if idx + 1 < script_index
-            && arg == "-e"
-            && args.get(idx + 1).is_some_and(|next| next == "--")
-        {
-            text = "-e ".to_string();
+) -> Result<(), String> {
+    let Some(global_table) = state.global_table else {
+        return Ok(());
+    };
+    gc.with_publication(|transaction| {
+        let global = transaction
+            .protect(global_table)
+            .map_err(|error| format!("invalid global-table publication owner: {error}"))?;
+        let table = transaction.alloc(Table::new());
+        for (idx, arg) in args.iter().enumerate() {
+            let mut text = arg.clone();
+            if idx == 0 {
+                text = text.replace('\\', "/");
+            } else if idx + 1 < script_index
+                && arg == "-e"
+                && args.get(idx + 1).is_some_and(|next| next == "--")
+            {
+                text = "-e ".to_string();
+            }
+            let key = Value::Number(idx as f64 - script_index as f64);
+            let value = transaction.alloc(GcString::from_utf8_text(&text));
+            transaction
+                .set_table_entry_string(&table, &key, &value)
+                .map_err(|error| format!("invalid arg-table entry publication: {error}"))?;
         }
-        let key = Value::Number(idx as f64 - script_index as f64);
-        let value = Value::String(gc.create(GcString::from_utf8_text(&text)));
-        table.set(&key, &value);
-    }
 
-    let arg_ref = gc.create(table);
-    if let Some(global_table) = state.global_table {
-        let name = gc.create(GcString::from_bytes(b"arg"));
-        let global_ptr = global_table.as_ptr() as *mut Table;
-        // SAFETY: the global table is a GC root owned by this LuaState.
-        unsafe {
-            (*global_ptr).set(&Value::String(name), &Value::Table(arg_ref));
-        }
-    }
-}
-
-fn lua_script_args(gc: &mut GarbageCollector, args: &[String], script_index: usize) -> Vec<Value> {
-    args.iter()
-        .skip(script_index + 1)
-        .map(|arg| Value::String(gc.create(GcString::from_utf8_text(arg))))
-        .collect()
+        let name = transaction.alloc(GcString::from_bytes(b"arg"));
+        transaction
+            .set_table_table(&global, &name, &table)
+            .map_err(|error| format!("invalid arg-table global publication: {error}"))
+    })
 }
 
 fn run_quiet_interactive(runtime: &mut Runtime) -> Result<(), String> {
@@ -431,11 +470,8 @@ fn run_quiet_interactive(runtime: &mut Runtime) -> Result<(), String> {
             buffer.push_str(&input);
         }
 
-        match execute_source(runtime, buffer.as_bytes(), "=stdin", &[], None) {
-            Ok(results) => {
-                if expression {
-                    print_values(&results);
-                }
+        match execute_source(runtime, buffer.as_bytes(), "=stdin", &[], None, expression) {
+            Ok(()) => {
                 buffer.clear();
                 first_line = true;
                 expression = false;

@@ -11,7 +11,7 @@ use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::table::Table;
 use lua_core::value::Value;
-use lua_vm::execute::call_value;
+use lua_vm::execute::call_value_with_results;
 use lua_vm::state::LuaState;
 
 const DEFAULT_PATH: &str = "?.lua;?/init.lua";
@@ -133,12 +133,16 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
     };
 
-    let execution = call_value(l, gc, loader, &[Value::String(module_ref)], None);
-    if compiled_loader_on_stack {
-        let _ = l.pop();
-    }
-    match execution {
-        Ok(results) => {
+    let execution = call_value_with_results(
+        l,
+        gc,
+        loader,
+        &[Value::String(module_ref)],
+        None,
+        |l, gc, results| {
+            if compiled_loader_on_stack {
+                let _ = l.pop();
+            }
             if let Some(result) = results.first()
                 && !result.is_nil()
             {
@@ -151,8 +155,13 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
             }
 
             l.push_value(table_get(loaded, &module_key));
-            1
-        }
+        },
+    );
+    if compiled_loader_on_stack && execution.is_err() {
+        let _ = l.pop();
+    }
+    match execution {
+        Ok(()) => 1,
         Err(err) => {
             push_runtime_error_value(l, gc, &err);
             -1
@@ -257,7 +266,14 @@ unsafe extern "C" fn lua_package_module(l_ptr: *mut std::ffi::c_void) -> i32 {
         if !matches!(option, Value::Function(_)) {
             return raise_string(l, "module option must be a function");
         }
-        if let Err(err) = call_value(l, gc, option, &[Value::Table(module_ref)], Some(0)) {
+        if let Err(err) = call_value_with_results(
+            l,
+            gc,
+            option,
+            &[Value::Table(module_ref)],
+            Some(0),
+            |_, _, _| (),
+        ) {
             push_runtime_error_value(l, gc, &err);
             return -1;
         }

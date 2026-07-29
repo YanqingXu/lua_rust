@@ -56,6 +56,17 @@ fn run_lua_file(path: &Path) -> Output {
         .expect("lua_app should run the script file")
 }
 
+fn run_lua_file_with_args(path: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lua_app"))
+        .arg(path)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("lua_app should run the script file with arguments")
+}
+
 #[test]
 fn standard_output_error_and_cpp_oracle_version_are_process_visible() {
     let output = run_lua(
@@ -119,6 +130,42 @@ fn script_file_preserves_non_utf8_source_bytes() {
 
     assert!(output.status.success(), "lua_app failed: {output:?}");
     assert_eq!(output.stdout, b"225\n");
+    assert!(output.stderr.is_empty(), "unexpected stderr: {output:?}");
+}
+
+#[test]
+fn script_argument_table_and_varargs_survive_runtime_publication_handoff() {
+    let path = temp_path("published-args.lua");
+    std::fs::write(
+        &path,
+        b"local first, second = ...; io.write(arg[0], '|', arg[1], '|', arg[2], '|', first, '|', second)",
+    )
+    .expect("argument fixture should be writable");
+
+    let output = run_lua_file_with_args(&path, &["alpha", "beta"]);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(output.status.success(), "lua_app failed: {output:?}");
+    let expected = format!("{}|alpha|beta|alpha|beta", path.to_string_lossy());
+    assert_eq!(output.stdout, expected.as_bytes());
+    assert!(output.stderr.is_empty(), "unexpected stderr: {output:?}");
+}
+
+#[test]
+fn xpcall_handler_failure_keeps_false_and_one_published_error_result() {
+    let output = run_lua(
+        "local ok, err = xpcall(\
+             function() error('primary failure') end,\
+             function() error('handler failure') end\
+         ); \
+         assert(ok == false); \
+         assert(type(err) == 'string' and string.find(err, 'handler failure')); \
+         io.write('protected-error-ok')",
+        b"",
+    );
+
+    assert!(output.status.success(), "lua_app failed: {output:?}");
+    assert_eq!(output.stdout, b"protected-error-ok");
     assert!(output.stderr.is_empty(), "unexpected stderr: {output:?}");
 }
 

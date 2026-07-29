@@ -5,8 +5,9 @@ use std::ptr::NonNull;
 
 use lua_compiler::opcode::{self, OpCode};
 use lua_core::function::Function;
-use lua_core::gc::collector::GarbageCollector;
+use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::gc::publication::{PublicationTxn, Rooted};
 use lua_core::gc_string::GcString;
 use lua_core::proto::Proto;
 use lua_core::table::Table;
@@ -170,36 +171,9 @@ unsafe extern "C" fn lua_debug_getinfo(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
     };
 
-    let mut info = Table::new();
-    set_string_field(&mut info, gc, "source", &debug_info.source);
-    set_string_field(&mut info, gc, "short_src", &debug_info.short_src);
-    set_string_field(&mut info, gc, "what", &debug_info.what);
-    if let Some(line) = debug_info.currentline {
-        set_number_field(&mut info, gc, "currentline", line as f64);
+    if publish_debug_info(l, gc, debug_info).is_err() {
+        l.push_nil();
     }
-    if let Some(line) = debug_info.linedefined {
-        set_number_field(&mut info, gc, "linedefined", line as f64);
-    }
-    if let Some(line) = debug_info.lastlinedefined {
-        set_number_field(&mut info, gc, "lastlinedefined", line as f64);
-    }
-    if let Some(name) = debug_info.name {
-        set_string_field(&mut info, gc, "name", &name);
-    }
-    set_string_field(&mut info, gc, "namewhat", &debug_info.namewhat);
-    if let Some(func) = debug_info.func {
-        set_value_field(&mut info, gc, "func", func);
-    }
-    if let Some(nups) = debug_info.nups {
-        set_number_field(&mut info, gc, "nups", nups as f64);
-    }
-    if !debug_info.active_lines.is_empty() {
-        let activelines = active_lines_table(gc, &debug_info.active_lines);
-        set_value_field(&mut info, gc, "activelines", Value::Table(activelines));
-    }
-
-    let info_ref = gc.create(info);
-    l.push_value(Value::Table(info_ref));
     1
 }
 
@@ -248,13 +222,18 @@ fn push_name_info(
     name: Option<Vec<u8>>,
     namewhat: Vec<u8>,
 ) -> i32 {
-    let mut info = Table::new();
-    if let Some(name) = name {
-        set_string_field(&mut info, gc, "name", &name);
+    let publication = gc.with_publication(|transaction| {
+        let info = transaction.alloc(Table::new());
+        if let Some(name) = name {
+            set_string_field(l, transaction, &info, b"name", &name)?;
+        }
+        set_string_field(l, transaction, &info, b"namewhat", &namewhat)?;
+        // SAFETY: the completed Table is installed on the active stack.
+        unsafe { transaction.publish_table_value(info, |value| l.push_value(value)) }
+    });
+    if publication.is_err() {
+        l.push_nil();
     }
-    set_string_field(&mut info, gc, "namewhat", &namewhat);
-    let info_ref = gc.create(info);
-    l.push_value(Value::Table(info_ref));
     1
 }
 
@@ -290,13 +269,11 @@ unsafe extern "C" fn lua_debug_setupvalue(l_ptr: *mut std::ffi::c_void) -> i32 {
         return 1;
     };
     if let Err(message) = set_upvalue_value(l, gc, upvalue_ref, value) {
-        let error = gc.create(GcString::from_bytes(message.as_bytes()));
-        l.push_value(Value::String(error));
+        let _ = crate::registration::push_string(l, gc, message.as_bytes());
         return -1;
     }
 
-    let name_ref = gc.create(GcString::from_bytes(&name));
-    l.push_value(Value::String(name_ref));
+    let _ = crate::registration::push_string(l, gc, &name);
     1
 }
 
@@ -331,13 +308,11 @@ unsafe extern "C" fn lua_debug_getupvalue(l_ptr: *mut std::ffi::c_void) -> i32 {
         return 1;
     };
 
-    let name_ref = gc.create(GcString::from_bytes(&name));
-    l.push_value(Value::String(name_ref));
+    let _ = crate::registration::push_string(l, gc, &name);
     let value = match get_upvalue_value(l, gc, upvalue_ref) {
         Ok(value) => value,
         Err(message) => {
-            let error = gc.create(GcString::from_bytes(message.as_bytes()));
-            l.push_value(Value::String(error));
+            let _ = crate::registration::push_string(l, gc, message.as_bytes());
             return -1;
         }
     };
@@ -354,8 +329,14 @@ unsafe extern "C" fn lua_debug_getregistry(l_ptr: *mut std::ffi::c_void) -> i32 
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let table_ref = gc.create(Table::new());
-    l.push_value(Value::Table(table_ref));
+    let publication = gc.with_publication(|transaction| {
+        let table = transaction.alloc(Table::new());
+        // SAFETY: the callback installs the Table on the active result stack.
+        unsafe { transaction.publish_table_value(table, |value| l.push_value(value)) }
+    });
+    if publication.is_err() {
+        l.push_nil();
+    }
     1
 }
 
@@ -370,8 +351,7 @@ unsafe extern "C" fn lua_debug_traceback(l_ptr: *mut std::ffi::c_void) -> i32 {
     let gc = unsafe { &mut *gc_ptr };
     if let Some(Value::Thread(thread_ref)) = l.at(1).cloned() {
         let traceback = thread_traceback(l, thread_ref);
-        let message_ref = gc.create(GcString::from_bytes(&traceback));
-        l.push_value(Value::String(message_ref));
+        let _ = crate::registration::push_string(l, gc, &traceback);
         return 1;
     }
 
@@ -401,8 +381,7 @@ unsafe extern "C" fn lua_debug_traceback(l_ptr: *mut std::ffi::c_void) -> i32 {
     if level <= 0 {
         traceback.extend_from_slice(b"\t[C]: in function 'traceback'\n");
     }
-    let message_ref = gc.create(GcString::from_bytes(&traceback));
-    l.push_value(Value::String(message_ref));
+    let _ = crate::registration::push_string(l, gc, &traceback);
     1
 }
 
@@ -563,9 +542,8 @@ unsafe extern "C" fn lua_debug_gethook(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let mask_ref = gc.create(GcString::from_bytes(&mask));
     l.push_value(hook);
-    l.push_value(Value::String(mask_ref));
+    let _ = crate::registration::push_string(l, gc, &mask);
     l.push_value(Value::Number(count as f64));
     3
 }
@@ -682,8 +660,7 @@ unsafe extern "C" fn lua_debug_getlocal(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    let name_ref = gc.create(GcString::from_bytes(&name));
-    l.push_value(Value::String(name_ref));
+    let _ = crate::registration::push_string(l, gc, &name);
     l.push_value(value);
     2
 }
@@ -732,8 +709,7 @@ unsafe extern "C" fn lua_debug_setlocal(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    let name_ref = gc.create(GcString::from_bytes(&name));
-    l.push_value(Value::String(name_ref));
+    let _ = crate::registration::push_string(l, gc, &name);
     1
 }
 
@@ -1428,28 +1404,89 @@ fn function_name_in_global(l: &LuaState, func_ref: GcRef<Function>) -> Option<Ve
     None
 }
 
-fn set_string_field(table: &mut Table, gc: &mut GarbageCollector, key: &str, value: &[u8]) {
-    let key = gc.create(GcString::from_bytes(key.as_bytes()));
-    let value = gc.create(GcString::from_bytes(value));
-    table.set(&Value::String(key), &Value::String(value));
+fn publish_debug_info(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    info: DebugInfo,
+) -> Result<(), GcRefValidationError> {
+    gc.with_publication(|transaction| {
+        let table = transaction.alloc(Table::new());
+        set_string_field(state, transaction, &table, b"source", &info.source)?;
+        set_string_field(state, transaction, &table, b"short_src", &info.short_src)?;
+        set_string_field(state, transaction, &table, b"what", &info.what)?;
+        if let Some(line) = info.currentline {
+            set_number_field(state, transaction, &table, b"currentline", line as f64)?;
+        }
+        if let Some(line) = info.linedefined {
+            set_number_field(state, transaction, &table, b"linedefined", line as f64)?;
+        }
+        if let Some(line) = info.lastlinedefined {
+            set_number_field(state, transaction, &table, b"lastlinedefined", line as f64)?;
+        }
+        if let Some(name) = &info.name {
+            set_string_field(state, transaction, &table, b"name", name)?;
+        }
+        set_string_field(state, transaction, &table, b"namewhat", &info.namewhat)?;
+        if let Some(function) = info.func {
+            set_value_field(state, transaction, &table, b"func", &function)?;
+        }
+        if let Some(nups) = info.nups {
+            set_number_field(state, transaction, &table, b"nups", nups as f64)?;
+        }
+        if !info.active_lines.is_empty() {
+            let key = crate::registration::rooted_bytes(state, transaction, b"activelines")?;
+            let active_lines = active_lines_table(transaction, &info.active_lines)?;
+            transaction.set_table_table(&table, &key, &active_lines)?;
+        }
+
+        // SAFETY: the completed info Table is installed on the active stack.
+        unsafe { transaction.publish_table_value(table, |value| state.push_value(value)) }
+    })
 }
 
-fn set_number_field(table: &mut Table, gc: &mut GarbageCollector, key: &str, value: f64) {
-    let key = gc.create(GcString::from_bytes(key.as_bytes()));
-    table.set(&Value::String(key), &Value::Number(value));
+fn set_string_field<'scope>(
+    state: &LuaState,
+    transaction: &mut PublicationTxn<'scope>,
+    table: &Rooted<'scope, Table>,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), GcRefValidationError> {
+    let key = crate::registration::rooted_bytes(state, transaction, key)?;
+    let value = crate::registration::rooted_bytes(state, transaction, value)?;
+    transaction.set_table_string(table, &key, &value)
 }
 
-fn set_value_field(table: &mut Table, gc: &mut GarbageCollector, key: &str, value: Value) {
-    let key = gc.create(GcString::from_bytes(key.as_bytes()));
-    table.set(&Value::String(key), &value);
+fn set_number_field<'scope>(
+    state: &LuaState,
+    transaction: &mut PublicationTxn<'scope>,
+    table: &Rooted<'scope, Table>,
+    key: &[u8],
+    value: f64,
+) -> Result<(), GcRefValidationError> {
+    let key = crate::registration::rooted_bytes(state, transaction, key)?;
+    transaction.set_table_value(table, &key, &Value::Number(value))
 }
 
-fn active_lines_table(gc: &mut GarbageCollector, lines: &[i32]) -> GcRef<Table> {
-    let mut table = Table::new();
+fn set_value_field<'scope>(
+    state: &LuaState,
+    transaction: &mut PublicationTxn<'scope>,
+    table: &Rooted<'scope, Table>,
+    key: &[u8],
+    value: &Value,
+) -> Result<(), GcRefValidationError> {
+    let key = crate::registration::rooted_bytes(state, transaction, key)?;
+    transaction.set_table_value(table, &key, value)
+}
+
+fn active_lines_table<'scope>(
+    transaction: &mut PublicationTxn<'scope>,
+    lines: &[i32],
+) -> Result<Rooted<'scope, Table>, GcRefValidationError> {
+    let table = transaction.alloc(Table::new());
     for line in lines {
-        table.set(&Value::Number(*line as f64), &Value::Boolean(true));
+        transaction.set_table_entry(&table, &Value::Number(*line as f64), &Value::Boolean(true))?;
     }
-    gc.create(table)
+    Ok(table)
 }
 
 fn upvalue_name(gc: &GarbageCollector, func_ref: GcRef<Function>, index: usize) -> Option<Vec<u8>> {

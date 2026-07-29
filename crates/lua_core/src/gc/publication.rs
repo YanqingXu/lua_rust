@@ -260,6 +260,34 @@ impl<'scope> PublicationTxn<'scope> {
         Ok(self.alloc(Function::new_lua(proto.reference)))
     }
 
+    /// Build a protected Lua closure from collector-validated live edges.
+    ///
+    /// This is the VM-facing counterpart to [`Self::alloc_lua_function`]:
+    /// nested Protos, environments, and open Upvalues are already reachable
+    /// from the active execution graph rather than newly allocated in this
+    /// transaction.
+    pub fn alloc_lua_closure(
+        &mut self,
+        proto: GcRef<Proto>,
+        environment: Option<GcRef<Table>>,
+        upvalues: &[GcRef<Upvalue>],
+    ) -> Result<Rooted<'scope, Function>, GcRefValidationError> {
+        self.collector.validate_ref(proto)?;
+        if let Some(environment) = environment {
+            self.collector.validate_ref(environment)?;
+        }
+        for upvalue in upvalues {
+            self.collector.validate_ref(*upvalue)?;
+        }
+
+        let mut function = Function::new_lua(proto);
+        function.set_env(environment);
+        for upvalue in upvalues {
+            function.add_upvalue(*upvalue);
+        }
+        Ok(self.alloc(function))
+    }
+
     /// Install a validated environment on a protected Function.
     pub fn set_function_environment(
         &mut self,
@@ -317,6 +345,38 @@ impl<'scope> PublicationTxn<'scope> {
         self.validate_value(value)?;
         self.collector.with_mut(table.reference, |table| {
             table.set(&Value::String(key.reference), value);
+        })
+    }
+
+    /// Attach a validated key/value pair to a protected Table.
+    ///
+    /// This covers numeric argument-table keys and other VM-owned entries
+    /// whose key is not a newly allocated string.
+    pub fn set_table_entry(
+        &mut self,
+        table: &Rooted<'scope, Table>,
+        key: &Value,
+        value: &Value,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(table)?;
+        self.validate_value(key)?;
+        self.validate_value(value)?;
+        self.collector
+            .with_mut(table.reference, |table| table.set(key, value))
+    }
+
+    /// Attach a protected string value under a validated arbitrary key.
+    pub fn set_table_entry_string(
+        &mut self,
+        table: &Rooted<'scope, Table>,
+        key: &Value,
+        value: &Rooted<'scope, GcString>,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(value)?;
+        self.validate_protection(table)?;
+        self.validate_value(key)?;
+        self.collector.with_mut(table.reference, |table| {
+            table.set(key, &Value::String(value.reference));
         })
     }
 
@@ -396,6 +456,21 @@ impl<'scope> PublicationTxn<'scope> {
             }
             None => None,
         };
+        self.collector.with_mut(userdata.reference, |userdata| {
+            userdata.set_metatable(metatable)
+        })
+    }
+
+    /// Set a protected Userdata's metatable to an already-live Table.
+    pub fn set_userdata_metatable_reference(
+        &mut self,
+        userdata: &Rooted<'scope, Userdata>,
+        metatable: Option<GcRef<Table>>,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(userdata)?;
+        if let Some(metatable) = metatable {
+            self.collector.validate_ref(metatable)?;
+        }
         self.collector.with_mut(userdata.reference, |userdata| {
             userdata.set_metatable(metatable)
         })
@@ -554,6 +629,65 @@ impl<'scope> PublicationTxn<'scope> {
         let result = publish(Value::Userdata(rooted.reference));
         self.release_owned_root(rooted.temporary_root_id);
         Ok(result)
+    }
+
+    /// Publish a protected Upvalue reference into a traced non-`Value` owner.
+    ///
+    /// # Safety
+    ///
+    /// On normal return, `publish` must install the supplied reference in an
+    /// independently traced owner, such as a LuaState open-Upvalue set or a
+    /// protected Function. It must not escape only through an unrooted local.
+    pub unsafe fn publish_upvalue_reference<R>(
+        &mut self,
+        rooted: Rooted<'scope, Upvalue>,
+        publish: impl FnOnce(GcRef<Upvalue>) -> R,
+    ) -> Result<R, GcRefValidationError> {
+        self.validate_protection(&rooted)?;
+        let result = publish(rooted.reference);
+        self.release_owned_root(rooted.temporary_root_id);
+        Ok(result)
+    }
+
+    /// Protect an existing result slice while a callback consumes or publishes
+    /// every collectable value.
+    ///
+    /// Each collectable entry receives its own exact-id temporary root. This
+    /// deliberately accepts duplicate references: exact identities make
+    /// nested/result-buffer cleanup independent of explicit-root ownership.
+    ///
+    /// # Safety
+    ///
+    /// Before returning normally, `publish` must either consume every supplied
+    /// value synchronously or install it in an independently traced owner. It
+    /// must not let collectable values escape only through unrooted locals or
+    /// return values.
+    pub unsafe fn publish_value_slice<R>(
+        &mut self,
+        values: &[Value],
+        publish: impl FnOnce(&mut GarbageCollector, &[Value]) -> R,
+    ) -> Result<R, GcRefValidationError> {
+        for value in values {
+            match value {
+                Value::String(reference) => {
+                    let _ = self.protect(*reference)?;
+                }
+                Value::Table(reference) => {
+                    let _ = self.protect(*reference)?;
+                }
+                Value::Function(reference) => {
+                    let _ = self.protect(*reference)?;
+                }
+                Value::Userdata(reference) => {
+                    let _ = self.protect(*reference)?;
+                }
+                Value::Thread(reference) => {
+                    let _ = self.protect(*reference)?;
+                }
+                Value::Nil | Value::Boolean(_) | Value::Number(_) | Value::LightUserdata(_) => {}
+            }
+        }
+        Ok(publish(self.collector, values))
     }
 
     /// Run a nested publication transaction while retaining all outer roots.
@@ -844,6 +978,82 @@ mod tests {
                 .expect("the owning collector accepts the exact live identity");
             assert_eq!(transaction.active_temporary_root_count(), 1);
         });
+    }
+
+    #[test]
+    fn result_slice_is_rooted_for_callback_and_released_after_consumption() {
+        let mut collector = GarbageCollector::new();
+        let string = collector.create(GcString::from_bytes(b"result"));
+        let table = collector.create(Table::new());
+        let values = [
+            Value::String(string),
+            Value::Table(table),
+            Value::Number(7.0),
+        ];
+
+        collector.with_publication(|transaction| {
+            // SAFETY: the callback consumes the values synchronously and does
+            // not let either collectable reference escape.
+            let kinds = unsafe {
+                transaction.publish_value_slice(&values, |collector, values| {
+                    assert_eq!(collector.temporary_root_count(), 2);
+                    let report = collector.begin_mark_only();
+                    assert_eq!(report.temporary_seeded, 2);
+                    values
+                        .iter()
+                        .map(|value| match value {
+                            Value::String(_) => "string",
+                            Value::Table(_) => "table",
+                            Value::Number(_) => "number",
+                            _ => "other",
+                        })
+                        .collect::<Vec<_>>()
+                })
+            }
+            .expect("live result values are accepted");
+            assert_eq!(kinds, ["string", "table", "number"]);
+        });
+
+        assert_eq!(collector.temporary_root_count(), 0);
+        assert_eq!(collector.rejected_temporary_root_release_count(), 0);
+    }
+
+    #[test]
+    fn result_slice_foreign_failure_and_panic_cleanup_exact_roots() {
+        let mut owner = GarbageCollector::new();
+        let local = owner.create(Table::new());
+        let mut foreign = GarbageCollector::new();
+        let foreign_value = foreign.create(Table::new());
+        let mut callback_ran = false;
+
+        owner.with_publication(|transaction| {
+            // SAFETY: validation fails before the callback can run.
+            let result = unsafe {
+                transaction.publish_value_slice(
+                    &[Value::Table(local), Value::Table(foreign_value)],
+                    |_, _| callback_ran = true,
+                )
+            };
+            assert!(result.is_err());
+            assert!(!callback_ran);
+            assert_eq!(transaction.active_temporary_root_count(), 1);
+        });
+        assert_eq!(owner.temporary_root_count(), 0);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.with_publication(|transaction| {
+                // SAFETY: the callback never returns normally.
+                unsafe {
+                    transaction.publish_value_slice(&[Value::Table(local)], |_, _| {
+                        panic!("injected result publication failure");
+                    })
+                }
+                .expect("panic occurs inside result publication");
+            });
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(owner.temporary_root_count(), 0);
+        assert_eq!(owner.rejected_temporary_root_release_count(), 0);
     }
 
     #[test]

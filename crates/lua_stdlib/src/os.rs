@@ -10,7 +10,6 @@ use std::os::windows::process::CommandExt;
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
-use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_vm::state::LuaState;
@@ -212,18 +211,30 @@ unsafe extern "C" fn lua_os_date(l_ptr: *mut std::ffi::c_void) -> i32 {
         };
         // SAFETY: LuaState::gc is installed by the VM before calling C functions.
         let gc = unsafe { &mut *gc_ptr };
-        let mut table = Table::new();
-        set_number_field(&mut table, gc, "year", parts.year as f64);
-        set_number_field(&mut table, gc, "month", parts.month as f64);
-        set_number_field(&mut table, gc, "day", parts.day as f64);
-        set_number_field(&mut table, gc, "hour", parts.hour as f64);
-        set_number_field(&mut table, gc, "min", parts.min as f64);
-        set_number_field(&mut table, gc, "sec", parts.sec as f64);
-        set_number_field(&mut table, gc, "wday", (parts.wday + 1) as f64);
-        set_number_field(&mut table, gc, "yday", parts.yday as f64);
-        set_bool_field(&mut table, gc, "isdst", false);
-        let table_ref = gc.create(table);
-        l.push_value(Value::Table(table_ref));
+        let publication = gc.with_publication(|transaction| {
+            let table = transaction.alloc(Table::new());
+            for (name, value) in [
+                (b"year".as_slice(), parts.year as f64),
+                (b"month".as_slice(), parts.month as f64),
+                (b"day".as_slice(), parts.day as f64),
+                (b"hour".as_slice(), parts.hour as f64),
+                (b"min".as_slice(), parts.min as f64),
+                (b"sec".as_slice(), parts.sec as f64),
+                (b"wday".as_slice(), (parts.wday + 1) as f64),
+                (b"yday".as_slice(), parts.yday as f64),
+            ] {
+                let key = crate::registration::rooted_bytes(l, transaction, name)?;
+                transaction.set_table_value(&table, &key, &Value::Number(value))?;
+            }
+            let isdst = crate::registration::rooted_bytes(l, transaction, b"isdst")?;
+            transaction.set_table_value(&table, &isdst, &Value::Boolean(false))?;
+            // SAFETY: the completed result Table is installed on the active
+            // stack before its temporary root is released.
+            unsafe { transaction.publish_table_value(table, |value| l.push_value(value)) }
+        });
+        if publication.is_err() {
+            l.push_nil();
+        }
         return 1;
     }
 
@@ -368,16 +379,6 @@ fn table_field(table: &Table, name: &str) -> Value {
     Value::Nil
 }
 
-fn set_number_field(table: &mut Table, gc: &mut GarbageCollector, name: &str, value: f64) {
-    let key = gc.create(GcString::from_bytes(name.as_bytes()));
-    table.set(&Value::String(key), &Value::Number(value));
-}
-
-fn set_bool_field(table: &mut Table, gc: &mut GarbageCollector, name: &str, value: bool) {
-    let key = gc.create(GcString::from_bytes(name.as_bytes()));
-    table.set(&Value::String(key), &Value::Boolean(value));
-}
-
 struct DateParts {
     year: i64,
     month: i64,
@@ -481,8 +482,9 @@ fn push_lua_string(l: &mut LuaState, text: &str) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let s = gc.create(GcString::from_utf8_text(text));
-    l.push_value(Value::String(s));
+    if crate::registration::push_string(l, gc, text.as_bytes()).is_err() {
+        l.push_nil();
+    }
     1
 }
 

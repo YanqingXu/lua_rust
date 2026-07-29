@@ -3,7 +3,6 @@
 use lua_core::function::RuntimeNativeFunction;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
-use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::thread::{CoroutineStatus, Thread};
 use lua_core::value::Value;
@@ -89,7 +88,7 @@ unsafe extern "C" fn lua_coroutine_create(l_ptr: *mut std::ffi::c_void) -> i32 {
     match publish_thread_to_stack(l, gc, func) {
         Ok(()) => 1,
         Err(error) => {
-            l.push_value(error);
+            push_lua_bytes(l, gc, error.as_bytes());
             -1
         }
     }
@@ -145,7 +144,7 @@ unsafe extern "C" fn lua_coroutine_wrap(l_ptr: *mut std::ffi::c_void) -> i32 {
     match publish_wrapper_to_stack(l, gc, func) {
         Ok(()) => 1,
         Err(error) => {
-            l.push_value(error);
+            push_lua_bytes(l, gc, error.as_bytes());
             -1
         }
     }
@@ -180,7 +179,7 @@ fn publish_thread_to_stack(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     entry: Value,
-) -> Result<(), Value> {
+) -> Result<(), String> {
     let state = coroutine_state(l, gc, entry);
     let published: Result<(), PendingStateError> = gc.with_publication(|transaction| {
         let thread = transaction.alloc(Thread::new());
@@ -190,16 +189,14 @@ fn publish_thread_to_stack(
             Ok(())
         })?
     });
-    published.map_err(|error| {
-        diagnostic_string_value(gc, &format!("invalid coroutine publication: {error}"))
-    })
+    published.map_err(|error| format!("invalid coroutine publication: {error}"))
 }
 
 fn publish_wrapper_to_stack(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     entry: Value,
-) -> Result<(), Value> {
+) -> Result<(), String> {
     let state = coroutine_state(l, gc, entry);
     let published: Result<(), PendingStateError> = gc.with_publication(|transaction| {
         let thread = transaction.alloc(Thread::new());
@@ -214,9 +211,7 @@ fn publish_wrapper_to_stack(
             Ok(())
         })?
     });
-    published.map_err(|error| {
-        diagnostic_string_value(gc, &format!("invalid coroutine publication: {error}"))
-    })
+    published.map_err(|error| format!("invalid coroutine publication: {error}"))
 }
 
 fn args_from(l: &LuaState, first: i32) -> Vec<Value> {
@@ -248,13 +243,7 @@ fn status_name(status: CoroutineStatus) -> &'static [u8] {
 }
 
 fn push_lua_bytes(l: &mut LuaState, gc: &mut GarbageCollector, bytes: &[u8]) {
-    let s = gc.create(GcString::from_bytes(bytes));
-    l.push_value(Value::String(s));
-}
-
-/// Convert host diagnostic text at the explicit UTF-8 boundary.
-fn diagnostic_string_value(gc: &mut GarbageCollector, text: &str) -> Value {
-    Value::String(gc.create(GcString::from_utf8_text(text)))
+    let _ = crate::registration::push_string(l, gc, bytes);
 }
 
 fn push_error(l: &mut LuaState, message: &'static [u8]) -> i32 {
@@ -271,6 +260,7 @@ fn push_error(l: &mut LuaState, message: &'static [u8]) -> i32 {
 #[cfg(test)]
 mod byte_string_tests {
     use super::*;
+    use lua_core::gc_string::GcString;
 
     #[test]
     fn library_lookup_requires_the_exact_ascii_key_bytes() {

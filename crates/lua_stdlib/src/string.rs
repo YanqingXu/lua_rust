@@ -2,13 +2,12 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 //!
 
-use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::value::Value;
-use lua_vm::execute::call_value;
+use lua_vm::execute::call_value_with_results;
 use lua_vm::state::LuaState;
 
 const STRING_DUMP_UNSUPPORTED: &str =
@@ -116,22 +115,32 @@ fn make_lua_string(l: &mut LuaState, bytes: &[u8]) -> Option<GcRef<GcString>> {
     let gc_ptr = l.gc?;
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
-    Some(if let Some(pool_ptr) = l.string_pool {
-        // SAFETY: string_pool is installed from a live StringPool owned by the host.
-        let pool = unsafe { &mut *pool_ptr };
-        pool.find_bytes(bytes)
-            .unwrap_or_else(|| pool.intern_bytes(gc, bytes))
-    } else {
-        gc.create(GcString::from_bytes(bytes))
+    gc.with_publication(|transaction| {
+        let string = crate::registration::rooted_bytes(l, transaction, bytes).ok()?;
+        // SAFETY: the callback publishes the string to the active stack before
+        // returning its reference. Callers pop that temporary owner only after
+        // the consuming call/table lookup has completed.
+        unsafe {
+            transaction
+                .publish_string_value(string, |value| {
+                    let Value::String(reference) = value.clone() else {
+                        unreachable!("string publication changed Value variant")
+                    };
+                    l.push_value(value);
+                    reference
+                })
+                .ok()
+        }
     })
 }
 
 fn push_lua_string(l: &mut LuaState, bytes: &[u8]) -> bool {
-    let Some(string_ref) = make_lua_string(l, bytes) else {
+    let Some(gc_ptr) = l.gc else {
         return false;
     };
-    l.push_value(Value::String(string_ref));
-    true
+    // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
+    let gc = unsafe { &mut *gc_ptr };
+    crate::registration::push_string(l, gc, bytes).is_ok()
 }
 
 fn lua_string_position(pos: i32, len: usize) -> i32 {
@@ -418,26 +427,30 @@ unsafe extern "C" fn lua_string_gmatch(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
 
-    let state_ref = gc.create(Table::new());
-    let iter_ref = gc.create(Function::new_c(lua_string_gmatch_iter));
-    let Some(source_ref) = make_lua_string(l, &source) else {
-        return -1;
-    };
-    let Some(pattern_ref) = make_lua_string(l, &pattern) else {
-        return -1;
-    };
+    let publication = gc.with_publication(|transaction| {
+        let state = transaction.alloc(Table::new());
+        let source_key = crate::registration::rooted_bytes(l, transaction, b"source")?;
+        let pattern_key = crate::registration::rooted_bytes(l, transaction, b"pattern")?;
+        let next_key = crate::registration::rooted_bytes(l, transaction, b"next")?;
+        let source = crate::registration::rooted_bytes(l, transaction, &source)?;
+        let pattern = crate::registration::rooted_bytes(l, transaction, &pattern)?;
+        transaction.set_table_string(&state, &source_key, &source)?;
+        transaction.set_table_string(&state, &pattern_key, &pattern)?;
+        transaction.set_table_value(&state, &next_key, &Value::Number(0.0))?;
+        let iterator = transaction.alloc_c_function(lua_string_gmatch_iter);
 
-    // SAFETY: state_ref was just allocated and is still owned by the active GC.
-    let state = unsafe { &mut *(state_ref.as_ptr() as *mut Table) };
-    if set_state_value(l, state, "source", Value::String(source_ref)).is_none()
-        || set_state_value(l, state, "pattern", Value::String(pattern_ref)).is_none()
-        || set_state_value(l, state, "next", Value::Number(0.0)).is_none()
-    {
+        // SAFETY: both callbacks install their values in the active result
+        // stack before the transaction releases their roots.
+        unsafe {
+            transaction.publish_function_value(iterator, |value| l.push_value(value))?;
+            transaction.publish_table_value(state, |value| l.push_value(value))?;
+        }
+        Ok::<_, lua_core::gc::collector::GcRefValidationError>(())
+    });
+    if publication.is_err() {
         return -1;
     }
 
-    l.push_value(Value::Function(iter_ref));
-    l.push_value(Value::Table(state_ref));
     l.push_value(Value::Nil);
     3
 }
@@ -453,13 +466,13 @@ unsafe extern "C" fn lua_string_gmatch_iter(l_ptr: *mut std::ffi::c_void) -> i32
         return 0;
     };
 
-    let Some(source) = state_string_field(l, state, "source") else {
+    let Some(source) = state_string_field(state, "source") else {
         return 0;
     };
-    let Some(pattern) = state_string_field(l, state, "pattern") else {
+    let Some(pattern) = state_string_field(state, "pattern") else {
         return 0;
     };
-    let next = state_number_field(l, state, "next").unwrap_or(0.0).max(0.0) as usize;
+    let next = state_number_field(state, "next").unwrap_or(0.0).max(0.0) as usize;
     let Some(found) = find_gsub_match(&source, &pattern, next) else {
         return 0;
     };
@@ -471,7 +484,7 @@ unsafe extern "C" fn lua_string_gmatch_iter(l_ptr: *mut std::ffi::c_void) -> i32
     };
     // SAFETY: state table is held by the generic-for state register and VM is single-threaded.
     let state_mut = unsafe { &mut *(state_ref.as_ptr() as *mut Table) };
-    if set_state_value(l, state_mut, "next", Value::Number(new_next as f64)).is_none() {
+    if set_state_value(state_mut, "next", Value::Number(new_next as f64)).is_none() {
         return -1;
     }
 
@@ -1007,19 +1020,31 @@ fn find_gsub_match(source: &[u8], pattern: &[u8], start_idx: usize) -> Option<Pa
     }
 }
 
-fn set_state_value(l: &mut LuaState, state: &mut Table, key: &str, value: Value) -> Option<()> {
-    let key_ref = make_lua_string(l, key.as_bytes())?;
-    state.set(&Value::String(key_ref), &value);
+fn set_state_value(state: &mut Table, key: &str, value: Value) -> Option<()> {
+    let key = state
+        .hash_entries()
+        .find_map(|(candidate, _)| string_key_matches(candidate, key).then(|| candidate.clone()))?;
+    state.set(&key, &value);
     Some(())
 }
 
-fn state_value(l: &mut LuaState, state: &Table, key: &str) -> Option<Value> {
-    let key_ref = make_lua_string(l, key.as_bytes())?;
-    Some(state.get(&Value::String(key_ref)))
+fn state_value(state: &Table, key: &str) -> Option<Value> {
+    state
+        .hash_entries()
+        .find_map(|(candidate, value)| string_key_matches(candidate, key).then(|| value.clone()))
 }
 
-fn state_string_field(l: &mut LuaState, state: &Table, key: &str) -> Option<Vec<u8>> {
-    match state_value(l, state, key)? {
+fn string_key_matches(candidate: &Value, expected: &str) -> bool {
+    let Value::String(candidate) = candidate else {
+        return false;
+    };
+    // SAFETY: candidate is retained as a key by the live state Table.
+    unsafe { candidate.as_ref() }
+        .is_some_and(|candidate| candidate.as_bytes() == expected.as_bytes())
+}
+
+fn state_string_field(state: &Table, key: &str) -> Option<Vec<u8>> {
+    match state_value(state, key)? {
         Value::String(s) => {
             // SAFETY: gmatch state table keeps the string reachable while iterating.
             unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
@@ -1028,8 +1053,8 @@ fn state_string_field(l: &mut LuaState, state: &Table, key: &str) -> Option<Vec<
     }
 }
 
-fn state_number_field(l: &mut LuaState, state: &Table, key: &str) -> Option<f64> {
-    match state_value(l, state, key)? {
+fn state_number_field(state: &Table, key: &str) -> Option<f64> {
+    match state_value(state, key)? {
         Value::Number(n) => Some(n),
         _ => None,
     }
@@ -1598,9 +1623,31 @@ fn gsub_replacement(
         }
         Value::Number(n) => Some(number_to_lua_string(*n).into_bytes()),
         Value::Table(table_ref) => {
-            let key = gsub_table_key(l, source, found)?;
-            let value = gsub_table_replacement_value(l, *table_ref, &key)?;
-            replacement_value_to_bytes(source, found, &value)
+            let (key, key_stack_protected) = gsub_table_key(l, source, found)?;
+            let key_slot = key_stack_protected.then_some(l.top.saturating_sub(1));
+            let Some((value, stack_protected)) = gsub_table_replacement_value(l, *table_ref, &key)
+            else {
+                if let Some(key_slot) = key_slot {
+                    if l.top > key_slot + 1 {
+                        let error = l.stack.at(l.top - 1).cloned().unwrap_or(Value::Nil);
+                        if let Some(slot) = l.stack.at_mut(key_slot) {
+                            *slot = error;
+                        }
+                        l.top -= 1;
+                    } else {
+                        l.top = key_slot;
+                    }
+                }
+                return None;
+            };
+            let replacement = replacement_value_to_bytes(source, found, &value);
+            if stack_protected {
+                let _ = l.pop();
+            }
+            if key_stack_protected {
+                let _ = l.pop();
+            }
+            replacement
         }
         Value::Function(_) => gsub_function_replacement(l, source, found, replacement),
         _ => None,
@@ -1617,11 +1664,26 @@ fn gsub_function_replacement(
         push_lua_string(l, b"gsub unavailable without an active GC");
         return None;
     };
-    let args = gsub_function_args(l, source, found)?;
+    let (args, stack_root_count) = gsub_function_args(l, source, found)?;
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
-    let results = match call_value(l, gc, replacement.clone(), &args, Some(1)) {
-        Ok(results) => results,
+    let mut replacement_bytes = None;
+    let call = call_value_with_results(
+        l,
+        gc,
+        replacement.clone(),
+        &args,
+        Some(1),
+        |_, _, results| {
+            let value = results.first().cloned().unwrap_or(Value::Nil);
+            replacement_bytes = replacement_value_to_bytes(source, found, &value);
+        },
+    );
+    for _ in 0..stack_root_count {
+        let _ = l.pop();
+    }
+    let replacement = match call {
+        Ok(()) => replacement_bytes,
         Err(err) => {
             if let Some(error_value) = err.error_value() {
                 l.push_value(error_value);
@@ -1631,8 +1693,7 @@ fn gsub_function_replacement(
             return None;
         }
     };
-    let value = results.first().cloned().unwrap_or(Value::Nil);
-    if let Some(bytes) = replacement_value_to_bytes(source, found, &value) {
+    if let Some(bytes) = replacement {
         return Some(bytes);
     }
 
@@ -1640,23 +1701,37 @@ fn gsub_function_replacement(
     None
 }
 
-fn gsub_function_args(l: &mut LuaState, source: &[u8], found: &PatternMatch) -> Option<Vec<Value>> {
+fn gsub_function_args(
+    l: &mut LuaState,
+    source: &[u8],
+    found: &PatternMatch,
+) -> Option<(Vec<Value>, usize)> {
     if found.captures.is_empty() {
-        return make_lua_string(l, &source[found.start..found.end]).map(|s| vec![Value::String(s)]);
+        return make_lua_string(l, &source[found.start..found.end])
+            .map(|s| (vec![Value::String(s)], 1));
     }
 
-    found
-        .captures
-        .iter()
-        .map(|capture| capture_to_value(l, source, capture))
-        .collect()
+    let mut values = Vec::with_capacity(found.captures.len());
+    let mut stack_root_count = 0;
+    for capture in &found.captures {
+        let Some((value, stack_protected)) = capture_to_value(l, source, capture) else {
+            for _ in 0..stack_root_count {
+                let _ = l.pop();
+            }
+            return None;
+        };
+        values.push(value);
+        stack_root_count += usize::from(stack_protected);
+    }
+    Some((values, stack_root_count))
 }
 
-fn gsub_table_key(l: &mut LuaState, source: &[u8], found: &PatternMatch) -> Option<Value> {
+fn gsub_table_key(l: &mut LuaState, source: &[u8], found: &PatternMatch) -> Option<(Value, bool)> {
     if let Some(capture) = found.captures.first() {
         capture_to_value(l, source, capture)
     } else {
-        make_lua_string(l, &source[found.start..found.end]).map(Value::String)
+        make_lua_string(l, &source[found.start..found.end])
+            .map(|string| (Value::String(string), true))
     }
 }
 
@@ -1664,18 +1739,18 @@ fn gsub_table_replacement_value(
     l: &mut LuaState,
     table_ref: GcRef<Table>,
     key: &Value,
-) -> Option<Value> {
+) -> Option<(Value, bool)> {
     let mut current = Value::Table(table_ref);
     for _ in 0..100 {
         let Value::Table(current_ref) = current.clone() else {
-            return Some(Value::Nil);
+            return Some((Value::Nil, false));
         };
         // SAFETY: replacement table and any chained __index table are reachable from
         // the active argument table or its metatable while gsub is executing.
         let table = unsafe { current_ref.as_ref() }?;
         let raw_value = table.get(key);
         if !raw_value.is_nil() {
-            return Some(raw_value);
+            return Some((raw_value, false));
         }
 
         let index = table
@@ -1684,9 +1759,10 @@ fn gsub_table_replacement_value(
         match index {
             Some(Value::Table(next_ref)) => current = Value::Table(next_ref),
             Some(index_func @ Value::Function(_)) => {
-                return call_index_metamethod(l, index_func, current, key);
+                return call_index_metamethod(l, index_func, current, key)
+                    .map(|value| (value, true));
             }
-            _ => return Some(Value::Nil),
+            _ => return Some((Value::Nil, false)),
         }
     }
 
@@ -1722,8 +1798,18 @@ fn call_index_metamethod(
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
-    match call_value(l, gc, index_func, &[table_value, key.clone()], Some(1)) {
-        Ok(results) => Some(results.first().cloned().unwrap_or(Value::Nil)),
+    match call_value_with_results(
+        l,
+        gc,
+        index_func,
+        &[table_value, key.clone()],
+        Some(1),
+        |l, _, results| {
+            let value = results.first().cloned().unwrap_or(Value::Nil);
+            l.push_value(value);
+        },
+    ) {
+        Ok(()) => Some(l.stack.at(l.top - 1).cloned().unwrap_or(Value::Nil)),
         Err(err) => {
             if let Some(error_value) = err.error_value() {
                 l.push_value(error_value);
@@ -1735,11 +1821,13 @@ fn call_index_metamethod(
     }
 }
 
-fn capture_to_value(l: &mut LuaState, source: &[u8], capture: &Capture) -> Option<Value> {
+fn capture_to_value(l: &mut LuaState, source: &[u8], capture: &Capture) -> Option<(Value, bool)> {
     match capture {
         Capture::Open(_) => None,
-        Capture::Range(start, end) => make_lua_string(l, &source[*start..*end]).map(Value::String),
-        Capture::Position(pos) => Some(Value::Number((*pos + 1) as f64)),
+        Capture::Range(start, end) => {
+            make_lua_string(l, &source[*start..*end]).map(|string| (Value::String(string), true))
+        }
+        Capture::Position(pos) => Some((Value::Number((*pos + 1) as f64), false)),
     }
 }
 

@@ -719,6 +719,7 @@ mod tests {
             let mut parts = runtime.parts_mut().expect("runtime parts");
             let (state, gc, _) = parts.split_mut();
             gc.remove_root(global);
+            gc.remove_root(registry);
             gc.remove_root(fixtures.explicit);
             state.global_table = None;
             state.thread_env = None;

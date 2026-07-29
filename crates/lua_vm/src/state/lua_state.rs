@@ -394,9 +394,18 @@ impl LuaState {
             }
         }
 
-        let new_ref = gc.create(Upvalue::new_open(owner, stack_index));
-        self.open_upvalues.insert(insertion_index, new_ref);
-        Ok(new_ref)
+        gc.with_publication(|transaction| {
+            let upvalue = transaction.alloc(Upvalue::new_open(owner, stack_index));
+            // SAFETY: the callback installs the Upvalue in the owner state's
+            // traced canonical open-Upvalue set before releasing its root.
+            unsafe {
+                transaction.publish_upvalue_reference(upvalue, |reference| {
+                    self.open_upvalues.insert(insertion_index, reference);
+                    reference
+                })
+            }
+        })
+        .map_err(OpenUpvalueError::InvalidReference)
     }
 
     pub(crate) fn close_upvalues(

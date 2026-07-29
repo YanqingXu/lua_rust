@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
-use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_vm::state::LuaState;
@@ -147,8 +146,7 @@ fn push_error(l: &mut LuaState, message: &str) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let message = gc.create(GcString::from_utf8_text(message));
-    l.push_value(Value::String(message));
+    let _ = crate::registration::push_string(l, gc, message.as_bytes());
     -1
 }
 

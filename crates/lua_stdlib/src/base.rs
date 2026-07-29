@@ -11,12 +11,11 @@ use lua_compiler::parser::Parser;
 use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
-use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::upvalue::Upvalue;
 use lua_core::userdata::Userdata;
 use lua_core::value::Value;
-use lua_vm::execute::call_value;
+use lua_vm::execute::call_value_with_results;
 use lua_vm::state::LuaState;
 use std::io::Write;
 
@@ -211,9 +210,10 @@ unsafe extern "C" fn lua_b_tostring_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
             };
             // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
             let gc = unsafe { &mut *gc_ptr };
-            match call_value(l, gc, metamethod, &[val], Some(1)) {
-                Ok(results) => {
-                    l.push_value(results.first().cloned().unwrap_or(Value::Nil));
+            match call_value_with_results(l, gc, metamethod, &[val], Some(1), |l, _, results| {
+                l.push_value(results.first().cloned().unwrap_or(Value::Nil));
+            }) {
+                Ok(()) => {
                     return 1;
                 }
                 Err(err) => {
@@ -261,32 +261,12 @@ fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
 }
 
 fn push_lua_bytes(l: &mut LuaState, bytes: &[u8]) -> bool {
-    if let Some(s) = intern_lua_bytes(l, bytes) {
-        l.push_value(Value::String(s));
-        true
-    } else {
-        false
-    }
-}
-
-fn intern_lua_string(l: &mut LuaState, text: &str) -> Option<GcRef<GcString>> {
-    intern_lua_bytes(l, text.as_bytes())
-}
-
-fn intern_lua_bytes(l: &mut LuaState, bytes: &[u8]) -> Option<GcRef<GcString>> {
-    let gc_ptr = l.gc?;
+    let Some(gc_ptr) = l.gc else {
+        return false;
+    };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
-    if let Some(pool_ptr) = l.string_pool {
-        // SAFETY: string_pool is installed from a live StringPool owned by the host.
-        let pool = unsafe { &mut *pool_ptr };
-        Some(
-            pool.find_bytes(bytes)
-                .unwrap_or_else(|| pool.intern_bytes(gc, bytes)),
-        )
-    } else {
-        Some(gc.create(GcString::from_bytes(bytes)))
-    }
+    crate::registration::push_string(l, gc, bytes).is_ok()
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -361,7 +341,7 @@ unsafe extern "C" fn lua_b_collectgarbage_raw(_l_ptr: *mut std::ffi::c_void) -> 
         }
         b"collect" => {
             if let Err(error) = run_gc_compat_cycle(l) {
-                l.push_value(error);
+                push_runtime_error_value(l, &error);
                 return -1;
             }
             finish_gcinfo_cycle(l);
@@ -375,7 +355,7 @@ unsafe extern "C" fn lua_b_collectgarbage_raw(_l_ptr: *mut std::ffi::c_void) -> 
             let done = step_gcinfo_cycle(l, size);
             if done {
                 if let Err(error) = run_gc_compat_cycle(l) {
-                    l.push_value(error);
+                    push_runtime_error_value(l, &error);
                     return -1;
                 }
             }
@@ -411,7 +391,7 @@ unsafe extern "C" fn lua_b_gcinfo_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     1
 }
 
-fn run_gc_compat_cycle(l: &mut LuaState) -> Result<(), Value> {
+fn run_gc_compat_cycle(l: &mut LuaState) -> Result<(), lua_vm::RuntimeError> {
     if let Some(gc_ptr) = l.gc {
         // SAFETY: LuaState::gc is installed by the VM before calling C functions.
         let gc = unsafe { &mut *gc_ptr };
@@ -503,7 +483,7 @@ fn run_userdata_finalizer(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     userdata: GcRef<Userdata>,
-) -> Result<(), Value> {
+) -> Result<(), lua_vm::RuntimeError> {
     // SAFETY: userdata is held in the pending-finalizer list and remains live
     // until the finalizer call path has finished.
     let finalizer = unsafe { userdata.as_ref() }
@@ -513,14 +493,14 @@ fn run_userdata_finalizer(
         return Ok(());
     };
 
-    call_value(l, gc, finalizer, &[Value::Userdata(userdata)], Some(0))
-        .map(|_| ())
-        .map_err(|err| {
-            err.error_value().unwrap_or_else(|| {
-                let message = gc.create(GcString::from_utf8_text(&err.message));
-                Value::String(message)
-            })
-        })
+    call_value_with_results(
+        l,
+        gc,
+        finalizer,
+        &[Value::Userdata(userdata)],
+        Some(0),
+        |_, _, _| (),
+    )
 }
 
 fn poll_gcinfo_kb(l: &mut LuaState) -> f64 {
@@ -595,15 +575,15 @@ unsafe extern "C" fn lua_b_pcall_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
 
-    match call_value(l, gc, func, &args, None) {
-        Ok(results) => {
-            l.push_value(Value::Boolean(true));
-            let result_count = results.len();
-            for result in results {
-                l.push_value(result);
-            }
-            1 + result_count as i32
+    let mut result_count = 0;
+    match call_value_with_results(l, gc, func, &args, None, |l, _, results| {
+        l.push_value(Value::Boolean(true));
+        result_count = results.len();
+        for result in results {
+            l.push_value(result.clone());
         }
+    }) {
+        Ok(()) => 1 + result_count as i32,
         Err(err) => {
             if err.is_native_request_suspend() {
                 return 0;
@@ -641,35 +621,38 @@ unsafe extern "C" fn lua_b_xpcall_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
 
-    match call_value(l, gc, func, &[], None) {
-        Ok(results) => {
-            l.push_value(Value::Boolean(true));
-            let result_count = results.len();
-            for result in results {
-                l.push_value(result);
-            }
-            1 + result_count as i32
+    let mut result_count = 0;
+    match call_value_with_results(l, gc, func, &[], None, |l, _, results| {
+        l.push_value(Value::Boolean(true));
+        result_count = results.len();
+        for result in results {
+            l.push_value(result.clone());
         }
+    }) {
+        Ok(()) => 1 + result_count as i32,
         Err(err) => {
-            let error_arg = runtime_error_value(l, &err);
-            match call_value(l, gc, handler, &[error_arg], None) {
-                Ok(handler_results) => {
-                    l.push_value(Value::Boolean(false));
-                    let result_count = handler_results.len();
-                    for result in handler_results {
-                        l.push_value(result);
-                    }
-                    1 + result_count as i32
+            push_runtime_error_value(l, &err);
+            let error_arg = l.stack.at(l.top - 1).cloned().unwrap_or(Value::Nil);
+            let mut handler_result_count = 0;
+            match call_value_with_results(l, gc, handler, &[error_arg], None, |l, _, results| {
+                let _ = l.pop();
+                l.push_value(Value::Boolean(false));
+                handler_result_count = results.len();
+                for result in results {
+                    l.push_value(result.clone());
                 }
+            }) {
+                Ok(()) => 1 + handler_result_count as i32,
                 Err(handler_err) => {
+                    let _ = l.pop();
                     l.push_value(Value::Boolean(false));
-                    let value = runtime_error_value(l, &handler_err);
-                    if value.is_nil() {
+                    let published = push_runtime_error_value(l, &handler_err);
+                    let published_nil = l.stack.at(l.top - 1).is_none_or(|value| value.is_nil());
+                    if !published || published_nil {
+                        let _ = l.pop();
                         if !push_lua_string(l, "error in error handling") {
                             return -1;
                         }
-                    } else {
-                        l.push_value(value);
                     }
                     2
                 }
@@ -678,19 +661,16 @@ unsafe extern "C" fn lua_b_xpcall_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     }
 }
 
-fn runtime_error_value(l: &mut LuaState, err: &lua_vm::RuntimeError) -> Value {
+fn push_runtime_error_value(l: &mut LuaState, err: &lua_vm::RuntimeError) -> bool {
     if let Some(value) = err.error_value() {
-        value
-    } else if let Some(s) = intern_lua_string(l, &err.message) {
-        Value::String(s)
+        l.push_value(value);
+        true
+    } else if !push_lua_string(l, &err.message) {
+        l.push_value(Value::Nil);
+        false
     } else {
-        Value::Nil
+        true
     }
-}
-
-fn push_runtime_error_value(l: &mut LuaState, err: &lua_vm::RuntimeError) {
-    let value = runtime_error_value(l, err);
-    l.push_value(value);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -777,35 +757,46 @@ fn read_from_lua_reader(l: &mut LuaState, reader: Value) -> Result<Vec<u8>, Valu
     let mut source = Vec::new();
 
     loop {
-        let results = call_value(l, gc, reader.clone(), &[], Some(1))
-            .map_err(|err| runtime_error_value(l, &err))?;
-        let chunk = results.first().cloned().unwrap_or(Value::Nil);
+        call_value_with_results(l, gc, reader.clone(), &[], Some(1), |l, _, results| {
+            l.push_value(results.first().cloned().unwrap_or(Value::Nil));
+        })
+        .map_err(|err| {
+            push_runtime_error_value(l, &err);
+            l.stack.at(l.top - 1).cloned().unwrap_or(Value::Nil)
+        })?;
+        let chunk = l.stack.at(l.top - 1).cloned().unwrap_or(Value::Nil);
         match chunk {
-            Value::Nil => break,
+            Value::Nil => {
+                let _ = l.pop();
+                break;
+            }
             Value::String(s) => {
                 // SAFETY: reader return value is kept alive by the active Lua stack/GC.
                 let Some(text) = (unsafe { s.as_ref() }) else {
+                    let _ = l.pop();
                     return Err(Value::Nil);
                 };
                 if text.as_bytes().is_empty() {
+                    let _ = l.pop();
                     break;
                 }
                 source.extend_from_slice(text.as_bytes());
+                let _ = l.pop();
                 if source.len() >= 2
                     && let Some(message) = definite_syntax_error(&source)
                 {
-                    let Some(message) = intern_lua_string(l, &message) else {
+                    if !push_lua_string(l, &message) {
                         return Err(Value::Nil);
-                    };
-                    return Err(Value::String(message));
+                    }
+                    return Err(l.stack.at(l.top - 1).cloned().unwrap_or(Value::Nil));
                 }
             }
             _ => {
-                let Some(message) = intern_lua_string(l, "reader function must return a string")
-                else {
+                let _ = l.pop();
+                if !push_lua_string(l, "reader function must return a string") {
                     return Err(Value::Nil);
-                };
-                return Err(Value::String(message));
+                }
+                return Err(l.stack.at(l.top - 1).cloned().unwrap_or(Value::Nil));
             }
         }
     }
@@ -895,16 +886,22 @@ unsafe extern "C" fn lua_b_dofile_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
 
-    let execution = call_value(l, gc, Value::Function(func_ref), &[], None);
-    let _ = l.pop();
-    match execution {
-        Ok(results) => {
-            let result_count = results.len();
+    let mut result_count = 0;
+    let execution = call_value_with_results(
+        l,
+        gc,
+        Value::Function(func_ref),
+        &[],
+        None,
+        |l, _, results| {
+            result_count = results.len();
             for result in results {
-                l.push_value(result);
+                l.push_value(result.clone());
             }
-            result_count as i32
-        }
+        },
+    );
+    match execution {
+        Ok(()) => result_count as i32,
         Err(err) => {
             push_runtime_error_value(l, &err);
             -1
@@ -1335,20 +1332,33 @@ unsafe extern "C" fn lua_b_newproxy_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
 
-    let metatable = match l.at(1).cloned().unwrap_or(Value::Nil) {
-        Value::Nil | Value::Boolean(false) => None,
-        Value::Boolean(true) => Some(gc.create(Table::new())),
+    let (create_metatable, existing_metatable) = match l.at(1).cloned().unwrap_or(Value::Nil) {
+        Value::Nil | Value::Boolean(false) => (false, None),
+        Value::Boolean(true) => (true, None),
         Value::Userdata(userdata_ref) => {
             // SAFETY: source proxy is an active argument.
-            unsafe { userdata_ref.as_ref() }.and_then(|userdata| userdata.metatable())
+            (
+                false,
+                unsafe { userdata_ref.as_ref() }.and_then(|userdata| userdata.metatable()),
+            )
         }
         _ => return -1,
     };
 
-    let mut userdata = Userdata::new(0);
-    userdata.set_metatable(metatable);
-    let userdata_ref = gc.create(userdata);
-    l.push_value(Value::Userdata(userdata_ref));
+    let publication = gc.with_publication(|transaction| {
+        let userdata = transaction.alloc(Userdata::new(0));
+        if create_metatable {
+            let metatable = transaction.alloc(Table::new());
+            transaction.set_userdata_metatable(&userdata, Some(&metatable))?;
+        } else if let Some(metatable) = existing_metatable {
+            transaction.set_userdata_metatable_reference(&userdata, Some(metatable))?;
+        }
+        // SAFETY: the callback installs the proxy on the active result stack.
+        unsafe { transaction.publish_userdata_value(userdata, |value| l.push_value(value)) }
+    });
+    if publication.is_err() {
+        return -1;
+    }
     1
 }
 
@@ -1583,11 +1593,10 @@ unsafe extern "C" fn lua_b_pairs_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     let Some(table_value @ Value::Table(_)) = l.at(1).cloned() else {
         return -1;
     };
-    let Some(next_func) = create_c_function(l, lua_b_next_raw) else {
+    if !push_c_function(l, lua_b_next_raw) {
         return -1;
-    };
+    }
 
-    l.push_value(Value::Function(next_func));
     l.push_value(table_value);
     l.push_value(Value::Nil);
     3
@@ -1599,11 +1608,10 @@ unsafe extern "C" fn lua_b_ipairs_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     let Some(table_value @ Value::Table(_)) = l.at(1).cloned() else {
         return -1;
     };
-    let Some(iter_func) = create_c_function(l, lua_b_ipairs_iter_raw) else {
+    if !push_c_function(l, lua_b_ipairs_iter_raw) {
         return -1;
-    };
+    }
 
-    l.push_value(Value::Function(iter_func));
     l.push_value(table_value);
     l.push_value(Value::Number(0.0));
     3
@@ -1635,12 +1643,19 @@ unsafe extern "C" fn lua_b_ipairs_iter_raw(_l_ptr: *mut std::ffi::c_void) -> i32
     2
 }
 
-fn create_c_function(
+fn push_c_function(
     l: &mut LuaState,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
-) -> Option<GcRef<Function>> {
-    let gc_ptr = l.gc?;
+) -> bool {
+    let Some(gc_ptr) = l.gc else {
+        return false;
+    };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
-    Some(gc.create(Function::new_c(func)))
+    gc.with_publication(|transaction| {
+        let function = transaction.alloc_c_function(func);
+        // SAFETY: the callback installs the Function on the active stack.
+        unsafe { transaction.publish_function_value(function, |value| l.push_value(value)) }
+    })
+    .is_ok()
 }

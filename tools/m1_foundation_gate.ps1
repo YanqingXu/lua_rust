@@ -282,6 +282,52 @@ function Assert-NoMatches {
         -Detail "rg failed: $(@($matches | Select-Object -Last 20) -join "`n")"
 }
 
+function Assert-NoProductionMatches {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [string]$Pattern,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Paths
+    )
+
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $foundMatches = [System.Collections.Generic.List[string]]::new()
+    try {
+        $regex = [regex]::new($Pattern)
+        foreach ($relativePath in $Paths) {
+            $absolutePath = Join-Path $Root $relativePath
+            $lines = Get-Content -LiteralPath $absolutePath
+            for ($index = 0; $index -lt $lines.Count; $index++) {
+                if ([regex]::IsMatch($lines[$index], '^\s*#\[cfg\(test\)\]')) {
+                    break
+                }
+                if ($regex.IsMatch($lines[$index])) {
+                    $foundMatches.Add(
+                        "${relativePath}:$($index + 1):$($lines[$index].Trim())"
+                    )
+                }
+            }
+        }
+    } catch {
+        $timer.Stop()
+        Add-Step -Name $Name -Status "failed" -ExitCode 2 `
+            -DurationMs $timer.ElapsedMilliseconds -Detail $_.Exception.Message
+        return
+    }
+    $timer.Stop()
+
+    if ($foundMatches.Count -eq 0) {
+        Add-Step -Name $Name -Status "passed" -ExitCode 0 `
+            -DurationMs $timer.ElapsedMilliseconds
+    } else {
+        Add-Step -Name $Name -Status "failed" -ExitCode 1 `
+            -DurationMs $timer.ElapsedMilliseconds `
+            -Detail (@($foundMatches | Select-Object -First 30) -join "`n")
+    }
+}
+
 $requestedCoreSkips = [System.Collections.Generic.List[string]]::new()
 if ($SkipQualityGate) {
     $requestedCoreSkips.Add("quality")
@@ -369,6 +415,29 @@ try {
         -Name "io-direct-publication" `
         -Pattern "gc\.create\s*\(" `
         -Paths @("crates/lua_stdlib/src/io.rs")
+    Assert-NoProductionMatches `
+        -Name "vm-app-result-direct-publication" `
+        -Pattern "(?:\bgc|heap_mut\.gc)\.create(?:_root)?\s*\(" `
+        -Paths @(
+            "crates/lua_app/src/main.rs",
+            "crates/lua_vm/src/execute.rs",
+            "crates/lua_vm/src/runtime.rs",
+            "crates/lua_vm/src/state/lua_state.rs",
+            "crates/lua_stdlib/src/base.rs",
+            "crates/lua_stdlib/src/coroutine.rs",
+            "crates/lua_stdlib/src/debug.rs",
+            "crates/lua_stdlib/src/math.rs",
+            "crates/lua_stdlib/src/os.rs",
+            "crates/lua_stdlib/src/string.rs",
+            "crates/lua_stdlib/src/table.rs"
+        )
+    Assert-NoMatches `
+        -Name "unrooted-call-result-api" `
+        -Pattern "\bcall_value\s*\(" `
+        -Paths @(
+            "crates/lua_vm/src",
+            "crates/lua_stdlib/src"
+        )
     Assert-NoMatches `
         -Name "pseudo-dump-registry" `
         -Pattern "thread_local!\s*\{|(?:DUMPS|SOURCES)\s*:" `
@@ -512,7 +581,7 @@ $openDebts = @(
     [ordered]@{
         id = "production-publication-roots"
         blocks = "destructive sweep"
-        detail = "Active/debug Proto identities, open Upvalue owners, coroutine activation buffers, and PendingState handles are canonical roots; coroutine create/wrap, compiler Proto-to-Function, library/package, and IO object publication are transactional, while VM/app/result publication remains incomplete."
+        detail = "Active/debug Proto identities, open Upvalue owners, coroutine activation buffers, and PendingState handles are canonical roots; coroutine create/wrap, compiler, library/package, IO, VM temporaries, app arguments, and synchronous result publication are transactional. String equality/canonicalization, unique Heap ownership, and live collector integration still block destructive sweep."
     },
     [ordered]@{
         id = "deterministic-runtime-shutdown"
@@ -527,7 +596,7 @@ $openDebts = @(
     [ordered]@{
         id = "generational-gc-handles-and-publication-roots"
         blocks = "destructive sweep"
-        detail = "GcRef carries non-reused ObjectId provenance, and StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement; lexical object roots plus coroutine, compiler, library/package, and IO publication are implemented, but VM/app/result graphs are not yet migrated."
+        detail = "GcRef carries non-reused ObjectId provenance, and StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement; lexical object roots plus coroutine, compiler, library/package, IO, VM/app, and result publication are implemented. Unique Heap ownership and live collector integration remain open."
     },
     [ordered]@{
         id = "string-content-equality-without-collector-borrow"
@@ -544,7 +613,7 @@ $result = [ordered]@{
         "m1-foundation-gate"
     }
     mode = if ($Smoke) { "smoke" } else { "full" }
-    scope = "ByteString, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, compiler, library/package, and IO publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
+    scope = "ByteString, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, compiler, library/package, IO, VM/app, and synchronous result publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
     checksPassed = $failures.Count -eq 0
     foundationPassed = (
         $failures.Count -eq 0 -and

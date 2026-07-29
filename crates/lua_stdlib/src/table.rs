@@ -8,7 +8,7 @@ use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_vm::RuntimeError;
-use lua_vm::execute::{call_value, compare_lua_string_bytes};
+use lua_vm::execute::{call_value_with_results, compare_lua_string_bytes};
 use lua_vm::state::LuaState;
 use std::cmp::Ordering;
 
@@ -116,15 +116,7 @@ fn push_lua_bytes(l: &mut LuaState, bytes: &[u8]) -> bool {
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
-    let string_ref = if let Some(pool_ptr) = l.string_pool {
-        // SAFETY: string_pool is installed from a live StringPool owned by the host.
-        let pool = unsafe { &mut *pool_ptr };
-        pool.intern_bytes(gc, bytes)
-    } else {
-        gc.create(GcString::from_bytes(bytes))
-    };
-    l.push_value(Value::String(string_ref));
-    true
+    crate::registration::push_string(l, gc, bytes).is_ok()
 }
 
 fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
@@ -226,15 +218,19 @@ fn compare_with_function(
     lhs: &Value,
     rhs: &Value,
 ) -> Result<bool, TableSortError> {
-    let results = call_value(
+    let mut comparison = false;
+    call_value_with_results(
         l,
         gc,
         comparator.clone(),
         &[lhs.clone(), rhs.clone()],
         Some(1),
+        |_, _, results| {
+            comparison = results.first().is_some_and(is_truthy);
+        },
     )
     .map_err(TableSortError::from_runtime)?;
-    Ok(results.first().is_some_and(is_truthy))
+    Ok(comparison)
 }
 
 fn default_less(
@@ -365,19 +361,25 @@ unsafe extern "C" fn lua_table_foreach(l_ptr: *mut std::ffi::c_void) -> i32 {
             l.push_nil();
             return 1;
         };
-        let results = match call_value(
+        let mut has_result = false;
+        match call_value_with_results(
             l,
             gc,
             callback.clone(),
             &[next_key.clone(), next_value],
             None,
+            |l, _, results| {
+                let result = results.first().cloned().unwrap_or(Value::Nil);
+                if !result.is_nil() {
+                    l.push_value(result);
+                    has_result = true;
+                }
+            },
         ) {
-            Ok(results) => results,
+            Ok(()) => {}
             Err(err) => return push_sort_error(l, TableSortError::from_runtime(err)),
-        };
-        let result = results.first().cloned().unwrap_or(Value::Nil);
-        if !result.is_nil() {
-            l.push_value(result);
+        }
+        if has_result {
             return 1;
         }
         key = next_key;
@@ -415,19 +417,25 @@ unsafe extern "C" fn lua_table_foreachi(l_ptr: *mut std::ffi::c_void) -> i32 {
             };
             table.get(&Value::Number(idx as f64))
         };
-        let results = match call_value(
+        let mut has_result = false;
+        match call_value_with_results(
             l,
             gc,
             callback.clone(),
             &[Value::Number(idx as f64), value],
             None,
+            |l, _, results| {
+                let result = results.first().cloned().unwrap_or(Value::Nil);
+                if !result.is_nil() {
+                    l.push_value(result);
+                    has_result = true;
+                }
+            },
         ) {
-            Ok(results) => results,
+            Ok(()) => {}
             Err(err) => return push_sort_error(l, TableSortError::from_runtime(err)),
-        };
-        let result = results.first().cloned().unwrap_or(Value::Nil);
-        if !result.is_nil() {
-            l.push_value(result);
+        }
+        if has_result {
             return 1;
         }
     }

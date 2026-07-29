@@ -54,8 +54,8 @@ is not closed:
   pseudo-dump prefix;
 - `Runtime::trace_roots_mark_only` now provides the canonical object/state
   fixed-point root callback; temporary state roots are implemented, while
-  pending finalizers, fixed strings, and several production publication paths
-  remain incomplete;
+  pending finalizers, fixed strings, scoped string access, and unique Heap
+  ownership remain incomplete;
 - the two VM-side weak-cleanup scanners at
   `crates/lua_vm/src/execute.rs:1137-1188` and
   `crates/lua_stdlib/src/base.rs:432-495` disagree and are not safe sweep root
@@ -63,7 +63,7 @@ is not closed:
 - `GcRef<T>` now carries a process-unique, non-reused `ObjectId`, and each
   collector has an authoritative address-to-identity/type live table. This
   closes pointer-address reuse for checked collector entry points, but does
-  not yet provide the final unique `Heap` owner or lexical temporary roots.
+  not yet provide the final unique `Heap` owner or scoped execution borrows.
 - safe `Value::String` equality and hashing still dereference the string
   candidate without a collector-side validation context. Production code
   currently creates non-interned `GcString` values directly, so changing Lua
@@ -760,9 +760,9 @@ unsafe-gap variant.
 No path in this API calls `collect`, `sweep`, `clear_all`, finalizers, or object
 destruction. Existing weak-maintenance scanners now use managed Proto roots
 and checked metadata reads, but have not yet been replaced by this Runtime-only
-safe-point API. Destructive sweep remains blocked on scoped VM borrows,
-unreachable-state integration, finalizer roots, production publication
-migration, and complete finalizer/shutdown semantics.
+safe-point API. Destructive sweep remains blocked on scoped VM/string borrows,
+unreachable-state integration, finalizer roots, unique Heap ownership, and
+complete finalizer/shutdown semantics.
 
 #### D.2 Implemented temporary-object root foundation (partial)
 
@@ -817,11 +817,32 @@ covers partial method registration, `__index`, Userdata metatable, iterator
 environment/file/Function edges, normal early return, panic cleanup, and
 foreign/stale rejection before mutation.
 
-This is an API/registry foundation, not completion of publication safety.
-VM temporaries, app arguments, general result construction, and returned
-`Vec<Value>` paths still use unprotected production allocation. Coroutine
-create/wrap, compiler Proto publication, library/package, and IO graphs are
-migrated. Allocation-triggered collection remains disabled.
+VM/app/result construction is the fourth migrated graph. VM `NEWTABLE`,
+`CLOSURE`, concat/debug/error strings, compatibility arg Tables, and open
+Upvalues remain transaction roots until an active register or state-owned open
+set receives them. Runtime global/registry Tables and error Values publish to
+explicit/state roots. CLI script arguments use exact explicit roots across the
+Runtime handoff, while top-level execution consumes results before clearing the
+main stack. The old helper-call `Vec<Value>` return API is replaced by
+`call_value_with_results`: it validates and protects every collectable result,
+restores the caller stack, and invokes a synchronous publication callback while
+the exact temporary identities remain registered. Standard-library result
+Tables, Functions, strings, and proxy Userdata use the same typed stack/Table
+handoff. The M1 gate scans the production prefix of each target source file and
+rejects direct `gc.create`, while test-only fixture allocation remains allowed.
+
+Result-slice tests cover mark seeding, foreign-edge rejection, panic cleanup,
+and stack publication after the callee window is restored. A process test
+proves both CLI `arg` and chunk varargs survive the explicit-root-to-state
+handoff.
+
+This is an API/registry foundation, not completion of live collection safety.
+Coroutine create/wrap, compiler, library/package, IO, VM/app, and synchronous
+result publication are migrated. Protected-call and top-level result callbacks
+are unit-returning, so collectable results cannot escape the rooted callback as
+Rust return values. Allocation-triggered collection remains
+disabled until production string Eq/Hash access is canonical/scoped, one Heap
+owns all services, and the Runtime root tracer drives the collector.
 
 #### D.3 Implemented temporary-state root transaction (local-complete slice)
 
@@ -850,12 +871,11 @@ and one-time MAX-generation retirement. Runtime close reports both remaining
 temporary state roots and rejected releases; normal close and 1,000-cycle
 shutdown leave both at zero.
 
-This closes the inventory entry for coroutine state publication, not the
-broader production publication program. Compiler Proto→Function builders are
-now migrated together with library/package and IO construction graphs, while
-VM temporaries, app arguments/results, unique Heap ownership,
-fixed strings, and finalizer roots remain blockers for live destructive
-collection.
+This closes the inventory entry for coroutine state publication. Compiler
+Proto→Function builders, library/package, IO, VM/app, and synchronous result
+construction are now migrated, while string Eq/Hash/scoped access, unique Heap
+ownership, fixed strings, and finalizer roots remain blockers for live
+destructive collection.
 
 ### E. Shutdown substrate — M1.8
 

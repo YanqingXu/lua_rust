@@ -1564,8 +1564,17 @@ impl Runtime {
         let heap_mut = unsafe { Pin::get_unchecked_mut(heap.as_mut()) };
         let gc_ptr = &mut heap_mut.gc as *mut GarbageCollector;
         let string_pool_ptr = &mut heap_mut.string_pool as *mut StringPool;
-        let global_root = heap_mut.gc.create_root(Table::new());
-        let registry_root = heap_mut.gc.create(Table::new());
+        let (global_root, registry_root) = heap_mut.gc.with_publication(|transaction| {
+            let global = transaction.alloc(Table::new());
+            let registry = transaction.alloc(Table::new());
+            let global = transaction
+                .publish_as_explicit_root(global)
+                .expect("new Runtime global Table remains registered");
+            let registry = transaction
+                .publish_as_explicit_root(registry)
+                .expect("new Runtime registry Table remains registered");
+            (global, registry)
+        });
 
         let mut main_state = Box::new(LuaState::with_global_table(global_root));
         main_state.registry = Some(registry_root);
@@ -1924,12 +1933,17 @@ impl Runtime {
                 ) = (replay_dead_thread, &event)
                     && replayed == *thread
                 {
-                    event = NativeTurnEvent::Coroutine {
-                        thread: *thread,
-                        response: ResumeResponse::Error(runtime_error_value(
+                    let error = StateArena::with_turn_state_mut(arena, current, |state| {
+                        runtime_error_value(
+                            state,
                             gc,
                             &RuntimeError::new("cannot resume dead coroutine"),
-                        )),
+                        )
+                    })
+                    .map_err(|source| RuntimeAccessError::StateArena { runtime_id, source })?;
+                    event = NativeTurnEvent::Coroutine {
+                        thread: *thread,
+                        response: ResumeResponse::Error(error),
                     };
                 }
             }
@@ -2057,7 +2071,8 @@ impl Runtime {
         }
     }
 
-    /// Execute a top-level Proto with Lua varargs and return owned results.
+    /// Execute a top-level Proto with Lua varargs and consume results while
+    /// they remain owned by the main-state stack.
     ///
     /// Preparation and result collection occur outside the scheduler session;
     /// the middle execution always uses the same Runtime-owned trampoline as
@@ -2066,7 +2081,8 @@ impl Runtime {
         &mut self,
         proto: GcRef<Proto>,
         args: Vec<Value>,
-    ) -> Result<Vec<Value>, RuntimeExecutionError> {
+        consume_results: impl FnOnce(&[Value]),
+    ) -> Result<(), RuntimeExecutionError> {
         self.check_owner()?;
         if self.phase != RuntimePhase::Running {
             return Err(RuntimeAccessError::NotRunning {
@@ -2101,16 +2117,15 @@ impl Runtime {
                 .ok_or(RuntimeAccessError::MainStateUnavailable {
                     runtime_id: self.id,
                 })?;
-        let results = if execution.is_ok() {
-            state_stack_values(state)
-        } else {
-            Vec::new()
-        };
-        state.unwind_call_info_to(0);
-        state.current_call_info_mut().reset();
-        state.top = 0;
+        let results = execution.is_ok().then(|| state_stack_values(state));
+        let _reset = TopLevelStateResetGuard { state };
         execution?;
-        Ok(results)
+        consume_results(
+            results
+                .as_deref()
+                .expect("successful execution exposes its result buffer"),
+        );
+        Ok(())
     }
 
     /// Deterministically reclaim Runtime-owned Rust states and GC allocations.
@@ -2552,8 +2567,7 @@ fn classify_native_turn(
             .map_err(|validation| {
                 RuntimeError::new(format!("invalid coroutine Thread: {validation}"))
             })?;
-            let error = runtime_error_value(gc, &error);
-            state.last_error = Some(error.clone());
+            let error = runtime_error_value(state, gc, &error);
             Ok(NativeTurnEvent::Coroutine {
                 thread,
                 response: ResumeResponse::Error(error),
@@ -2680,12 +2694,42 @@ fn state_stack_values(state: &LuaState) -> Vec<Value> {
         .collect()
 }
 
-fn runtime_error_value(gc: &mut GarbageCollector, error: &RuntimeError) -> Value {
-    error.error_value().unwrap_or_else(|| {
-        Value::String(gc.create(lua_core::gc_string::GcString::from_utf8_text(
+struct TopLevelStateResetGuard<'state> {
+    state: &'state mut LuaState,
+}
+
+impl Drop for TopLevelStateResetGuard<'_> {
+    fn drop(&mut self) {
+        self.state.unwind_call_info_to(0);
+        self.state.current_call_info_mut().reset();
+        self.state.top = 0;
+    }
+}
+
+fn runtime_error_value(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    error: &RuntimeError,
+) -> Value {
+    if let Some(value) = error.error_value() {
+        state.last_error = Some(value.clone());
+        return value;
+    }
+
+    gc.with_publication(|transaction| {
+        let message = transaction.alloc(lua_core::gc_string::GcString::from_utf8_text(
             &error.message,
-        )))
+        ));
+        // SAFETY: last_error is a Runtime-traced LuaState owner and receives
+        // the string before its temporary publication root is released.
+        unsafe {
+            transaction.publish_string_value(message, |value| {
+                state.last_error = Some(value.clone());
+                value
+            })
+        }
     })
+    .expect("new Runtime error string remains registered during publication")
 }
 
 fn release_yield_permission(state: &mut LuaState) -> Result<(), RuntimeError> {
