@@ -45,33 +45,29 @@ pub fn open_debug(l: &mut LuaState, gc: &mut GarbageCollector) {
         return;
     }
 
-    let table_ptr = debug_table.as_ptr() as *mut Table;
-    reg(gc, table_ptr, "getfenv", lua_debug_getfenv);
-    reg(gc, table_ptr, "gethook", lua_debug_gethook);
-    reg(gc, table_ptr, "getinfo", lua_debug_getinfo);
-    reg(gc, table_ptr, "getlocal", lua_debug_getlocal);
-    reg(gc, table_ptr, "getregistry", lua_debug_getregistry);
-    reg(gc, table_ptr, "getupvalue", lua_debug_getupvalue);
-    reg(gc, table_ptr, "setfenv", lua_debug_setfenv);
-    reg(gc, table_ptr, "sethook", lua_debug_sethook);
-    reg(gc, table_ptr, "setlocal", lua_debug_setlocal);
-    reg(gc, table_ptr, "setmetatable", lua_debug_setmetatable);
-    reg(gc, table_ptr, "setupvalue", lua_debug_setupvalue);
-    reg(gc, table_ptr, "traceback", lua_debug_traceback);
+    reg(l, gc, debug_table, "getfenv", lua_debug_getfenv);
+    reg(l, gc, debug_table, "gethook", lua_debug_gethook);
+    reg(l, gc, debug_table, "getinfo", lua_debug_getinfo);
+    reg(l, gc, debug_table, "getlocal", lua_debug_getlocal);
+    reg(l, gc, debug_table, "getregistry", lua_debug_getregistry);
+    reg(l, gc, debug_table, "getupvalue", lua_debug_getupvalue);
+    reg(l, gc, debug_table, "setfenv", lua_debug_setfenv);
+    reg(l, gc, debug_table, "sethook", lua_debug_sethook);
+    reg(l, gc, debug_table, "setlocal", lua_debug_setlocal);
+    reg(l, gc, debug_table, "setmetatable", lua_debug_setmetatable);
+    reg(l, gc, debug_table, "setupvalue", lua_debug_setupvalue);
+    reg(l, gc, debug_table, "traceback", lua_debug_traceback);
 }
 
 fn reg(
+    state: &LuaState,
     gc: &mut GarbageCollector,
-    table: *mut Table,
+    table: GcRef<Table>,
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let func_obj = gc.create(Function::new_c(func));
-    // SAFETY: table points to the library table created and rooted by open_library.
-    unsafe {
-        (*table).set(&Value::String(name_str), &Value::Function(func_obj));
-    }
+    crate::registration::register_c_function(state, gc, table, name.as_bytes(), func, None)
+        .expect("debug Function publication must remain collector-valid");
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {

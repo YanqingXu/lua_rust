@@ -347,6 +347,17 @@ try {
             "crates/lua_stdlib/src/package.rs"
         )
     Assert-NoMatches `
+        -Name "library-package-direct-publication" `
+        -Pattern "gc\.create\s*\(" `
+        -Paths @(
+            "crates/lua_stdlib/src/catalog.rs",
+            "crates/lua_stdlib/src/package.rs"
+        )
+    Assert-NoMatches `
+        -Name "legacy-library-registration-allocation" `
+        -Pattern "let\s+(?:name_str|func_obj)\s*=\s*gc\.create" `
+        -Paths @("crates/lua_stdlib/src")
+    Assert-NoMatches `
         -Name "runtime-static-mut-state" `
         -Pattern "&'static\s+mut\s+LuaState" `
         -Paths @("crates")
@@ -497,7 +508,7 @@ $openDebts = @(
     [ordered]@{
         id = "production-publication-roots"
         blocks = "destructive sweep"
-        detail = "Active/debug Proto identities, open Upvalue owners, coroutine activation buffers, and PendingState handles are canonical roots; coroutine create/wrap and compiler Proto-to-Function publication are transactional, while general library/package, IO, VM, and app/result publication remains incomplete."
+        detail = "Active/debug Proto identities, open Upvalue owners, coroutine activation buffers, and PendingState handles are canonical roots; coroutine create/wrap, compiler Proto-to-Function, library registration, and package object publication are transactional, while IO construction and VM/app/result publication remain incomplete."
     },
     [ordered]@{
         id = "deterministic-runtime-shutdown"
@@ -512,7 +523,7 @@ $openDebts = @(
     [ordered]@{
         id = "generational-gc-handles-and-publication-roots"
         blocks = "destructive sweep"
-        detail = "GcRef carries non-reused ObjectId provenance, and StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement; lexical object roots, PendingState roots, and compiler Proto-to-Function publication are implemented, but the remaining production object graphs are not yet migrated."
+        detail = "GcRef carries non-reused ObjectId provenance, and StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement; lexical object roots plus coroutine, compiler, library-registration, and package publication are implemented, but IO and VM/app/result graphs are not yet migrated."
     },
     [ordered]@{
         id = "string-content-equality-without-collector-borrow"
@@ -529,7 +540,7 @@ $result = [ordered]@{
         "m1-foundation-gate"
     }
     mode = if ($Smoke) { "smoke" } else { "full" }
-    scope = "ByteString, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, compiler Proto-to-Function publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
+    scope = "ByteString, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, compiler and library/package publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
     checksPassed = $failures.Count -eq 0
     foundationPassed = (
         $failures.Count -eq 0 -and

@@ -20,46 +20,43 @@ pub fn open_string(l: &mut LuaState, gc: &mut GarbageCollector) {
         return;
     }
 
-    let table_ptr = string_lib.as_ptr() as *mut Table;
-    reg(gc, table_ptr, "byte", lua_string_byte);
-    reg(gc, table_ptr, "char", lua_string_char);
-    reg(gc, table_ptr, "dump", lua_string_dump);
-    reg(gc, table_ptr, "find", lua_string_find);
-    reg(gc, table_ptr, "format", lua_string_format);
-    reg_gmatch_aliases(gc, table_ptr);
-    reg(gc, table_ptr, "gsub", lua_string_gsub);
-    reg(gc, table_ptr, "len", lua_string_len);
-    reg(gc, table_ptr, "lower", lua_string_lower);
-    reg(gc, table_ptr, "match", lua_string_match);
-    reg(gc, table_ptr, "rep", lua_string_rep);
-    reg(gc, table_ptr, "reverse", lua_string_reverse);
-    reg(gc, table_ptr, "sub", lua_string_sub);
-    reg(gc, table_ptr, "upper", lua_string_upper);
+    reg(l, gc, string_lib, "byte", lua_string_byte);
+    reg(l, gc, string_lib, "char", lua_string_char);
+    reg(l, gc, string_lib, "dump", lua_string_dump);
+    reg(l, gc, string_lib, "find", lua_string_find);
+    reg(l, gc, string_lib, "format", lua_string_format);
+    reg_gmatch_aliases(l, gc, string_lib);
+    reg(l, gc, string_lib, "gsub", lua_string_gsub);
+    reg(l, gc, string_lib, "len", lua_string_len);
+    reg(l, gc, string_lib, "lower", lua_string_lower);
+    reg(l, gc, string_lib, "match", lua_string_match);
+    reg(l, gc, string_lib, "rep", lua_string_rep);
+    reg(l, gc, string_lib, "reverse", lua_string_reverse);
+    reg(l, gc, string_lib, "sub", lua_string_sub);
+    reg(l, gc, string_lib, "upper", lua_string_upper);
 }
 
 fn reg(
+    state: &LuaState,
     gc: &mut GarbageCollector,
-    table: *mut Table,
+    table: GcRef<Table>,
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let func_obj = gc.create(Function::new_c(func));
-    // SAFETY: table points to the library table created and rooted by open_library.
-    unsafe {
-        (*table).set(&Value::String(name_str), &Value::Function(func_obj));
-    }
+    crate::registration::register_c_function(state, gc, table, name.as_bytes(), func, None)
+        .expect("string Function publication must remain collector-valid");
 }
 
-fn reg_gmatch_aliases(gc: &mut GarbageCollector, table: *mut Table) {
-    let func_obj = gc.create(Function::new_c(lua_string_gmatch));
-    for name in ["gmatch", "gfind"] {
-        let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-        // SAFETY: table points to the library table created and rooted by open_library.
-        unsafe {
-            (*table).set(&Value::String(name_str), &Value::Function(func_obj));
-        }
-    }
+fn reg_gmatch_aliases(state: &LuaState, gc: &mut GarbageCollector, table: GcRef<Table>) {
+    crate::registration::register_c_function_aliases(
+        state,
+        gc,
+        table,
+        &[b"gmatch", b"gfind"],
+        lua_string_gmatch,
+        None,
+    )
+    .expect("string alias publication must remain collector-valid");
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {

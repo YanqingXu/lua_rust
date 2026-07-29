@@ -12,7 +12,6 @@ use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
-use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
 use lua_core::upvalue::Upvalue;
 use lua_core::userdata::Userdata;
@@ -28,96 +27,68 @@ const LUA_VERSION: &str = "Lua 5.1 (C core prototype)";
 /// 打开基础库（注册到全局表 _G）
 pub fn open_base(l: &mut LuaState, gc: &mut GarbageCollector) {
     if let Some(global_table) = l.global_table {
-        let table_ptr = global_table.as_ptr() as *mut Table;
-
-        set_global_value(l, gc, table_ptr, "_G", &Value::Table(global_table));
-        let version = Value::String(intern_string(l, gc, LUA_VERSION));
-        set_global_value(l, gc, table_ptr, "_VERSION", &version);
+        set_global_value(l, gc, global_table, "_G", &Value::Table(global_table));
+        crate::registration::set_string(l, gc, global_table, b"_VERSION", LUA_VERSION.as_bytes())
+            .expect("base version publication must remain collector-valid");
 
         // Register core functions
-        register(l, gc, table_ptr, "assert", lua_b_assert_raw);
-        register(l, gc, table_ptr, "collectgarbage", lua_b_collectgarbage_raw);
-        register(l, gc, table_ptr, "error", lua_b_error_raw);
-        register(l, gc, table_ptr, "gcinfo", lua_b_gcinfo_raw);
-        register(l, gc, table_ptr, "getfenv", lua_b_getfenv_raw);
-        register(l, gc, table_ptr, "getmetatable", lua_b_getmetatable_raw);
-        register(l, gc, table_ptr, "ipairs", lua_b_ipairs_raw);
-        register(l, gc, table_ptr, "dofile", lua_b_dofile_raw);
-        register(l, gc, table_ptr, "load", lua_b_load_raw);
-        register(l, gc, table_ptr, "loadfile", lua_b_loadfile_raw);
-        register(l, gc, table_ptr, "loadstring", lua_b_loadstring_raw);
-        register(l, gc, table_ptr, "newproxy", lua_b_newproxy_raw);
-        register(l, gc, table_ptr, "next", lua_b_next_raw);
-        register(l, gc, table_ptr, "pairs", lua_b_pairs_raw);
-        register(l, gc, table_ptr, "pcall", lua_b_pcall_raw);
-        register(l, gc, table_ptr, "print", lua_b_print_raw);
-        register(l, gc, table_ptr, "rawequal", lua_b_rawequal_raw);
-        register(l, gc, table_ptr, "rawget", lua_b_rawget_raw);
-        register(l, gc, table_ptr, "rawset", lua_b_rawset_raw);
-        register(l, gc, table_ptr, "select", lua_b_select_raw);
-        register(l, gc, table_ptr, "setfenv", lua_b_setfenv_raw);
-        register(l, gc, table_ptr, "setmetatable", lua_b_setmetatable_raw);
-        register(l, gc, table_ptr, "tonumber", lua_b_tonumber_raw);
-        register(l, gc, table_ptr, "type", lua_b_type_raw);
-        register(l, gc, table_ptr, "tostring", lua_b_tostring_raw);
-        register(l, gc, table_ptr, "unpack", lua_b_unpack_raw);
-        register(l, gc, table_ptr, "xpcall", lua_b_xpcall_raw);
+        register(l, gc, global_table, "assert", lua_b_assert_raw);
+        register(
+            l,
+            gc,
+            global_table,
+            "collectgarbage",
+            lua_b_collectgarbage_raw,
+        );
+        register(l, gc, global_table, "error", lua_b_error_raw);
+        register(l, gc, global_table, "gcinfo", lua_b_gcinfo_raw);
+        register(l, gc, global_table, "getfenv", lua_b_getfenv_raw);
+        register(l, gc, global_table, "getmetatable", lua_b_getmetatable_raw);
+        register(l, gc, global_table, "ipairs", lua_b_ipairs_raw);
+        register(l, gc, global_table, "dofile", lua_b_dofile_raw);
+        register(l, gc, global_table, "load", lua_b_load_raw);
+        register(l, gc, global_table, "loadfile", lua_b_loadfile_raw);
+        register(l, gc, global_table, "loadstring", lua_b_loadstring_raw);
+        register(l, gc, global_table, "newproxy", lua_b_newproxy_raw);
+        register(l, gc, global_table, "next", lua_b_next_raw);
+        register(l, gc, global_table, "pairs", lua_b_pairs_raw);
+        register(l, gc, global_table, "pcall", lua_b_pcall_raw);
+        register(l, gc, global_table, "print", lua_b_print_raw);
+        register(l, gc, global_table, "rawequal", lua_b_rawequal_raw);
+        register(l, gc, global_table, "rawget", lua_b_rawget_raw);
+        register(l, gc, global_table, "rawset", lua_b_rawset_raw);
+        register(l, gc, global_table, "select", lua_b_select_raw);
+        register(l, gc, global_table, "setfenv", lua_b_setfenv_raw);
+        register(l, gc, global_table, "setmetatable", lua_b_setmetatable_raw);
+        register(l, gc, global_table, "tonumber", lua_b_tonumber_raw);
+        register(l, gc, global_table, "type", lua_b_type_raw);
+        register(l, gc, global_table, "tostring", lua_b_tostring_raw);
+        register(l, gc, global_table, "unpack", lua_b_unpack_raw);
+        register(l, gc, global_table, "xpcall", lua_b_xpcall_raw);
     }
 }
 
 fn set_global_value(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    table_ptr: *mut Table,
+    table: GcRef<Table>,
     name: &str,
     value: &Value,
 ) {
-    let name_str = intern_string(l, gc, name);
-    // SAFETY: table_ptr points to the GC-rooted global table.
-    unsafe {
-        (*table_ptr).set(&Value::String(name_str), value);
-    }
+    crate::registration::set_value(l, gc, table, name.as_bytes(), value)
+        .expect("base global publication must remain collector-valid");
 }
 
 /// Register a C function in the global table.
-/// Uses StringPool for string interning when available.
 fn register(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    table_ptr: *mut Table,
+    table: GcRef<Table>,
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    // Use StringPool interning if available so that the same string
-    // from the compiler shares the same GcRef.
-    let name_str = if let Some(pool_ptr) = l.string_pool {
-        // SAFETY: pool_ptr was set from a valid &mut StringPool
-        let pool: &mut StringPool = unsafe { &mut *pool_ptr };
-        // Check if already interned
-        if let Some(existing) = pool.find_bytes(name.as_bytes()) {
-            existing
-        } else {
-            pool.intern_bytes(gc, name.as_bytes())
-        }
-    } else {
-        gc.create(GcString::from_bytes(name.as_bytes()))
-    };
-    let func_obj = gc.create(Function::new_c(func));
-    // SAFETY: table_ptr points to a valid GC-rooted table
-    unsafe {
-        (*table_ptr).set(&Value::String(name_str), &Value::Function(func_obj));
-    }
-}
-
-fn intern_string(l: &mut LuaState, gc: &mut GarbageCollector, text: &str) -> GcRef<GcString> {
-    if let Some(pool_ptr) = l.string_pool {
-        // SAFETY: pool_ptr was set from a valid &mut StringPool.
-        let pool: &mut StringPool = unsafe { &mut *pool_ptr };
-        pool.find_bytes(text.as_bytes())
-            .unwrap_or_else(|| pool.intern_bytes(gc, text.as_bytes()))
-    } else {
-        gc.create(GcString::from_bytes(text.as_bytes()))
-    }
+    crate::registration::register_c_function(l, gc, table, name.as_bytes(), func, None)
+        .expect("base Function publication must remain collector-valid");
 }
 
 // ═══════════════════════════════════════════════════════════════════

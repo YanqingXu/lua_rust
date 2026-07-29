@@ -20,6 +20,7 @@ pub mod io;
 pub mod math;
 pub mod os;
 pub mod package;
+mod registration;
 pub mod string;
 pub mod table;
 // pub mod test;

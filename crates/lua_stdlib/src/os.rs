@@ -8,7 +8,6 @@ use std::time::Instant;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
@@ -25,30 +24,26 @@ pub fn open_os(l: &mut LuaState, gc: &mut GarbageCollector) {
         return;
     }
 
-    let table_ptr = os_table.as_ptr() as *mut Table;
-    reg(gc, table_ptr, "clock", lua_os_clock);
-    reg(gc, table_ptr, "date", lua_os_date);
-    reg(gc, table_ptr, "difftime", lua_os_difftime);
-    reg(gc, table_ptr, "execute", lua_os_execute);
-    reg(gc, table_ptr, "remove", lua_os_remove);
-    reg(gc, table_ptr, "rename", lua_os_rename);
-    reg(gc, table_ptr, "setlocale", lua_os_setlocale);
-    reg(gc, table_ptr, "time", lua_os_time);
-    reg(gc, table_ptr, "tmpname", lua_os_tmpname);
+    reg(l, gc, os_table, "clock", lua_os_clock);
+    reg(l, gc, os_table, "date", lua_os_date);
+    reg(l, gc, os_table, "difftime", lua_os_difftime);
+    reg(l, gc, os_table, "execute", lua_os_execute);
+    reg(l, gc, os_table, "remove", lua_os_remove);
+    reg(l, gc, os_table, "rename", lua_os_rename);
+    reg(l, gc, os_table, "setlocale", lua_os_setlocale);
+    reg(l, gc, os_table, "time", lua_os_time);
+    reg(l, gc, os_table, "tmpname", lua_os_tmpname);
 }
 
 fn reg(
+    state: &LuaState,
     gc: &mut GarbageCollector,
-    table: *mut Table,
+    table: GcRef<Table>,
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let func_obj = gc.create(Function::new_c(func));
-    // SAFETY: table points to the library table created and rooted by open_library.
-    unsafe {
-        (*table).set(&Value::String(name_str), &Value::Function(func_obj));
-    }
+    crate::registration::register_c_function(state, gc, table, name.as_bytes(), func, None)
+        .expect("OS Function publication must remain collector-valid");
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {

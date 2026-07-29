@@ -1,6 +1,6 @@
 //! Minimal coroutine library.
 
-use lua_core::function::{Function, RuntimeNativeFunction};
+use lua_core::function::RuntimeNativeFunction;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
@@ -16,46 +16,40 @@ pub fn open_coroutine(l: &mut LuaState, gc: &mut GarbageCollector) {
         return;
     }
 
-    let table_ptr = coroutine_table.as_ptr() as *mut Table;
-    reg(gc, table_ptr, "create", lua_coroutine_create);
+    reg(l, gc, coroutine_table, "create", lua_coroutine_create);
     reg_runtime_native(
+        l,
         gc,
-        table_ptr,
+        coroutine_table,
         "resume",
         RuntimeNativeFunction::CoroutineResume,
     );
-    reg(gc, table_ptr, "running", lua_coroutine_running);
-    reg(gc, table_ptr, "status", lua_coroutine_status);
-    reg(gc, table_ptr, "wrap", lua_coroutine_wrap);
-    reg(gc, table_ptr, "yield", lua_coroutine_yield);
+    reg(l, gc, coroutine_table, "running", lua_coroutine_running);
+    reg(l, gc, coroutine_table, "status", lua_coroutine_status);
+    reg(l, gc, coroutine_table, "wrap", lua_coroutine_wrap);
+    reg(l, gc, coroutine_table, "yield", lua_coroutine_yield);
 }
 
 fn reg(
+    state: &LuaState,
     gc: &mut GarbageCollector,
-    table: *mut Table,
+    table: GcRef<Table>,
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let func_obj = gc.create(Function::new_c(func));
-    // SAFETY: table points to the library table created and rooted by open_library.
-    unsafe {
-        (*table).set(&Value::String(name_str), &Value::Function(func_obj));
-    }
+    crate::registration::register_c_function(state, gc, table, name.as_bytes(), func, None)
+        .expect("coroutine Function publication must remain collector-valid");
 }
 
 fn reg_runtime_native(
+    state: &LuaState,
     gc: &mut GarbageCollector,
-    table: *mut Table,
+    table: GcRef<Table>,
     name: &str,
     operation: RuntimeNativeFunction,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let func_obj = gc.create(Function::new_runtime_native(operation));
-    // SAFETY: table points to the library table created and rooted by open_library.
-    unsafe {
-        (*table).set(&Value::String(name_str), &Value::Function(func_obj));
-    }
+    crate::registration::register_runtime_native(state, gc, table, name.as_bytes(), operation)
+        .expect("coroutine Runtime-native publication must remain collector-valid");
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {

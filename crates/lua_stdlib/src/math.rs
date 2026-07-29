@@ -5,8 +5,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;
+use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::value::Value;
@@ -26,64 +26,62 @@ pub fn open_math(l: &mut LuaState, gc: &mut GarbageCollector) {
     if math_table.is_null() {
         return;
     }
-    let tbl_ptr = math_table.as_ptr() as *mut Table;
-
     // Register all math functions
-    reg(gc, tbl_ptr, "abs", lua_math_abs);
-    reg(gc, tbl_ptr, "acos", lua_math_acos);
-    reg(gc, tbl_ptr, "asin", lua_math_asin);
-    reg(gc, tbl_ptr, "atan", lua_math_atan);
-    reg(gc, tbl_ptr, "atan2", lua_math_atan2);
-    reg(gc, tbl_ptr, "ceil", lua_math_ceil);
-    reg(gc, tbl_ptr, "cos", lua_math_cos);
-    reg(gc, tbl_ptr, "cosh", lua_math_cosh);
-    reg(gc, tbl_ptr, "deg", lua_math_deg);
-    reg(gc, tbl_ptr, "exp", lua_math_exp);
-    reg(gc, tbl_ptr, "floor", lua_math_floor);
-    reg(gc, tbl_ptr, "frexp", lua_math_frexp);
-    reg(gc, tbl_ptr, "fmod", lua_math_fmod);
-    reg(gc, tbl_ptr, "ldexp", lua_math_ldexp);
-    reg(gc, tbl_ptr, "log", lua_math_log);
-    reg(gc, tbl_ptr, "log10", lua_math_log10);
-    reg(gc, tbl_ptr, "max", lua_math_max);
-    reg(gc, tbl_ptr, "min", lua_math_min);
-    reg(gc, tbl_ptr, "mod", lua_math_fmod);
-    reg(gc, tbl_ptr, "modf", lua_math_modf);
-    reg(gc, tbl_ptr, "pow", lua_math_pow);
-    reg(gc, tbl_ptr, "rad", lua_math_rad);
-    reg(gc, tbl_ptr, "random", lua_math_random);
-    reg(gc, tbl_ptr, "randomseed", lua_math_randomseed);
-    reg(gc, tbl_ptr, "sin", lua_math_sin);
-    reg(gc, tbl_ptr, "sinh", lua_math_sinh);
-    reg(gc, tbl_ptr, "sqrt", lua_math_sqrt);
-    reg(gc, tbl_ptr, "tan", lua_math_tan);
-    reg(gc, tbl_ptr, "tanh", lua_math_tanh);
+    reg(l, gc, math_table, "abs", lua_math_abs);
+    reg(l, gc, math_table, "acos", lua_math_acos);
+    reg(l, gc, math_table, "asin", lua_math_asin);
+    reg(l, gc, math_table, "atan", lua_math_atan);
+    reg(l, gc, math_table, "atan2", lua_math_atan2);
+    reg(l, gc, math_table, "ceil", lua_math_ceil);
+    reg(l, gc, math_table, "cos", lua_math_cos);
+    reg(l, gc, math_table, "cosh", lua_math_cosh);
+    reg(l, gc, math_table, "deg", lua_math_deg);
+    reg(l, gc, math_table, "exp", lua_math_exp);
+    reg(l, gc, math_table, "floor", lua_math_floor);
+    reg(l, gc, math_table, "frexp", lua_math_frexp);
+    reg(l, gc, math_table, "fmod", lua_math_fmod);
+    reg(l, gc, math_table, "ldexp", lua_math_ldexp);
+    reg(l, gc, math_table, "log", lua_math_log);
+    reg(l, gc, math_table, "log10", lua_math_log10);
+    reg(l, gc, math_table, "max", lua_math_max);
+    reg(l, gc, math_table, "min", lua_math_min);
+    reg(l, gc, math_table, "mod", lua_math_fmod);
+    reg(l, gc, math_table, "modf", lua_math_modf);
+    reg(l, gc, math_table, "pow", lua_math_pow);
+    reg(l, gc, math_table, "rad", lua_math_rad);
+    reg(l, gc, math_table, "random", lua_math_random);
+    reg(l, gc, math_table, "randomseed", lua_math_randomseed);
+    reg(l, gc, math_table, "sin", lua_math_sin);
+    reg(l, gc, math_table, "sinh", lua_math_sinh);
+    reg(l, gc, math_table, "sqrt", lua_math_sqrt);
+    reg(l, gc, math_table, "tan", lua_math_tan);
+    reg(l, gc, math_table, "tanh", lua_math_tanh);
 
-    set_number(gc, tbl_ptr, "huge", f64::INFINITY);
-    set_number(gc, tbl_ptr, "pi", std::f64::consts::PI);
+    set_number(l, gc, math_table, "huge", f64::INFINITY);
+    set_number(l, gc, math_table, "pi", std::f64::consts::PI);
 }
 
 /// Register a C function in a table
 fn reg(
+    state: &LuaState,
     gc: &mut GarbageCollector,
-    table: *mut Table,
+    table: GcRef<Table>,
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let func_obj = gc.create(Function::new_c(func));
-    // SAFETY: table points to a valid GC-rooted table; GC does not run here
-    unsafe {
-        (*table).set(&Value::String(name_str), &Value::Function(func_obj));
-    }
+    crate::registration::register_c_function(state, gc, table, name.as_bytes(), func, None)
+        .expect("math Function publication must remain collector-valid");
 }
 
-fn set_number(gc: &mut GarbageCollector, table: *mut Table, name: &str, value: f64) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    // SAFETY: table points to a valid GC-rooted table; GC does not run here.
-    unsafe {
-        (*table).set(&Value::String(name_str), &Value::Number(value));
-    }
+fn set_number(
+    state: &LuaState,
+    gc: &mut GarbageCollector,
+    table: GcRef<Table>,
+    name: &str,
+    value: f64,
+) {
+    crate::registration::set_value(state, gc, table, name.as_bytes(), &Value::Number(value))
+        .expect("math constant publication must remain collector-valid");
 }
 
 /// Find a library table in the global namespace

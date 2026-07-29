@@ -11,7 +11,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-use crate::function::{Function, RuntimeNativeFunction};
+use crate::function::{CFunction, Function, RuntimeNativeFunction};
 use crate::gc::collector::{GarbageCollector, GcRefValidationError};
 use crate::gc::gc_object::GcObject;
 use crate::gc::gc_ref::GcRef;
@@ -152,8 +152,8 @@ impl<'scope> PublicationTxn<'scope> {
     ///
     /// The explicit root is installed before the temporary root is released.
     /// This is intentionally the only initial operation that returns a raw
-    /// `GcRef`; object-graph publication will be added as typed methods rather
-    /// than an unchecked generic `commit`.
+    /// `GcRef`; object-graph publication uses typed methods rather than an
+    /// unchecked generic `commit`.
     pub fn publish_as_explicit_root<T: GcObject>(
         &mut self,
         rooted: Rooted<'scope, T>,
@@ -186,6 +186,19 @@ impl<'scope> PublicationTxn<'scope> {
         let mut function = Function::new_runtime_native(operation);
         function.add_upvalue(upvalue.reference);
         Ok(self.alloc(function))
+    }
+
+    /// Allocate a protected C Function.
+    pub fn alloc_c_function(&mut self, function: CFunction) -> Rooted<'scope, Function> {
+        self.alloc(Function::new_c(function))
+    }
+
+    /// Allocate a protected Runtime-native Function without Upvalues.
+    pub fn alloc_runtime_native_function(
+        &mut self,
+        operation: RuntimeNativeFunction,
+    ) -> Rooted<'scope, Function> {
+        self.alloc(Function::new_runtime_native(operation))
     }
 
     /// Intern one Lua byte string and retain it as a publication root.
@@ -246,8 +259,8 @@ impl<'scope> PublicationTxn<'scope> {
         Ok(self.alloc(Function::new_lua(proto.reference)))
     }
 
-    /// Install a validated environment on a protected Lua Function.
-    pub fn set_lua_function_environment(
+    /// Install a validated environment on a protected Function.
+    pub fn set_function_environment(
         &mut self,
         function: &Rooted<'scope, Function>,
         environment: Option<GcRef<Table>>,
@@ -258,6 +271,85 @@ impl<'scope> PublicationTxn<'scope> {
         }
         self.collector
             .with_mut(function.reference, |function| function.set_env(environment))
+    }
+
+    /// Install a validated environment on a protected Lua Function.
+    pub fn set_lua_function_environment(
+        &mut self,
+        function: &Rooted<'scope, Function>,
+        environment: Option<GcRef<Table>>,
+    ) -> Result<(), GcRefValidationError> {
+        self.set_function_environment(function, environment)
+    }
+
+    /// Attach an already-live Value under a protected string key in a
+    /// protected Table.
+    ///
+    /// Collectable values are validated against this transaction's collector
+    /// before the edge is installed.
+    pub fn set_table_value(
+        &mut self,
+        table: &Rooted<'scope, Table>,
+        key: &Rooted<'scope, GcString>,
+        value: &Value,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(table)?;
+        self.validate_protection(key)?;
+        self.validate_value(value)?;
+        self.collector.with_mut(table.reference, |table| {
+            table.set(&Value::String(key.reference), value);
+        })
+    }
+
+    /// Attach a protected string value to a protected Table.
+    pub fn set_table_string(
+        &mut self,
+        table: &Rooted<'scope, Table>,
+        key: &Rooted<'scope, GcString>,
+        value: &Rooted<'scope, GcString>,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(value)?;
+        self.set_table_value(table, key, &Value::String(value.reference))
+    }
+
+    /// Attach a protected child Table to a protected parent Table.
+    pub fn set_table_table(
+        &mut self,
+        table: &Rooted<'scope, Table>,
+        key: &Rooted<'scope, GcString>,
+        value: &Rooted<'scope, Table>,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(value)?;
+        self.set_table_value(table, key, &Value::Table(value.reference))
+    }
+
+    /// Attach a protected Function to a protected Table.
+    pub fn set_table_function(
+        &mut self,
+        table: &Rooted<'scope, Table>,
+        key: &Rooted<'scope, GcString>,
+        value: &Rooted<'scope, Function>,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(value)?;
+        self.set_table_value(table, key, &Value::Function(value.reference))
+    }
+
+    /// Set a protected Table's metatable to another protected Table.
+    pub fn set_table_metatable(
+        &mut self,
+        table: &Rooted<'scope, Table>,
+        metatable: Option<&Rooted<'scope, Table>>,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(table)?;
+        let metatable = match metatable {
+            Some(metatable) => {
+                self.validate_protection(metatable)?;
+                Some(metatable.reference)
+            }
+            None => None,
+        };
+        self.collector
+            .with_mut(table.reference, |table| table.set_metatable(metatable))
     }
 
     /// Check that a protected Function retains a protected Thread through one
@@ -361,6 +453,42 @@ impl<'scope> PublicationTxn<'scope> {
         Ok(result)
     }
 
+    /// Publish a protected string Value while its temporary root remains
+    /// installed for the entire callback.
+    ///
+    /// # Safety
+    ///
+    /// On normal return, `publish` must install the supplied Value in an
+    /// independently traced owner or consume it synchronously.
+    pub unsafe fn publish_string_value<R>(
+        &mut self,
+        rooted: Rooted<'scope, GcString>,
+        publish: impl FnOnce(Value) -> R,
+    ) -> Result<R, GcRefValidationError> {
+        self.validate_protection(&rooted)?;
+        let result = publish(Value::String(rooted.reference));
+        self.release_owned_root(rooted.temporary_root_id);
+        Ok(result)
+    }
+
+    /// Publish a protected Table Value while its temporary root remains
+    /// installed for the entire callback.
+    ///
+    /// # Safety
+    ///
+    /// On normal return, `publish` must install the supplied Value in an
+    /// independently traced owner or consume it synchronously.
+    pub unsafe fn publish_table_value<R>(
+        &mut self,
+        rooted: Rooted<'scope, Table>,
+        publish: impl FnOnce(Value) -> R,
+    ) -> Result<R, GcRefValidationError> {
+        self.validate_protection(&rooted)?;
+        let result = publish(Value::Table(rooted.reference));
+        self.release_owned_root(rooted.temporary_root_id);
+        Ok(result)
+    }
+
     /// Run a nested publication transaction while retaining all outer roots.
     pub fn with_nested<R>(
         &mut self,
@@ -402,6 +530,17 @@ impl<'scope> PublicationTxn<'scope> {
             _ => Err(GcRefValidationError::NotLive {
                 object_id: rooted.reference.object_id(),
             }),
+        }
+    }
+
+    fn validate_value(&self, value: &Value) -> Result<(), GcRefValidationError> {
+        match value {
+            Value::String(value) => self.collector.validate_ref(*value).map(|_| ()),
+            Value::Table(value) => self.collector.validate_ref(*value).map(|_| ()),
+            Value::Function(value) => self.collector.validate_ref(*value).map(|_| ()),
+            Value::Userdata(value) => self.collector.validate_ref(*value).map(|_| ()),
+            Value::Thread(value) => self.collector.validate_ref(*value).map(|_| ()),
+            Value::Nil | Value::Boolean(_) | Value::Number(_) | Value::LightUserdata(_) => Ok(()),
         }
     }
 

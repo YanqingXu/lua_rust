@@ -607,8 +607,18 @@
         },
         {
           "path": "crates/lua_stdlib/src/package.rs",
-          "line": 297,
-          "symbol": "compile_chunk_function typed loader stack publication"
+          "line": 355,
+          "symbol": "package/loaded/preload and nested module Table publication"
+        },
+        {
+          "path": "crates/lua_stdlib/src/catalog.rs",
+          "line": 93,
+          "symbol": "open_library global Table publication"
+        },
+        {
+          "path": "crates/lua_stdlib/src/registration.rs",
+          "line": 26,
+          "symbol": "shared standard-library Function/Table/string publication"
         },
         {
           "path": "crates/lua_stdlib/src/io.rs",
@@ -623,18 +633,18 @@
       ],
       "status": "partial",
       "owner": {
-        "current": "GarbageCollector::with_publication provides a higher-ranked PublicationTxn and branded Rooted handle. New allocations enter an ObjectId-bearing temporary-root registry before the handle is exposed; panic/nested-scope Drop removes exact identities. The compiler now roots interned strings and child Proto nodes throughout builder execution, and typed Proto-to-Function/environment operations publish CLI, bytecode-tool, base load/dofile, and package file-loader outputs either to an explicit root or directly to a traced Lua stack.",
+        "current": "GarbageCollector::with_publication provides a higher-ranked PublicationTxn and branded Rooted handle. New allocations enter an ObjectId-bearing temporary-root registry before the handle is exposed; panic/nested-scope Drop removes exact identities. Compiler Proto graphs, standard-library Table/key/C-or-runtime-native Function registration, package/loaded/preload/nested-module graphs, and package strings now remain protected until an explicit root, traced Table, or active Lua stack owns them.",
         "target": "Heap owns publication transactions with typed Table/Function/Proto/Userdata edge-publish operations and makes unprotected production allocation unavailable."
       },
       "tracer": {
         "current": "GarbageCollector::begin_mark_only validates and seeds active temporary object roots, with separate seeded/rejected counts.",
         "target": "RuntimeRootTracer seeds every active temporary-root scope."
       },
-      "missing_risk": "The compiler Proto tree and its production top-level consumers are migrated, as is coroutine create/wrap, but general library/package registration, IO graphs, VM temporaries, app argument/result buffers, and remaining direct production gc.create calls have not migrated. Allocation-triggered collection therefore remains disabled.",
+      "missing_risk": "Compiler, coroutine create/wrap, library registration, and package object graphs are migrated, but IO construction graphs, VM temporaries, app argument/result buffers, general result construction, and remaining direct production gc.create calls have not migrated. Allocation-triggered collection therefore remains disabled.",
       "planned_test": {
-        "name": "compiler_proto_tree_publishes_atomically_into_a_lua_function; compiler_publication_panic_releases_every_partial_graph_root; allocation_during_object_construction_preserves_temporaries",
+        "name": "compiler_proto_tree_publishes_atomically_into_a_lua_function; open_all_publishes_every_library_graph_from_the_global_root; panic_after_partial_library_edges_releases_only_temporary_roots; allocation_during_object_construction_preserves_temporaries",
         "layer": "lua_vm runtime_gc_roots",
-        "assertion": "Compiler strings, nested Proto nodes, top Proto, and Lua Function remain exact temporary roots until explicit-root or stack publication; future forced-GC-at-every-allocation tests must preserve library, IO, VM, app/result, and remaining closure construction intermediates."
+        "assertion": "Compiler and library/package graphs retain exact temporary identities until explicit-root, Table, or stack publication; future forced-GC-at-every-allocation tests must preserve IO, VM, app/result, and remaining closure construction intermediates."
       }
     },
     {

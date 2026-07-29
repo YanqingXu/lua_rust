@@ -43,29 +43,41 @@ pub fn open_io(l: &mut LuaState, gc: &mut GarbageCollector) {
     set_table_value(table_ptr, gc, "stderr", &Value::Userdata(stderr));
     set_table_value(table_ptr, gc, "__output", &Value::Userdata(stdout));
     set_table_value(table_ptr, gc, "__input", &Value::Userdata(stdin));
-    reg(gc, table_ptr, "close", lua_io_close);
-    reg(gc, table_ptr, "flush", lua_io_flush);
-    reg(gc, table_ptr, "input", lua_io_input);
-    reg(gc, table_ptr, "lines", lua_io_lines);
-    reg(gc, table_ptr, "open", lua_io_open);
-    reg(gc, table_ptr, "output", lua_io_output);
-    reg(gc, table_ptr, "read", lua_io_read);
-    reg(gc, table_ptr, "tmpfile", lua_io_tmpfile);
-    reg(gc, table_ptr, "type", lua_io_type);
-    reg(gc, table_ptr, "write", lua_io_write);
+    reg(l, gc, io_table, "close", lua_io_close);
+    reg(l, gc, io_table, "flush", lua_io_flush);
+    reg(l, gc, io_table, "input", lua_io_input);
+    reg(l, gc, io_table, "lines", lua_io_lines);
+    reg(l, gc, io_table, "open", lua_io_open);
+    reg(l, gc, io_table, "output", lua_io_output);
+    reg(l, gc, io_table, "read", lua_io_read);
+    reg(l, gc, io_table, "tmpfile", lua_io_tmpfile);
+    reg(l, gc, io_table, "type", lua_io_type);
+    reg(l, gc, io_table, "write", lua_io_write);
 }
 
 fn reg(
+    state: &LuaState,
+    gc: &mut GarbageCollector,
+    table: GcRef<Table>,
+    name: &str,
+    func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+) {
+    crate::registration::register_c_function(state, gc, table, name.as_bytes(), func, None)
+        .expect("IO Function publication must remain collector-valid");
+}
+
+fn reg_unpublished_table(
     gc: &mut GarbageCollector,
     table: *mut Table,
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let func_obj = gc.create(Function::new_c(func));
-    // SAFETY: table points to a library or file-handle table kept alive by GC roots/stack.
+    let name = gc.create(GcString::from_bytes(name.as_bytes()));
+    let function = gc.create(Function::new_c(func));
+    // SAFETY: this is the remaining IO construction graph tracked by the
+    // TEMPORARY_PROTECTED_ROOTS inventory entry.
     unsafe {
-        (*table).set(&Value::String(name_str), &Value::Function(func_obj));
+        (*table).set(&Value::String(name), &Value::Function(function));
     }
 }
 
@@ -151,15 +163,15 @@ fn create_file(
     }
 
     let file_ptr = &mut state as *mut Table;
-    reg(gc, file_ptr, "write", lua_io_file_write);
-    reg(gc, file_ptr, "read", lua_io_file_read);
-    reg(gc, file_ptr, "seek", lua_io_file_seek);
-    reg(gc, file_ptr, "close", lua_io_file_close);
-    reg(gc, file_ptr, "setvbuf", lua_io_file_setvbuf);
-    reg(gc, file_ptr, "lines", lua_io_file_lines);
-    reg(gc, file_ptr, "flush", lua_io_file_flush);
-    reg(gc, file_ptr, "__gc", lua_io_file_gc);
-    reg(gc, file_ptr, "__tostring", lua_io_file_tostring);
+    reg_unpublished_table(gc, file_ptr, "write", lua_io_file_write);
+    reg_unpublished_table(gc, file_ptr, "read", lua_io_file_read);
+    reg_unpublished_table(gc, file_ptr, "seek", lua_io_file_seek);
+    reg_unpublished_table(gc, file_ptr, "close", lua_io_file_close);
+    reg_unpublished_table(gc, file_ptr, "setvbuf", lua_io_file_setvbuf);
+    reg_unpublished_table(gc, file_ptr, "lines", lua_io_file_lines);
+    reg_unpublished_table(gc, file_ptr, "flush", lua_io_file_flush);
+    reg_unpublished_table(gc, file_ptr, "__gc", lua_io_file_gc);
+    reg_unpublished_table(gc, file_ptr, "__tostring", lua_io_file_tostring);
     let index_key = gc.create(GcString::from_bytes(b"__index"));
     let state_ref = gc.create(state);
     // SAFETY: state_ref points to the freshly allocated metatable.

@@ -2,7 +2,6 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 //!
 
-use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
@@ -19,29 +18,25 @@ pub fn open_table(l: &mut LuaState, gc: &mut GarbageCollector) {
         return;
     }
 
-    let table_ptr = table_lib.as_ptr() as *mut Table;
-    reg(gc, table_ptr, "concat", lua_table_concat);
-    reg(gc, table_ptr, "foreach", lua_table_foreach);
-    reg(gc, table_ptr, "foreachi", lua_table_foreachi);
-    reg(gc, table_ptr, "getn", lua_table_getn);
-    reg(gc, table_ptr, "insert", lua_table_insert);
-    reg(gc, table_ptr, "maxn", lua_table_maxn);
-    reg(gc, table_ptr, "remove", lua_table_remove);
-    reg(gc, table_ptr, "sort", lua_table_sort);
+    reg(l, gc, table_lib, "concat", lua_table_concat);
+    reg(l, gc, table_lib, "foreach", lua_table_foreach);
+    reg(l, gc, table_lib, "foreachi", lua_table_foreachi);
+    reg(l, gc, table_lib, "getn", lua_table_getn);
+    reg(l, gc, table_lib, "insert", lua_table_insert);
+    reg(l, gc, table_lib, "maxn", lua_table_maxn);
+    reg(l, gc, table_lib, "remove", lua_table_remove);
+    reg(l, gc, table_lib, "sort", lua_table_sort);
 }
 
 fn reg(
+    state: &LuaState,
     gc: &mut GarbageCollector,
-    table: *mut Table,
+    table: GcRef<Table>,
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let func_obj = gc.create(Function::new_c(func));
-    // SAFETY: table points to the library table created and rooted by open_library.
-    unsafe {
-        (*table).set(&Value::String(name_str), &Value::Function(func_obj));
-    }
+    crate::registration::register_c_function(state, gc, table, name.as_bytes(), func, None)
+        .expect("table Function publication must remain collector-valid");
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {

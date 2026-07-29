@@ -225,11 +225,15 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   compiler builder 也已改用 sealed publication allocator：interned string、
   child Proto、top Proto 与 Lua Function 在错误返回或 panic 时均由事务清理，
   成功路径只在 CLI/bytecode explicit root 或 base/package 活动栈接管后释放。
+  标准库共享 registration layer 现保护 destination Table、canonical key、
+  C/Runtime-native Function 与 environment；catalog library Table 以及
+  package/loaded/preload/nested-module/metadata/metatable/error string 也只在
+  traced Table 或 stack 接管后释放，foreign edge 在 mutation 前拒绝。
   但 main state 仍是 external arena slot，LuaState 仍保存 transitional
   GC/StringPool backpointer，debug/protected-helper 跨 state open-Upvalue
   访问尚未纳入同一调度协议；Lua `__gc`、IO/module service drain 与
-  allocator live-byte 合同也未闭环，library/package 其余注册图、IO、
-  VM/app/results publication 路径仍待迁移。
+  allocator live-byte 合同也未闭环，IO、VM/app/results publication 路径仍待
+  迁移。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
   close、coroutine lifecycle 和 allocator live-byte 合同。
 - **测试与任务：** 1000 轮 state/coroutine create-close、fixed/ordinary
@@ -248,10 +252,10 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   owner 风险，并能声称当前 Rust-owned 对象的 deterministic shutdown
   substrate；剩余 service/backpointer 与未迁移 publication 路径仍不允许
   声称完整 Lua close 或 live collection。
-- **处置状态：** `open`。temporary state 与 compiler Proto→Function
-  publication 子项已关闭；唯一 Heap/service owner、其余生产 publication、
-  debug/protected-helper 跨 state、Lua-visible close 与 lifecycle 验收全部
-  完成前保持开放。
+- **处置状态：** `open`。temporary state、compiler Proto→Function 与
+  library/package publication 子项已关闭；唯一 Heap/service owner、其余生产
+  publication、debug/protected-helper 跨 state、Lua-visible close 与 lifecycle
+  验收全部完成前保持开放。
 
 ### NOTE-010: Lua 字符串 intern hash 选择固定 C++ 的前向采样
 

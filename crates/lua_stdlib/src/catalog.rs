@@ -3,11 +3,10 @@
 //! 管理 Lua 5.1 全部标准库的注册和查询。
 //!
 
-use lua_core::function::Function;
+use lua_core::function::CFunction;
 use lua_core::gc::collector::GarbageCollector;
-use lua_core::gc_string::GcString;
+use lua_core::gc::gc_ref::GcRef;
 use lua_core::table::Table;
-use lua_core::value::Value;
 use lua_vm::state::LuaState;
 
 /// 库打开函数类型（C 函数签名：返回栈上返回值数量）
@@ -92,54 +91,36 @@ pub fn open_all(l: &mut LuaState, gc: &mut GarbageCollector) {
 
 /// 打开一个命名空间库（创建库表 + 注册函数 + 设置全局变量）
 fn open_library(l: &mut LuaState, gc: &mut GarbageCollector, entry: &LibEntry) {
-    // Create the library table
-    let lib_table = gc.create(Table::new());
+    let Some(global) = l.global_table else {
+        return;
+    };
+    crate::registration::publish_new_table(l, gc, global, entry.name.as_bytes())
+        .expect("global library Table publication must remain collector-valid");
 
-    // Store it temporarily in a well-known location
-    // We use a helper pattern: push the table ref, open the library (which
-    // registers functions into it), then set as global
-    let lib_ref = lib_table;
-    let name_str = gc.create(GcString::from_bytes(entry.name.as_bytes()));
-
-    // Set empty table as global first, so open function can find it
-    if let Some(gt) = l.global_table {
-        let gt_ptr = gt.as_ptr() as *mut Table;
-        // SAFETY: gt is a GC root
-        unsafe {
-            (*gt_ptr).set(&Value::String(name_str), &Value::Table(lib_ref));
-        }
-    }
-
-    // Now open the library (it will register into the lib table via the global)
+    // The published global edge owns the table while its open function
+    // installs the library's remaining entries.
     (entry.open)(l, gc);
 }
 
-/// 在指定表中注册一个 C 函数（直接操作，需要 GC）
+/// 在指定的受管表中注册一个 C 函数。
 pub fn register_in_table(
+    state: &LuaState,
     gc: &mut GarbageCollector,
-    table: &mut Table,
+    table: GcRef<Table>,
     name: &str,
-    func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+    function: CFunction,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let func_obj = gc.create(Function::new_c(func));
-    table.set(&Value::String(name_str), &Value::Function(func_obj));
+    crate::registration::register_c_function(state, gc, table, name.as_bytes(), function, None)
+        .expect("library Function publication must remain collector-valid");
 }
 
 /// 在全局表中注册函数（用于 base 库）
-///
-/// # Safety
-/// `global_table` must point to a valid GC-rooted Table.
-pub unsafe fn register_global(
+pub fn register_global(
+    state: &LuaState,
     gc: &mut GarbageCollector,
-    global_table: *mut Table,
+    global_table: GcRef<Table>,
     name: &str,
-    func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+    function: CFunction,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let func_obj = gc.create(Function::new_c(func));
-    // SAFETY: caller guarantees global_table is a valid GC-rooted table
-    unsafe {
-        (*global_table).set(&Value::String(name_str), &Value::Function(func_obj));
-    }
+    register_in_table(state, gc, global_table, name, function);
 }

@@ -9,7 +9,6 @@ use lua_compiler::parser::Parser;
 use lua_core::function::Function;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
-use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_vm::execute::call_value;
@@ -28,23 +27,16 @@ pub fn open_package(l: &mut LuaState, gc: &mut GarbageCollector) {
     let preload = ensure_preload_table(l, gc, package);
     preload_global_libraries(l, gc, loaded);
 
-    let default_path = lua_string_value(l, gc, DEFAULT_PATH);
-    set_table_string(l, gc, package, "path", &default_path);
-    let default_cpath = lua_string_value(l, gc, DEFAULT_CPATH);
-    set_table_string(l, gc, package, "cpath", &default_cpath);
-    register_package_function(gc, package, "loadlib", lua_package_loadlib);
-    register_package_function(gc, package, "seeall", lua_package_seeall);
+    crate::registration::set_string(l, gc, package, b"path", DEFAULT_PATH.as_bytes())
+        .expect("package.path publication must remain collector-valid");
+    crate::registration::set_string(l, gc, package, b"cpath", DEFAULT_CPATH.as_bytes())
+        .expect("package.cpath publication must remain collector-valid");
+    register_package_function(l, gc, package, "loadlib", lua_package_loadlib);
+    register_package_function(l, gc, package, "seeall", lua_package_seeall);
 
     if let Some(global) = l.global_table {
-        let global_ptr = global.as_ptr() as *mut Table;
-        register_global(
-            gc,
-            global_ptr,
-            "require",
-            lua_package_require,
-            Some(package),
-        );
-        register_global(gc, global_ptr, "module", lua_package_module, Some(package));
+        register_global(l, gc, global, "require", lua_package_require, Some(package));
+        register_global(l, gc, global, "module", lua_package_module, Some(package));
     }
 
     // Keep the preload table live and visible even when no preloaders are registered yet.
@@ -82,8 +74,8 @@ pub fn add_script_directory_to_path(
     } else {
         format!("{prefix};{current}")
     };
-    let path_value = lua_string_value(l, gc, &path);
-    set_table_string(l, gc, package, "path", &path_value);
+    crate::registration::set_string(l, gc, package, b"path", path.as_bytes())
+        .expect("package.path update must remain collector-valid");
 }
 
 unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -192,15 +184,36 @@ unsafe extern "C" fn lua_package_seeall(l_ptr: *mut std::ffi::c_void) -> i32 {
     let global = l.global_table;
 
     if let Some(global) = global {
-        set_table_string(l, gc, module_ref, "_G", &Value::Table(global));
+        crate::registration::set_value(l, gc, module_ref, b"_G", &Value::Table(global))
+            .expect("module _G publication must remain collector-valid");
         let mt = {
             // SAFETY: module_ref is an active argument.
             unsafe { module_ref.as_ref() }.and_then(|module| module.metatable())
+        };
+        if let Some(mt) = mt {
+            crate::registration::set_value(l, gc, mt, b"__index", &Value::Table(global))
+                .expect("module __index publication must remain collector-valid");
+            crate::registration::set_metatable(gc, module_ref, mt)
+                .expect("module metatable publication must remain collector-valid");
+        } else {
+            gc.with_publication(|transaction| {
+                let module = transaction
+                    .protect(module_ref)
+                    .expect("module argument must remain collector-valid");
+                let _global = transaction
+                    .protect(global)
+                    .expect("global Table must remain collector-valid");
+                let metatable = transaction.alloc(Table::new());
+                let index = crate::registration::rooted_bytes(l, transaction, b"__index")
+                    .expect("module __index key must remain collector-valid");
+                transaction
+                    .set_table_value(&metatable, &index, &Value::Table(global))
+                    .expect("module __index edge must remain collector-valid");
+                transaction
+                    .set_table_metatable(&module, Some(&metatable))
+                    .expect("module metatable edge must remain collector-valid");
+            });
         }
-        .unwrap_or_else(|| gc.create(Table::new()));
-        set_table_string(l, gc, mt, "__index", &Value::Table(global));
-        // SAFETY: module_ref is an active argument and VM is single-threaded.
-        unsafe { &mut *(module_ref.as_ptr() as *mut Table) }.set_metatable(Some(mt));
     }
     0
 }
@@ -344,9 +357,11 @@ fn ensure_package_table(l: &mut LuaState, gc: &mut GarbageCollector) -> GcRef<Ta
         return package;
     }
 
-    let package = gc.create(Table::new());
-    set_global_value(l, gc, "package", &Value::Table(package));
-    package
+    let Some(global) = l.global_table else {
+        return GcRef::null();
+    };
+    crate::registration::publish_new_table(l, gc, global, b"package")
+        .expect("package Table publication must remain collector-valid")
 }
 
 fn ensure_loaded_table(
@@ -354,13 +369,8 @@ fn ensure_loaded_table(
     gc: &mut GarbageCollector,
     package: GcRef<Table>,
 ) -> GcRef<Table> {
-    if let Value::Table(loaded) = table_get_string(l, gc, package, "loaded") {
-        return loaded;
-    }
-
-    let loaded = gc.create(Table::new());
-    set_table_string(l, gc, package, "loaded", &Value::Table(loaded));
-    loaded
+    crate::registration::ensure_table(l, gc, package, b"loaded")
+        .expect("package.loaded publication must remain collector-valid")
 }
 
 fn ensure_preload_table(
@@ -368,13 +378,8 @@ fn ensure_preload_table(
     gc: &mut GarbageCollector,
     package: GcRef<Table>,
 ) -> GcRef<Table> {
-    if let Value::Table(preload) = table_get_string(l, gc, package, "preload") {
-        return preload;
-    }
-
-    let preload = gc.create(Table::new());
-    set_table_string(l, gc, package, "preload", &Value::Table(preload));
-    preload
+    crate::registration::ensure_table(l, gc, package, b"preload")
+        .expect("package.preload publication must remain collector-valid")
 }
 
 fn active_package_table(l: &mut LuaState, gc: &mut GarbageCollector) -> GcRef<Table> {
@@ -407,42 +412,33 @@ fn preload_global_libraries(l: &mut LuaState, gc: &mut GarbageCollector, loaded:
         if let Some(value) = global_value(l, name)
             && !value.is_nil()
         {
-            let key = lua_string_value(l, gc, name);
-            table_set(l, gc, loaded, &key, &value);
+            crate::registration::set_value(l, gc, loaded, name.as_bytes(), &value)
+                .expect("package.loaded preload publication must remain collector-valid");
         }
     }
 }
 
 fn register_global(
+    state: &LuaState,
     gc: &mut GarbageCollector,
-    table: *mut Table,
+    table: GcRef<Table>,
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
     env: Option<GcRef<Table>>,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let mut function = Function::new_c(func);
-    function.set_env(env);
-    let func_obj = gc.create(function);
-    // SAFETY: table points to the GC-rooted global table during library registration.
-    unsafe {
-        (*table).set(&Value::String(name_str), &Value::Function(func_obj));
-    }
+    crate::registration::register_c_function(state, gc, table, name.as_bytes(), func, env)
+        .expect("package global Function publication must remain collector-valid");
 }
 
 fn register_package_function(
+    state: &LuaState,
     gc: &mut GarbageCollector,
     package: GcRef<Table>,
     name: &str,
     func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 ) {
-    let name_str = gc.create(GcString::from_bytes(name.as_bytes()));
-    let func_obj = gc.create(Function::new_c(func));
-    // SAFETY: package is rooted through the global table during library registration.
-    unsafe {
-        let package = &mut *(package.as_ptr() as *mut Table);
-        package.set(&Value::String(name_str), &Value::Function(func_obj));
-    }
+    crate::registration::register_c_function(state, gc, package, name.as_bytes(), func, None)
+        .expect("package Function publication must remain collector-valid");
 }
 
 fn preload_loader(
@@ -486,17 +482,15 @@ fn ensure_global_module_path(
     };
     let mut parent = global;
     for (index, field) in fields.iter().enumerate() {
-        let key = lua_bytes_value(l, gc, field);
         if index + 1 == fields.len() {
-            table_set(l, gc, parent, &key, &Value::Table(module_ref));
+            crate::registration::set_value(l, gc, parent, field, &Value::Table(module_ref))
+                .map_err(|error| format!("invalid module path publication: {error}"))?;
             return Ok(());
         }
-        match table_get(parent, &key) {
+        match crate::registration::table_value_by_bytes(gc, parent, field)? {
             Value::Table(next) => parent = next,
             Value::Nil => {
-                let next = gc.create(Table::new());
-                table_set(l, gc, parent, &key, &Value::Table(next));
-                parent = next;
+                parent = crate::registration::publish_new_table(l, gc, parent, field)?;
             }
             _ => return Err(module_name_conflict(module_name)),
         }
@@ -523,25 +517,18 @@ fn create_named_module_table(
     };
     let mut parent = global;
     for (index, field) in fields.iter().enumerate() {
-        let key = lua_bytes_value(l, gc, field);
-        let existing = table_get(parent, &key);
+        let existing = crate::registration::table_value_by_bytes(gc, parent, field)?;
         if index + 1 == fields.len() {
             return match existing {
                 Value::Table(module_ref) => Ok(module_ref),
-                Value::Nil => {
-                    let module_ref = gc.create(Table::new());
-                    table_set(l, gc, parent, &key, &Value::Table(module_ref));
-                    Ok(module_ref)
-                }
+                Value::Nil => crate::registration::publish_new_table(l, gc, parent, field),
                 _ => Err(module_name_conflict(module_name)),
             };
         }
         match existing {
             Value::Table(next) => parent = next,
             Value::Nil => {
-                let next = gc.create(Table::new());
-                table_set(l, gc, parent, &key, &Value::Table(next));
-                parent = next;
+                parent = crate::registration::publish_new_table(l, gc, parent, field)?;
             }
             _ => return Err(module_name_conflict(module_name)),
         }
@@ -557,11 +544,13 @@ fn set_module_metadata(
     module_name: &[u8],
     module_key: &Value,
 ) {
-    set_table_string(l, gc, module_ref, "_NAME", module_key);
-    set_table_string(l, gc, module_ref, "_M", &Value::Table(module_ref));
+    crate::registration::set_value(l, gc, module_ref, b"_NAME", module_key)
+        .expect("module _NAME publication must remain collector-valid");
+    crate::registration::set_value(l, gc, module_ref, b"_M", &Value::Table(module_ref))
+        .expect("module _M publication must remain collector-valid");
     let package_name = module_package_name(module_name);
-    let package = lua_bytes_value(l, gc, package_name);
-    set_table_string(l, gc, module_ref, "_PACKAGE", &package);
+    crate::registration::set_string(l, gc, module_ref, b"_PACKAGE", package_name)
+        .expect("module _PACKAGE publication must remain collector-valid");
 }
 
 fn module_package_name(module_name: &[u8]) -> &[u8] {
@@ -611,16 +600,6 @@ fn set_caller_env(l: &mut LuaState, module_ref: GcRef<Table>) -> bool {
     true
 }
 
-fn table_get_string(
-    l: &mut LuaState,
-    gc: &mut GarbageCollector,
-    table: GcRef<Table>,
-    key: &str,
-) -> Value {
-    let key = lua_string_value(l, gc, key);
-    table_get(table, &key)
-}
-
 fn table_string_field(table: GcRef<Table>, key: &str) -> Option<String> {
     // SAFETY: package table is reachable from the global table during package operations.
     let table_obj = unsafe { table.as_ref() }?;
@@ -640,17 +619,6 @@ fn table_string_field(table: GcRef<Table>, key: &str) -> Option<String> {
     None
 }
 
-fn set_table_string(
-    l: &mut LuaState,
-    gc: &mut GarbageCollector,
-    table: GcRef<Table>,
-    key: &str,
-    value: &Value,
-) {
-    let key = lua_string_value(l, gc, key);
-    table_set(l, gc, table, &key, value);
-}
-
 fn table_get(table: GcRef<Table>, key: &Value) -> Value {
     if table.is_null() {
         return Value::Nil;
@@ -663,7 +631,7 @@ fn table_get(table: GcRef<Table>, key: &Value) -> Value {
 
 fn table_set(
     _l: &mut LuaState,
-    _gc: &mut GarbageCollector,
+    gc: &mut GarbageCollector,
     table: GcRef<Table>,
     key: &Value,
     value: &Value,
@@ -671,11 +639,20 @@ fn table_set(
     if table.is_null() {
         return;
     }
-    let table_ptr = table.as_ptr() as *mut Table;
-    // SAFETY: table is reachable from globals/package.loaded during require.
-    unsafe {
-        (*table_ptr).set(key, value);
-    }
+    let Value::String(key) = key else {
+        panic!("package publication only supports string table keys");
+    };
+    gc.with_publication(|transaction| {
+        let table = transaction
+            .protect(table)
+            .expect("package target Table must remain collector-valid");
+        let key = transaction
+            .protect(*key)
+            .expect("package key must remain collector-valid");
+        transaction
+            .set_table_value(&table, &key, value)
+            .expect("package table edge must remain collector-valid");
+    });
 }
 
 fn global_value(l: &LuaState, name: &str) -> Option<Value> {
@@ -694,49 +671,13 @@ fn global_value(l: &LuaState, name: &str) -> Option<Value> {
     None
 }
 
-fn set_global_value(l: &mut LuaState, gc: &mut GarbageCollector, name: &str, value: &Value) {
-    let Some(global) = l.global_table else {
-        return;
-    };
-    let key = lua_string_value(l, gc, name);
-    let global_ptr = global.as_ptr() as *mut Table;
-    // SAFETY: global table is rooted by LuaState.
-    unsafe {
-        (*global_ptr).set(&key, value);
-    }
-}
-
-fn lua_string_value(l: &mut LuaState, gc: &mut GarbageCollector, text: &str) -> Value {
-    Value::String(intern_string(l, gc, text))
-}
-
-fn lua_bytes_value(l: &mut LuaState, gc: &mut GarbageCollector, bytes: &[u8]) -> Value {
-    Value::String(intern_bytes(l, gc, bytes))
-}
-
 fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
     let Some(gc_ptr) = l.gc else {
         return false;
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let value = lua_string_value(l, gc, text);
-    l.push_value(value);
-    true
-}
-
-fn intern_string(l: &mut LuaState, gc: &mut GarbageCollector, text: &str) -> GcRef<GcString> {
-    intern_bytes(l, gc, text.as_bytes())
-}
-
-fn intern_bytes(l: &mut LuaState, gc: &mut GarbageCollector, bytes: &[u8]) -> GcRef<GcString> {
-    if let Some(pool_ptr) = l.string_pool {
-        // SAFETY: string_pool is installed from a live StringPool owned by the host.
-        let pool = unsafe { &mut *pool_ptr };
-        pool.intern_bytes(gc, bytes)
-    } else {
-        gc.create(GcString::from_bytes(bytes))
-    }
+    crate::registration::push_string(l, gc, text.as_bytes()).is_ok()
 }
 
 fn value_to_string(value: Value) -> String {
@@ -772,8 +713,7 @@ fn push_runtime_error_value(
     if let Some(value) = err.error_value() {
         l.push_value(value);
     } else {
-        let message = lua_string_value(l, gc, &err.message);
-        l.push_value(message);
+        let _ = crate::registration::push_string(l, gc, err.message.as_bytes());
     }
 }
 
@@ -784,7 +724,6 @@ fn raise_string(l: &mut LuaState, message: &str) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let message = lua_string_value(l, gc, message);
-    l.push_value(message);
+    let _ = crate::registration::push_string(l, gc, message.as_bytes());
     -1
 }

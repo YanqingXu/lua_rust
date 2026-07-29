@@ -791,11 +791,23 @@ an explicit root or base/package installs the Function directly on a traced
 Lua stack. Error return and panic injection cover both partial builder graphs
 and the window after Function construction but before publication.
 
+Library registration and package construction are the next migrated graph.
+The shared standard-library registration layer protects the destination
+Table, canonical key, C or Runtime-native Function, and optional environment
+until the Table edge exists. Catalog-created library tables are attached to
+the rooted global Table before their open functions run. Package creation,
+`loaded`/`preload`, nested module paths, module metadata/metatables, loader
+functions, and generated error strings use the same typed Table or stack
+handoff. Tests prove the complete `open_all` graph is reachable from the
+global root, aliases retain one Function identity, foreign edges fail before
+mutation, and panic cleanup releases every temporary identity.
+
 This is an API/registry foundation, not completion of publication safety.
-General library/package registration, IO graphs, VM temporaries, app
-arguments, and returned `Vec<Value>` paths still use unprotected production
-allocation. Coroutine create/wrap and compiler Proto publication are the
-migrated production graphs. Allocation-triggered collection remains disabled.
+IO construction graphs, VM temporaries, app arguments, general result
+construction, and returned `Vec<Value>` paths still use unprotected production
+allocation. Coroutine create/wrap, compiler Proto publication, library
+registration, and package graphs are migrated. Allocation-triggered
+collection remains disabled.
 
 #### D.3 Implemented temporary-state root transaction (local-complete slice)
 
@@ -826,9 +838,10 @@ shutdown leave both at zero.
 
 This closes the inventory entry for coroutine state publication, not the
 broader production publication program. Compiler Proto→Function builders are
-now migrated, while remaining library/package and IO graphs, VM temporaries,
-app arguments/results, unique Heap ownership, fixed strings, and finalizer
-roots remain blockers for live destructive collection.
+now migrated together with library registration and package graphs, while IO
+construction, VM temporaries, app arguments/results, unique Heap ownership,
+fixed strings, and finalizer roots remain blockers for live destructive
+collection.
 
 ### E. Shutdown substrate — M1.8
 
