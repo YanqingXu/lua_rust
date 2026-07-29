@@ -104,7 +104,7 @@ unsafe extern "C" fn lua_b_print_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
             output.push(b'\t');
         }
         if let Some(val) = l.at(i) {
-            append_print_value(&mut output, val);
+            append_print_value(l, &mut output, val);
         }
     }
     output.push(b'\n');
@@ -116,7 +116,7 @@ unsafe extern "C" fn lua_b_print_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     }
 }
 
-fn append_print_value(output: &mut Vec<u8>, v: &Value) {
+fn append_print_value(l: &LuaState, output: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Nil => output.extend_from_slice(b"nil"),
         Value::Boolean(b) => output.extend_from_slice(if *b { b"true" } else { b"false" }),
@@ -129,10 +129,7 @@ fn append_print_value(output: &mut Vec<u8>, v: &Value) {
             output.extend_from_slice(text.as_bytes());
         }
         Value::String(s) => {
-            // SAFETY: GC is not running; s is a valid GcRef
-            if let Some(gc_str) = unsafe { s.as_ref() } {
-                output.extend_from_slice(gc_str.as_bytes());
-            }
+            let _ = l.with_string_bytes(*s, |bytes| output.extend_from_slice(bytes));
         }
         Value::Table(t) => output.extend_from_slice(format!("table: {:p}", t.as_ptr()).as_bytes()),
         Value::Function(f) => {
@@ -202,7 +199,7 @@ unsafe extern "C" fn lua_b_tostring_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
             return 1;
         }
         if let Some(mt) = value_metatable(&val)
-            && let Some(metamethod) = metatable_field(mt, "__tostring")
+            && let Some(metamethod) = metatable_field(l, mt, "__tostring")
             && matches!(metamethod, Value::Function(_))
         {
             let Some(gc_ptr) = l.gc else {
@@ -222,13 +219,13 @@ unsafe extern "C" fn lua_b_tostring_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
                 }
             }
         }
-        let s = value_to_string_helper(&val);
+        let s = value_to_string_helper(l, &val);
         return if push_lua_string(l, &s) { 1 } else { -1 };
     }
     if push_lua_string(l, "nil") { 1 } else { -1 }
 }
 
-fn value_to_string_helper(v: &Value) -> String {
+fn value_to_string_helper(l: &LuaState, v: &Value) -> String {
     match v {
         Value::Nil => "nil".to_string(),
         Value::Boolean(b) => b.to_string(),
@@ -239,15 +236,9 @@ fn value_to_string_helper(v: &Value) -> String {
                 n.to_string()
             }
         }
-        Value::String(s) => {
-            // SAFETY: GC is not running during C function execution;
-            // the GcString is alive as long as its on the Lua stack.
-            if let Some(gc_str) = unsafe { s.as_ref() } {
-                gc_str.to_string_lossy().into_owned()
-            } else {
-                String::new()
-            }
-        }
+        Value::String(s) => l
+            .with_string_bytes(*s, |bytes| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default(),
         Value::Table(t) => format!("table: {:p}", t.as_ptr()),
         Value::Function(f) => format!("function: {:p}", f.as_ptr()),
         Value::Userdata(u) => format!("userdata: {:p}", u.as_ptr()),
@@ -310,10 +301,7 @@ unsafe extern "C" fn lua_b_error_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     {
         let mut bytes = prefix.into_bytes();
         bytes.extend_from_slice(b": ");
-        // SAFETY: message is an active argument.
-        if let Some(message) = unsafe { message_ref.as_ref() } {
-            bytes.extend_from_slice(message.as_bytes());
-        }
+        let _ = l.with_string_bytes(message_ref, |message| bytes.extend_from_slice(message));
         if !push_lua_bytes(l, &bytes) {
             return -1;
         }
@@ -327,10 +315,7 @@ unsafe extern "C" fn lua_b_collectgarbage_raw(_l_ptr: *mut std::ffi::c_void) -> 
     // SAFETY: _l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l: &mut LuaState = unsafe { &mut *(_l_ptr as *mut LuaState) };
     let option = match l.at(1) {
-        Some(Value::String(s)) => {
-            // SAFETY: option string is on the active Lua stack.
-            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
-        }
+        Some(Value::String(s)) => l.copy_string_bytes(*s).ok(),
         _ => None,
     };
 
@@ -488,7 +473,7 @@ fn run_userdata_finalizer(
     // until the finalizer call path has finished.
     let finalizer = unsafe { userdata.as_ref() }
         .and_then(|userdata| userdata.metatable())
-        .and_then(|metatable| metatable_field(metatable, "__gc"));
+        .and_then(|metatable| metatable_field(l, metatable, "__gc"));
     let Some(finalizer) = finalizer else {
         return Ok(());
     };
@@ -683,21 +668,14 @@ unsafe extern "C" fn lua_b_loadstring_raw(_l_ptr: *mut std::ffi::c_void) -> i32 
     let Some(Value::String(source_ref)) = l.at(1).cloned() else {
         return push_load_error(l, "bad argument #1 to 'loadstring' (string expected)");
     };
-    let source = {
-        // SAFETY: source string is an argument on the active Lua stack.
-        let Some(source) = (unsafe { source_ref.as_ref() }) else {
-            return push_load_error(l, "invalid source string");
-        };
-        source.as_bytes().to_vec()
+    let Ok(source) = l.copy_string_bytes(source_ref) else {
+        return push_load_error(l, "invalid source string");
     };
 
     let chunk_name = l
         .at(2)
         .and_then(|value| match value {
-            Value::String(name_ref) => {
-                // SAFETY: chunk name is an argument on the active Lua stack.
-                unsafe { name_ref.as_ref() }.map(|name| name.as_bytes().to_vec())
-            }
+            Value::String(name_ref) => l.copy_string_bytes(*name_ref).ok(),
             _ => None,
         })
         .unwrap_or_else(|| default_loadstring_chunk_name(&source));
@@ -715,22 +693,16 @@ unsafe extern "C" fn lua_b_load_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     let chunk_name = l
         .at(2)
         .and_then(|value| match value {
-            Value::String(name_ref) => {
-                // SAFETY: chunk name is an argument on the active Lua stack.
-                unsafe { name_ref.as_ref() }.map(|name| name.as_bytes().to_vec())
-            }
+            Value::String(name_ref) => l.copy_string_bytes(*name_ref).ok(),
             _ => None,
         })
         .unwrap_or_else(|| b"=(load)".to_vec());
 
     let source = match reader {
-        Value::String(source_ref) => {
-            // SAFETY: source string is an argument on the active Lua stack.
-            match unsafe { source_ref.as_ref() } {
-                Some(source) => source.as_bytes().to_vec(),
-                None => return push_load_error(l, "invalid source string"),
-            }
-        }
+        Value::String(source_ref) => match l.copy_string_bytes(source_ref) {
+            Ok(source) => source,
+            Err(_) => return push_load_error(l, "invalid source string"),
+        },
         Value::Function(_) => match read_from_lua_reader(l, reader) {
             Ok(source) => source,
             Err(err) => {
@@ -771,16 +743,15 @@ fn read_from_lua_reader(l: &mut LuaState, reader: Value) -> Result<Vec<u8>, Valu
                 break;
             }
             Value::String(s) => {
-                // SAFETY: reader return value is kept alive by the active Lua stack/GC.
-                let Some(text) = (unsafe { s.as_ref() }) else {
+                let Ok(text) = l.copy_string_bytes(s) else {
                     let _ = l.pop();
                     return Err(Value::Nil);
                 };
-                if text.as_bytes().is_empty() {
+                if text.is_empty() {
                     let _ = l.pop();
                     break;
                 }
-                source.extend_from_slice(text.as_bytes());
+                source.extend_from_slice(&text);
                 let _ = l.pop();
                 if source.len() >= 2
                     && let Some(message) = definite_syntax_error(&source)
@@ -950,12 +921,12 @@ fn string_chunk_id(source: &[u8]) -> Vec<u8> {
 
 fn optional_filename_arg(l: &LuaState, idx: i32, _name: &str) -> Option<String> {
     match l.at(idx) {
-        Some(Value::String(s)) => {
-            // SAFETY: filename argument is on the active Lua stack.
-            unsafe { s.as_ref() }
-                .and_then(|string| string.to_utf8().ok())
-                .map(str::to_owned)
-        }
+        Some(Value::String(s)) => l
+            .with_string_bytes(*s, |bytes| {
+                std::str::from_utf8(bytes).ok().map(str::to_owned)
+            })
+            .ok()
+            .flatten(),
         Some(Value::Nil) | None => None,
         _ => None,
     }
@@ -983,14 +954,14 @@ fn compile_chunk_function(
     })?;
 
     let environment = l.thread_env.or(l.global_table);
+    let pool_ptr = l
+        .string_pool
+        .ok_or_else(|| "chunk compilation unavailable without an active StringPool".to_string())?;
     gc.with_publication(|transaction| {
-        let generator = if let Some(pool_ptr) = l.string_pool {
-            // SAFETY: LuaState::string_pool is installed from a live
-            // StringPool owned by the host for this compilation.
-            CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr })
-        } else {
-            CodeGenerator::new_in_publication(transaction)
-        };
+        // SAFETY: LuaState::string_pool is installed from a live StringPool
+        // owned by the host for this compilation.
+        let generator =
+            CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr });
         let proto = generator
             .generate_with_source_bytes(&chunk, chunk_name)
             .map_err(|err| format!("{}:{err}", chunk_name_for_diagnostic(chunk_name)))?;
@@ -1061,7 +1032,7 @@ unsafe extern "C" fn lua_b_tonumber_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
         return 1;
     }
 
-    let Some(text) = value_to_plain_string(&value) else {
+    let Some(text) = value_to_plain_string(l, &value) else {
         l.push_value(Value::Nil);
         return 1;
     };
@@ -1083,8 +1054,8 @@ unsafe extern "C" fn lua_b_select_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     let extra = (n - 1).max(0);
 
     let selector_is_count = matches!(l.at(1), Some(Value::String(s)) if {
-        // SAFETY: selector string is an argument on the active Lua stack.
-        unsafe { s.as_ref() }.is_some_and(|gs| gs.as_bytes() == b"#")
+        l.with_string_bytes(*s, |bytes| bytes == b"#")
+            .unwrap_or(false)
     });
     if selector_is_count {
         l.push_value(Value::Number(extra as f64));
@@ -1142,15 +1113,15 @@ unsafe extern "C" fn lua_b_unpack_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     end - start + 1
 }
 
-fn value_to_plain_string(value: &Value) -> Option<String> {
+fn value_to_plain_string(l: &LuaState, value: &Value) -> Option<String> {
     match value {
-        Value::String(s) => {
-            // SAFETY: GC is not running during C function execution.
-            unsafe { s.as_ref() }
-                .and_then(|string| string.to_utf8().ok())
-                .map(str::to_owned)
-        }
-        Value::Number(n) => Some(value_to_string_helper(&Value::Number(*n))),
+        Value::String(s) => l
+            .with_string_bytes(*s, |bytes| {
+                std::str::from_utf8(bytes).ok().map(str::to_owned)
+            })
+            .ok()
+            .flatten(),
+        Value::Number(n) => Some(value_to_string_helper(l, &Value::Number(*n))),
         _ => None,
     }
 }
@@ -1312,7 +1283,7 @@ unsafe extern "C" fn lua_b_getmetatable_raw(_l_ptr: *mut std::ffi::c_void) -> i3
         _ => None,
     };
     if let Some(mt) = metatable {
-        if let Some(protected) = metatable_field(mt, "__metatable") {
+        if let Some(protected) = metatable_field(l, mt, "__metatable") {
             l.push_value(protected);
         } else {
             l.push_value(Value::Table(mt));
@@ -1376,7 +1347,7 @@ unsafe extern "C" fn lua_b_setmetatable_raw(_l_ptr: *mut std::ffi::c_void) -> i3
     if let Some(existing_mt) = {
         // SAFETY: table argument is on the active Lua stack.
         unsafe { table_ref.as_ref() }.and_then(|table| table.metatable())
-    } && metatable_field(existing_mt, "__metatable").is_some()
+    } && metatable_field(l, existing_mt, "__metatable").is_some()
     {
         let _ = push_lua_string(l, "cannot change a protected metatable");
         return -1;
@@ -1384,7 +1355,7 @@ unsafe extern "C" fn lua_b_setmetatable_raw(_l_ptr: *mut std::ffi::c_void) -> i3
     // SAFETY: table argument is on the active Lua stack and VM execution is single-threaded.
     unsafe { &mut *(table_ref.as_ptr() as *mut Table) }.set_metatable(mt);
     if let Some(mt_ref) = mt
-        && let Some((weak_keys, weak_values)) = weak_mode(mt_ref)
+        && let Some((weak_keys, weak_values)) = weak_mode(l, mt_ref)
         && let Some(gc_ptr) = l.gc
     {
         // SAFETY: LuaState::gc is installed by the VM before calling C functions.
@@ -1409,37 +1380,18 @@ fn value_metatable(value: &Value) -> Option<GcRef<Table>> {
     }
 }
 
-fn metatable_field(metatable: GcRef<Table>, name: &str) -> Option<Value> {
-    // SAFETY: metatable is held by a reachable table/userdata value.
-    let mt = unsafe { metatable.as_ref() }?;
-    for (key, value) in mt.hash_entries() {
-        if let Value::String(key_ref) = key
-            // SAFETY: key is held by the metatable.
-            && let Some(key_string) = unsafe { key_ref.as_ref() }
-            && key_string.as_bytes() == name.as_bytes()
-        {
-            return Some(value.clone());
-        }
-    }
-    None
+fn metatable_field(l: &LuaState, metatable: GcRef<Table>, name: &str) -> Option<Value> {
+    crate::registration::find_table_field(l, metatable, name.as_bytes())
+        .ok()
+        .flatten()
 }
 
-fn weak_mode(metatable: GcRef<Table>) -> Option<(bool, bool)> {
-    // SAFETY: metatable is held by the table that is being configured.
-    let mt = unsafe { metatable.as_ref() }?;
-    for (key, value) in mt.hash_entries() {
-        if let Value::String(key_ref) = key
-            // SAFETY: key is held by the metatable.
-            && let Some(key_str) = unsafe { key_ref.as_ref() }
-            && key_str.as_bytes() == b"__mode"
-            && let Value::String(mode_ref) = value
-        {
-            // SAFETY: mode string is held by the metatable.
-            let mode = unsafe { mode_ref.as_ref() }?.as_bytes();
-            return Some((mode.contains(&b'k'), mode.contains(&b'v')));
-        }
-    }
-    None
+fn weak_mode(l: &LuaState, metatable: GcRef<Table>) -> Option<(bool, bool)> {
+    let Value::String(mode) = metatable_field(l, metatable, "__mode")? else {
+        return None;
+    };
+    l.with_string_bytes(mode, |mode| (mode.contains(&b'k'), mode.contains(&b'v')))
+        .ok()
 }
 
 fn function_env_at_level(l: &LuaState, level: usize) -> Option<GcRef<Table>> {
@@ -1487,8 +1439,10 @@ fn error_location_prefix(l: &LuaState, level: usize) -> Option<String> {
     let source = proto
         .source()
         .and_then(|source_ref| {
-            // SAFETY: the proto keeps its source string alive.
-            unsafe { source_ref.as_ref() }.map(|source| source.to_string_lossy().into_owned())
+            l.with_string_bytes(source_ref, |bytes| {
+                String::from_utf8_lossy(bytes).into_owned()
+            })
+            .ok()
         })
         .unwrap_or_else(|| "?".to_string());
     Some(format!("{}:{}", source, proto.line(pc)))
@@ -1550,16 +1504,7 @@ fn set_function_env(func_ref: GcRef<Function>, env: GcRef<Table>) {
 }
 
 fn raw_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::String(a), Value::String(b)) => {
-            // SAFETY: both strings are live Value operands during this C function call.
-            let a = unsafe { a.as_ref() }.map(|s| s.as_bytes());
-            // SAFETY: both strings are live Value operands during this C function call.
-            let b = unsafe { b.as_ref() }.map(|s| s.as_bytes());
-            a == b
-        }
-        _ => a == b,
-    }
+    a == b
 }
 
 // ═══════════════════════════════════════════════════════════════════

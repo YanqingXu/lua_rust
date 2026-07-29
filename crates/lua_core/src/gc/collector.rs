@@ -6,6 +6,7 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 
@@ -15,6 +16,7 @@ use crate::gc::header::GcObjectHeader;
 use crate::gc::header::bits;
 use crate::gc::object_id::ObjectId;
 use crate::gc::strategy::{GcStrategy, MarkSweepGc};
+use crate::gc_string::GcString;
 use crate::string_pool::StringPool;
 use crate::table::Table;
 use crate::types::{GcColor, GcObjectType};
@@ -30,6 +32,12 @@ pub(crate) struct LiveAllocation {
 /// Why a copied GC handle could not be validated by one collector.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum GcRefValidationError {
+    /// A scoped managed-object read was attempted without its owner collector.
+    #[error("managed object access requires an active GarbageCollector")]
+    CollectorUnavailable,
+    /// A production string publication attempted to bypass canonical interning.
+    #[error("canonical Lua string publication requires an active StringPool")]
+    StringPoolUnavailable,
     /// Null is not a registered object.
     #[error("null GC reference")]
     Null,
@@ -611,6 +619,42 @@ impl GarbageCollector {
         Ok(write(unsafe { pointer.as_mut() }))
     }
 
+    /// Read a live Lua string's bytes for exactly the duration of `read`.
+    ///
+    /// Validation happens before object memory is touched, so foreign, stale,
+    /// wrong-type, and address-reused handles fail closed.
+    pub fn with_string_bytes<R>(
+        &self,
+        value: GcRef<GcString>,
+        read: impl for<'a> FnOnce(&'a [u8]) -> R,
+    ) -> Result<R, GcRefValidationError> {
+        self.with_ref(value, |string| read(string.as_bytes()))
+    }
+
+    /// Compare two collector-owned strings by exact Lua byte content.
+    ///
+    /// Normal `Value::String` equality is canonical allocation identity. This
+    /// scoped operation is reserved for boundaries that intentionally receive
+    /// non-canonical handles.
+    pub fn string_refs_equal(
+        &self,
+        left: GcRef<GcString>,
+        right: GcRef<GcString>,
+    ) -> Result<bool, GcRefValidationError> {
+        let left = self.with_string_bytes(left, <[u8]>::to_vec)?;
+        self.with_string_bytes(right, |right| left.as_slice() == right)
+    }
+
+    /// Order two collector-owned strings by exact unsigned byte lexicography.
+    pub fn compare_string_refs(
+        &self,
+        left: GcRef<GcString>,
+        right: GcRef<GcString>,
+    ) -> Result<Ordering, GcRefValidationError> {
+        let left = self.with_string_bytes(left, <[u8]>::to_vec)?;
+        self.with_string_bytes(right, |right| left.as_slice().cmp(right))
+    }
+
     pub(crate) fn validate_erased(
         &self,
         value: ErasedGcRef,
@@ -835,6 +879,8 @@ impl Drop for GarbageCollector {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -946,6 +992,76 @@ mod tests {
 
         assert_eq!(gc.sweep(&mut pool), 1);
         assert!(gc.live_allocations.is_empty());
+    }
+
+    #[test]
+    fn scoped_string_comparison_rejects_foreign_stale_and_reused_identity() {
+        let mut owner = GarbageCollector::new();
+        let mut owner_pool = StringPool::new();
+        let left = owner.create(GcString::from_bytes(&[b'a', 0, 0x80, 0xff]));
+        let duplicate = owner.create(GcString::from_bytes(&[b'a', 0, 0x80, 0xff]));
+        let different = owner.create(GcString::from_bytes(&[b'a', 0, 0x80, 0xfe]));
+
+        assert_eq!(owner.string_refs_equal(left, duplicate), Ok(true));
+        assert_eq!(
+            owner.compare_string_refs(left, different),
+            Ok(std::cmp::Ordering::Greater)
+        );
+
+        let mut foreign = GarbageCollector::new();
+        let foreign_string = foreign.create(GcString::from_bytes(&[b'a', 0, 0x80, 0xff]));
+        assert_ne!(Value::String(left), Value::String(foreign_string));
+        assert!(matches!(
+            owner.string_refs_equal(left, foreign_string),
+            Err(GcRefValidationError::NotLive { .. })
+        ));
+
+        let reused_address = left.as_ptr() as usize;
+        let value = Value::String(left);
+        let mut before = DefaultHasher::new();
+        value.hash(&mut before);
+        let hash_before_reuse = before.finish();
+        let replacement_id = ObjectId::allocate();
+        owner
+            .live_allocations
+            .get_mut(&reused_address)
+            .expect("string allocation is registered")
+            .object_id = replacement_id;
+        assert!(matches!(
+            owner.with_string_bytes(left, <[u8]>::to_vec),
+            Err(GcRefValidationError::IdentityMismatch {
+                requested,
+                live,
+            }) if requested == left.object_id() && live == replacement_id
+        ));
+        let replacement_pointer =
+            NonNull::new(left.as_ptr().cast_mut()).expect("string address remains non-null");
+        // SAFETY: the test side table currently assigns `replacement_id` to
+        // this address, so this handle models an actual address reuse.
+        let replacement =
+            unsafe { GcRef::<GcString>::from_registered(replacement_pointer, replacement_id) };
+        assert_ne!(value, Value::String(replacement));
+        let mut after = DefaultHasher::new();
+        value.hash(&mut after);
+        assert_eq!(after.finish(), hash_before_reuse);
+
+        // Restore the identity so normal sweeping can destroy the allocation.
+        owner
+            .live_allocations
+            .get_mut(&reused_address)
+            .expect("string allocation remains registered")
+            .object_id = left.object_id();
+        assert_eq!(owner.sweep(&mut owner_pool), 3);
+        assert!(matches!(
+            owner.with_string_bytes(duplicate, <[u8]>::to_vec),
+            Err(GcRefValidationError::NotLive { .. })
+        ));
+        let mut stale_hash = DefaultHasher::new();
+        value.hash(&mut stale_hash);
+        assert_eq!(stale_hash.finish(), hash_before_reuse);
+
+        let mut foreign_pool = StringPool::new();
+        assert_eq!(foreign.sweep(&mut foreign_pool), 1);
     }
 
     #[test]

@@ -6,8 +6,8 @@
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
-use lua_core::gc_string::GcString;
 use lua_core::light_userdata::LightUserdataRef;
+use lua_core::string_pool::StringPool;
 use lua_core::types::{Function, Table, Thread, Userdata, ValueType};
 use lua_core::value::Value;
 use std::mem;
@@ -96,7 +96,8 @@ fn test_value_light_userdata_roundtrip() {
 #[test]
 fn test_value_string_type_check() {
     let mut gc = GarbageCollector::new();
-    let p = gc.create(GcString::from_bytes(b"type-check"));
+    let mut pool = StringPool::new();
+    let p = pool.intern_bytes(&mut gc, b"type-check");
     let v = Value::String(p);
     assert!(v.is_string());
     assert!(!v.is_nil());
@@ -211,13 +212,14 @@ fn test_value_equality_different_type() {
 }
 
 #[test]
-fn test_value_equality_string_content() {
+fn test_value_equality_string_canonical_identity() {
     let mut gc = GarbageCollector::new();
-    let p1 = gc.create(GcString::from_bytes(b"same"));
-    let p2 = gc.create(GcString::from_bytes(b"same"));
-    let p3 = gc.create(GcString::from_bytes(b"different"));
+    let mut pool = StringPool::new();
+    let p1 = pool.intern_bytes(&mut gc, b"same");
+    let p2 = pool.intern_bytes(&mut gc, b"same");
+    let p3 = pool.intern_bytes(&mut gc, b"different");
 
-    assert_ne!(p1, p2);
+    assert_eq!(p1, p2);
     assert_eq!(Value::String(p1), Value::String(p2));
     assert_ne!(Value::String(p1), Value::String(p3));
 }
@@ -286,7 +288,8 @@ fn test_display_gc_types() {
     use lua_core::proto::Proto;
 
     let mut gc = GarbageCollector::new();
-    let string = gc.create(GcString::from_bytes(b"display"));
+    let mut pool = StringPool::new();
+    let string = pool.intern_bytes(&mut gc, b"display");
     assert!(format!("{}", Value::String(string)).starts_with("string: 0x"));
 
     let table = gc.create(Table::new());

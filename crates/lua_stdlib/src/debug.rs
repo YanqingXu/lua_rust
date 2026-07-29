@@ -72,22 +72,10 @@ fn reg(
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
-    if let Some(gt) = l.global_table
-        // SAFETY: global table is rooted for the duration of library init.
-        && let Some(gt_obj) = unsafe { gt.as_ref() }
-    {
-        for (key, val) in gt_obj.hash_entries() {
-            if let Value::String(key_ref) = key
-                // SAFETY: key is held by the rooted global table.
-                && let Some(key_str) = unsafe { key_ref.as_ref() }
-                && key_str.as_bytes() == name.as_bytes()
-                && let Value::Table(t) = val
-            {
-                return *t;
-            }
-        }
-    }
-    GcRef::null()
+    crate::registration::find_library_table(l, name.as_bytes())
+        .ok()
+        .flatten()
+        .unwrap_or_else(GcRef::null)
 }
 
 unsafe extern "C" fn lua_debug_getinfo(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -179,10 +167,7 @@ unsafe extern "C" fn lua_debug_getinfo(l_ptr: *mut std::ffi::c_void) -> i32 {
 
 fn debug_options(l: &LuaState, idx: i32) -> Option<Vec<u8>> {
     match l.at(idx) {
-        Some(Value::String(options_ref)) => {
-            // SAFETY: the option string is an active argument while getinfo runs.
-            unsafe { options_ref.as_ref() }.map(|options| options.as_bytes().to_vec())
-        }
+        Some(Value::String(options_ref)) => l.copy_string_bytes(*options_ref).ok(),
         _ => None,
     }
 }
@@ -356,13 +341,7 @@ unsafe extern "C" fn lua_debug_traceback(l_ptr: *mut std::ffi::c_void) -> i32 {
     }
 
     let (message, has_message) = match l.at(1).cloned().unwrap_or(Value::Nil) {
-        Value::String(message_ref) => (
-            // SAFETY: traceback argument is on the active Lua stack.
-            unsafe { message_ref.as_ref() }
-                .map(|message| message.as_bytes().to_vec())
-                .unwrap_or_default(),
-            true,
-        ),
+        Value::String(message_ref) => (l.copy_string_bytes(message_ref).unwrap_or_default(), true),
         Value::Nil => (Vec::new(), false),
         other => {
             l.push_value(other);
@@ -412,7 +391,7 @@ fn state_traceback(state: &mut LuaState) -> Vec<u8> {
         // owning collector; destructive sweep is disabled during callbacks.
         let proto = unsafe { proto_ptr.as_ref() };
         let func_ref = frame_function_ref(state, ci);
-        let source = proto_source(proto);
+        let source = proto_source(state, proto);
         let short = short_source(&source);
         let line = ci.savedpc.map(|pc| proto.line(pc)).unwrap_or(0);
         if line == 0 {
@@ -471,12 +450,7 @@ unsafe extern "C" fn lua_debug_sethook(l_ptr: *mut std::ffi::c_void) -> i32 {
     }
 
     let mask = match l.at(mask_arg).cloned().unwrap_or(Value::Nil) {
-        Value::String(mask_ref) => {
-            // SAFETY: mask is an active function argument.
-            unsafe { mask_ref.as_ref() }
-                .map(|mask| mask.as_bytes().to_vec())
-                .unwrap_or_default()
-        }
+        Value::String(mask_ref) => l.copy_string_bytes(mask_ref).unwrap_or_default(),
         _ => Vec::new(),
     };
     let count = match l.at(count_arg).cloned().unwrap_or(Value::Nil) {
@@ -803,10 +777,7 @@ fn function_info(gc: &GarbageCollector, func_ref: GcRef<Function>) -> Option<Deb
     let proto = unsafe { proto_ptr.as_ref() };
     let source = proto
         .source()
-        .and_then(|source_ref| {
-            // SAFETY: the proto keeps its source string alive.
-            unsafe { source_ref.as_ref() }.map(|source| source.as_bytes().to_vec())
-        })
+        .and_then(|source_ref| gc.with_string_bytes(source_ref, <[u8]>::to_vec).ok())
         .unwrap_or_default();
     let short_src = short_source(&source);
     Some(DebugInfo {
@@ -849,10 +820,7 @@ fn stack_frame_info(l: &LuaState, level: usize, include_current: bool) -> Option
     let proto = unsafe { proto_ptr.as_ref() };
     let source = proto
         .source()
-        .and_then(|source_ref| {
-            // SAFETY: the proto keeps its source string alive.
-            unsafe { source_ref.as_ref() }.map(|source| source.as_bytes().to_vec())
-        })
+        .and_then(|source_ref| l.copy_string_bytes(source_ref).ok())
         .unwrap_or_default();
     let line = ci.savedpc.map(|pc| proto.line(pc));
     if include_current && (ci.savedpc.is_none() || line == Some(0)) {
@@ -968,7 +936,7 @@ fn get_local_value(
     // owning collector.
     let proto = unsafe { proto_ptr.as_ref() };
     if let Some(loc) = proto.local_var_info(local_number, pc as i32) {
-        let name = loc.varname.and_then(gc_string_bytes)?;
+        let name = loc.varname.and_then(|name| gc_string_bytes(l, name))?;
         let value = l
             .stack
             .at(ci.base + loc.reg as usize)
@@ -998,7 +966,7 @@ fn set_local_value(
     // owning collector.
     let proto = unsafe { proto_ptr.as_ref() };
     if let Some(loc) = proto.local_var_info(local_number, pc as i32) {
-        let name = loc.varname.and_then(gc_string_bytes)?;
+        let name = loc.varname.and_then(|name| gc_string_bytes(l, name))?;
         let slot = l.call_stack.get(frame_idx)?.base + loc.reg as usize;
         if let Some(dst) = l.stack.at_mut(slot) {
             *dst = value;
@@ -1171,13 +1139,10 @@ fn active_lines(proto: &lua_core::proto::Proto) -> Vec<i32> {
     lines.into_iter().collect()
 }
 
-fn proto_source(proto: &Proto) -> Vec<u8> {
+fn proto_source(l: &LuaState, proto: &Proto) -> Vec<u8> {
     proto
         .source()
-        .and_then(|source_ref| {
-            // SAFETY: the proto keeps its source string alive.
-            unsafe { source_ref.as_ref() }.map(|source| source.as_bytes().to_vec())
-        })
+        .and_then(|source_ref| l.copy_string_bytes(source_ref).ok())
         .unwrap_or_default()
 }
 
@@ -1221,18 +1186,24 @@ fn call_site_name(l: &LuaState, frame_idx: usize) -> Option<DebugName> {
     match opcode::get_opcode(inst) {
         OpCode::CALL | OpCode::TAILCALL => {
             let reg = opcode::get_arg_a(inst) as usize;
-            register_name(caller_proto, call_pc, reg, 8)
+            register_name(l, caller_proto, call_pc, reg, 8)
         }
         _ => None,
     }
 }
 
-fn register_name(proto: &Proto, pc: usize, reg: usize, depth: usize) -> Option<DebugName> {
+fn register_name(
+    l: &LuaState,
+    proto: &Proto,
+    pc: usize,
+    reg: usize,
+    depth: usize,
+) -> Option<DebugName> {
     if depth == 0 {
         return None;
     }
 
-    if let Some(name) = local_name_for_reg(proto, reg, pc) {
+    if let Some(name) = local_name_for_reg(l, proto, reg, pc) {
         return Some(DebugName {
             name,
             namewhat: b"local".to_vec(),
@@ -1250,13 +1221,13 @@ fn register_name(proto: &Proto, pc: usize, reg: usize, depth: usize) -> Option<D
         match op {
             OpCode::MOVE => {
                 let source = opcode::get_arg_b(inst) as usize;
-                return register_name(proto, cursor, source, depth - 1);
+                return register_name(l, proto, cursor, source, depth - 1);
             }
             OpCode::GETUPVAL => {
                 let upvalue = opcode::get_arg_b(inst) as usize;
                 return proto
                     .upvalue_name(upvalue)
-                    .and_then(gc_string_bytes)
+                    .and_then(|name| gc_string_bytes(l, name))
                     .map(|name| DebugName {
                         name,
                         namewhat: b"upvalue".to_vec(),
@@ -1264,21 +1235,21 @@ fn register_name(proto: &Proto, pc: usize, reg: usize, depth: usize) -> Option<D
             }
             OpCode::GETGLOBAL => {
                 let bx = opcode::get_arg_bx(inst) as usize;
-                return constant_string(proto.constants(), bx).map(|name| DebugName {
+                return constant_string(l, proto.constants(), bx).map(|name| DebugName {
                     name,
                     namewhat: b"global".to_vec(),
                 });
             }
             OpCode::GETTABLE => {
                 let key = opcode::get_arg_c(inst);
-                return rk_string(proto.constants(), key).map(|name| DebugName {
+                return rk_string(l, proto.constants(), key).map(|name| DebugName {
                     name,
                     namewhat: b"field".to_vec(),
                 });
             }
             OpCode::SELF => {
                 let key = opcode::get_arg_c(inst);
-                return rk_string(proto.constants(), key).map(|name| DebugName {
+                return rk_string(l, proto.constants(), key).map(|name| DebugName {
                     name,
                     namewhat: b"method".to_vec(),
                 });
@@ -1290,7 +1261,7 @@ fn register_name(proto: &Proto, pc: usize, reg: usize, depth: usize) -> Option<D
     None
 }
 
-fn local_name_for_reg(proto: &Proto, reg: usize, pc: usize) -> Option<Vec<u8>> {
+fn local_name_for_reg(l: &LuaState, proto: &Proto, reg: usize, pc: usize) -> Option<Vec<u8>> {
     let pc = pc as i32;
     for idx in (0..proto.loc_var_count()).rev() {
         let loc = proto.loc_var(idx);
@@ -1299,30 +1270,29 @@ fn local_name_for_reg(proto: &Proto, reg: usize, pc: usize) -> Option<Vec<u8>> {
             && pc < loc.endpc
             && let Some(name_ref) = loc.varname
         {
-            return gc_string_bytes(name_ref);
+            return gc_string_bytes(l, name_ref);
         }
     }
     None
 }
 
-fn rk_string(constants: &[Value], rk: i32) -> Option<Vec<u8>> {
+fn rk_string(l: &LuaState, constants: &[Value], rk: i32) -> Option<Vec<u8>> {
     if opcode::is_k(rk) {
-        constant_string(constants, opcode::index_k(rk) as usize)
+        constant_string(l, constants, opcode::index_k(rk) as usize)
     } else {
         None
     }
 }
 
-fn constant_string(constants: &[Value], idx: usize) -> Option<Vec<u8>> {
+fn constant_string(l: &LuaState, constants: &[Value], idx: usize) -> Option<Vec<u8>> {
     match constants.get(idx) {
-        Some(Value::String(name_ref)) => gc_string_bytes(*name_ref),
+        Some(Value::String(name_ref)) => gc_string_bytes(l, *name_ref),
         _ => None,
     }
 }
 
-fn gc_string_bytes(name_ref: GcRef<GcString>) -> Option<Vec<u8>> {
-    // SAFETY: debug metadata is owned by live Proto/constant tables while executing.
-    unsafe { name_ref.as_ref() }.map(|name| name.as_bytes().to_vec())
+fn gc_string_bytes(l: &LuaState, name_ref: GcRef<GcString>) -> Option<Vec<u8>> {
+    l.copy_string_bytes(name_ref).ok()
 }
 
 fn short_source(source: &[u8]) -> Vec<u8> {
@@ -1379,10 +1349,9 @@ fn function_name_in_env(l: &LuaState, func_ref: GcRef<Function>) -> Option<Vec<u
     for (key, value) in table.hash_entries() {
         if let (Value::String(key_ref), Value::Function(value_func)) = (key, value)
             && *value_func == func_ref
-            // SAFETY: key is held by the environment table.
-            && let Some(key_string) = unsafe { key_ref.as_ref() }
+            && let Ok(key_string) = l.copy_string_bytes(*key_ref)
         {
-            return Some(key_string.as_bytes().to_vec());
+            return Some(key_string);
         }
     }
     None
@@ -1395,10 +1364,9 @@ fn function_name_in_global(l: &LuaState, func_ref: GcRef<Function>) -> Option<Ve
     for (key, value) in table.hash_entries() {
         if let (Value::String(key_ref), Value::Function(value_func)) = (key, value)
             && *value_func == func_ref
-            // SAFETY: key is held by the global table.
-            && let Some(key_string) = unsafe { key_ref.as_ref() }
+            && let Ok(key_string) = l.copy_string_bytes(*key_ref)
         {
-            return Some(key_string.as_bytes().to_vec());
+            return Some(key_string);
         }
     }
     None
@@ -1496,8 +1464,7 @@ fn upvalue_name(gc: &GarbageCollector, func_ref: GcRef<Function>, index: usize) 
     // debug C callback.
     let proto = unsafe { proto_ptr.as_ref() };
     let name_ref = proto.upvalue_name(index)?;
-    // SAFETY: the proto keeps its upvalue-name string alive.
-    unsafe { name_ref.as_ref() }.map(|name| name.as_bytes().to_vec())
+    gc.with_string_bytes(name_ref, <[u8]>::to_vec).ok()
 }
 
 fn function_upvalue(
@@ -1602,20 +1569,19 @@ fn with_thread_state_mut<T>(
 #[cfg(test)]
 mod byte_string_tests {
     use super::*;
+    use lua_core::string_pool::StringPool;
 
     unsafe extern "C" fn test_hook(_state: *mut std::ffi::c_void) -> i32 {
         0
     }
 
-    fn string_bytes(value: &Value) -> &[u8] {
+    fn string_bytes(state: &LuaState, value: &Value) -> Vec<u8> {
         let Value::String(string_ref) = value else {
             panic!("expected Lua string, got {value:?}");
         };
-        // SAFETY: each test keeps the collector alive while inspecting values
-        // allocated from it, and does not run collection.
-        unsafe { string_ref.as_ref() }
+        state
+            .copy_string_bytes(*string_ref)
             .expect("test string is live")
-            .as_bytes()
     }
 
     #[test]
@@ -1630,8 +1596,9 @@ mod byte_string_tests {
     #[test]
     fn source_and_short_source_preserve_nul_and_invalid_utf8() {
         let mut gc = GarbageCollector::new();
+        let mut string_pool = StringPool::new();
         let source_bytes = b"=\xff\0chunk";
-        let source_ref = gc.create(GcString::from_bytes(source_bytes));
+        let source_ref = string_pool.intern_bytes(&mut gc, source_bytes);
         let mut proto = Proto::new();
         proto.set_source(Some(source_ref));
         let proto_ref = gc.create(proto);
@@ -1651,10 +1618,12 @@ mod byte_string_tests {
     #[test]
     fn traceback_preserves_message_bytes_before_ascii_suffix() {
         let mut gc = GarbageCollector::new();
+        let mut string_pool = StringPool::new();
         let mut state = LuaState::new();
         state.gc = Some(&mut gc);
+        state.string_pool = Some(&mut string_pool);
         let message = [0xff, 0, 0x80, b'x'];
-        let message_ref = gc.create(GcString::from_bytes(&message));
+        let message_ref = string_pool.intern_bytes(&mut gc, &message);
         state.push_value(Value::String(message_ref));
 
         // SAFETY: the callback receives a valid LuaState pointer for exactly
@@ -1667,17 +1636,19 @@ mod byte_string_tests {
         let output = state.at(-1).expect("traceback result is on the stack");
         let mut expected = message.to_vec();
         expected.extend_from_slice(b"\nstack traceback:\n");
-        assert_eq!(string_bytes(output), expected);
+        assert_eq!(string_bytes(&state, output), expected);
     }
 
     #[test]
     fn hook_mask_round_trips_every_byte_including_nul() {
         let mut gc = GarbageCollector::new();
+        let mut string_pool = StringPool::new();
         let mut state = LuaState::new();
         state.gc = Some(&mut gc);
+        state.string_pool = Some(&mut string_pool);
         let hook_ref = gc.create(Function::new_c(test_hook));
         let mask: Vec<u8> = (0..=u8::MAX).collect();
-        let mask_ref = gc.create(GcString::from_bytes(&mask));
+        let mask_ref = string_pool.intern_bytes(&mut gc, &mask);
         state.push_value(Value::Function(hook_ref));
         state.push_value(Value::String(mask_ref));
         state.push_number(7.0);
@@ -1696,7 +1667,7 @@ mod byte_string_tests {
             3
         );
         assert_eq!(
-            string_bytes(state.at(2).expect("gethook returns mask second")),
+            string_bytes(&state, state.at(2).expect("gethook returns mask second")),
             mask
         );
         assert_eq!(mask_storage_to_bytes(&state.debug_hook_mask), mask);

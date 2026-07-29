@@ -581,7 +581,7 @@ mod tests {
 
         let fixtures = {
             let mut parts = runtime.parts_mut().expect("runtime parts");
-            let (state, gc, _) = parts.split_mut();
+            let (state, gc, string_pool) = parts.split_mut();
             let explicit = gc.create_root(Table::new());
             let thread_env = gc.create(Table::new());
             let chunk_env = gc.create(Table::new());
@@ -596,7 +596,7 @@ mod tests {
             let open_value = gc.create(Table::new());
             let debug_hook = gc.create(Table::new());
             let yielded = gc.create(Table::new());
-            let last_error = gc.create(GcString::from_bytes(b"last error"));
+            let last_error = string_pool.intern_bytes(gc, b"last error");
             let retired_stack = gc.create(Table::new());
             let inactive_vararg = gc.create(Table::new());
 

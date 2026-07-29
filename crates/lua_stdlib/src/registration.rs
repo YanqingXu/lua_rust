@@ -19,8 +19,36 @@ pub(crate) fn rooted_bytes<'scope>(
         // StringPool for the duration of standard-library execution.
         transaction.intern_bytes(unsafe { &mut *pool }, bytes)
     } else {
-        Ok(transaction.alloc(GcString::from_bytes(bytes)))
+        Err(GcRefValidationError::StringPoolUnavailable)
     }
+}
+
+pub(crate) fn find_table_field(
+    state: &LuaState,
+    table: GcRef<Table>,
+    name: &[u8],
+) -> Result<Option<Value>, GcRefValidationError> {
+    let Some(name) = state.find_interned_string(name)? else {
+        return Ok(None);
+    };
+    let gc = state.gc.ok_or(GcRefValidationError::CollectorUnavailable)?;
+    // SAFETY: LuaState carries the Runtime-owned collector for this state
+    // turn. `with_ref` validates identity before accessing table memory.
+    let value = unsafe { &*gc }.with_ref(table, |table| table.get(&Value::String(name)))?;
+    Ok((!value.is_nil()).then_some(value))
+}
+
+pub(crate) fn find_library_table(
+    state: &LuaState,
+    name: &[u8],
+) -> Result<Option<GcRef<Table>>, GcRefValidationError> {
+    let Some(global) = state.global_table else {
+        return Ok(None);
+    };
+    Ok(match find_table_field(state, global, name)? {
+        Some(Value::Table(table)) => Some(table),
+        _ => None,
+    })
 }
 
 pub(crate) fn register_c_function(

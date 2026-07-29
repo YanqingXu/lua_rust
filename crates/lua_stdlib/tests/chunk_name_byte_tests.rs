@@ -10,7 +10,7 @@ fn load_and_loadstring_keep_lua_provided_chunk_name_bytes() {
     let mut runtime = Runtime::new();
     {
         let mut parts = runtime.parts_mut().expect("runtime parts are available");
-        let (state, gc, _) = parts.split_mut();
+        let (state, gc, string_pool) = parts.split_mut();
         open_all(state, gc);
 
         let source = br#"
@@ -28,7 +28,7 @@ fn load_and_loadstring_keep_lua_provided_chunk_name_bytes() {
         "#;
         let mut parser = Parser::from_bytes(source);
         let chunk = parser.parse().expect("test source should parse");
-        let proto = CodeGenerator::new(gc)
+        let proto = CodeGenerator::new_with_pool(gc, string_pool)
             .generate(&chunk, "<chunk-name-byte-test>")
             .expect("test source should compile");
         let proto = gc.create(proto);
@@ -43,7 +43,12 @@ fn load_and_loadstring_keep_lua_provided_chunk_name_bytes() {
     let Value::String(result) = result else {
         panic!("expected a string result, got {result:?}");
     };
-    // SAFETY: the result remains rooted by the live Runtime.
-    let result = unsafe { result.as_ref() }.expect("result string should be live");
-    assert_eq!(result.as_bytes(), [0x00, 0x80, 0xff]);
+    assert_eq!(
+        runtime
+            .main_state()
+            .expect("main state remains live")
+            .copy_string_bytes(result)
+            .expect("result string should be live"),
+        [0x00, 0x80, 0xff]
+    );
 }

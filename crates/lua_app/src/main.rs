@@ -4,7 +4,6 @@ use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::parser::Parser;
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
-use lua_core::gc_string::GcString;
 use lua_core::proto::Proto;
 use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
@@ -230,8 +229,8 @@ fn run_app_with_runtime(
     if let (Some(script), Some(script_index)) = (&options.script_file, options.script_index) {
         {
             let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
-            let (state, gc, _) = parts.split_mut();
-            install_arg_table(state, gc, args, script_index)?;
+            let (state, gc, string_pool) = parts.split_mut();
+            install_arg_table(state, gc, string_pool, args, script_index)?;
         }
         let script_args = &args[script_index + 1..];
         let result = if script == "-" {
@@ -325,12 +324,14 @@ fn execute_source(
     };
     let (argument_values, argument_roots) = {
         let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
-        let (_, gc, _) = parts.split_mut();
+        let (_, gc, string_pool) = parts.split_mut();
         gc.with_publication(|transaction| {
             let mut values = Vec::with_capacity(args.len());
             let mut roots = Vec::with_capacity(args.len());
             for argument in args {
-                let string = transaction.alloc(GcString::from_utf8_text(argument));
+                let string = transaction
+                    .intern_bytes(string_pool, argument.as_bytes())
+                    .expect("Runtime StringPool belongs to the CLI collector");
                 let string = transaction
                     .publish_as_explicit_root(string)
                     .expect("new CLI argument remains registered during root promotion");
@@ -341,9 +342,9 @@ fn execute_source(
         })
     };
     let execution = runtime
-        .execute_proto_with_args(proto, argument_values, |results| {
+        .execute_proto_with_args(proto, argument_values, |state, results| {
             if display_results {
-                print_values(results);
+                print_values(state, results);
             }
         })
         .map_err(|error| error.to_string());
@@ -383,6 +384,7 @@ fn compile_or_load_proto(
 fn install_arg_table(
     state: &mut LuaState,
     gc: &mut GarbageCollector,
+    string_pool: &mut StringPool,
     args: &[String],
     script_index: usize,
 ) -> Result<(), String> {
@@ -405,13 +407,17 @@ fn install_arg_table(
                 text = "-e ".to_string();
             }
             let key = Value::Number(idx as f64 - script_index as f64);
-            let value = transaction.alloc(GcString::from_utf8_text(&text));
+            let value = transaction
+                .intern_bytes(string_pool, text.as_bytes())
+                .map_err(|error| format!("invalid arg string interning: {error}"))?;
             transaction
                 .set_table_entry_string(&table, &key, &value)
                 .map_err(|error| format!("invalid arg-table entry publication: {error}"))?;
         }
 
-        let name = transaction.alloc(GcString::from_bytes(b"arg"));
+        let name = transaction
+            .intern_bytes(string_pool, b"arg")
+            .map_err(|error| format!("invalid arg name interning: {error}"))?;
         transaction
             .set_table_table(&global, &name, &table)
             .map_err(|error| format!("invalid arg-table global publication: {error}"))
@@ -488,17 +494,17 @@ fn run_quiet_interactive(runtime: &mut Runtime) -> Result<(), String> {
     }
 }
 
-fn print_values(values: &[Value]) {
+fn print_values(state: &LuaState, values: &[Value]) {
     for (idx, value) in values.iter().enumerate() {
         if idx > 0 {
             print!("\t");
         }
-        print!("{}", value_to_string(value));
+        print!("{}", value_to_string(state, value));
     }
     println!();
 }
 
-fn value_to_string(value: &Value) -> String {
+fn value_to_string(state: &LuaState, value: &Value) -> String {
     match value {
         Value::Nil => "nil".to_string(),
         Value::Boolean(value) => value.to_string(),
@@ -509,12 +515,9 @@ fn value_to_string(value: &Value) -> String {
                 value.to_string()
             }
         }
-        Value::String(value) => {
-            // SAFETY: values being printed are returned on the live Lua stack.
-            unsafe { value.as_ref() }
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        }
+        Value::String(value) => state
+            .with_string_bytes(*value, |bytes| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default(),
         Value::Table(value) => format!("table: {:p}", value.as_ptr()),
         Value::Function(value) => format!("function: {:p}", value.as_ptr()),
         Value::Userdata(value) => format!("userdata: {:p}", value.as_ptr()),
@@ -525,20 +528,18 @@ fn value_to_string(value: &Value) -> String {
 
 fn global_string(state: &LuaState, name: &str) -> Option<String> {
     let global = state.global_table?;
-    // SAFETY: the global table is rooted by the LuaState.
-    let table = unsafe { global.as_ref() }?;
-    for (key, value) in table.hash_entries() {
-        if let Value::String(key_ref) = key
-            // SAFETY: the key is held by the global table.
-            && let Some(key_string) = unsafe { key_ref.as_ref() }
-            && key_string.as_bytes() == name.as_bytes()
-            && let Value::String(value_ref) = value
-        {
-            // SAFETY: the value is held by the global table.
-            return unsafe { value_ref.as_ref() }.map(|value| value.to_string_lossy().into_owned());
-        }
-    }
-    None
+    let key = state.find_interned_string(name.as_bytes()).ok().flatten()?;
+    let gc = state.gc?;
+    // SAFETY: Runtime installs the live collector for the main state.
+    let Value::String(value) = unsafe { &*gc }
+        .with_ref(global, |table| table.get(&Value::String(key)))
+        .ok()?
+    else {
+        return None;
+    };
+    state
+        .with_string_bytes(value, |bytes| String::from_utf8_lossy(bytes).into_owned())
+        .ok()
 }
 
 fn is_incomplete_error(message: &str) -> bool {

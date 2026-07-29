@@ -625,6 +625,7 @@ mod tests {
     use crate::gc::collector::GarbageCollector;
     use crate::gc::gc_ref::GcRef;
     use crate::gc_string::GcString;
+    use crate::string_pool::StringPool;
 
     // ── 辅助函数 ────────────────────────────────────────────────
 
@@ -635,7 +636,7 @@ mod tests {
 
     /// 创建一个测试用的字符串并注册到 GC
     fn create_test_string(gc: &mut GarbageCollector, s: &str) -> GcRef<GcString> {
-        gc.create(GcString::from_utf8_text(s))
+        gc.create(GcString::from_bytes(s.as_bytes()))
     }
 
     // ── 创建和基本属性测试 ─────────────────────────────────────
@@ -772,14 +773,16 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_string_key_matches_by_content_without_interning() {
+    fn canonical_string_key_identity_updates_one_hash_entry() {
         let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
         let mut table = Table::new();
 
-        let s1 = create_test_string(&mut gc, "same");
-        let s2 = create_test_string(&mut gc, "same");
+        let key_bytes = [b'k', 0, 0x80, 0xff];
+        let s1 = pool.intern_bytes(&mut gc, &key_bytes);
+        let s2 = pool.intern_bytes(&mut gc, &key_bytes);
 
-        assert_ne!(s1, s2);
+        assert_eq!(s1, s2);
 
         table.set(&Value::String(s1), &Value::Number(1.0));
         table.set(&Value::String(s2), &Value::Number(2.0));

@@ -7,6 +7,7 @@ use lua_compiler::lexer::Lexer;
 use lua_compiler::parser::Parser;
 use lua_compiler::token::{Token, TokenValue};
 use lua_core::gc::collector::GarbageCollector;
+use lua_core::string_pool::StringPool;
 use lua_core::value::Value;
 
 fn string_bytes(token: &Token) -> &[u8] {
@@ -115,7 +116,8 @@ fn codegen_interns_literal_without_utf8_reencoding() {
     let mut parser = Parser::from_bytes(br#"return "\000\128\255""#);
     let chunk = parser.parse().expect("byte source should parse");
     let mut gc = GarbageCollector::new();
-    let proto = CodeGenerator::new(&mut gc)
+    let mut pool = StringPool::new();
+    let proto = CodeGenerator::new_with_pool(&mut gc, &mut pool)
         .generate(&chunk, "<byte-source-test>")
         .expect("byte source should compile");
 
@@ -123,11 +125,10 @@ fn codegen_interns_literal_without_utf8_reencoding() {
         .constants()
         .iter()
         .find_map(|constant| match constant {
-            Value::String(value) => {
-                // SAFETY: `gc` owns every string referenced by `proto` and cannot
-                // collect while immutably borrowed in this assertion.
-                unsafe { value.as_ref() }.filter(|value| value.as_bytes() == [0x00, 0x80, 0xff])
-            }
+            Value::String(value) => gc
+                .with_string_bytes(*value, |bytes| (bytes == [0x00, 0x80, 0xff]).then_some(()))
+                .ok()
+                .flatten(),
             _ => None,
         });
 

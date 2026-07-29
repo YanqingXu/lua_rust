@@ -161,10 +161,11 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 - **Rust 位置：** `crates/lua_core/src/gc_string.rs`；
   `crates/lua_core/src/string_pool.rs`；`crates/lua_compiler/src/lexer.rs`；
   `crates/lua_stdlib/src/string.rs`；`crates/lua_stdlib/src/io.rs`。
-- **当前行为：** 核心数据由 Rust `String`/`&str` 承载，多个边界在
-  `char`、Latin-1 映射和 UTF-8 bytes 之间转换。`GcString::len` 使用自定义
-  Lua-byte 长度，但 `as_ptr` 指向 UTF-8 buffer，二者对部分字符并不描述同一
-  字节序列；无效 UTF-8 不能原样存在。
+- **当前行为：** ByteString/GcString/StringPool 已承载任意 bytes；生产 compiler、
+  VM、stdlib、app、参数/错误/字段/name 构造强制走 owning StringPool。
+  `Value::String` Eq/Hash 使用不可复用的 `GcRef` identity 而不解引用，内容语义
+  经 collector/state-scoped bytes 完成。17-path 静态 inventory/gate 与
+  duplicate/foreign/stale/NUL/high-byte/address-reuse 回归已锁定该边界。
 - **Oracle：** stock Lua 5.1 字符串是任意 byte sequence；固定
   `lua_cpp@87c15e6` 的 GCString/hash/string library 与 C API
   pointer+length 行为。
@@ -172,8 +173,9 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   hash/intern/pointer+length corpus；M1.1–M1.3、M2.10。
 - **影响：** 高位字节、无效 UTF-8、长度、切片、pattern、IO round-trip、
   dump 和未来 C API 可能不兼容或双重编码。
-- **处置状态：** `open`。ByteString 迁移与全链路 oracle 测试通过前，
-  字符串兼容状态保持 partial。
+- **处置状态：** `mitigated-open`。核心表示与当前生产 identity/access 合同已
+  本地闭合；真实 binary dump/load、未来 C API pointer+length 与全链路双-oracle
+  验收完成前，整体字符串兼容状态仍为 partial。
 
 ### NOTE-008: Lua 5.1 C API/ABI 尚不存在
 
@@ -244,7 +246,8 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   但 main state 仍是 external arena slot，LuaState 仍保存 transitional
   GC/StringPool backpointer，debug/protected-helper 跨 state open-Upvalue
   访问尚未纳入同一调度协议；Lua `__gc`、IO/module service drain 与
-  allocator live-byte、字符串 Eq/Hash scoped/canonical 合同也未闭环。
+  allocator live-byte 合同也未闭环。生产字符串 Eq/Hash/canonical/scoped
+  access 已由独立 inventory 和静态门本地闭合。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
   close、coroutine lifecycle 和 allocator live-byte 合同。
 - **测试与任务：** 1000 轮 state/coroutine create-close、fixed/ordinary
@@ -268,12 +271,12 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 - **影响：** 已移除 resume/wrap 递归跨 state 借用和 raw open-Upvalue
   owner 风险，并能声称当前 Rust-owned 对象的 deterministic shutdown
   substrate；当前 production publication 切片已关闭，但剩余
-  string/service/backpointer/Heap owner 风险仍不允许声称完整 Lua close 或
+  service/backpointer/Heap owner 风险仍不允许声称完整 Lua close 或
   live collection。
 - **处置状态：** `open`。temporary state、compiler Proto→Function、
-  library/package、IO 与 VM/app/result publication 子项已关闭；字符串
-  scoped/canonical Eq/Hash、唯一 Heap/service owner、debug/protected-helper
-  跨 state、Lua-visible close 与 lifecycle 验收全部完成前保持开放。
+  library/package、IO、VM/app/result publication 与字符串 identity/access
+  子项已关闭；唯一 Heap/service owner、debug/protected-helper 跨 state、
+  Lua-visible close 与 lifecycle 验收全部完成前保持开放。
 
 ### NOTE-010: Lua 字符串 intern hash 选择固定 C++ 的前向采样
 
@@ -293,8 +296,9 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   corpus、intern identity 和双 oracle 差分。
 - **影响：** hash bucket 分布与 stock Lua/旧 Rust 不同；Lua 级字符串相等性
   不应改变，但依赖内部 hash 数值或布局的调试/ABI 观察会看到差异。
-- **处置状态：** `decided-in-progress`。M1 已完成目标决策；实现迁移和
-  differential 验收进行中，完成前不得标为 `resolved`。
+- **处置状态：** `implemented-local`。前向采样实现、固定 `b"ab"`/长字符串
+  向量、canonical intern identity 与生产构造静态门已完成；整体 ByteString
+  迁移仍按 NOTE-007 的 dump/load、C API 和双-oracle 完成条件保持开放。
 
 ### NOTE-011: 官方 Lua 5.1 的含 NUL chunk name 会在 C 字符串边界截断
 
@@ -327,10 +331,10 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 | NOTE-004 | stdio | stock + `lua_cpp@87c15e6` | M0.4, M0.5, M2.12 | `remediation-verified-local` |
 | NOTE-005 | native module | stock + `lua_cpp@87c15e6` | M3.9 | `open` |
 | NOTE-006 | OS / locale / time | per-platform stock + C++ | M2.13, M5.1 | `open` |
-| NOTE-007 | byte strings | stock + `lua_cpp@87c15e6` | M1.1–M1.3, M2.10 | `open` |
+| NOTE-007 | byte strings | stock + `lua_cpp@87c15e6` | M1.1–M1.3, M2.10 | `mitigated-open` |
 | NOTE-008 | C API / ABI | stock + `lua_cpp@87c15e6` | M3.4–M3.8 | `open` |
 | NOTE-009 | ownership / lifecycle | `lua_cpp@87c15e6` | M1.4–M1.8, M1.13 | `open` |
-| NOTE-010 | string intern hash | `lua_cpp@87c15e6` 优先于 stock | M1.1–M1.2 | `decided-in-progress` |
+| NOTE-010 | string intern hash | `lua_cpp@87c15e6` 优先于 stock | M1.1–M1.2 | `implemented-local` |
 | NOTE-011 | NUL chunk-name boundary | `lua_cpp@87c15e6` 优先于 stock | M1.3, M2.1, M2.7 | `approved` |
 
 ## 维护规则

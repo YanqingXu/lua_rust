@@ -46,22 +46,10 @@ fn reg(
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
-    if let Some(gt) = l.global_table
-        // SAFETY: global table is rooted for the duration of library init.
-        && let Some(gt_obj) = unsafe { gt.as_ref() }
-    {
-        for (key, val) in gt_obj.hash_entries() {
-            if let Value::String(key_ref) = key
-                // SAFETY: key is held by the rooted global table.
-                && let Some(key_str) = unsafe { key_ref.as_ref() }
-                && key_str.as_bytes() == name.as_bytes()
-                && let Value::Table(t) = val
-            {
-                return *t;
-            }
-        }
-    }
-    GcRef::null()
+    crate::registration::find_library_table(l, name.as_bytes())
+        .ok()
+        .flatten()
+        .unwrap_or_else(GcRef::null)
 }
 
 unsafe extern "C" fn lua_os_clock(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -90,12 +78,12 @@ unsafe extern "C" fn lua_os_time(l_ptr: *mut std::ffi::c_void) -> i32 {
                 l.push_nil();
                 return 1;
             };
-            let year = table_number_field(table, "year").unwrap_or(1970.0) as i64;
-            let month = table_number_field(table, "month").unwrap_or(1.0) as i64;
-            let day = table_number_field(table, "day").unwrap_or(1.0) as i64;
-            let hour = table_number_field(table, "hour").unwrap_or(12.0) as i64;
-            let min = table_number_field(table, "min").unwrap_or(0.0) as i64;
-            let sec = table_number_field(table, "sec").unwrap_or(0.0) as i64;
+            let year = table_number_field(l, table, "year").unwrap_or(1970.0) as i64;
+            let month = table_number_field(l, table, "month").unwrap_or(1.0) as i64;
+            let day = table_number_field(l, table, "day").unwrap_or(1.0) as i64;
+            let hour = table_number_field(l, table, "hour").unwrap_or(12.0) as i64;
+            let min = table_number_field(l, table, "min").unwrap_or(0.0) as i64;
+            let sec = table_number_field(l, table, "sec").unwrap_or(0.0) as i64;
             let days = days_from_civil(year, month, day);
             l.push_value(Value::Number(
                 (days * 86_400 + hour * 3_600 + min * 60 + sec) as f64,
@@ -127,10 +115,12 @@ unsafe extern "C" fn lua_os_execute(l_ptr: *mut std::ffi::c_void) -> i32 {
             return 1;
         }
         Value::String(s) => {
-            // SAFETY: command string is held by the active Lua stack.
-            let Some(command) = (unsafe { s.as_ref() })
-                .and_then(|s| s.to_utf8().ok())
-                .map(str::to_owned)
+            let Some(command) = l
+                .with_string_bytes(s, |bytes| {
+                    std::str::from_utf8(bytes).ok().map(str::to_owned)
+                })
+                .ok()
+                .flatten()
             else {
                 l.push_nil();
                 let _ = push_lua_string(l, "os.execute command must be valid UTF-8");
@@ -179,10 +169,12 @@ unsafe extern "C" fn lua_os_date(l_ptr: *mut std::ffi::c_void) -> i32 {
     let format = match l.at(1) {
         None | Some(Value::Nil) => "%c".to_string(),
         Some(Value::String(string_ref)) => {
-            // SAFETY: the format argument is kept alive on the active stack.
-            let Some(format) = (unsafe { string_ref.as_ref() })
-                .and_then(|string| string.to_utf8().ok())
-                .map(str::to_owned)
+            let Some(format) = l
+                .with_string_bytes(*string_ref, |bytes| {
+                    std::str::from_utf8(bytes).ok().map(str::to_owned)
+                })
+                .ok()
+                .flatten()
             else {
                 l.push_nil();
                 let _ = push_lua_string(l, "os.date format must be valid UTF-8");
@@ -247,12 +239,7 @@ unsafe extern "C" fn lua_os_setlocale(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     let locale = match l.at(1).cloned().unwrap_or(Value::Nil) {
         Value::Nil => return push_lua_string(l, "C"),
-        Value::String(s) => {
-            // SAFETY: argument strings are kept alive on the active Lua stack.
-            unsafe { s.as_ref() }
-                .map(|string| string.as_bytes().to_vec())
-                .unwrap_or_default()
-        }
+        Value::String(s) => l.copy_string_bytes(s).unwrap_or_default(),
         _ => {
             l.push_nil();
             return 1;
@@ -333,12 +320,13 @@ unsafe extern "C" fn lua_os_tmpname(l_ptr: *mut std::ffi::c_void) -> i32 {
 fn string_arg_text(l: &LuaState, idx: i32) -> Option<String> {
     match l.at(idx) {
         Some(Value::String(s)) => {
-            // SAFETY: string arguments are kept alive on the active Lua stack.
             // Host OS APIs accept text paths/commands, so this boundary rejects
             // arbitrary Lua bytes instead of silently re-encoding them.
-            unsafe { s.as_ref() }
-                .and_then(|s| s.to_utf8().ok())
-                .map(str::to_owned)
+            l.with_string_bytes(*s, |bytes| {
+                std::str::from_utf8(bytes).ok().map(str::to_owned)
+            })
+            .ok()
+            .flatten()
         }
         _ => None,
     }
@@ -347,36 +335,30 @@ fn string_arg_text(l: &LuaState, idx: i32) -> Option<String> {
 fn number_arg(l: &LuaState, idx: i32) -> Option<f64> {
     match l.at(idx) {
         Some(Value::Number(n)) => Some(*n),
-        Some(Value::String(s)) => {
-            // SAFETY: string arguments are kept alive on the active Lua stack.
-            unsafe { s.as_ref() }.and_then(|s| parse_lua_number_bytes(s.as_bytes()))
-        }
+        Some(Value::String(s)) => l
+            .with_string_bytes(*s, parse_lua_number_bytes)
+            .ok()
+            .flatten(),
         _ => None,
     }
 }
 
-fn table_number_field(table: &Table, name: &str) -> Option<f64> {
-    match table_field(table, name) {
+fn table_number_field(l: &LuaState, table: &Table, name: &str) -> Option<f64> {
+    match table_field(l, table, name) {
         Value::Number(n) => Some(n),
-        Value::String(s) => {
-            // SAFETY: string value is owned by this live table.
-            unsafe { s.as_ref() }.and_then(|s| parse_lua_number_bytes(s.as_bytes()))
-        }
+        Value::String(s) => l
+            .with_string_bytes(s, parse_lua_number_bytes)
+            .ok()
+            .flatten(),
         _ => None,
     }
 }
 
-fn table_field(table: &Table, name: &str) -> Value {
-    for (key, value) in table.hash_entries() {
-        if let Value::String(key_ref) = key
-            // SAFETY: keys are owned by this live table.
-            && let Some(key_str) = unsafe { key_ref.as_ref() }
-            && key_str.as_bytes() == name.as_bytes()
-        {
-            return value.clone();
-        }
-    }
-    Value::Nil
+fn table_field(l: &LuaState, table: &Table, name: &str) -> Value {
+    let Ok(Some(key)) = l.find_interned_string(name.as_bytes()) else {
+        return Value::Nil;
+    };
+    table.get(&Value::String(key))
 }
 
 struct DateParts {

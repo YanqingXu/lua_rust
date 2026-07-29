@@ -2081,7 +2081,7 @@ impl Runtime {
         &mut self,
         proto: GcRef<Proto>,
         args: Vec<Value>,
-        consume_results: impl FnOnce(&[Value]),
+        consume_results: impl FnOnce(&LuaState, &[Value]),
     ) -> Result<(), RuntimeExecutionError> {
         self.check_owner()?;
         if self.phase != RuntimePhase::Running {
@@ -2118,9 +2118,10 @@ impl Runtime {
                     runtime_id: self.id,
                 })?;
         let results = execution.is_ok().then(|| state_stack_values(state));
-        let _reset = TopLevelStateResetGuard { state };
+        let reset = TopLevelStateResetGuard { state };
         execution?;
         consume_results(
+            &*reset.state,
             results
                 .as_deref()
                 .expect("successful execution exposes its result buffer"),
@@ -2717,9 +2718,12 @@ fn runtime_error_value(
     }
 
     gc.with_publication(|transaction| {
-        let message = transaction.alloc(lua_core::gc_string::GcString::from_utf8_text(
-            &error.message,
-        ));
+        let pool = state
+            .string_pool
+            .ok_or(GcRefValidationError::StringPoolUnavailable)?;
+        // SAFETY: this state turn exclusively owns the pinned RuntimeHeap
+        // StringPool service.
+        let message = transaction.intern_bytes(unsafe { &mut *pool }, error.message.as_bytes())?;
         // SAFETY: last_error is a Runtime-traced LuaState owner and receives
         // the string before its temporary publication root is released.
         unsafe {
@@ -2729,7 +2733,7 @@ fn runtime_error_value(
             })
         }
     })
-    .expect("new Runtime error string remains registered during publication")
+    .expect("Runtime errors require the active canonical StringPool")
 }
 
 fn release_yield_permission(state: &mut LuaState) -> Result<(), RuntimeError> {

@@ -97,7 +97,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         for upvalue in &upvalues {
             let name = self
                 .allocator
-                .allocate_string(self.string_pool.as_deref_mut(), upvalue.name.as_bytes());
+                .allocate_string(self.string_pool, upvalue.name.as_bytes());
             self.builder.add_upvalue_name(name);
         }
         let max_stack = self

@@ -12,10 +12,10 @@ fn compile_and_run(source: &str) -> (Value, Runtime) {
     let mut runtime = Runtime::new();
     let proto = {
         let mut parts = runtime.parts_mut().expect("runtime parts are available");
-        let (_, gc, _) = parts.split_mut();
+        let (_, gc, string_pool) = parts.split_mut();
         let mut parser = Parser::new(source);
         let chunk = parser.parse().expect("Parse should succeed");
-        let proto = CodeGenerator::new(gc)
+        let proto = CodeGenerator::new_with_pool(gc, string_pool)
             .generate(&chunk, "<test>")
             .expect("Codegen should succeed");
         gc.create(proto)

@@ -85,34 +85,20 @@ fn set_number(
 
 /// Find a library table in the global namespace
 fn find_lib_table(l: &LuaState, name: &str) -> lua_core::gc::gc_ref::GcRef<Table> {
-    if let Some(gt) = l.global_table {
-        // SAFETY: global_table is a GC root; GC not running during library init
-        if let Some(gt_obj) = unsafe { gt.as_ref() } {
-            for (key, val) in gt_obj.hash_entries() {
-                if let Value::String(key_ref) = key {
-                    // SAFETY: key is from the GC-rooted global table
-                    if let Some(key_str) = unsafe { key_ref.as_ref() } {
-                        if key_str.as_bytes() == name.as_bytes() {
-                            if let Value::Table(t) = val {
-                                return *t;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    lua_core::gc::gc_ref::GcRef::null()
+    crate::registration::find_library_table(l, name.as_bytes())
+        .ok()
+        .flatten()
+        .unwrap_or_else(lua_core::gc::gc_ref::GcRef::null)
 }
 
 /// Helper: get a number argument from the stack
 fn get_number(l: &LuaState, index: usize) -> Option<f64> {
     l.at(index as i32 + 1).and_then(|v| match v {
         Value::Number(n) => Some(*n),
-        Value::String(s) => {
-            // SAFETY: string arguments are on the active Lua stack.
-            unsafe { s.as_ref() }.and_then(|s| parse_lua_number_bytes(s.as_bytes()))
-        }
+        Value::String(s) => l
+            .with_string_bytes(*s, parse_lua_number_bytes)
+            .ok()
+            .flatten(),
         _ => None,
     })
 }

@@ -6,8 +6,9 @@
 
 use lua_compiler::opcode::{self, OpCode};
 use lua_core::function::{CFunction, Function, RuntimeNativeFunction};
-use lua_core::gc::collector::GarbageCollector;
+use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::gc::publication::{PublicationTxn, Rooted};
 use lua_core::gc_string::GcString;
 use lua_core::proto::{Proto, VARARG_NEEDSARG};
 use lua_core::table::Table;
@@ -43,6 +44,19 @@ pub enum VmExit {
 /// 最大嵌套调用深度
 const MAX_CALLS: i32 = 512;
 const MAX_STRING_LENGTH: usize = 64 * 1024 * 1024;
+
+fn rooted_vm_bytes<'scope>(
+    state: &LuaState,
+    transaction: &mut PublicationTxn<'scope>,
+    bytes: &[u8],
+) -> Result<Rooted<'scope, GcString>, GcRefValidationError> {
+    let pool = state
+        .string_pool
+        .ok_or(GcRefValidationError::StringPoolUnavailable)?;
+    // SAFETY: LuaState::string_pool points at the pinned RuntimeHeap service
+    // for the duration of this exclusive VM state turn.
+    transaction.intern_bytes(unsafe { &mut *pool }, bytes)
+}
 
 /// 虚拟机主执行循环
 ///
@@ -231,11 +245,12 @@ fn execute_proto_inner(
                 let table = l.stack.at(base_idx + b).cloned().unwrap_or(Value::Nil);
                 let key = get_rk(l, base_idx, c, constants);
                 let stack_limit = base_idx + active_proto.max_stack_size() as usize;
-                if should_error_index(l, &table) {
+                if should_error_index(l, gc, &table) {
                     return Err(runtime_error_at(
+                        gc,
                         active_proto,
                         pc,
-                        index_error_message(active_proto, pc, b, constants, &table),
+                        index_error_message(gc, active_proto, pc, b, constants, &table),
                     ));
                 }
                 get_table_into(l, gc, stack_limit, &table, &key, base_idx + a)?;
@@ -280,11 +295,12 @@ fn execute_proto_inner(
                 let value = get_rk(l, base_idx, c, constants);
                 let table_val = l.stack.at(base_idx + a).cloned().unwrap_or(Value::Nil);
                 let stack_limit = base_idx + active_proto.max_stack_size() as usize;
-                if should_error_newindex(l, &table_val) {
+                if should_error_newindex(l, gc, &table_val) {
                     return Err(runtime_error_at(
+                        gc,
                         active_proto,
                         pc,
-                        index_error_message(active_proto, pc, a, constants, &table_val),
+                        index_error_message(gc, active_proto, pc, a, constants, &table_val),
                     ));
                 }
                 set_table_value(l, gc, stack_limit, &table_val, &key, &value)?;
@@ -319,11 +335,12 @@ fn execute_proto_inner(
                 let c = opcode::get_arg_c(inst);
                 let obj = l.stack.at(base_idx + b).cloned().unwrap_or(Value::Nil);
                 let key = get_rk(l, base_idx, c, constants);
-                if should_error_index(l, &obj) {
+                if should_error_index(l, gc, &obj) {
                     return Err(runtime_error_at(
+                        gc,
                         active_proto,
                         pc,
-                        index_error_message(active_proto, pc, b, constants, &obj),
+                        index_error_message(gc, active_proto, pc, b, constants, &obj),
                     ));
                 }
                 // R(A+1) = R(B)
@@ -349,13 +366,12 @@ fn execute_proto_inner(
                         if err.message == "attempt to perform arithmetic on a non-number value" =>
                     {
                         return Err(RuntimeError::new(arith_error_message(
+                            gc,
                             active_proto,
                             pc,
-                            b,
-                            c,
                             constants,
-                            &lhs,
-                            &rhs,
+                            (b, &lhs),
+                            (c, &rhs),
                         )));
                     }
                     Err(err) => return Err(err),
@@ -374,6 +390,7 @@ fn execute_proto_inner(
                         if err.message == "attempt to perform arithmetic on a non-number value" =>
                     {
                         return Err(RuntimeError::new(unm_error_message(
+                            gc,
                             active_proto,
                             pc,
                             b,
@@ -399,7 +416,7 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst) as usize;
                 let b = opcode::get_arg_b(inst) as usize;
                 let val = l.stack.at(base_idx + b).cloned().unwrap_or(Value::Nil);
-                let len = exec_len(&val);
+                let len = exec_len(gc, &val);
                 if let Some(dst) = l.stack.at_mut(base_idx + a) {
                     *dst = len;
                 }
@@ -612,13 +629,18 @@ fn execute_proto_inner(
                                     return Ok(VmExit::UpvalueAccess(request));
                                 }
                                 Err(err) if err.message.starts_with("bad argument") => {
-                                    return Err(runtime_error_at(active_proto, pc, err.message));
+                                    return Err(runtime_error_at(
+                                        gc,
+                                        active_proto,
+                                        pc,
+                                        err.message,
+                                    ));
                                 }
                                 Err(err) => return Err(err),
                             }
                         }
                     }
-                } else if let Some(metamethod) = find_metamethod(l, &func, &func, "__call") {
+                } else if let Some(metamethod) = find_metamethod(l, gc, &func, &func, "__call") {
                     let actual_nargs = nargs.max(0) as usize;
                     ensure_stack_slot(l, func_pos + actual_nargs + 1);
                     for i in (0..=actual_nargs).rev() {
@@ -644,7 +666,7 @@ fn execute_proto_inner(
                         Value::String(_) => "string",
                         _ => "userdata",
                     };
-                    let detail = describe_register(active_proto, pc, a, constants, 8)
+                    let detail = describe_register(gc, active_proto, pc, a, constants, 8)
                         .map(|name| format!("{} (a {} value)", name, type_desc))
                         .unwrap_or_else(|| format!("a {} value", type_desc));
                     return Err(RuntimeError::new(format!("attempt to call {detail}")));
@@ -663,7 +685,7 @@ fn execute_proto_inner(
                 let mut actual_nargs = nargs.max(0) as usize;
                 let func = l.stack.at(func_pos).cloned().unwrap_or(Value::Nil);
                 if !matches!(func, Value::Function(_))
-                    && let Some(metamethod) = find_metamethod(l, &func, &func, "__call")
+                    && let Some(metamethod) = find_metamethod(l, gc, &func, &func, "__call")
                 {
                     ensure_stack_slot(l, func_pos + actual_nargs + 1);
                     for i in (0..=actual_nargs).rev() {
@@ -876,9 +898,9 @@ fn execute_proto_inner(
                     .at(base_idx + a)
                     .cloned()
                     .unwrap_or(Value::Number(0.0));
-                let step_num = as_number(&step);
-                let limit_num = as_number(&limit);
-                let idx_num = as_number(&idx_val) + step_num;
+                let step_num = as_number(gc, &step);
+                let limit_num = as_number(gc, &limit);
+                let idx_num = as_number(gc, &idx_val) + step_num;
                 // Update R(A) and R(A+3)
                 if let Some(dst) = l.stack.at_mut(base_idx + a) {
                     *dst = Value::Number(idx_num);
@@ -910,27 +932,30 @@ fn execute_proto_inner(
                     .cloned()
                     .unwrap_or(Value::Number(0.0));
                 let limit = l.stack.at(base_idx + a + 1).cloned().unwrap_or(Value::Nil);
-                let step_num = match to_arith_number(&step) {
+                let step_num = match to_arith_number(gc, &step) {
                     Some(step) => step,
                     None => {
                         return Err(runtime_error_at(
+                            gc,
                             active_proto,
                             pc,
                             "'for' step must be a number",
                         ));
                     }
                 };
-                if to_arith_number(&limit).is_none() {
+                if to_arith_number(gc, &limit).is_none() {
                     return Err(runtime_error_at(
+                        gc,
                         active_proto,
                         pc,
                         "'for' limit must be a number",
                     ));
                 }
-                let init_num = match to_arith_number(&init) {
+                let init_num = match to_arith_number(gc, &init) {
                     Some(init) => init - step_num,
                     None => {
                         return Err(runtime_error_at(
+                            gc,
                             active_proto,
                             pc,
                             "'for' initial value must be a number",
@@ -1062,6 +1087,7 @@ fn execute_proto_inner(
                     }
                     _ => {
                         return Err(runtime_error_at(
+                            gc,
                             active_proto,
                             pc,
                             "generic for: iterator function expected",
@@ -1422,7 +1448,7 @@ fn fire_debug_hook(
 
     let saved_top = l.top;
     gc.with_publication(|transaction| {
-        let event = transaction.alloc(GcString::from_bytes(event.as_bytes()));
+        let event = rooted_vm_bytes(l, transaction, event.as_bytes())?;
         // SAFETY: the callback installs the string in the active Lua stack.
         unsafe {
             transaction.publish_string_value(event, |value| {
@@ -1756,7 +1782,7 @@ fn c_function_display_name(l: &LuaState, func_pos: usize) -> String {
     let Some(global) = (unsafe { global_ref.as_ref() }) else {
         return format!("function: {:p}", func_ref.as_ptr());
     };
-    find_function_name_in_table(global, func_ref).unwrap_or_else(|| {
+    find_function_name_in_table(l, global, func_ref).unwrap_or_else(|| {
         for (key, value) in global.hash_entries() {
             let Value::String(lib_name_ref) = key else {
                 continue;
@@ -1768,10 +1794,12 @@ fn c_function_display_name(l: &LuaState, func_pos: usize) -> String {
             let Some(table) = (unsafe { table_ref.as_ref() }) else {
                 continue;
             };
-            if let Some(name) = find_function_name_in_table(table, func_ref) {
-                // SAFETY: key is held by the global table.
-                let lib_name = unsafe { lib_name_ref.as_ref() }
-                    .map(|name| name.to_string_lossy().into_owned())
+            if let Some(name) = find_function_name_in_table(l, table, func_ref) {
+                let lib_name = l
+                    .with_string_bytes(*lib_name_ref, |bytes| {
+                        String::from_utf8_lossy(bytes).into_owned()
+                    })
+                    .ok()
                     .unwrap_or_default();
                 return format!("{lib_name}.{name}");
             }
@@ -1780,13 +1808,20 @@ fn c_function_display_name(l: &LuaState, func_pos: usize) -> String {
     })
 }
 
-fn find_function_name_in_table(table: &Table, func_ref: GcRef<Function>) -> Option<String> {
+fn find_function_name_in_table(
+    l: &LuaState,
+    table: &Table,
+    func_ref: GcRef<Function>,
+) -> Option<String> {
     for (key, value) in table.hash_entries() {
         if let (Value::String(name_ref), Value::Function(value_ref)) = (key, value)
             && *value_ref == func_ref
         {
-            // SAFETY: key is held by the table being inspected.
-            return unsafe { name_ref.as_ref() }.map(|name| name.to_string_lossy().into_owned());
+            return l
+                .with_string_bytes(*name_ref, |bytes| {
+                    String::from_utf8_lossy(bytes).into_owned()
+                })
+                .ok();
         }
     }
     None
@@ -1806,12 +1841,19 @@ fn value_type_name(value: &Value) -> &'static str {
     }
 }
 
-fn runtime_error_at(proto: &Proto, pc: usize, message: impl Into<String>) -> RuntimeError {
+fn runtime_error_at(
+    gc: &GarbageCollector,
+    proto: &Proto,
+    pc: usize,
+    message: impl Into<String>,
+) -> RuntimeError {
     let source = proto
         .source()
         .and_then(|source_ref| {
-            // SAFETY: the active Proto keeps its source string alive.
-            unsafe { source_ref.as_ref() }.map(|source| source.to_string_lossy().into_owned())
+            gc.with_string_bytes(source_ref, |bytes| {
+                String::from_utf8_lossy(bytes).into_owned()
+            })
+            .ok()
         })
         .unwrap_or_else(|| "?".to_string());
     let line = proto.line(pc);
@@ -1859,21 +1901,22 @@ fn first_non_recursive_caller_line(l: &LuaState, gc: &GarbageCollector) -> Optio
     None
 }
 
-fn should_error_index(l: &LuaState, value: &Value) -> bool {
+fn should_error_index(l: &LuaState, gc: &GarbageCollector, value: &Value) -> bool {
     !matches!(value, Value::Table(_) | Value::String(_))
-        && value_metatable(l, value)
-            .and_then(|mt| lookup_metamethod(mt, "__index"))
+        && value_metatable(l, gc, value)
+            .and_then(|mt| lookup_metamethod(l, gc, mt, "__index"))
             .is_none()
 }
 
-fn should_error_newindex(l: &LuaState, value: &Value) -> bool {
+fn should_error_newindex(l: &LuaState, gc: &GarbageCollector, value: &Value) -> bool {
     !matches!(value, Value::Table(_))
-        && value_metatable(l, value)
-            .and_then(|mt| lookup_metamethod(mt, "__newindex"))
+        && value_metatable(l, gc, value)
+            .and_then(|mt| lookup_metamethod(l, gc, mt, "__newindex"))
             .is_none()
 }
 
 fn index_error_message(
+    gc: &GarbageCollector,
     proto: &Proto,
     pc: usize,
     reg: usize,
@@ -1881,26 +1924,26 @@ fn index_error_message(
     value: &Value,
 ) -> String {
     let type_desc = value_type_name(value);
-    describe_register_for_index(proto, pc, reg, constants, 8)
+    describe_register_for_index(gc, proto, pc, reg, constants, 8)
         .map(|name| format!("attempt to index {name} (a {type_desc} value)"))
         .unwrap_or_else(|| format!("attempt to index a {type_desc} value"))
 }
 
 fn arith_error_message(
+    gc: &GarbageCollector,
     proto: &Proto,
     pc: usize,
-    lhs_rk: i32,
-    rhs_rk: i32,
     constants: &[Value],
-    lhs: &Value,
-    rhs: &Value,
+    lhs: (i32, &Value),
+    rhs: (i32, &Value),
 ) -> String {
-    let (bad_rk, bad_value) = if to_arith_number(lhs).is_none() {
-        (lhs_rk, lhs)
+    let (bad_rk, bad_value) = if to_arith_number(gc, lhs.1).is_none() {
+        lhs
     } else {
-        (rhs_rk, rhs)
+        rhs
     };
     operand_error_message(
+        gc,
         proto,
         pc,
         bad_rk,
@@ -1911,6 +1954,7 @@ fn arith_error_message(
 }
 
 fn unm_error_message(
+    gc: &GarbageCollector,
     proto: &Proto,
     pc: usize,
     rk: usize,
@@ -1918,6 +1962,7 @@ fn unm_error_message(
     value: &Value,
 ) -> String {
     operand_error_message(
+        gc,
         proto,
         pc,
         rk as i32,
@@ -1928,6 +1973,7 @@ fn unm_error_message(
 }
 
 fn operand_error_message(
+    gc: &GarbageCollector,
     proto: &Proto,
     pc: usize,
     rk: i32,
@@ -1936,12 +1982,13 @@ fn operand_error_message(
     prefix: &str,
 ) -> String {
     let type_desc = value_type_name(value);
-    describe_operand(proto, pc, rk, constants, 8)
+    describe_operand(gc, proto, pc, rk, constants, 8)
         .map(|name| format!("{prefix} {name} (a {type_desc} value)"))
         .unwrap_or_else(|| format!("{prefix} a non-number value"))
 }
 
 fn describe_operand(
+    gc: &GarbageCollector,
     proto: &Proto,
     pc: usize,
     rk: i32,
@@ -1951,31 +1998,34 @@ fn describe_operand(
     if opcode::is_k(rk) {
         None
     } else {
-        describe_register(proto, pc, rk as usize, constants, depth)
+        describe_register(gc, proto, pc, rk as usize, constants, depth)
     }
 }
 
 fn describe_register(
+    gc: &GarbageCollector,
     proto: &Proto,
     pc: usize,
     reg: usize,
     constants: &[Value],
     depth: usize,
 ) -> Option<String> {
-    describe_register_impl(proto, pc, reg, constants, depth, true)
+    describe_register_impl(gc, proto, pc, reg, constants, depth, true)
 }
 
 fn describe_register_for_index(
+    gc: &GarbageCollector,
     proto: &Proto,
     pc: usize,
     reg: usize,
     constants: &[Value],
     depth: usize,
 ) -> Option<String> {
-    describe_register_impl(proto, pc, reg, constants, depth, false)
+    describe_register_impl(gc, proto, pc, reg, constants, depth, false)
 }
 
 fn describe_register_impl(
+    gc: &GarbageCollector,
     proto: &Proto,
     pc: usize,
     reg: usize,
@@ -1987,7 +2037,7 @@ fn describe_register_impl(
         return None;
     }
 
-    if let Some(name) = local_name_for_reg(proto, reg, pc) {
+    if let Some(name) = local_name_for_reg(gc, proto, reg, pc) {
         return Some(format!("local '{name}'"));
     }
 
@@ -2004,6 +2054,7 @@ fn describe_register_impl(
             OpCode::MOVE => {
                 let source = opcode::get_arg_b(inst) as usize;
                 return describe_register_impl(
+                    gc,
                     proto,
                     cursor,
                     source,
@@ -2016,7 +2067,7 @@ fn describe_register_impl(
                 let upvalue = opcode::get_arg_b(inst) as usize;
                 return proto
                     .upvalue_name(upvalue)
-                    .and_then(gc_string_lossy)
+                    .and_then(|name| gc_string_lossy(gc, name))
                     .map(|name| format!("upvalue '{name}'"));
             }
             OpCode::GETGLOBAL => {
@@ -2028,18 +2079,18 @@ fn describe_register_impl(
                     return None;
                 }
                 let bx = opcode::get_arg_bx(inst) as usize;
-                return constant_string(constants, bx).map(|name| format!("global '{name}'"));
+                return constant_string(gc, constants, bx).map(|name| format!("global '{name}'"));
             }
             OpCode::GETTABLE => {
                 let key = opcode::get_arg_c(inst);
-                if let Some(name) = rk_string(constants, key) {
+                if let Some(name) = rk_string(gc, constants, key) {
                     return Some(format!("field '{name}'"));
                 }
                 return None;
             }
             OpCode::SELF => {
                 let key = opcode::get_arg_c(inst);
-                if let Some(name) = rk_string(constants, key) {
+                if let Some(name) = rk_string(gc, constants, key) {
                     return Some(format!("method '{name}'"));
                 }
                 return None;
@@ -2101,7 +2152,12 @@ fn instruction_writes_register(op: OpCode, inst: lua_core::proto::Instruction, r
     }
 }
 
-fn local_name_for_reg(proto: &Proto, reg: usize, pc: usize) -> Option<String> {
+fn local_name_for_reg(
+    gc: &GarbageCollector,
+    proto: &Proto,
+    reg: usize,
+    pc: usize,
+) -> Option<String> {
     let pc = pc as i32;
     for idx in (0..proto.loc_var_count()).rev() {
         let loc = proto.loc_var(idx);
@@ -2110,30 +2166,32 @@ fn local_name_for_reg(proto: &Proto, reg: usize, pc: usize) -> Option<String> {
             && pc < loc.endpc
             && let Some(name_ref) = loc.varname
         {
-            return gc_string_lossy(name_ref);
+            return gc_string_lossy(gc, name_ref);
         }
     }
     None
 }
 
-fn rk_string(constants: &[Value], rk: i32) -> Option<String> {
+fn rk_string(gc: &GarbageCollector, constants: &[Value], rk: i32) -> Option<String> {
     if opcode::is_k(rk) {
-        constant_string(constants, opcode::index_k(rk) as usize)
+        constant_string(gc, constants, opcode::index_k(rk) as usize)
     } else {
         None
     }
 }
 
-fn constant_string(constants: &[Value], idx: usize) -> Option<String> {
+fn constant_string(gc: &GarbageCollector, constants: &[Value], idx: usize) -> Option<String> {
     match constants.get(idx) {
-        Some(Value::String(name_ref)) => gc_string_lossy(*name_ref),
+        Some(Value::String(name_ref)) => gc_string_lossy(gc, *name_ref),
         _ => None,
     }
 }
 
-fn gc_string_lossy(name_ref: GcRef<GcString>) -> Option<String> {
-    // SAFETY: debug names/constants are owned by the active Proto while executing.
-    unsafe { name_ref.as_ref() }.map(|name| name.to_string_lossy().into_owned())
+fn gc_string_lossy(gc: &GarbageCollector, name_ref: GcRef<GcString>) -> Option<String> {
+    gc.with_string_bytes(name_ref, |bytes| {
+        String::from_utf8_lossy(bytes).into_owned()
+    })
+    .ok()
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2205,7 +2263,8 @@ fn install_arg_table(l: &mut LuaState, gc: &mut GarbageCollector, slot: usize, v
                 .set_table_entry(&table, &Value::Number((idx + 1) as f64), value)
                 .expect("VM vararg values belong to the active collector");
         }
-        let n_key = transaction.alloc(GcString::from_bytes(b"n"));
+        let n_key = rooted_vm_bytes(l, transaction, b"n")
+            .expect("VM vararg Table requires the active Runtime StringPool");
         transaction
             .set_table_value(&table, &n_key, &Value::Number(varargs.len() as f64))
             .expect("VM vararg count publication remains collector-valid");
@@ -2359,7 +2418,7 @@ fn finish_native_call(
         unwind_lua_frames_to(l, gc, saved_ci)?;
         l.top = saved_top;
         return Err(error_value
-            .map(RuntimeError::with_value)
+            .map(|value| RuntimeError::with_value(gc, value))
             .unwrap_or_else(|| {
                 RuntimeError::new(format!("C function call failed: {display_name}"))
             }));
@@ -2645,7 +2704,8 @@ fn publish_runtime_native_error(
     message: &[u8],
 ) -> i32 {
     gc.with_publication(|transaction| {
-        let error = transaction.alloc(GcString::from_bytes(message));
+        let error = rooted_vm_bytes(l, transaction, message)
+            .expect("Runtime-native errors require the active Runtime StringPool");
         // SAFETY: every branch installs the error string on the active stack
         // before its publication root is released.
         unsafe {
@@ -2893,7 +2953,7 @@ fn get_table_into(
 
                 let Some(index_metamethod) = table_obj
                     .metatable()
-                    .and_then(|mt| lookup_metamethod(mt, "__index"))
+                    .and_then(|mt| lookup_metamethod(l, gc, mt, "__index"))
                 else {
                     if let Some(slot) = l.stack.at_mut(destination) {
                         *slot = Value::Nil;
@@ -2922,15 +2982,15 @@ fn get_table_into(
                 }
             }
             Value::String(_) => {
-                let result = get_string_library_member(l, key);
+                let result = get_string_library_member(l, gc, key);
                 if let Some(slot) = l.stack.at_mut(destination) {
                     *slot = result;
                 }
                 return Ok(());
             }
             _ => {
-                let Some(index_metamethod) =
-                    value_metatable(l, &current).and_then(|mt| lookup_metamethod(mt, "__index"))
+                let Some(index_metamethod) = value_metatable(l, gc, &current)
+                    .and_then(|mt| lookup_metamethod(l, gc, mt, "__index"))
                 else {
                     if let Some(slot) = l.stack.at_mut(destination) {
                         *slot = Value::Nil;
@@ -2962,33 +3022,23 @@ fn get_table_into(
     Err(RuntimeError::new("'__index' chain too long"))
 }
 
-fn get_string_library_member(l: &LuaState, key: &Value) -> Value {
+fn get_string_library_member(l: &LuaState, gc: &GarbageCollector, key: &Value) -> Value {
     let Some(global_table) = l.global_table else {
         return Value::Nil;
     };
-    // SAFETY: the global table is rooted and GC does not run during VM execution.
-    let Some(global) = (unsafe { global_table.as_ref() }) else {
+    let Some(string_name) = interned_name_ref(l, gc, b"string") else {
         return Value::Nil;
     };
-
-    for (global_key, global_value) in global.hash_entries() {
-        let Value::String(name_ref) = global_key else {
-            continue;
-        };
-        // SAFETY: keys are held by the rooted global table.
-        let Some(name) = (unsafe { name_ref.as_ref() }) else {
-            continue;
-        };
-        if name.as_bytes() == b"string"
-            && let Value::Table(string_table_ref) = global_value
-            // SAFETY: string library table is reachable from the global table.
-            && let Some(string_table) = unsafe { string_table_ref.as_ref() }
-        {
-            return string_table.get(key);
-        }
-    }
-
-    Value::Nil
+    let string_table = gc
+        .with_ref(global_table, |global| {
+            global.get(&Value::String(string_name))
+        })
+        .ok();
+    let Some(Value::Table(string_table)) = string_table else {
+        return Value::Nil;
+    };
+    gc.with_ref(string_table, |table| table.get(key))
+        .unwrap_or(Value::Nil)
 }
 
 /// 表赋值（含元方法回退）
@@ -3022,7 +3072,7 @@ fn set_table_value(
                     if let Some(table_obj) = unsafe { t.as_ref() }
                         && let Some(newindex_metamethod) = table_obj
                             .metatable()
-                            .and_then(|mt| lookup_metamethod(mt, "__newindex"))
+                            .and_then(|mt| lookup_metamethod(l, gc, mt, "__newindex"))
                     {
                         match newindex_metamethod {
                             Value::Function(_) => {
@@ -3057,8 +3107,8 @@ fn set_table_value(
                 return Ok(());
             }
             _ => {
-                if let Some(newindex_metamethod) =
-                    value_metatable(l, &current).and_then(|mt| lookup_metamethod(mt, "__newindex"))
+                if let Some(newindex_metamethod) = value_metatable(l, gc, &current)
+                    .and_then(|mt| lookup_metamethod(l, gc, mt, "__newindex"))
                 {
                     match newindex_metamethod {
                         Value::Function(_) => {
@@ -3113,7 +3163,7 @@ fn exec_arith_into(
         _ => return Err(RuntimeError::new("unknown arithmetic operation")),
     };
 
-    if let (Some(a), Some(b)) = (to_arith_number(lhs), to_arith_number(rhs)) {
+    if let (Some(a), Some(b)) = (to_arith_number(gc, lhs), to_arith_number(gc, rhs)) {
         let result = match op {
             OpCode::ADD => a + b,
             OpCode::SUB => a - b,
@@ -3139,7 +3189,7 @@ fn exec_arith_into(
         return Ok(());
     }
 
-    if let Some(metamethod) = find_metamethod(l, lhs, rhs, metamethod_name) {
+    if let Some(metamethod) = find_metamethod(l, gc, lhs, rhs, metamethod_name) {
         call_metamethod_into(
             l,
             gc,
@@ -3163,13 +3213,13 @@ fn exec_unm_into(
     val: &Value,
     destination: usize,
 ) -> Result<(), RuntimeError> {
-    if let Some(n) = to_arith_number(val) {
+    if let Some(n) = to_arith_number(gc, val) {
         if let Some(slot) = l.stack.at_mut(destination) {
             *slot = Value::Number(-n);
         }
         return Ok(());
     }
-    if let Some(metamethod) = find_metamethod(l, val, val, "__unm") {
+    if let Some(metamethod) = find_metamethod(l, gc, val, val, "__unm") {
         call_metamethod_into(
             l,
             gc,
@@ -3193,7 +3243,7 @@ fn exec_concat_into(
     rhs: &Value,
     destination: usize,
 ) -> Result<(), RuntimeError> {
-    if let (Some(left), Some(right)) = (to_concat_bytes(lhs), to_concat_bytes(rhs)) {
+    if let (Some(left), Some(right)) = (to_concat_bytes(gc, lhs), to_concat_bytes(gc, rhs)) {
         let len = left
             .len()
             .checked_add(right.len())
@@ -3207,13 +3257,10 @@ fn exec_concat_into(
         let pool = l.string_pool;
         return gc
             .with_publication(|transaction| {
-                let string = if let Some(pool) = pool {
-                    // SAFETY: the Runtime owns the pool and VM execution has
-                    // exclusive access to it for this state turn.
-                    transaction.intern_bytes(unsafe { &mut *pool }, &bytes)?
-                } else {
-                    transaction.alloc(GcString::from_bytes(&bytes))
-                };
+                let pool = pool.ok_or(GcRefValidationError::StringPoolUnavailable)?;
+                // SAFETY: the Runtime owns the pool and VM execution has
+                // exclusive access to it for this state turn.
+                let string = transaction.intern_bytes(unsafe { &mut *pool }, &bytes)?;
                 // SAFETY: the callback installs the result in the destination
                 // VM register before releasing its temporary root.
                 unsafe {
@@ -3228,7 +3275,7 @@ fn exec_concat_into(
                 RuntimeError::new(format!("VM: could not publish concat string: {error}"))
             });
     }
-    if let Some(metamethod) = find_metamethod(l, lhs, rhs, "__concat") {
+    if let Some(metamethod) = find_metamethod(l, gc, lhs, rhs, "__concat") {
         call_metamethod_into(
             l,
             gc,
@@ -3245,26 +3292,14 @@ fn exec_concat_into(
 }
 
 /// 取长度
-fn exec_len(val: &Value) -> Value {
+fn exec_len(gc: &GarbageCollector, val: &Value) -> Value {
     match val {
-        Value::String(s) => {
-            // SAFETY: GC does not run during VM execution; the GcString is alive
-            // as long as it's reachable from the LuaState stack or proto constants.
-            if let Some(gc_str) = unsafe { s.as_ref() } {
-                Value::Number(gc_str.len() as f64)
-            } else {
-                Value::Number(0.0)
-            }
-        }
-        Value::Table(t) => {
-            // SAFETY: GC does not run during VM execution; the table is alive
-            // as long as it's reachable from the LuaState stack.
-            if let Some(table_obj) = unsafe { t.as_ref() } {
-                Value::Number(table_obj.length() as f64)
-            } else {
-                Value::Number(0.0)
-            }
-        }
+        Value::String(s) => gc
+            .with_ref(*s, |string| Value::Number(string.len() as f64))
+            .unwrap_or(Value::Number(0.0)),
+        Value::Table(t) => gc
+            .with_ref(*t, |table| Value::Number(table.length() as f64))
+            .unwrap_or(Value::Number(0.0)),
         _ => Value::Number(0.0),
     }
 }
@@ -3279,21 +3314,15 @@ fn exec_lt(
 ) -> Result<bool, RuntimeError> {
     match (lhs, rhs) {
         (Value::Number(a), Value::Number(b)) => Ok(a < b),
-        (Value::String(a_ref), Value::String(b_ref)) => {
-            // SAFETY: GC does not run during VM execution; GcString refs are valid
-            // because the string values are on the LuaState stack.
-            let a_str = unsafe { a_ref.as_ref() };
-            // SAFETY: Same justification as above — GC is not running during execution.
-            let b_str = unsafe { b_ref.as_ref() };
-            match (a_str, b_str) {
-                (Some(a), Some(b)) => {
-                    Ok(compare_lua_string_bytes(a.as_bytes(), b.as_bytes()) == Ordering::Less)
-                }
-                _ => Ok(false),
-            }
-        }
+        (Value::String(a_ref), Value::String(b_ref)) => gc
+            .with_string_bytes(*a_ref, |left| {
+                gc.with_string_bytes(*b_ref, |right| compare_lua_string_bytes(left, right))
+            })
+            .and_then(|ordering| ordering)
+            .map(|ordering| ordering == Ordering::Less)
+            .map_err(|error| RuntimeError::new(format!("invalid string comparison: {error}"))),
         _ => {
-            if let Some(metamethod) = find_common_metamethod(l, lhs, rhs, "__lt") {
+            if let Some(metamethod) = find_common_metamethod(l, gc, lhs, rhs, "__lt") {
                 call_metamethod_bool(l, gc, stack_limit, metamethod, lhs, rhs)
             } else {
                 Err(RuntimeError::new(
@@ -3314,23 +3343,18 @@ fn exec_le(
 ) -> Result<bool, RuntimeError> {
     match (lhs, rhs) {
         (Value::Number(a), Value::Number(b)) => Ok(a <= b),
-        (Value::String(a_ref), Value::String(b_ref)) => {
-            // SAFETY: GC does not run during VM execution; same justification as exec_lt.
-            let a_str = unsafe { a_ref.as_ref() };
-            // SAFETY: Same justification — GC is not running during execution.
-            let b_str = unsafe { b_ref.as_ref() };
-            match (a_str, b_str) {
-                (Some(a), Some(b)) => {
-                    Ok(compare_lua_string_bytes(a.as_bytes(), b.as_bytes()) != Ordering::Greater)
-                }
-                _ => Ok(false),
-            }
-        }
+        (Value::String(a_ref), Value::String(b_ref)) => gc
+            .with_string_bytes(*a_ref, |left| {
+                gc.with_string_bytes(*b_ref, |right| compare_lua_string_bytes(left, right))
+            })
+            .and_then(|ordering| ordering)
+            .map(|ordering| ordering != Ordering::Greater)
+            .map_err(|error| RuntimeError::new(format!("invalid string comparison: {error}"))),
         _ => {
-            if let Some(metamethod) = find_common_metamethod(l, lhs, rhs, "__le") {
+            if let Some(metamethod) = find_common_metamethod(l, gc, lhs, rhs, "__le") {
                 return call_metamethod_bool(l, gc, stack_limit, metamethod, lhs, rhs);
             }
-            if let Some(metamethod) = find_common_metamethod(l, lhs, rhs, "__lt") {
+            if let Some(metamethod) = find_common_metamethod(l, gc, lhs, rhs, "__lt") {
                 return call_metamethod_bool(l, gc, stack_limit, metamethod, rhs, lhs)
                     .map(|result| !result);
             }
@@ -3446,26 +3470,39 @@ fn exec_eq(
     if !matches!(lhs, Value::Table(_) | Value::Userdata(_)) {
         return Ok(false);
     }
-    if let Some(metamethod) = find_common_metamethod(l, lhs, rhs, "__eq") {
+    if let Some(metamethod) = find_common_metamethod(l, gc, lhs, rhs, "__eq") {
         call_metamethod_bool(l, gc, stack_limit, metamethod, lhs, rhs)
     } else {
         Ok(false)
     }
 }
 
-fn find_metamethod(l: &LuaState, lhs: &Value, rhs: &Value, name: &str) -> Option<Value> {
-    value_metatable(l, lhs)
-        .and_then(|metatable| lookup_metamethod(metatable, name))
+fn find_metamethod(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    lhs: &Value,
+    rhs: &Value,
+    name: &str,
+) -> Option<Value> {
+    value_metatable(l, gc, lhs)
+        .and_then(|metatable| lookup_metamethod(l, gc, metatable, name))
         .or_else(|| {
-            value_metatable(l, rhs).and_then(|metatable| lookup_metamethod(metatable, name))
+            value_metatable(l, gc, rhs)
+                .and_then(|metatable| lookup_metamethod(l, gc, metatable, name))
         })
 }
 
-fn find_common_metamethod(l: &LuaState, lhs: &Value, rhs: &Value, name: &str) -> Option<Value> {
+fn find_common_metamethod(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    lhs: &Value,
+    rhs: &Value,
+    name: &str,
+) -> Option<Value> {
     let lhs_method =
-        value_metatable(l, lhs).and_then(|metatable| lookup_metamethod(metatable, name));
+        value_metatable(l, gc, lhs).and_then(|metatable| lookup_metamethod(l, gc, metatable, name));
     let rhs_method =
-        value_metatable(l, rhs).and_then(|metatable| lookup_metamethod(metatable, name));
+        value_metatable(l, gc, rhs).and_then(|metatable| lookup_metamethod(l, gc, metatable, name));
     match (lhs_method, rhs_method) {
         (Some(lhs_method), Some(rhs_method)) if values_equal(&lhs_method, &rhs_method) => {
             Some(lhs_method)
@@ -3474,16 +3511,13 @@ fn find_common_metamethod(l: &LuaState, lhs: &Value, rhs: &Value, name: &str) ->
     }
 }
 
-fn value_metatable(l: &LuaState, value: &Value) -> Option<GcRef<Table>> {
+fn value_metatable(l: &LuaState, gc: &GarbageCollector, value: &Value) -> Option<GcRef<Table>> {
     match value {
-        Value::Table(table_ref) => {
-            // SAFETY: compared table values are reachable during VM execution.
-            unsafe { table_ref.as_ref() }.and_then(|table| table.metatable())
-        }
-        Value::Userdata(userdata_ref) => {
-            // SAFETY: compared userdata values are reachable during VM execution.
-            unsafe { userdata_ref.as_ref() }.and_then(|userdata| userdata.metatable())
-        }
+        Value::Table(table_ref) => gc.with_ref(*table_ref, Table::metatable).ok().flatten(),
+        Value::Userdata(userdata_ref) => gc
+            .with_ref(*userdata_ref, |userdata| userdata.metatable())
+            .ok()
+            .flatten(),
         Value::Nil => l.nil_metatable,
         Value::Boolean(_) => l.boolean_metatable,
         Value::Number(_) => l.number_metatable,
@@ -3491,32 +3525,32 @@ fn value_metatable(l: &LuaState, value: &Value) -> Option<GcRef<Table>> {
     }
 }
 
-fn lookup_metamethod(metatable: GcRef<Table>, name: &str) -> Option<Value> {
-    // SAFETY: metatable is held by a live value being compared.
-    let metatable = unsafe { metatable.as_ref() }?;
-    for (key, value) in metatable.hash_entries() {
-        if string_value_bytes(key).is_some_and(|key| key == name.as_bytes()) && !value.is_nil() {
-            return Some(value.clone());
-        }
-    }
-    None
+fn interned_name_ref(l: &LuaState, gc: &GarbageCollector, name: &[u8]) -> Option<GcRef<GcString>> {
+    let string_pool = l.string_pool?;
+    // SAFETY: Runtime installs its live StringPool for exactly the state turn.
+    let candidate = unsafe { &*string_pool }.find_bytes(name)?;
+    gc.with_ref(candidate, |_| candidate).ok()
 }
 
-fn string_value_bytes(value: &Value) -> Option<&[u8]> {
-    let Value::String(string_ref) = value else {
-        return None;
-    };
-    // SAFETY: string value is reachable during VM execution.
-    unsafe { string_ref.as_ref() }.map(GcString::as_bytes)
+fn lookup_metamethod(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    metatable: GcRef<Table>,
+    name: &str,
+) -> Option<Value> {
+    let key = interned_name_ref(l, gc, name.as_bytes())?;
+    gc.with_ref(metatable, |table| table.get(&Value::String(key)))
+        .ok()
+        .filter(|value| !value.is_nil())
 }
 
-fn to_arith_number(value: &Value) -> Option<f64> {
+fn to_arith_number(gc: &GarbageCollector, value: &Value) -> Option<f64> {
     match value {
         Value::Number(n) => Some(*n),
-        Value::String(s) => {
-            // SAFETY: string value is reachable during VM execution.
-            unsafe { s.as_ref() }.and_then(|string| parse_lua_number_bytes(string.as_bytes()))
-        }
+        Value::String(s) => gc
+            .with_string_bytes(*s, parse_lua_number_bytes)
+            .ok()
+            .flatten(),
         _ => None,
     }
 }
@@ -3531,12 +3565,9 @@ fn parse_lua_number_bytes(mut bytes: &[u8]) -> Option<f64> {
     std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()
 }
 
-fn to_concat_bytes(value: &Value) -> Option<Vec<u8>> {
+fn to_concat_bytes(gc: &GarbageCollector, value: &Value) -> Option<Vec<u8>> {
     match value {
-        Value::String(s) => {
-            // SAFETY: string value is reachable during VM execution.
-            unsafe { s.as_ref() }.map(|string| string.as_bytes().to_vec())
-        }
+        Value::String(s) => gc.with_string_bytes(*s, <[u8]>::to_vec).ok(),
         Value::Number(n) => {
             let text = if n.fract() == 0.0 && n.is_finite() {
                 format!("{n:.0}")
@@ -3551,34 +3582,11 @@ fn to_concat_bytes(value: &Value) -> Option<Vec<u8>> {
 
 /// 值相等
 fn values_equal(lhs: &Value, rhs: &Value) -> bool {
-    match (lhs, rhs) {
-        (Value::Nil, Value::Nil) => true,
-        (Value::Boolean(a), Value::Boolean(b)) => a == b,
-        (Value::Number(a), Value::Number(b)) => a == b,
-        (Value::String(a), Value::String(b)) => {
-            // Compare string content, not pointer identity
-            // SAFETY: GC does not run during VM execution; string refs are valid
-            // because they are on the LuaState stack or in proto constants.
-            let a_str = unsafe { a.as_ref() };
-            // SAFETY: Same justification — GC is not running during execution.
-            let b_str = unsafe { b.as_ref() };
-            match (a_str, b_str) {
-                (Some(a), Some(b)) => a.as_bytes() == b.as_bytes(),
-                _ => a.as_ptr() == b.as_ptr(),
-            }
-        }
-        // GC pointer types: compare pointer identity.
-        (Value::Table(a), Value::Table(b)) => a.as_ptr() == b.as_ptr(),
-        (Value::Function(a), Value::Function(b)) => a.as_ptr() == b.as_ptr(),
-        (Value::Userdata(a), Value::Userdata(b)) => a.as_ptr() == b.as_ptr(),
-        (Value::Thread(a), Value::Thread(b)) => a.as_ptr() == b.as_ptr(),
-        // Different types are never equal
-        _ => false,
-    }
+    lhs == rhs
 }
 
 /// 提取数值（含字符串强制转换）
-fn as_number(val: &Value) -> f64 {
+fn as_number(gc: &GarbageCollector, val: &Value) -> f64 {
     match val {
         Value::Number(n) => *n,
         Value::Boolean(b) => {
@@ -3588,21 +3596,17 @@ fn as_number(val: &Value) -> f64 {
                 0.0
             }
         }
-        Value::String(s) => {
-            // Try to parse string as number
-            // SAFETY: GC does not run during VM execution; same justification as above.
-            if let Some(gc_str) = unsafe { s.as_ref() } {
-                parse_lua_number_bytes(gc_str.as_bytes()).unwrap_or(0.0)
-            } else {
-                0.0
-            }
-        }
+        Value::String(s) => gc
+            .with_string_bytes(*s, parse_lua_number_bytes)
+            .ok()
+            .flatten()
+            .unwrap_or(0.0),
         _ => 0.0,
     }
 }
 
 /// 值转字符串（调试和 CONCAT 使用）
-fn value_to_string(val: &Value) -> String {
+fn value_to_string(gc: &GarbageCollector, val: &Value) -> String {
     match val {
         Value::Nil => "nil".to_string(),
         Value::Boolean(b) => b.to_string(),
@@ -3614,15 +3618,9 @@ fn value_to_string(val: &Value) -> String {
                 n.to_string()
             }
         }
-        Value::String(s) => {
-            // SAFETY: GC does not run during VM execution; GcString is valid
-            // because the string value is on the LuaState stack or in constants.
-            if let Some(gc_str) = unsafe { s.as_ref() } {
-                gc_str.to_string_lossy().into_owned()
-            } else {
-                String::new()
-            }
-        }
+        Value::String(s) => gc
+            .with_string_bytes(*s, |bytes| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default(),
         Value::Table(t) => format!("table: {:p}", t.as_ptr()),
         Value::Function(f) => format!("function: {:p}", f.as_ptr()),
         Value::Userdata(u) => format!("userdata: {:p}", u.as_ptr()),
@@ -3655,9 +3653,9 @@ impl RuntimeError {
         }
     }
 
-    pub fn with_value(value: Value) -> Self {
+    pub fn with_value(gc: &GarbageCollector, value: Value) -> Self {
         Self {
-            message: value_to_string(&value),
+            message: value_to_string(gc, &value),
             error_value: Some(value),
             native_request_suspend: false,
         }
@@ -3699,22 +3697,28 @@ mod byte_string_tests {
         let Some(gc) = state.gc else {
             return 0;
         };
+        let Some(string_pool) = state.string_pool else {
+            return 0;
+        };
         // SAFETY: the collector pointer is installed for this call.
         let gc = unsafe { &mut *gc };
-        let string = gc.create(GcString::from_bytes(b"fresh result"));
+        // SAFETY: the StringPool pointer is installed for this call.
+        let string_pool = unsafe { &mut *string_pool };
+        let string = string_pool.intern_bytes(gc, b"fresh result");
         state.push_value(Value::String(string));
         1
     }
 
-    fn byte_value(gc: &mut GarbageCollector, bytes: &[u8]) -> Value {
-        Value::String(gc.create(GcString::from_bytes(bytes)))
+    fn byte_value(gc: &mut GarbageCollector, string_pool: &mut StringPool, bytes: &[u8]) -> Value {
+        Value::String(string_pool.intern_bytes(gc, bytes))
     }
 
     #[test]
     fn raw_ff_is_not_equal_to_utf8_encoding_of_y_diaeresis() {
         let mut gc = GarbageCollector::new();
-        let raw_ff = byte_value(&mut gc, &[0xff]);
-        let utf8_y_diaeresis = byte_value(&mut gc, &[0xc3, 0xbf]);
+        let mut pool = StringPool::new();
+        let raw_ff = byte_value(&mut gc, &mut pool, &[0xff]);
+        let utf8_y_diaeresis = byte_value(&mut gc, &mut pool, &[0xc3, 0xbf]);
 
         assert!(!values_equal(&raw_ff, &utf8_y_diaeresis));
     }
@@ -3724,9 +3728,10 @@ mod byte_string_tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
         let mut state = LuaState::new();
+        state.gc = Some(&mut gc);
         state.string_pool = Some(&mut pool);
-        let left = byte_value(&mut gc, &[0x00, 0x80, 0xff]);
-        let right = byte_value(&mut gc, &[0xfe, 0xc3, 0x00]);
+        let left = byte_value(&mut gc, &mut pool, &[0x00, 0x80, 0xff]);
+        let right = byte_value(&mut gc, &mut pool, &[0xfe, 0xc3, 0x00]);
         let expected = [0x00, 0x80, 0xff, 0xfe, 0xc3, 0x00];
 
         ensure_stack_slot(&mut state, 0);
@@ -3735,21 +3740,20 @@ mod byte_string_tests {
         let Value::String(result_ref) = result else {
             panic!("concat must return a Lua string");
         };
-        // SAFETY: result_ref was just allocated in gc and remains live.
-        let result_string = unsafe { result_ref.as_ref() }.expect("non-null string");
-
-        assert_eq!(result_string.as_bytes(), expected);
+        gc.with_string_bytes(result_ref, |bytes| assert_eq!(bytes, expected))
+            .expect("non-null string");
         assert_eq!(pool.find_bytes(&expected), Some(result_ref));
     }
 
     #[test]
     fn embedded_nul_participates_in_length_and_equality() {
         let mut gc = GarbageCollector::new();
-        let first = byte_value(&mut gc, b"a\0b");
-        let same = byte_value(&mut gc, b"a\0b");
-        let different_tail = byte_value(&mut gc, b"a\0c");
+        let mut pool = StringPool::new();
+        let first = byte_value(&mut gc, &mut pool, b"a\0b");
+        let same = byte_value(&mut gc, &mut pool, b"a\0b");
+        let different_tail = byte_value(&mut gc, &mut pool, b"a\0c");
 
-        assert_eq!(exec_len(&first), Value::Number(3.0));
+        assert_eq!(exec_len(&gc, &first), Value::Number(3.0));
         assert!(values_equal(&first, &same));
         assert!(!values_equal(&first, &different_tail));
     }
@@ -3765,9 +3769,12 @@ mod byte_string_tests {
         );
 
         let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
         let mut state = LuaState::new();
-        let left = byte_value(&mut gc, b"a\0b");
-        let right = byte_value(&mut gc, b"a\0c");
+        state.gc = Some(&mut gc);
+        state.string_pool = Some(&mut pool);
+        let left = byte_value(&mut gc, &mut pool, b"a\0b");
+        let right = byte_value(&mut gc, &mut pool, b"a\0c");
         assert!(exec_lt(&mut state, &mut gc, 0, &left, &right).expect("strings compare"));
         assert!(exec_le(&mut state, &mut gc, 0, &left, &right).expect("strings compare"));
     }
@@ -3775,19 +3782,24 @@ mod byte_string_tests {
     #[test]
     fn invalid_utf8_numeric_string_fails_without_panicking() {
         let mut gc = GarbageCollector::new();
-        let invalid = byte_value(&mut gc, &[b' ', 0xff, b'1', b' ']);
+        let mut pool = StringPool::new();
+        let invalid = byte_value(&mut gc, &mut pool, &[b' ', 0xff, b'1', b' ']);
 
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| to_arith_number(&invalid)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            to_arith_number(&gc, &invalid)
+        }));
         assert_eq!(result.expect("numeric conversion must not panic"), None);
-        assert_eq!(as_number(&invalid), 0.0);
+        assert_eq!(as_number(&gc, &invalid), 0.0);
     }
 
     #[test]
     fn protected_call_results_are_published_before_stack_window_restores() {
         let mut gc = GarbageCollector::new();
+        let mut string_pool = StringPool::new();
         let function = gc.create(Function::new_c(return_fresh_string));
         let mut state = LuaState::new();
+        state.gc = Some(&mut gc);
+        state.string_pool = Some(&mut string_pool);
 
         call_value_with_results(
             &mut state,
@@ -3827,10 +3839,14 @@ mod proto_handle_tests {
         0
     }
 
-    fn compile(gc: &mut GarbageCollector, source: &str) -> GcRef<Proto> {
+    fn compile(
+        gc: &mut GarbageCollector,
+        string_pool: &mut StringPool,
+        source: &str,
+    ) -> GcRef<Proto> {
         let mut parser = Parser::new(source);
         let chunk = parser.parse().expect("test source parses");
-        let proto = CodeGenerator::new(gc)
+        let proto = CodeGenerator::new_with_pool(gc, string_pool)
             .generate(&chunk, "<proto-handle-test>")
             .expect("test source compiles");
         gc.create(proto)
@@ -3859,9 +3875,13 @@ mod proto_handle_tests {
     #[test]
     fn return_and_error_clear_inactive_proto_and_vararg_frames() {
         let mut gc = GarbageCollector::new();
+        let mut string_pool = StringPool::new();
         let mut returned = LuaState::new();
+        returned.gc = Some(&mut gc);
+        returned.string_pool = Some(&mut string_pool);
         let return_proto = compile(
             &mut gc,
+            &mut string_pool,
             "local function f(...) return 42 end return f(1, 2)",
         );
         assert!(matches!(
@@ -3879,8 +3899,11 @@ mod proto_handle_tests {
         );
 
         let mut errored = LuaState::new();
+        errored.gc = Some(&mut gc);
+        errored.string_pool = Some(&mut string_pool);
         let error_proto = compile(
             &mut gc,
+            &mut string_pool,
             "local function f(...) return nil + 1 end return f(1, 2)",
         );
         execute_proto(&mut errored, error_proto, &mut gc)
@@ -3898,6 +3921,7 @@ mod proto_handle_tests {
     fn debug_line_skip_is_one_shot_and_matches_full_object_identity() {
         LINE_HOOK_CALLS.store(0, AtomicOrdering::SeqCst);
         let mut gc = GarbageCollector::new();
+        let mut string_pool = StringPool::new();
         let mut first = Proto::new();
         first.add_line_info(17);
         let first = gc.create(first);
@@ -3908,6 +3932,8 @@ mod proto_handle_tests {
 
         let hook = gc.create(Function::new_c(counting_line_hook));
         let mut state = LuaState::new();
+        state.gc = Some(&mut gc);
+        state.string_pool = Some(&mut string_pool);
         state.debug_hook = Some(Value::Function(hook));
         state.debug_hook_mask = "l".to_string();
         state.debug_hook_skip_proto = Some(first);

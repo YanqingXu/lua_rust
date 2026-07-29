@@ -286,20 +286,12 @@ impl PartialEq for Value {
             (Value::Number(a), Value::Number(b)) => a.to_bits() == b.to_bits(),
             // Light userdata compares by exact host-pointer identity.
             (Value::LightUserdata(a), Value::LightUserdata(b)) => a == b,
-            // Lua strings compare by byte content. Interning keeps this fast in
-            // the common path, but equality must still be correct if a caller
-            // creates two GC strings outside the shared pool.
-            (Value::String(a), Value::String(b)) => {
-                if a == b {
-                    true
-                } else {
-                    // SAFETY: string Value operands are live while equality is evaluated.
-                    let a_data = unsafe { a.as_ref() }.map(|s| s.as_bytes());
-                    // SAFETY: string Value operands are live while equality is evaluated.
-                    let b_data = unsafe { b.as_ref() }.map(|s| s.as_bytes());
-                    a_data == b_data
-                }
-            }
+            // Runtime-visible strings are canonical-interned. Value equality
+            // therefore uses allocation identity and never dereferences a
+            // possibly foreign, stale, or address-reused handle. Boundaries
+            // that intentionally compare non-canonical strings by content
+            // must use GarbageCollector::string_refs_equal.
+            (Value::String(a), Value::String(b)) => a == b,
             (Value::Table(a), Value::Table(b)) => a == b,
             (Value::Function(a), Value::Function(b)) => a == b,
             (Value::Userdata(a), Value::Userdata(b)) => a == b,
@@ -328,13 +320,8 @@ impl Hash for Value {
             }
             Value::Number(n) => n.to_bits().hash(state),
             Value::LightUserdata(p) => p.hash(state),
-            Value::String(s) => {
-                // SAFETY: GC single-threaded model ensures the GcString
-                // is alive while we hold a GcRef to it. Reading the
-                // precomputed hash is a pure read with no side effects.
-                let h = unsafe { s.as_ref() }.map(|gs| gs.hash()).unwrap_or(0);
-                h.hash(state);
-            }
+            // Hash the same non-dereferencing identity used by PartialEq.
+            Value::String(s) => s.hash(state),
             Value::Table(t) => t.hash(state),
             Value::Function(f) => f.hash(state),
             Value::Userdata(u) => u.hash(state),
@@ -400,21 +387,23 @@ mod tests {
     }
 
     #[test]
-    fn test_string_values_compare_by_content_without_interning() {
+    fn noncanonical_string_values_compare_by_identity_without_dereferencing() {
         let mut gc = GarbageCollector::new();
         let left = gc.create(GcString::from_bytes(b"same"));
         let right = gc.create(GcString::from_bytes(b"same"));
 
         assert_ne!(left, right);
-        assert_eq!(Value::String(left), Value::String(right));
+        assert_ne!(Value::String(left), Value::String(right));
+        assert_eq!(Value::String(left), Value::String(left));
     }
 
     #[test]
-    fn string_value_equality_and_hash_use_the_same_exact_bytes() {
+    fn canonical_string_value_equality_and_hash_use_the_same_identity() {
         let mut gc = GarbageCollector::new();
-        let latin1 = Value::String(gc.create(GcString::from_bytes(&[0xe9])));
-        let latin1_duplicate = Value::String(gc.create(GcString::from_bytes(&[0xe9])));
-        let utf8 = Value::String(gc.create(GcString::from_utf8_text("é")));
+        let mut pool = StringPool::new();
+        let latin1 = Value::String(pool.intern_bytes(&mut gc, &[0xe9]));
+        let latin1_duplicate = Value::String(pool.intern_bytes(&mut gc, &[0xe9]));
+        let utf8 = Value::String(pool.intern_bytes(&mut gc, "é".as_bytes()));
 
         assert_eq!(latin1, latin1_duplicate);
         assert_ne!(latin1, utf8);

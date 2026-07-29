@@ -389,8 +389,9 @@ mod byte_source_tests {
         let mut parser = Parser::from_bytes(&source);
         let chunk = parser.parse().expect("byte source should parse");
         let mut gc = GarbageCollector::new();
+        let mut string_pool = StringPool::new();
         let proto = gc.with_publication(|transaction| {
-            let proto = CodeGenerator::new_in_publication(transaction)
+            let proto = CodeGenerator::new_in_publication_with_pool(transaction, &mut string_pool)
                 .generate(&chunk, "@bytes.lua")
                 .expect("byte source should compile");
             let proto = transaction.alloc(proto);
@@ -449,10 +450,8 @@ mod byte_source_tests {
             let Value::String(print_name) = proto.constant(0) else {
                 panic!("first constant should be the interned global name");
             };
-            // SAFETY: `gc` remains alive and no collection runs during this read.
-            let print_name =
-                unsafe { print_name.as_ref() }.expect("string constant should be live");
-            assert_eq!(print_name.as_bytes(), b"print");
+            gc.with_string_bytes(*print_name, |bytes| assert_eq!(bytes, b"print"))
+                .expect("string constant should be live");
         })
         .expect("root Proto remains registered");
     }

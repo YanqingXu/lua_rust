@@ -54,8 +54,8 @@ is not closed:
   pseudo-dump prefix;
 - `Runtime::trace_roots_mark_only` now provides the canonical object/state
   fixed-point root callback; temporary state roots are implemented, while
-  pending finalizers, fixed strings, scoped string access, and unique Heap
-  ownership remain incomplete;
+  pending finalizers, fixed strings, and unique Heap ownership remain
+  incomplete;
 - the two VM-side weak-cleanup scanners at
   `crates/lua_vm/src/execute.rs:1137-1188` and
   `crates/lua_stdlib/src/base.rs:432-495` disagree and are not safe sweep root
@@ -63,12 +63,14 @@ is not closed:
 - `GcRef<T>` now carries a process-unique, non-reused `ObjectId`, and each
   collector has an authoritative address-to-identity/type live table. This
   closes pointer-address reuse for checked collector entry points, but does
-  not yet provide the final unique `Heap` owner or scoped execution borrows.
-- safe `Value::String` equality and hashing still dereference the string
-  candidate without a collector-side validation context. Production code
-  currently creates non-interned `GcString` values directly, so changing Lua
-  string equality to handle identity would be a semantic regression. This is
-  an explicit sweep blocker, not a completed provenance claim.
+  not yet provide the final unique `Heap` owner or a general scoped object
+  execution context.
+- the production string contract is locally closed: every production
+  constructor is routed through the owning `StringPool`; `Value::String`
+  equality and hashing use non-reused handle identity without dereferencing;
+  and byte-content operations use collector/state-scoped validation. Duplicate
+  bytes, foreign/stale handles, embedded NUL/high-byte keys, and address reuse
+  are covered by regression tests and a static inventory gate.
 
 Standalone collector Drop and incomplete live-collection paths still use
 leaking as a fail-safe for several dangling-reference defects. Runtime close
@@ -413,15 +415,30 @@ API:
   checked against the live table before dispatch and are pruned before an
   allocation is dropped.
 
-This does **not** authorize live sweep. In particular, `GcRef::as_ref` remains
-an unsafe transitional escape hatch used by VM code, production construction
-does not yet force all strings through one interning boundary, and safe
-`Value::String::{eq, hash}` must preserve byte-content semantics but currently
-lacks a collector borrow. Until those call sites use checked scoped access (or
-string identity becomes a proven invariant), a stale string handle can still
-make safe equality/hashing read reclaimed memory. `ConstantKey` already hashes
-string handles by allocation identity, and safe `Value` formatting reports
-only pointer identity, but those narrower fixes do not close the string debt.
+The string-specific boundary is now explicit and locally enforced:
+
+- production `GcString` construction is canonical through the owning
+  `StringPool`; compiler entry points cannot operate without that pool;
+- safe `Value::String::{eq, hash}` uses `GcRef` identity and never reads object
+  memory;
+- Lua byte-content semantics use `GarbageCollector::with_string_bytes`,
+  `LuaState::with_string_bytes`, or a copy made inside those scopes;
+- Table keys and internal metamethod/library/name lookups use canonical
+  identity from the same pool.
+
+The normative string inventory is
+[`tests/compatibility/string_access_inventory.json`](../../tests/compatibility/string_access_inventory.json),
+validated by
+[`tools/check_string_contract.ps1`](../../tools/check_string_contract.ps1).
+That gate rejects production raw constructors, common unscoped string
+dereferences, compiler no-pool fallbacks, and regressions in the `Value`
+identity trait implementation.
+
+This still does **not** authorize live sweep. A unique `Heap` does not yet own
+collector, pool, allocator/accounting, and services as one lifetime; fixed
+strings and pending finalizers are not complete canonical roots; and the
+Runtime tracer is not yet the only destructive collector entry point. General
+non-string `GcRef::as_ref` migration also remains broader owner/context work.
 
 ## 5. Root tracing contract
 
@@ -837,12 +854,13 @@ proves both CLI `arg` and chunk varargs survive the explicit-root-to-state
 handoff.
 
 This is an API/registry foundation, not completion of live collection safety.
-Coroutine create/wrap, compiler, library/package, IO, VM/app, and synchronous
-result publication are migrated. Protected-call and top-level result callbacks
-are unit-returning, so collectable results cannot escape the rooted callback as
-Rust return values. Allocation-triggered collection remains
-disabled until production string Eq/Hash access is canonical/scoped, one Heap
-owns all services, and the Runtime root tracer drives the collector.
+Coroutine create/wrap, compiler, library/package, IO, VM/app, synchronous
+result publication, and the production string identity/access boundary are
+migrated. Protected-call and top-level result callbacks are unit-returning, so
+collectable results cannot escape the rooted callback as Rust return values.
+Allocation-triggered collection remains disabled until one Heap owns all
+services, fixed/finalizer roots are complete, and the Runtime root tracer drives
+the collector.
 
 #### D.3 Implemented temporary-state root transaction (local-complete slice)
 
@@ -872,10 +890,10 @@ temporary state roots and rejected releases; normal close and 1,000-cycle
 shutdown leave both at zero.
 
 This closes the inventory entry for coroutine state publication. Compiler
-Proto→Function builders, library/package, IO, VM/app, and synchronous result
-construction are now migrated, while string Eq/Hash/scoped access, unique Heap
-ownership, fixed strings, and finalizer roots remain blockers for live
-destructive collection.
+Proto→Function builders, library/package, IO, VM/app, synchronous result
+construction, and string identity/scoped access are now migrated. Unique Heap
+ownership, fixed strings, finalizer roots, and Runtime-only tracer wiring remain
+blockers for live destructive collection.
 
 ### E. Shutdown substrate — M1.8
 

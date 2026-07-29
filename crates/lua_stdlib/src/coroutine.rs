@@ -52,22 +52,10 @@ fn reg_runtime_native(
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
-    if let Some(gt) = l.global_table
-        // SAFETY: global table is rooted for the duration of library init.
-        && let Some(gt_obj) = unsafe { gt.as_ref() }
-    {
-        for (key, val) in gt_obj.hash_entries() {
-            if let Value::String(key_ref) = key
-                // SAFETY: key is held by the rooted global table.
-                && let Some(key_str) = unsafe { key_ref.as_ref() }
-                && key_str.as_bytes() == name.as_bytes()
-                && let Value::Table(t) = val
-            {
-                return *t;
-            }
-        }
-    }
-    GcRef::null()
+    crate::registration::find_library_table(l, name.as_bytes())
+        .ok()
+        .flatten()
+        .unwrap_or_else(GcRef::null)
 }
 
 unsafe extern "C" fn lua_coroutine_create(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -260,20 +248,23 @@ fn push_error(l: &mut LuaState, message: &'static [u8]) -> i32 {
 #[cfg(test)]
 mod byte_string_tests {
     use super::*;
-    use lua_core::gc_string::GcString;
+    use lua_core::string_pool::StringPool;
 
     #[test]
     fn library_lookup_requires_the_exact_ascii_key_bytes() {
         let mut gc = GarbageCollector::new();
+        let mut string_pool = StringPool::new();
         let target = gc.create(Table::new());
         let decoy = gc.create(Table::new());
-        let exact_key = gc.create(GcString::from_bytes(b"coroutine"));
-        let invalid_prefix_key = gc.create(GcString::from_bytes(b"coroutine\0\xff"));
+        let exact_key = string_pool.intern_bytes(&mut gc, b"coroutine");
+        let invalid_prefix_key = string_pool.intern_bytes(&mut gc, b"coroutine\0\xff");
         let mut global = Table::new();
         global.set(&Value::String(invalid_prefix_key), &Value::Table(decoy));
         global.set(&Value::String(exact_key), &Value::Table(target));
         let global_ref = gc.create(global);
-        let state = LuaState::with_global_table(global_ref);
+        let mut state = LuaState::with_global_table(global_ref);
+        state.gc = Some(&mut gc);
+        state.string_pool = Some(&mut string_pool);
 
         assert_eq!(find_lib_table(&state, "coroutine"), target);
         assert_ne!(find_lib_table(&state, "coroutine"), decoy);
@@ -290,15 +281,21 @@ mod byte_string_tests {
     #[test]
     fn lua_byte_results_preserve_nul_and_invalid_utf8() {
         let mut gc = GarbageCollector::new();
+        let mut string_pool = StringPool::new();
         let mut state = LuaState::new();
+        state.gc = Some(&mut gc);
+        state.string_pool = Some(&mut string_pool);
         let bytes = [0, 0xff, 0x80, b'x'];
 
         push_lua_bytes(&mut state, &mut gc, &bytes);
         let Value::String(string_ref) = state.at(-1).expect("result is pushed") else {
             panic!("expected Lua string result");
         };
-        // SAFETY: the collector remains alive and no collection runs.
-        let string = unsafe { string_ref.as_ref() }.expect("test string is live");
-        assert_eq!(string.as_bytes(), bytes);
+        assert_eq!(
+            state
+                .copy_string_bytes(*string_ref)
+                .expect("test string is live"),
+            bytes
+        );
     }
 }

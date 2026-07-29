@@ -59,30 +59,15 @@ fn reg_gmatch_aliases(state: &LuaState, gc: &mut GarbageCollector, table: GcRef<
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
-    if let Some(gt) = l.global_table
-        // SAFETY: global table is rooted for the duration of library init.
-        && let Some(gt_obj) = unsafe { gt.as_ref() }
-    {
-        for (key, val) in gt_obj.hash_entries() {
-            if let Value::String(key_ref) = key
-                // SAFETY: key is held by the rooted global table.
-                && let Some(key_str) = unsafe { key_ref.as_ref() }
-                && key_str.as_bytes() == name.as_bytes()
-                && let Value::Table(t) = val
-            {
-                return *t;
-            }
-        }
-    }
-    GcRef::null()
+    crate::registration::find_library_table(l, name.as_bytes())
+        .ok()
+        .flatten()
+        .unwrap_or_else(GcRef::null)
 }
 
 fn string_arg(l: &LuaState, idx: i32) -> Option<Vec<u8>> {
     match l.at(idx) {
-        Some(Value::String(s)) => {
-            // SAFETY: string argument is on the active Lua stack.
-            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
-        }
+        Some(Value::String(s)) => l.copy_string_bytes(*s).ok(),
         Some(Value::Number(n)) => Some(number_to_lua_string(*n).into_bytes()),
         _ => None,
     }
@@ -91,14 +76,14 @@ fn string_arg(l: &LuaState, idx: i32) -> Option<Vec<u8>> {
 fn number_arg(l: &LuaState, idx: i32) -> Option<f64> {
     match l.at(idx) {
         Some(Value::Number(n)) => Some(*n),
-        Some(Value::String(s)) => {
-            // SAFETY: string argument is on the active Lua stack.
-            unsafe { s.as_ref() }.and_then(|s| {
-                std::str::from_utf8(s.as_bytes())
+        Some(Value::String(s)) => l
+            .with_string_bytes(*s, |bytes| {
+                std::str::from_utf8(bytes)
                     .ok()
                     .and_then(|text| text.parse::<f64>().ok())
             })
-        }
+            .ok()
+            .flatten(),
         _ => None,
     }
 }
@@ -466,13 +451,13 @@ unsafe extern "C" fn lua_string_gmatch_iter(l_ptr: *mut std::ffi::c_void) -> i32
         return 0;
     };
 
-    let Some(source) = state_string_field(state, "source") else {
+    let Some(source) = state_string_field(l, state, "source") else {
         return 0;
     };
-    let Some(pattern) = state_string_field(state, "pattern") else {
+    let Some(pattern) = state_string_field(l, state, "pattern") else {
         return 0;
     };
-    let next = state_number_field(state, "next").unwrap_or(0.0).max(0.0) as usize;
+    let next = state_number_field(l, state, "next").unwrap_or(0.0).max(0.0) as usize;
     let Some(found) = find_gsub_match(&source, &pattern, next) else {
         return 0;
     };
@@ -484,7 +469,7 @@ unsafe extern "C" fn lua_string_gmatch_iter(l_ptr: *mut std::ffi::c_void) -> i32
     };
     // SAFETY: state table is held by the generic-for state register and VM is single-threaded.
     let state_mut = unsafe { &mut *(state_ref.as_ptr() as *mut Table) };
-    if set_state_value(state_mut, "next", Value::Number(new_next as f64)).is_none() {
+    if set_state_value(l, state_mut, "next", Value::Number(new_next as f64)).is_none() {
         return -1;
     }
 
@@ -593,7 +578,7 @@ fn format_lua_string(l: &LuaState, format: &[u8]) -> Result<Vec<u8>, String> {
             .ok_or_else(|| "string.format: not enough arguments".to_string())?;
         arg_idx += 1;
 
-        let piece = format_value_with_spec(&arg, &spec)?;
+        let piece = format_value_with_spec(l, &arg, &spec)?;
         out.extend_from_slice(&piece);
         idx = next_idx;
     }
@@ -674,35 +659,39 @@ fn parse_format_spec(format: &[u8], mut idx: usize) -> Result<(FormatSpec, usize
     Ok((spec, idx + 1))
 }
 
-fn format_value_with_spec(value: &Value, spec: &FormatSpec) -> Result<Vec<u8>, String> {
+fn format_value_with_spec(
+    l: &LuaState,
+    value: &Value,
+    spec: &FormatSpec,
+) -> Result<Vec<u8>, String> {
     match spec.conv {
         b's' => Ok(apply_string_precision_and_width(
-            value_to_format_bytes(value),
+            value_to_format_bytes(l, value),
             spec,
         )),
-        b'q' => Ok(lua_quote_string(&value_to_format_bytes(value))),
+        b'q' => Ok(lua_quote_string(&value_to_format_bytes(l, value))),
         b'c' => {
-            let byte = numeric_value(value)? as i32 as u8;
+            let byte = numeric_value(l, value)? as i32 as u8;
             Ok(apply_byte_width(vec![byte], spec))
         }
         b'd' | b'i' => {
-            Ok(format_integer(numeric_value(value)? as i64, 10, false, spec).into_bytes())
+            Ok(format_integer(numeric_value(l, value)? as i64, 10, false, spec).into_bytes())
         }
-        b'u' => {
-            Ok(format_unsigned_integer(numeric_value(value)? as u64, 10, false, spec).into_bytes())
-        }
-        b'o' => {
-            Ok(format_unsigned_integer(numeric_value(value)? as u64, 8, false, spec).into_bytes())
-        }
-        b'x' => {
-            Ok(format_unsigned_integer(numeric_value(value)? as u64, 16, false, spec).into_bytes())
-        }
-        b'X' => {
-            Ok(format_unsigned_integer(numeric_value(value)? as u64, 16, true, spec).into_bytes())
-        }
-        b'f' => Ok(format_float_fixed(numeric_value(value)?, spec).into_bytes()),
-        b'e' | b'E' => Ok(format_float_exp(numeric_value(value)?, spec).into_bytes()),
-        b'g' | b'G' => Ok(format_float_general(numeric_value(value)?, spec).into_bytes()),
+        b'u' => Ok(
+            format_unsigned_integer(numeric_value(l, value)? as u64, 10, false, spec).into_bytes(),
+        ),
+        b'o' => Ok(
+            format_unsigned_integer(numeric_value(l, value)? as u64, 8, false, spec).into_bytes(),
+        ),
+        b'x' => Ok(
+            format_unsigned_integer(numeric_value(l, value)? as u64, 16, false, spec).into_bytes(),
+        ),
+        b'X' => Ok(
+            format_unsigned_integer(numeric_value(l, value)? as u64, 16, true, spec).into_bytes(),
+        ),
+        b'f' => Ok(format_float_fixed(numeric_value(l, value)?, spec).into_bytes()),
+        b'e' | b'E' => Ok(format_float_exp(numeric_value(l, value)?, spec).into_bytes()),
+        b'g' | b'G' => Ok(format_float_general(numeric_value(l, value)?, spec).into_bytes()),
         _ => Err(format!(
             "invalid option '%{}' to 'format'",
             char::from(spec.conv)
@@ -717,18 +706,14 @@ fn string_format_error(l: &mut LuaState, message: &str) -> i32 {
     -1
 }
 
-fn value_to_format_string(value: &Value) -> String {
+fn value_to_format_string(l: &LuaState, value: &Value) -> String {
     match value {
         Value::Nil => "nil".to_string(),
         Value::Boolean(b) => b.to_string(),
         Value::Number(n) => number_to_lua_string(*n),
-        Value::String(s) => {
-            // SAFETY: this is only a diagnostic fallback; `%s` and `%q` use
-            // value_to_format_bytes and retain the original Lua bytes.
-            unsafe { s.as_ref() }
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        }
+        Value::String(s) => l
+            .with_string_bytes(*s, |bytes| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default(),
         Value::Table(t) => format!("table: {:p}", t.as_ptr()),
         Value::Function(f) => format!("function: {:p}", f.as_ptr()),
         Value::Userdata(u) => format!("userdata: {:p}", u.as_ptr()),
@@ -737,28 +722,25 @@ fn value_to_format_string(value: &Value) -> String {
     }
 }
 
-fn value_to_format_bytes(value: &Value) -> Vec<u8> {
+fn value_to_format_bytes(l: &LuaState, value: &Value) -> Vec<u8> {
     match value {
-        Value::String(s) => {
-            // SAFETY: value is an argument on the active Lua stack.
-            unsafe { s.as_ref() }
-                .map(|s| s.as_bytes().to_vec())
-                .unwrap_or_default()
-        }
-        _ => value_to_format_string(value).into_bytes(),
+        Value::String(s) => l.copy_string_bytes(*s).unwrap_or_default(),
+        _ => value_to_format_string(l, value).into_bytes(),
     }
 }
 
-fn numeric_value(value: &Value) -> Result<f64, String> {
+fn numeric_value(l: &LuaState, value: &Value) -> Result<f64, String> {
     match value {
         Value::Number(n) => Ok(*n),
-        Value::String(s) => {
-            // SAFETY: value is an argument on the active Lua stack.
-            unsafe { s.as_ref() }
-                .and_then(|s| std::str::from_utf8(s.as_bytes()).ok())
-                .and_then(|text| text.trim().parse::<f64>().ok())
-                .ok_or_else(|| "string.format: number expected".to_string())
-        }
+        Value::String(s) => l
+            .with_string_bytes(*s, |bytes| {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<f64>().ok())
+            })
+            .ok()
+            .flatten()
+            .ok_or_else(|| "string.format: number expected".to_string()),
         _ => Err("string.format: number expected".to_string()),
     }
 }
@@ -1020,41 +1002,26 @@ fn find_gsub_match(source: &[u8], pattern: &[u8], start_idx: usize) -> Option<Pa
     }
 }
 
-fn set_state_value(state: &mut Table, key: &str, value: Value) -> Option<()> {
-    let key = state
-        .hash_entries()
-        .find_map(|(candidate, _)| string_key_matches(candidate, key).then(|| candidate.clone()))?;
-    state.set(&key, &value);
+fn set_state_value(l: &LuaState, state: &mut Table, key: &str, value: Value) -> Option<()> {
+    let key = l.find_interned_string(key.as_bytes()).ok().flatten()?;
+    state.set(&Value::String(key), &value);
     Some(())
 }
 
-fn state_value(state: &Table, key: &str) -> Option<Value> {
-    state
-        .hash_entries()
-        .find_map(|(candidate, value)| string_key_matches(candidate, key).then(|| value.clone()))
+fn state_value(l: &LuaState, state: &Table, key: &str) -> Option<Value> {
+    let key = l.find_interned_string(key.as_bytes()).ok().flatten()?;
+    Some(state.get(&Value::String(key)))
 }
 
-fn string_key_matches(candidate: &Value, expected: &str) -> bool {
-    let Value::String(candidate) = candidate else {
-        return false;
-    };
-    // SAFETY: candidate is retained as a key by the live state Table.
-    unsafe { candidate.as_ref() }
-        .is_some_and(|candidate| candidate.as_bytes() == expected.as_bytes())
-}
-
-fn state_string_field(state: &Table, key: &str) -> Option<Vec<u8>> {
-    match state_value(state, key)? {
-        Value::String(s) => {
-            // SAFETY: gmatch state table keeps the string reachable while iterating.
-            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
-        }
+fn state_string_field(l: &LuaState, state: &Table, key: &str) -> Option<Vec<u8>> {
+    match state_value(l, state, key)? {
+        Value::String(s) => l.copy_string_bytes(s).ok(),
         _ => None,
     }
 }
 
-fn state_number_field(state: &Table, key: &str) -> Option<f64> {
-    match state_value(state, key)? {
+fn state_number_field(l: &LuaState, state: &Table, key: &str) -> Option<f64> {
+    match state_value(l, state, key)? {
         Value::Number(n) => Some(n),
         _ => None,
     }
@@ -1611,9 +1578,8 @@ fn gsub_replacement(
 ) -> Option<Vec<u8>> {
     match replacement {
         Value::String(template_ref) => {
-            // SAFETY: replacement argument is on the active Lua stack.
-            let template = unsafe { template_ref.as_ref() }?.as_bytes();
-            match expand_replacement_template(template, source, found) {
+            let template = l.copy_string_bytes(*template_ref).ok()?;
+            match expand_replacement_template(&template, source, found) {
                 Ok(bytes) => Some(bytes),
                 Err(message) => {
                     push_lua_string(l, message.as_bytes());
@@ -1640,7 +1606,7 @@ fn gsub_replacement(
                 }
                 return None;
             };
-            let replacement = replacement_value_to_bytes(source, found, &value);
+            let replacement = replacement_value_to_bytes(l, source, found, &value);
             if stack_protected {
                 let _ = l.pop();
             }
@@ -1674,9 +1640,9 @@ fn gsub_function_replacement(
         replacement.clone(),
         &args,
         Some(1),
-        |_, _, results| {
+        |state, _, results| {
             let value = results.first().cloned().unwrap_or(Value::Nil);
-            replacement_bytes = replacement_value_to_bytes(source, found, &value);
+            replacement_bytes = replacement_value_to_bytes(state, source, found, &value);
         },
     );
     for _ in 0..stack_root_count {
@@ -1755,7 +1721,7 @@ fn gsub_table_replacement_value(
 
         let index = table
             .metatable()
-            .and_then(|metatable| lookup_string_metamethod(metatable, "__index"));
+            .and_then(|metatable| lookup_string_metamethod(l, metatable, "__index"));
         match index {
             Some(Value::Table(next_ref)) => current = Value::Table(next_ref),
             Some(index_func @ Value::Function(_)) => {
@@ -1770,20 +1736,10 @@ fn gsub_table_replacement_value(
     None
 }
 
-fn lookup_string_metamethod(metatable: GcRef<Table>, name: &str) -> Option<Value> {
-    // SAFETY: metatable is held by a reachable table.
-    let metatable = unsafe { metatable.as_ref() }?;
-    for (key, value) in metatable.hash_entries() {
-        if let Value::String(key_ref) = key
-            // SAFETY: key is held by the metatable.
-            && let Some(key_string) = unsafe { key_ref.as_ref() }
-            && key_string.as_bytes() == name.as_bytes()
-            && !value.is_nil()
-        {
-            return Some(value.clone());
-        }
-    }
-    None
+fn lookup_string_metamethod(l: &LuaState, metatable: GcRef<Table>, name: &str) -> Option<Value> {
+    crate::registration::find_table_field(l, metatable, name.as_bytes())
+        .ok()
+        .flatten()
 }
 
 fn call_index_metamethod(
@@ -1832,16 +1788,14 @@ fn capture_to_value(l: &mut LuaState, source: &[u8], capture: &Capture) -> Optio
 }
 
 fn replacement_value_to_bytes(
+    l: &LuaState,
     source: &[u8],
     found: &PatternMatch,
     value: &Value,
 ) -> Option<Vec<u8>> {
     match value {
         Value::Nil | Value::Boolean(false) => Some(source[found.start..found.end].to_vec()),
-        Value::String(s) => {
-            // SAFETY: table replacement value is reachable from an active table argument.
-            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
-        }
+        Value::String(s) => l.copy_string_bytes(*s).ok(),
         Value::Number(n) => Some(number_to_lua_string(*n).into_bytes()),
         _ => None,
     }

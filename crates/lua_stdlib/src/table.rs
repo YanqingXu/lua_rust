@@ -4,7 +4,6 @@
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
-use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_vm::RuntimeError;
@@ -40,22 +39,10 @@ fn reg(
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
-    if let Some(gt) = l.global_table
-        // SAFETY: global table is rooted for the duration of library init.
-        && let Some(gt_obj) = unsafe { gt.as_ref() }
-    {
-        for (key, val) in gt_obj.hash_entries() {
-            if let Value::String(key_ref) = key
-                // SAFETY: key is held by the rooted global table.
-                && let Some(key_str) = unsafe { key_ref.as_ref() }
-                && key_str.as_bytes() == name.as_bytes()
-                && let Value::Table(t) = val
-            {
-                return *t;
-            }
-        }
-    }
-    GcRef::null()
+    crate::registration::find_library_table(l, name.as_bytes())
+        .ok()
+        .flatten()
+        .unwrap_or_else(GcRef::null)
 }
 
 fn table_arg(l: &LuaState, idx: i32) -> Option<GcRef<Table>> {
@@ -74,10 +61,7 @@ fn number_arg(l: &LuaState, idx: i32) -> Option<f64> {
 
 fn string_arg_bytes(l: &LuaState, idx: i32) -> Option<Vec<u8>> {
     match l.at(idx) {
-        Some(Value::String(s)) => {
-            // SAFETY: string argument is on the active Lua stack.
-            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
-        }
+        Some(Value::String(s)) => l.copy_string_bytes(*s).ok(),
         Some(Value::Number(n)) => Some(number_to_lua_string(*n).into_bytes()),
         Some(Value::Nil) | None => None,
         _ => None,
@@ -92,12 +76,9 @@ fn number_to_lua_string(n: f64) -> String {
     }
 }
 
-fn value_to_concat_bytes(value: &Value) -> Option<Vec<u8>> {
+fn value_to_concat_bytes(l: &LuaState, value: &Value) -> Option<Vec<u8>> {
     match value {
-        Value::String(s) => {
-            // SAFETY: table value is reachable while the table is on the Lua stack.
-            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
-        }
+        Value::String(s) => l.copy_string_bytes(*s).ok(),
         Value::Number(n) => Some(number_to_lua_string(*n).into_bytes()),
         _ => None,
     }
@@ -156,59 +137,42 @@ fn is_truthy(value: &Value) -> bool {
     !matches!(value, Value::Nil | Value::Boolean(false))
 }
 
-fn table_foreachi_limit(table: &Table) -> usize {
-    for (key, value) in table.hash_entries() {
-        if let Value::String(key_ref) = key
-            // SAFETY: key is held by the table being inspected.
-            && let Some(key_string) = unsafe { key_ref.as_ref() }
-            && key_string.as_bytes() == b"n"
-            && let Value::Number(n) = value
-            && *n >= 0.0
-        {
-            return *n as usize;
-        }
+fn table_foreachi_limit(l: &LuaState, table: &Table) -> usize {
+    if let Ok(Some(key)) = l.find_interned_string(b"n")
+        && let Value::Number(n) = table.get(&Value::String(key))
+        && n >= 0.0
+    {
+        return n as usize;
     }
     table.length()
 }
 
-fn string_bytes(value: &Value) -> Option<&[u8]> {
-    let Value::String(string_ref) = value else {
-        return None;
-    };
-    // SAFETY: the string value is reachable through the active Lua stack, a
-    // table, or a temporary sort buffer whose source table remains reachable.
-    unsafe { string_ref.as_ref() }.map(GcString::as_bytes)
-}
-
-fn value_metatable(value: &Value) -> Option<GcRef<Table>> {
+fn value_metatable(gc: &GarbageCollector, value: &Value) -> Option<GcRef<Table>> {
     match value {
-        Value::Table(table_ref) => {
-            // SAFETY: table values being compared are reachable during sorting.
-            unsafe { table_ref.as_ref() }.and_then(|table| table.metatable())
-        }
-        Value::Userdata(userdata_ref) => {
-            // SAFETY: userdata values being compared are reachable during sorting.
-            unsafe { userdata_ref.as_ref() }.and_then(|userdata| userdata.metatable())
-        }
+        Value::Table(table_ref) => gc.with_ref(*table_ref, Table::metatable).ok().flatten(),
+        Value::Userdata(userdata_ref) => gc
+            .with_ref(*userdata_ref, |userdata| userdata.metatable())
+            .ok()
+            .flatten(),
         _ => None,
     }
 }
 
-fn lookup_metamethod(metatable: GcRef<Table>, name: &str) -> Option<Value> {
-    // SAFETY: metatable references are held by values being compared.
-    let metatable = unsafe { metatable.as_ref() }?;
-    for (key, value) in metatable.hash_entries() {
-        if string_bytes(key).is_some_and(|key| key == name.as_bytes()) && !value.is_nil() {
-            return Some(value.clone());
-        }
-    }
-    None
+fn lookup_metamethod(l: &LuaState, metatable: GcRef<Table>, name: &str) -> Option<Value> {
+    crate::registration::find_table_field(l, metatable, name.as_bytes())
+        .ok()
+        .flatten()
 }
 
-fn find_less_metamethod(lhs: &Value, rhs: &Value) -> Option<Value> {
-    value_metatable(lhs)
-        .and_then(|mt| lookup_metamethod(mt, "__lt"))
-        .or_else(|| value_metatable(rhs).and_then(|mt| lookup_metamethod(mt, "__lt")))
+fn find_less_metamethod(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    lhs: &Value,
+    rhs: &Value,
+) -> Option<Value> {
+    value_metatable(gc, lhs)
+        .and_then(|mt| lookup_metamethod(l, mt, "__lt"))
+        .or_else(|| value_metatable(gc, rhs).and_then(|mt| lookup_metamethod(l, mt, "__lt")))
 }
 
 fn compare_with_function(
@@ -241,13 +205,15 @@ fn default_less(
 ) -> Result<bool, TableSortError> {
     match (lhs, rhs) {
         (Value::Number(a), Value::Number(b)) => Ok(a < b),
-        (Value::String(_), Value::String(_)) => {
-            let lhs = string_bytes(lhs).unwrap_or_default();
-            let rhs = string_bytes(rhs).unwrap_or_default();
-            Ok(compare_lua_string_bytes(lhs, rhs) == Ordering::Less)
-        }
+        (Value::String(lhs), Value::String(rhs)) => gc
+            .with_string_bytes(*lhs, |lhs| {
+                gc.with_string_bytes(*rhs, |rhs| compare_lua_string_bytes(lhs, rhs))
+            })
+            .and_then(|ordering| ordering)
+            .map(|ordering| ordering == Ordering::Less)
+            .map_err(|error| TableSortError::Message(format!("invalid string key: {error}"))),
         _ => {
-            if let Some(metamethod) = find_less_metamethod(lhs, rhs) {
+            if let Some(metamethod) = find_less_metamethod(l, gc, lhs, rhs) {
                 return compare_with_function(l, gc, &metamethod, lhs, rhs);
             }
             Err(TableSortError::Message(
@@ -406,7 +372,7 @@ unsafe extern "C" fn lua_table_foreachi(l_ptr: *mut std::ffi::c_void) -> i32 {
         let Some(table) = (unsafe { table_ref.as_ref() }) else {
             return table_error(l, "bad argument #1 to 'foreachi' (table expected)");
         };
-        table_foreachi_limit(table)
+        table_foreachi_limit(l, table)
     };
 
     for idx in 1..=len {
@@ -583,7 +549,7 @@ unsafe extern "C" fn lua_table_concat(l_ptr: *mut std::ffi::c_void) -> i32 {
             return table_error(l, "table.concat: result length overflow");
         }
         let value = table.get(&Value::Number(idx as f64));
-        let Some(piece) = value_to_concat_bytes(&value) else {
+        let Some(piece) = value_to_concat_bytes(l, &value) else {
             return -1;
         };
         if append_concat_bytes(&mut result, &piece).is_err() {
@@ -647,21 +613,32 @@ unsafe extern "C" fn lua_table_sort(l_ptr: *mut std::ffi::c_void) -> i32 {
 #[cfg(test)]
 mod byte_string_tests {
     use super::*;
+    use lua_core::string_pool::StringPool;
 
     #[test]
     fn concat_value_preserves_nul_and_invalid_utf8() {
         let mut gc = GarbageCollector::new();
-        let value = Value::String(gc.create(GcString::from_bytes(&[0, 0x80, 0xff])));
+        let mut string_pool = StringPool::new();
+        let value = Value::String(string_pool.intern_bytes(&mut gc, &[0, 0x80, 0xff]));
+        let mut state = LuaState::new();
+        state.gc = Some(&mut gc);
+        state.string_pool = Some(&mut string_pool);
 
-        assert_eq!(value_to_concat_bytes(&value), Some(vec![0x00, 0x80, 0xff]));
+        assert_eq!(
+            value_to_concat_bytes(&state, &value),
+            Some(vec![0x00, 0x80, 0xff])
+        );
     }
 
     #[test]
     fn default_string_order_uses_vm_nul_segment_rule() {
         let mut gc = GarbageCollector::new();
+        let mut string_pool = StringPool::new();
         let mut state = LuaState::new();
-        let left = Value::String(gc.create(GcString::from_bytes(b"a\0b")));
-        let right = Value::String(gc.create(GcString::from_bytes(b"a\0c")));
+        state.gc = Some(&mut gc);
+        state.string_pool = Some(&mut string_pool);
+        let left = Value::String(string_pool.intern_bytes(&mut gc, b"a\0b"));
+        let right = Value::String(string_pool.intern_bytes(&mut gc, b"a\0c"));
 
         assert!(matches!(
             default_less(&mut state, &mut gc, &left, &right),

@@ -225,7 +225,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
             };
             let name = self
                 .allocator
-                .allocate_string(self.string_pool.as_deref_mut(), var.name.as_bytes());
+                .allocate_string(self.string_pool, var.name.as_bytes());
             self.builder
                 .add_local_debug(Some(name), var.startpc, endpc, var.reg);
         }

@@ -68,7 +68,8 @@ pub fn add_script_directory_to_path(
         std::path::MAIN_SEPARATOR,
         std::path::MAIN_SEPARATOR
     );
-    let current = table_string_field(package, "path").unwrap_or_else(|| DEFAULT_PATH.to_string());
+    let current =
+        table_string_field(l, package, "path").unwrap_or_else(|| DEFAULT_PATH.to_string());
     let path = if current.is_empty() {
         prefix
     } else {
@@ -84,8 +85,7 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
     let Some(Value::String(module_ref)) = l.at(1).cloned() else {
         return raise_string(l, "bad argument #1 to 'require' (string expected)");
     };
-    // SAFETY: module_ref is the first argument on the active Lua stack.
-    if unsafe { module_ref.as_ref() }.is_none() {
+    if l.copy_string_bytes(module_ref).is_err() {
         return raise_string(l, "invalid module name");
     }
 
@@ -112,13 +112,17 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
             // `package.loaded` and `package.preload` are Lua tables, so their
             // keys remain arbitrary byte strings. UTF-8 is required only when
             // the unresolved name crosses into the host filesystem.
-            // SAFETY: module_ref is still the first active argument.
-            let module_name =
-                match unsafe { module_ref.as_ref() }.and_then(|name| name.to_utf8().ok()) {
-                    Some(name) => name.to_owned(),
-                    None => return raise_string(l, "module name must be valid UTF-8"),
-                };
-            let (path, source) = match find_module_source(package, &module_name) {
+            let module_name = match l
+                .with_string_bytes(module_ref, |bytes| {
+                    std::str::from_utf8(bytes).ok().map(str::to_owned)
+                })
+                .ok()
+                .flatten()
+            {
+                Some(name) => name,
+                None => return raise_string(l, "module name must be valid UTF-8"),
+            };
+            let (path, source) = match find_module_source(l, package, &module_name) {
                 Ok(found) => found,
                 Err(message) => return raise_string(l, &message),
             };
@@ -172,7 +176,7 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_package_loadlib(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let path = value_to_string(l.at(1).cloned().unwrap_or(Value::Nil));
+    let path = value_to_string(l, l.at(1).cloned().unwrap_or(Value::Nil));
     l.push_value(Value::Nil);
     let _ = push_lua_string(l, &format!("dynamic libraries not supported: {path}"));
     let _ = push_lua_string(l, "absent");
@@ -233,10 +237,9 @@ unsafe extern "C" fn lua_package_module(l_ptr: *mut std::ffi::c_void) -> i32 {
     let Some(Value::String(name_ref)) = l.at(1).cloned() else {
         return raise_string(l, "bad argument #1 to 'module' (string expected)");
     };
-    // SAFETY: name_ref is the first argument on the active Lua stack.
-    let module_name = match unsafe { name_ref.as_ref() } {
-        Some(name) => name.as_bytes().to_vec(),
-        None => return raise_string(l, "invalid module name"),
+    let module_name = match l.copy_string_bytes(name_ref) {
+        Ok(name) => name,
+        Err(_) => return raise_string(l, "invalid module name"),
     };
     let Some(gc_ptr) = l.gc else {
         return raise_string(l, "module unavailable without an active GC");
@@ -283,10 +286,11 @@ unsafe extern "C" fn lua_package_module(l_ptr: *mut std::ffi::c_void) -> i32 {
 }
 
 fn find_module_source(
+    l: &LuaState,
     package: GcRef<Table>,
     module_name: &str,
 ) -> Result<(PathBuf, Vec<u8>), String> {
-    let path = table_string_field(package, "path").unwrap_or_else(|| DEFAULT_PATH.to_string());
+    let path = table_string_field(l, package, "path").unwrap_or_else(|| DEFAULT_PATH.to_string());
     let module_path = module_path_name(module_name);
     let mut attempted = Vec::new();
 
@@ -333,15 +337,15 @@ fn compile_chunk_function(
     let chunk = parser
         .parse()
         .map_err(|err| format!("{chunk_name}:{}:{}: {}", err.line, err.column, err.message))?;
+    let pool_ptr = l
+        .string_pool
+        .ok_or_else(|| format!("{chunk_name}: loader unavailable without an active StringPool"))?;
 
     let func_ref = gc.with_publication(|transaction| {
-        let generator = if let Some(pool_ptr) = l.string_pool {
-            // SAFETY: LuaState::string_pool is a transitional Runtime
-            // backpointer installed from the live host-owned pool.
-            CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr })
-        } else {
-            CodeGenerator::new_in_publication(transaction)
-        };
+        // SAFETY: LuaState::string_pool is a transitional Runtime backpointer
+        // installed from the live host-owned pool.
+        let generator =
+            CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr });
         let proto = generator
             .generate(&chunk, chunk_name)
             .map_err(|err| format!("{chunk_name}:{err}"))?;
@@ -616,23 +620,18 @@ fn set_caller_env(l: &mut LuaState, module_ref: GcRef<Table>) -> bool {
     true
 }
 
-fn table_string_field(table: GcRef<Table>, key: &str) -> Option<String> {
-    // SAFETY: package table is reachable from the global table during package operations.
-    let table_obj = unsafe { table.as_ref() }?;
-    for (field_key, value) in table_obj.hash_entries() {
-        if let Value::String(key_ref) = field_key
-            // SAFETY: keys are held by the table being inspected.
-            && let Some(key_str) = unsafe { key_ref.as_ref() }
-            && key_str.as_bytes() == key.as_bytes()
-            && let Value::String(value_ref) = value
-        {
-            // SAFETY: values are held by the table being inspected.
-            return unsafe { value_ref.as_ref() }
-                .and_then(|value| value.to_utf8().ok())
-                .map(str::to_owned);
-        }
-    }
-    None
+fn table_string_field(l: &LuaState, table: GcRef<Table>, key: &str) -> Option<String> {
+    let Value::String(value) = crate::registration::find_table_field(l, table, key.as_bytes())
+        .ok()
+        .flatten()?
+    else {
+        return None;
+    };
+    l.with_string_bytes(value, |bytes| {
+        std::str::from_utf8(bytes).ok().map(str::to_owned)
+    })
+    .ok()
+    .flatten()
 }
 
 fn table_get(table: GcRef<Table>, key: &Value) -> Value {
@@ -673,18 +672,9 @@ fn table_set(
 
 fn global_value(l: &LuaState, name: &str) -> Option<Value> {
     let global = l.global_table?;
-    // SAFETY: global table is rooted by LuaState.
-    let global_obj = unsafe { global.as_ref() }?;
-    for (key, value) in global_obj.hash_entries() {
-        if let Value::String(key_ref) = key
-            // SAFETY: key is held by the rooted global table.
-            && let Some(key_str) = unsafe { key_ref.as_ref() }
-            && key_str.as_bytes() == name.as_bytes()
-        {
-            return Some(value.clone());
-        }
-    }
-    None
+    crate::registration::find_table_field(l, global, name.as_bytes())
+        .ok()
+        .flatten()
 }
 
 fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
@@ -696,7 +686,7 @@ fn push_lua_string(l: &mut LuaState, text: &str) -> bool {
     crate::registration::push_string(l, gc, text.as_bytes()).is_ok()
 }
 
-fn value_to_string(value: Value) -> String {
+fn value_to_string(l: &LuaState, value: Value) -> String {
     match value {
         Value::Nil => "nil".to_string(),
         Value::Boolean(b) => b.to_string(),
@@ -707,12 +697,9 @@ fn value_to_string(value: Value) -> String {
                 n.to_string()
             }
         }
-        Value::String(s) => {
-            // SAFETY: string value is an active argument while package.loadlib runs.
-            unsafe { s.as_ref() }
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        }
+        Value::String(s) => l
+            .with_string_bytes(s, |bytes| String::from_utf8_lossy(bytes).into_owned())
+            .unwrap_or_default(),
         Value::Table(t) => format!("table: {:p}", t.as_ptr()),
         Value::Function(f) => format!("function: {:p}", f.as_ptr()),
         Value::Userdata(u) => format!("userdata: {:p}", u.as_ptr()),

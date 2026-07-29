@@ -306,16 +306,9 @@ impl GarbageCollector {
         let mode_value = self.lookup_metamethod_by_name(mt, "__mode");
 
         match mode_value {
-            Some(Value::String(s)) => {
-                let Ok(pointer) = self.validate_ref(s) else {
-                    return (false, false);
-                };
-                // SAFETY: validation matched address, identity, and String tag.
-                let mode = unsafe { pointer.as_ref() }.as_bytes();
-                let weak_keys = mode.contains(&b'k');
-                let weak_values = mode.contains(&b'v');
-                (weak_keys, weak_values)
-            }
+            Some(Value::String(s)) => self
+                .with_string_bytes(s, |mode| (mode.contains(&b'k'), mode.contains(&b'v')))
+                .unwrap_or((false, false)),
             _ => (false, false),
         }
     }
@@ -328,16 +321,12 @@ impl GarbageCollector {
         // 通过 next() 迭代器遍历所有键值对查找匹配的字符串键
         let mut key = Value::Nil;
         while let Some((next_key, next_value)) = table.next(&key) {
-            if let Value::String(s) = &next_key {
-                let Ok(pointer) = self.validate_ref(*s) else {
-                    key = next_key;
-                    continue;
-                };
-                // SAFETY: validation matched address, identity, and String tag.
-                let key_bytes = unsafe { pointer.as_ref() }.as_bytes();
-                if key_bytes == name.as_bytes() {
-                    return Some(next_value);
-                }
+            if let Value::String(s) = &next_key
+                && self
+                    .with_string_bytes(*s, |bytes| bytes == name.as_bytes())
+                    .unwrap_or(false)
+            {
+                return Some(next_value);
             }
             key = next_key;
         }

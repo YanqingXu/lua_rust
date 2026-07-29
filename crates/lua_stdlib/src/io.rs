@@ -108,22 +108,10 @@ fn reg(
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
-    if let Some(gt) = l.global_table
-        // SAFETY: global table is rooted for the duration of library init.
-        && let Some(gt_obj) = unsafe { gt.as_ref() }
-    {
-        for (key, val) in gt_obj.hash_entries() {
-            if let Value::String(key_ref) = key
-                // SAFETY: key is held by the rooted global table.
-                && let Some(key_str) = unsafe { key_ref.as_ref() }
-                && key_str.as_bytes() == name.as_bytes()
-                && let Value::Table(t) = val
-            {
-                return *t;
-            }
-        }
-    }
-    GcRef::null()
+    crate::registration::find_library_table(l, name.as_bytes())
+        .ok()
+        .flatten()
+        .unwrap_or_else(GcRef::null)
 }
 
 fn memory_file_construction(
@@ -298,17 +286,17 @@ fn set_table_ref_value(
     crate::registration::set_value(state, gc, table_ref, key, value)
 }
 
-fn table_get_string(table_ref: GcRef<Table>, key: &str) -> Value {
+fn table_get_string(l: &LuaState, table_ref: GcRef<Table>, key: &str) -> Value {
     // SAFETY: table_ref is reachable from globals while IO functions execute.
     let Some(table) = (unsafe { table_ref.as_ref() }) else {
         return Value::Nil;
     };
-    get_field(table, key)
+    get_field(l, table, key)
 }
 
 fn current_output(l: &LuaState) -> Option<GcRef<Userdata>> {
     let io_table = find_lib_table(l, "io");
-    match table_get_string(io_table, "__output") {
+    match table_get_string(l, io_table, "__output") {
         Value::Userdata(file_ref) => Some(file_ref),
         Value::Table(file_ref) => table_to_file_userdata(file_ref),
         _ => None,
@@ -317,7 +305,7 @@ fn current_output(l: &LuaState) -> Option<GcRef<Userdata>> {
 
 fn current_input(l: &LuaState) -> Option<GcRef<Userdata>> {
     let io_table = find_lib_table(l, "io");
-    match table_get_string(io_table, "__input") {
+    match table_get_string(l, io_table, "__input") {
         Value::Userdata(file_ref) => Some(file_ref),
         Value::Table(file_ref) => table_to_file_userdata(file_ref),
         _ => None,
@@ -330,10 +318,10 @@ fn set_current_output(
     io_table: GcRef<Table>,
     file_ref: GcRef<Userdata>,
 ) {
-    if let Value::Userdata(previous) = table_get_string(io_table, "__output")
+    if let Value::Userdata(previous) = table_get_string(state, io_table, "__output")
         && previous != file_ref
     {
-        let _ = flush_file_to_disk(previous);
+        let _ = flush_file_to_disk(state, previous);
     }
     set_table_ref_value(state, gc, io_table, b"__output", &Value::Userdata(file_ref))
         .expect("current output publication must remain collector-valid");
@@ -489,12 +477,12 @@ unsafe extern "C" fn lua_io_input(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     match l.at(1).cloned().unwrap_or(Value::Nil) {
         Value::Nil => {
-            l.push_value(table_get_string(io_table, "__input"));
+            l.push_value(table_get_string(l, io_table, "__input"));
             1
         }
         Value::String(path_ref) => {
             // SAFETY: path argument is on the active stack.
-            let path = match gc_string_utf8(path_ref) {
+            let path = match gc_string_utf8(l, path_ref) {
                 Ok(path) => path,
                 Err(message) => return push_io_error_tuple(l, gc, message, 0),
             };
@@ -589,7 +577,8 @@ unsafe extern "C" fn lua_io_type(l_ptr: *mut std::ffi::c_void) -> i32 {
     let gc = unsafe { &mut *gc_ptr };
     match l.at(1).cloned().unwrap_or(Value::Nil) {
         Value::Userdata(file_ref) => {
-            let Some(closed) = with_file_state(file_ref, |state| get_bool_field(state, "__closed"))
+            let Some(closed) =
+                with_file_state(file_ref, |state| get_bool_field(l, state, "__closed"))
             else {
                 l.push_nil();
                 return 1;
@@ -615,7 +604,7 @@ unsafe extern "C" fn lua_io_flush(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_value(Value::Boolean(false));
         return 1;
     };
-    l.push_value(Value::Boolean(flush_file_to_disk(file_ref).is_ok()));
+    l.push_value(Value::Boolean(flush_file_to_disk(l, file_ref).is_ok()));
     1
 }
 
@@ -639,7 +628,7 @@ unsafe extern "C" fn lua_io_lines(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
         Value::String(path_ref) => {
             // SAFETY: path argument is on the active stack.
-            let path = match gc_string_utf8(path_ref) {
+            let path = match gc_string_utf8(l, path_ref) {
                 Ok(path) => path,
                 Err(message) => return push_io_error_tuple(l, gc, message, 0),
             };
@@ -678,19 +667,19 @@ unsafe extern "C" fn lua_io_output(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     match l.at(1).cloned().unwrap_or(Value::Nil) {
         Value::Nil => {
-            l.push_value(table_get_string(io_table, "__output"));
+            l.push_value(table_get_string(l, io_table, "__output"));
             1
         }
         Value::String(path_ref) => {
             // SAFETY: path argument is on the active stack.
-            let path = match gc_string_utf8(path_ref) {
+            let path = match gc_string_utf8(l, path_ref) {
                 Ok(path) => path,
                 Err(message) => return push_io_error_tuple(l, gc, message, 0),
             };
             match prepare_open_file(&path, b"w") {
                 Ok(construction) => {
-                    if let Value::Userdata(previous) = table_get_string(io_table, "__output") {
-                        let _ = flush_file_to_disk(previous);
+                    if let Value::Userdata(previous) = table_get_string(l, io_table, "__output") {
+                        let _ = flush_file_to_disk(l, previous);
                     }
                     match publish_file_to_table_and_stack(
                         l,
@@ -777,26 +766,27 @@ fn write_to_file(
     let mut appended = Vec::new();
     for idx in first_arg..=l.get_top() {
         let value = l.at(idx).cloned().unwrap_or(Value::Nil);
-        appended.extend_from_slice(&value_to_write_bytes(&value));
+        appended.extend_from_slice(&value_to_write_bytes(l, &value));
     }
 
     let Some((closed, writable, pos, content, direct_write, buffer_mode)) =
         with_file_state(file_ref, |file| {
-            let already_direct = get_bool_field(file, "__direct");
-            let pos = get_number_field(file, "__pos").max(0.0) as usize;
+            let already_direct = get_bool_field(l, file, "__direct");
+            let pos = get_number_field(l, file, "__pos").max(0.0) as usize;
             let content = if already_direct {
                 Vec::new()
             } else {
-                get_bytes_field(file, "__content")
+                get_bytes_field(l, file, "__content")
             };
-            let direct_write = should_write_direct(file, already_direct, &content, pos, &appended);
+            let direct_write =
+                should_write_direct(l, file, already_direct, &content, pos, &appended);
             (
-                get_bool_field(file, "__closed"),
-                get_bool_field(file, "__writable"),
+                get_bool_field(l, file, "__closed"),
+                get_bool_field(l, file, "__writable"),
                 pos,
                 content,
                 direct_write,
-                get_bytes_field(file, "__buffer"),
+                get_bytes_field(l, file, "__buffer"),
             )
         })
     else {
@@ -825,7 +815,7 @@ fn write_to_file(
         match write_standard_stream(stream, &appended) {
             Ok(()) => {
                 if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
-                    let _ = set_number_field(file, gc, "__pos", (pos + appended.len()) as f64);
+                    let _ = set_number_field(l, file, gc, "__pos", (pos + appended.len()) as f64);
                 }
                 l.push_value(Value::Userdata(file_ref));
                 return 1;
@@ -843,10 +833,10 @@ fn write_to_file(
     }
 
     if direct_write {
-        match write_direct(gc, file_ref, &content, pos, &appended) {
+        match write_direct(l, gc, file_ref, &content, pos, &appended) {
             Ok(new_pos) => {
                 if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
-                    let _ = set_number_field(file, gc, "__pos", new_pos as f64);
+                    let _ = set_number_field(l, file, gc, "__pos", new_pos as f64);
                 }
                 l.push_value(Value::Userdata(file_ref));
                 return 1;
@@ -863,12 +853,12 @@ fn write_to_file(
     let new_content = write_at(&content, pos, &appended);
     let new_pos = pos + appended.len();
     if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
-        let _ = set_bytes_field(file, gc, "__content", &new_content);
-        let _ = set_number_field(file, gc, "__pos", new_pos as f64);
+        let _ = set_bytes_field(l, file, gc, "__content", &new_content);
+        let _ = set_number_field(l, file, gc, "__pos", new_pos as f64);
     }
 
     if buffer_mode == b"no" || (buffer_mode == b"line" && appended.contains(&b'\n')) {
-        let _ = flush_file_to_disk(file_ref);
+        let _ = flush_file_to_disk(l, file_ref);
     }
 
     l.push_value(Value::Userdata(file_ref));
@@ -922,9 +912,9 @@ unsafe extern "C" fn lua_io_file_seek(l_ptr: *mut std::ffi::c_void) -> i32 {
     let offset = number_arg(l, 3).unwrap_or(0.0) as isize;
     let Some((direct, buffered_len, current)) = with_file_state(file_ref, |file| {
         (
-            get_bool_field(file, "__direct"),
-            get_bytes_field(file, "__content").len(),
-            get_number_field(file, "__pos") as isize,
+            get_bool_field(l, file, "__direct"),
+            get_bytes_field(l, file, "__content").len(),
+            get_number_field(l, file, "__pos") as isize,
         )
     }) else {
         l.push_nil();
@@ -932,7 +922,7 @@ unsafe extern "C" fn lua_io_file_seek(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
 
     let content_len = if direct {
-        direct_file_len(file_ref).unwrap_or(buffered_len) as isize
+        direct_file_len(l, file_ref).unwrap_or(buffered_len) as isize
     } else {
         buffered_len as isize
     };
@@ -943,7 +933,7 @@ unsafe extern "C" fn lua_io_file_seek(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     let new_pos = (base + offset).clamp(0, content_len) as usize;
     if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
-        let _ = set_number_field(file, gc, "__pos", new_pos as f64);
+        let _ = set_number_field(l, file, gc, "__pos", new_pos as f64);
     }
     l.push_value(Value::Number(new_pos as f64));
     1
@@ -982,7 +972,7 @@ unsafe extern "C" fn lua_io_file_flush(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_value(Value::Boolean(false));
         return 1;
     };
-    l.push_value(Value::Boolean(flush_file_to_disk(file_ref).is_ok()));
+    l.push_value(Value::Boolean(flush_file_to_disk(l, file_ref).is_ok()));
     1
 }
 
@@ -1006,8 +996,8 @@ unsafe extern "C" fn lua_io_file_setvbuf(l_ptr: *mut std::ffi::c_void) -> i32 {
     let updated = match mode.as_slice() {
         b"no" | b"full" | b"line" => {
             if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
-                set_bytes_field(file, gc, "__buffer", &mode).is_ok()
-                    && set_bool_field(file, gc, "__buffer_explicit", true).is_ok()
+                set_bytes_field(l, file, gc, "__buffer", &mode).is_ok()
+                    && set_bool_field(l, file, gc, "__buffer_explicit", true).is_ok()
             } else {
                 false
             }
@@ -1028,7 +1018,7 @@ unsafe extern "C" fn lua_io_file_tostring(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
     let text = match file_arg(l)
-        .and_then(|file_ref| with_file_state(file_ref, |file| get_bool_field(file, "__closed")))
+        .and_then(|file_ref| with_file_state(file_ref, |file| get_bool_field(l, file, "__closed")))
     {
         Some(true) => "file (closed)".to_string(),
         Some(false) => "file".to_string(),
@@ -1047,7 +1037,7 @@ unsafe extern "C" fn lua_io_file_gc(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
     if let Some(file_ref) = file_arg(l) {
-        let _ = close_file_silent(gc, file_ref);
+        let _ = close_file_silent(l, gc, file_ref);
     } else {
         return push_error(l, gc, "no value");
     }
@@ -1072,17 +1062,17 @@ unsafe extern "C" fn lua_io_lines_iter(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    if get_bool_field(env, "__dead") {
+    if get_bool_field(l, env, "__dead") {
         return push_error(l, gc, "file iterator is closed");
     }
-    let file_ref = match get_field(env, "__file") {
+    let file_ref = match get_field(l, env, "__file") {
         Value::Userdata(file_ref) => file_ref,
         _ => {
             l.push_nil();
             return 1;
         }
     };
-    let auto_close = get_bool_field(env, "__auto_close");
+    let auto_close = get_bool_field(l, env, "__auto_close");
 
     match read_line_from_file(l, gc, file_ref) {
         Ok(Some(line)) => {
@@ -1091,9 +1081,9 @@ unsafe extern "C" fn lua_io_lines_iter(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
         Ok(None) => {
             if auto_close {
-                let _ = close_file_silent(gc, file_ref);
+                let _ = close_file_silent(l, gc, file_ref);
             }
-            let _ = set_bool_field(env_ref, gc, "__dead", true);
+            let _ = set_bool_field(l, env_ref, gc, "__dead", true);
             0
         }
         Err(message) => push_error(l, gc, &message),
@@ -1107,7 +1097,7 @@ fn close_file_handle(l: &mut LuaState, file_ref: GcRef<Userdata>) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(file, "__closed")) else {
+    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(l, file, "__closed")) else {
         l.push_value(Value::Boolean(false));
         return 1;
     };
@@ -1116,34 +1106,39 @@ fn close_file_handle(l: &mut LuaState, file_ref: GcRef<Userdata>) -> i32 {
         return push_error(l, gc, "attempt to close a closed file");
     }
 
-    if flush_file_to_disk(file_ref).is_err() {
+    if flush_file_to_disk(l, file_ref).is_err() {
         l.push_value(Value::Boolean(false));
         return 1;
     }
 
     close_direct_handle(file_ref);
     if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
-        let _ = set_bool_field(file, gc, "__closed", true);
+        let _ = set_bool_field(l, file, gc, "__closed", true);
     }
     l.push_value(Value::Boolean(true));
     1
 }
 
-fn close_file_silent(gc: &mut GarbageCollector, file_ref: GcRef<Userdata>) -> Result<(), String> {
-    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(file, "__closed")) else {
+fn close_file_silent(
+    l: &LuaState,
+    gc: &mut GarbageCollector,
+    file_ref: GcRef<Userdata>,
+) -> Result<(), String> {
+    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(l, file, "__closed")) else {
         return Err("invalid file".to_string());
     };
     if closed {
         return Err("attempt to close a closed file".to_string());
     }
-    flush_file_to_disk(file_ref).map_err(|err| err.to_string())?;
+    flush_file_to_disk(l, file_ref).map_err(|err| err.to_string())?;
     close_direct_handle(file_ref);
     let Some(file) =
         file_state_ref(gc, file_ref).map_err(|error| format!("invalid file: {error}"))?
     else {
         return Err("invalid file".to_string());
     };
-    set_bool_field(file, gc, "__closed", true).map_err(|error| format!("invalid file: {error}"))?;
+    set_bool_field(l, file, gc, "__closed", true)
+        .map_err(|error| format!("invalid file: {error}"))?;
     Ok(())
 }
 
@@ -1169,7 +1164,7 @@ fn read_from_file(l: &mut LuaState, file_ref: GcRef<Userdata>, first_arg: i32) -
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
 
-    if let Err(message) = ensure_file_readable(gc, file_ref) {
+    if let Err(message) = ensure_file_readable(l, gc, file_ref) {
         return push_error(l, gc, &message);
     }
 
@@ -1180,8 +1175,8 @@ fn read_from_file(l: &mut LuaState, file_ref: GcRef<Userdata>, first_arg: i32) -
 
     let Some((readable, mut pos)) = with_file_state(file_ref, |file| {
         (
-            get_bool_field(file, "__readable"),
-            get_number_field(file, "__pos").max(0.0) as usize,
+            get_bool_field(l, file, "__readable"),
+            get_number_field(l, file, "__pos").max(0.0) as usize,
         )
     }) else {
         l.push_nil();
@@ -1194,10 +1189,10 @@ fn read_from_file(l: &mut LuaState, file_ref: GcRef<Userdata>, first_arg: i32) -
 
     let mut values = Vec::new();
     for format in formats {
-        if let Err(message) = prepare_standard_input(gc, file_ref, pos, &format) {
+        if let Err(message) = prepare_standard_input(l, gc, file_ref, pos, &format) {
             return push_error(l, gc, &message);
         }
-        let content = with_file_state(file_ref, |file| get_bytes_field(file, "__content"))
+        let content = with_file_state(file_ref, |file| get_bytes_field(l, file, "__content"))
             .unwrap_or_default();
         let value = read_one(&content, pos, &format);
         pos = value.1;
@@ -1210,7 +1205,7 @@ fn read_from_file(l: &mut LuaState, file_ref: GcRef<Userdata>, first_arg: i32) -
     }
 
     if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
-        let _ = set_number_field(file, gc, "__pos", pos as f64);
+        let _ = set_number_field(l, file, gc, "__pos", pos as f64);
     }
 
     let count = values.len();
@@ -1225,15 +1220,15 @@ fn read_from_file(l: &mut LuaState, file_ref: GcRef<Userdata>, first_arg: i32) -
 }
 
 fn read_line_from_file(
-    _l: &mut LuaState,
+    l: &mut LuaState,
     gc: &mut GarbageCollector,
     file_ref: GcRef<Userdata>,
 ) -> Result<Option<Vec<u8>>, String> {
-    ensure_file_readable(gc, file_ref)?;
+    ensure_file_readable(l, gc, file_ref)?;
     let Some((readable, pos)) = with_file_state(file_ref, |file| {
         (
-            get_bool_field(file, "__readable"),
-            get_number_field(file, "__pos").max(0.0) as usize,
+            get_bool_field(l, file, "__readable"),
+            get_number_field(l, file, "__pos").max(0.0) as usize,
         )
     }) else {
         return Err("invalid file".to_string());
@@ -1241,14 +1236,15 @@ fn read_line_from_file(
     if !readable {
         return Ok(None);
     }
-    prepare_standard_input(gc, file_ref, pos, &ReadFormat::Line)?;
-    let Some(content) = with_file_state(file_ref, |file| get_bytes_field(file, "__content")) else {
+    prepare_standard_input(l, gc, file_ref, pos, &ReadFormat::Line)?;
+    let Some(content) = with_file_state(file_ref, |file| get_bytes_field(l, file, "__content"))
+    else {
         return Err("invalid file".to_string());
     };
     match read_one(&content, pos, &ReadFormat::Line) {
         (ReadValue::Bytes(line), new_pos) => {
             if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
-                let _ = set_number_field(file, gc, "__pos", new_pos as f64);
+                let _ = set_number_field(l, file, gc, "__pos", new_pos as f64);
             }
             Ok(Some(line))
         }
@@ -1258,20 +1254,22 @@ fn read_line_from_file(
 }
 
 fn ensure_file_readable(
+    l: &LuaState,
     gc: &mut GarbageCollector,
     file_ref: GcRef<Userdata>,
 ) -> Result<(), String> {
-    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(file, "__closed")) else {
+    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(l, file, "__closed")) else {
         return Err("invalid file".to_string());
     };
     if closed {
         return Err("attempt to use a closed file".to_string());
     }
-    refresh_file_from_disk(gc, file_ref);
+    refresh_file_from_disk(l, gc, file_ref);
     Ok(())
 }
 
 fn prepare_standard_input(
+    l: &LuaState,
     gc: &mut GarbageCollector,
     file_ref: GcRef<Userdata>,
     pos: usize,
@@ -1283,8 +1281,8 @@ fn prepare_standard_input(
 
     let Some((stdin_eof, content)) = with_file_state(file_ref, |file| {
         (
-            get_bool_field(file, "__stdin_eof"),
-            get_bytes_field(file, "__content"),
+            get_bool_field(l, file, "__stdin_eof"),
+            get_bytes_field(l, file, "__content"),
         )
     }) else {
         return Err("invalid file".to_string());
@@ -1346,11 +1344,11 @@ fn prepare_standard_input(
     if !bytes.is_empty() {
         let mut updated = content;
         updated.extend_from_slice(&bytes);
-        set_bytes_field(file, gc, "__content", &updated)
+        set_bytes_field(l, file, gc, "__content", &updated)
             .map_err(|error| format!("invalid file: {error}"))?;
     }
     if reached_eof {
-        set_bool_field(file, gc, "__stdin_eof", true)
+        set_bool_field(l, file, gc, "__stdin_eof", true)
             .map_err(|error| format!("invalid file: {error}"))?;
     }
     Ok(())
@@ -1366,11 +1364,8 @@ fn read_formats_from_args(l: &LuaState, first_arg: i32) -> Result<Vec<ReadFormat
         match l.at(idx).cloned().unwrap_or(Value::Nil) {
             Value::Number(n) if n >= 0.0 => formats.push(ReadFormat::Bytes(n as usize)),
             Value::String(s) => {
-                // SAFETY: argument strings are kept alive on the active Lua stack.
-                let option = unsafe { s.as_ref() }
-                    .map(|s| s.as_bytes())
-                    .unwrap_or_default();
-                match option {
+                let option = l.copy_string_bytes(s).unwrap_or_default();
+                match option.as_slice() {
                     b"*l" | b"*line" => formats.push(ReadFormat::Line),
                     b"*a" | b"*all" => formats.push(ReadFormat::All),
                     b"*n" | b"*number" => formats.push(ReadFormat::Number),
@@ -1481,12 +1476,12 @@ fn read_number_bytes(content: &[u8], pos: usize) -> (ReadValue, usize) {
     }
 }
 
-fn refresh_file_from_disk(gc: &mut GarbageCollector, file_ref: GcRef<Userdata>) {
+fn refresh_file_from_disk(l: &LuaState, gc: &mut GarbageCollector, file_ref: GcRef<Userdata>) {
     let Some((writable, path, old_pos)) = with_file_state(file_ref, |file| {
         (
-            get_bool_field(file, "__writable"),
-            get_utf8_field(file, "__path"),
-            get_number_field(file, "__pos").max(0.0) as usize,
+            get_bool_field(l, file, "__writable"),
+            get_utf8_field(l, file, "__path"),
+            get_number_field(l, file, "__pos").max(0.0) as usize,
         )
     }) else {
         return;
@@ -1500,20 +1495,20 @@ fn refresh_file_from_disk(gc: &mut GarbageCollector, file_ref: GcRef<Userdata>) 
     if let Ok(bytes) = std::fs::read(&path) {
         let len = bytes.len();
         if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
-            let _ = set_bytes_field(file, gc, "__content", &bytes);
-            let _ = set_number_field(file, gc, "__pos", old_pos.min(len) as f64);
+            let _ = set_bytes_field(l, file, gc, "__content", &bytes);
+            let _ = set_number_field(l, file, gc, "__pos", old_pos.min(len) as f64);
         }
     }
 }
 
-fn flush_file_to_disk(file_ref: GcRef<Userdata>) -> std::io::Result<()> {
+fn flush_file_to_disk(l: &LuaState, file_ref: GcRef<Userdata>) -> std::io::Result<()> {
     let Some((closed, writable, direct, path, content)) = with_file_state(file_ref, |file| {
         (
-            get_bool_field(file, "__closed"),
-            get_bool_field(file, "__writable"),
-            get_bool_field(file, "__direct"),
-            get_utf8_field(file, "__path"),
-            get_bytes_field(file, "__content"),
+            get_bool_field(l, file, "__closed"),
+            get_bool_field(l, file, "__writable"),
+            get_bool_field(l, file, "__direct"),
+            get_utf8_field(l, file, "__path"),
+            get_bytes_field(l, file, "__content"),
         )
     }) else {
         return Ok(());
@@ -1548,23 +1543,24 @@ fn flush_standard_stream(stream: StandardStream) -> std::io::Result<()> {
 }
 
 fn should_write_direct(
+    l: &LuaState,
     file: &Table,
     already_direct: bool,
     content: &[u8],
     pos: usize,
     appended: &[u8],
 ) -> bool {
-    if get_bool_field(file, "__buffer_explicit") || get_bool_field(file, "__closed") {
+    if get_bool_field(l, file, "__buffer_explicit") || get_bool_field(l, file, "__closed") {
         return false;
     }
-    if !get_bool_field(file, "__writable") {
+    if !get_bool_field(l, file, "__writable") {
         return false;
     }
-    let path = get_bytes_field(file, "__path");
+    let path = get_bytes_field(l, file, "__path");
     if path.is_empty() {
         return false;
     }
-    if !get_bool_field(file, "__readable") {
+    if !get_bool_field(l, file, "__readable") {
         return true;
     }
     already_direct
@@ -1573,6 +1569,7 @@ fn should_write_direct(
 }
 
 fn write_direct(
+    l: &LuaState,
     gc: &mut GarbageCollector,
     file_ref: GcRef<Userdata>,
     content: &[u8],
@@ -1581,8 +1578,8 @@ fn write_direct(
 ) -> std::io::Result<usize> {
     let Some((path, direct)) = with_file_state(file_ref, |file| {
         (
-            get_utf8_field(file, "__path"),
-            get_bool_field(file, "__direct"),
+            get_utf8_field(l, file, "__path"),
+            get_bool_field(l, file, "__direct"),
         )
     }) else {
         return Err(std::io::Error::new(
@@ -1610,7 +1607,7 @@ fn write_direct(
                 "file state is missing",
             ));
         };
-        set_bool_field(file, gc, "__direct", true).map_err(|error| {
+        set_bool_field(l, file, gc, "__direct", true).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("file state is invalid: {error}"),
@@ -1682,7 +1679,7 @@ fn close_direct_handle(file_ref: GcRef<Userdata>) {
     });
 }
 
-fn direct_file_len(file_ref: GcRef<Userdata>) -> Option<usize> {
+fn direct_file_len(l: &LuaState, file_ref: GcRef<Userdata>) -> Option<usize> {
     if let Some(length) = with_file_data_mut(file_ref, |data| {
         let handle = data.direct_handle.as_mut()?;
         let current = handle.stream_position().ok()?;
@@ -1695,7 +1692,7 @@ fn direct_file_len(file_ref: GcRef<Userdata>) -> Option<usize> {
         return Some(length);
     }
 
-    let path = with_file_state(file_ref, |file| get_utf8_field(file, "__path"))?;
+    let path = with_file_state(file_ref, |file| get_utf8_field(l, file, "__path"))?;
     let Ok(Some(path)) = path else {
         return None;
     };
@@ -1809,73 +1806,54 @@ fn file_arg(l: &LuaState) -> Option<GcRef<Userdata>> {
 
 fn bytes_arg(l: &LuaState, idx: i32) -> Option<Vec<u8>> {
     match l.at(idx) {
-        Some(Value::String(s)) => {
-            // SAFETY: argument strings are kept alive on the active Lua stack.
-            unsafe { s.as_ref() }.map(|s| s.as_bytes().to_vec())
-        }
+        Some(Value::String(s)) => l.copy_string_bytes(*s).ok(),
         _ => None,
     }
 }
 
 fn utf8_string_arg(l: &LuaState, idx: i32) -> Result<Option<String>, &'static str> {
     match l.at(idx) {
-        Some(Value::String(s)) => gc_string_utf8(*s).map(Some),
+        Some(Value::String(s)) => gc_string_utf8(l, *s).map(Some),
         _ => Ok(None),
     }
 }
 
-fn gc_string_utf8(value: GcRef<GcString>) -> Result<String, &'static str> {
-    // SAFETY: callers only pass strings rooted by the active Lua stack/table.
-    let Some(value) = (unsafe { value.as_ref() }) else {
-        return Ok(String::new());
-    };
-    value
-        .to_utf8()
-        .map(str::to_owned)
+fn gc_string_utf8(l: &LuaState, value: GcRef<GcString>) -> Result<String, &'static str> {
+    l.with_string_bytes(value, |bytes| std::str::from_utf8(bytes).map(str::to_owned))
+        .map_err(|_| "invalid Lua string reference")?
         .map_err(|_| "file path must be valid UTF-8")
 }
 
 fn number_arg(l: &LuaState, idx: i32) -> Option<f64> {
     match l.at(idx) {
         Some(Value::Number(n)) => Some(*n),
-        Some(Value::String(s)) => {
-            // SAFETY: argument strings are kept alive on the active Lua stack.
-            unsafe { s.as_ref() }.and_then(|s| {
-                let bytes = trim_ascii_whitespace(s.as_bytes());
+        Some(Value::String(s)) => l
+            .with_string_bytes(*s, |bytes| {
+                let bytes = trim_ascii_whitespace(bytes);
                 std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()
             })
-        }
+            .ok()
+            .flatten(),
         _ => None,
     }
 }
 
-fn get_field(table: &Table, name: &str) -> Value {
-    for (key, value) in table.hash_entries() {
-        if let Value::String(key_ref) = key
-            // SAFETY: keys are owned by this live table.
-            && let Some(key_str) = unsafe { key_ref.as_ref() }
-            && key_str.as_bytes() == name.as_bytes()
-        {
-            return value.clone();
-        }
-    }
-    Value::Nil
+fn get_field(l: &LuaState, table: &Table, name: &str) -> Value {
+    let Ok(Some(key)) = l.find_interned_string(name.as_bytes()) else {
+        return Value::Nil;
+    };
+    table.get(&Value::String(key))
 }
 
-fn get_bytes_field(table: &Table, name: &str) -> Vec<u8> {
-    match get_field(table, name) {
-        Value::String(s) => {
-            // SAFETY: string value is owned by this live table.
-            unsafe { s.as_ref() }
-                .map(|s| s.as_bytes().to_vec())
-                .unwrap_or_default()
-        }
+fn get_bytes_field(l: &LuaState, table: &Table, name: &str) -> Vec<u8> {
+    match get_field(l, table, name) {
+        Value::String(s) => l.copy_string_bytes(s).unwrap_or_default(),
         _ => Vec::new(),
     }
 }
 
-fn get_utf8_field(table: &Table, name: &str) -> std::io::Result<Option<String>> {
-    let bytes = get_bytes_field(table, name);
+fn get_utf8_field(l: &LuaState, table: &Table, name: &str) -> std::io::Result<Option<String>> {
+    let bytes = get_bytes_field(l, table, name);
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -1887,21 +1865,22 @@ fn get_utf8_field(table: &Table, name: &str) -> std::io::Result<Option<String>> 
     })
 }
 
-fn get_number_field(table: &Table, name: &str) -> f64 {
-    match get_field(table, name) {
+fn get_number_field(l: &LuaState, table: &Table, name: &str) -> f64 {
+    match get_field(l, table, name) {
         Value::Number(n) => n,
         _ => 0.0,
     }
 }
 
-fn get_bool_field(table: &Table, name: &str) -> bool {
-    match get_field(table, name) {
+fn get_bool_field(l: &LuaState, table: &Table, name: &str) -> bool {
+    match get_field(l, table, name) {
         Value::Boolean(value) => value,
         _ => false,
     }
 }
 
 fn set_bytes_field(
+    state: &LuaState,
     table: GcRef<Table>,
     gc: &mut GarbageCollector,
     name: &str,
@@ -1909,13 +1888,14 @@ fn set_bytes_field(
 ) -> Result<(), GcRefValidationError> {
     gc.with_publication(|transaction| {
         let table = transaction.protect(table)?;
-        let key = transaction.alloc(GcString::from_bytes(name.as_bytes()));
-        let text = transaction.alloc(GcString::from_bytes(value));
+        let key = crate::registration::rooted_bytes(state, transaction, name.as_bytes())?;
+        let text = crate::registration::rooted_bytes(state, transaction, value)?;
         transaction.set_table_string(&table, &key, &text)
     })
 }
 
 fn set_number_field(
+    state: &LuaState,
     table: GcRef<Table>,
     gc: &mut GarbageCollector,
     name: &str,
@@ -1923,12 +1903,13 @@ fn set_number_field(
 ) -> Result<(), GcRefValidationError> {
     gc.with_publication(|transaction| {
         let table = transaction.protect(table)?;
-        let key = transaction.alloc(GcString::from_bytes(name.as_bytes()));
+        let key = crate::registration::rooted_bytes(state, transaction, name.as_bytes())?;
         transaction.set_table_value(&table, &key, &Value::Number(value))
     })
 }
 
 fn set_bool_field(
+    state: &LuaState,
     table: GcRef<Table>,
     gc: &mut GarbageCollector,
     name: &str,
@@ -1936,7 +1917,7 @@ fn set_bool_field(
 ) -> Result<(), GcRefValidationError> {
     gc.with_publication(|transaction| {
         let table = transaction.protect(table)?;
-        let key = transaction.alloc(GcString::from_bytes(name.as_bytes()));
+        let key = crate::registration::rooted_bytes(state, transaction, name.as_bytes())?;
         transaction.set_table_value(&table, &key, &Value::Boolean(value))
     })
 }
@@ -1992,17 +1973,12 @@ fn write_at(content: &[u8], pos: usize, appended: &[u8]) -> Vec<u8> {
     result
 }
 
-fn value_to_write_bytes(value: &Value) -> Vec<u8> {
+fn value_to_write_bytes(l: &LuaState, value: &Value) -> Vec<u8> {
     match value {
         Value::Nil => b"nil".to_vec(),
         Value::Boolean(b) => b.to_string().into_bytes(),
         Value::Number(n) => number_to_lua_string(*n).into_bytes(),
-        Value::String(s) => {
-            // SAFETY: string arguments are kept alive on the active Lua stack.
-            unsafe { s.as_ref() }
-                .map(|s| s.as_bytes().to_vec())
-                .unwrap_or_default()
-        }
+        Value::String(s) => l.copy_string_bytes(*s).unwrap_or_default(),
         Value::Table(t) => format!("table: {:p}", t.as_ptr()).into_bytes(),
         Value::Function(f) => format!("function: {:p}", f.as_ptr()).into_bytes(),
         Value::Userdata(u) => format!("userdata: {:p}", u.as_ptr()).into_bytes(),
@@ -2073,16 +2049,17 @@ mod tests {
 
         assert_eq!(gc.temporary_root_count(), 0);
         for name in [b"stdin".as_slice(), b"stdout", b"stderr"] {
-            let file = table_get_string(io, std::str::from_utf8(name).unwrap()).as_userdata();
+            let file =
+                table_get_string(&state, io, std::str::from_utf8(name).unwrap()).as_userdata();
             let metatable = file_state_ref(&gc, file)
                 .expect("file Userdata should validate")
                 .expect("file metatable should publish");
             assert!(matches!(
-                table_get_string(metatable, "__index"),
+                table_get_string(&state, metatable, "__index"),
                 Value::Table(index) if index == metatable
             ));
             assert!(matches!(
-                table_get_string(metatable, "write"),
+                table_get_string(&state, metatable, "write"),
                 Value::Function(_)
             ));
         }
@@ -2246,7 +2223,7 @@ mod tests {
             .with_ref(iterator, |iterator| iterator.env())
             .expect("iterator should remain live")
             .expect("iterator environment should publish");
-        let file = match table_get_string(environment, "__file") {
+        let file = match table_get_string(&state, environment, "__file") {
             Value::Userdata(file) => file,
             value => panic!("expected iterator file Userdata, got {value:?}"),
         };
@@ -2333,7 +2310,10 @@ mod tests {
             set_table_ref_value(&state, &mut gc, io, b"foreign", &Value::Userdata(foreign));
         assert!(foreign_result.is_err());
         assert!(file_state_ref(&gc, foreign).is_err());
-        assert!(matches!(table_get_string(io, "foreign"), Value::Nil));
+        assert!(matches!(
+            table_get_string(&state, io, "foreign"),
+            Value::Nil
+        ));
         assert_eq!(gc.temporary_root_count(), 0);
 
         let stale = gc.create_root(Userdata::new(0));
@@ -2344,7 +2324,7 @@ mod tests {
             set_table_ref_value(&state, &mut gc, io, b"stale", &Value::Userdata(stale));
         assert!(stale_result.is_err());
         assert!(file_state_ref(&gc, stale).is_err());
-        assert!(matches!(table_get_string(io, "stale"), Value::Nil));
+        assert!(matches!(table_get_string(&state, io, "stale"), Value::Nil));
         assert_eq!(gc.temporary_root_count(), 0);
 
         gc.remove_root(global);

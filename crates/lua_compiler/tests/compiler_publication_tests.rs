@@ -149,9 +149,10 @@ fn compiler_consumer_error_drops_builder_roots_without_a_top_proto() {
 fn published_function_layout_is_lua_not_native() {
     let chunk = parse(b"return 42");
     let mut gc = GarbageCollector::new();
+    let mut pool = StringPool::new();
 
     let function = gc.with_publication(|transaction| {
-        let proto = CodeGenerator::new_in_publication(transaction)
+        let proto = CodeGenerator::new_in_publication_with_pool(transaction, &mut pool)
             .generate(&chunk, "@compiler-publication-layout")
             .expect("fixture should compile");
         let proto = transaction.alloc(proto);

@@ -43,17 +43,11 @@ pub struct GcString {
 impl GcString {
     /// 从任意 Lua 字节序列创建字符串，不要求 UTF-8。
     ///
-    /// 直接调用会绕过驻留机制；需要规范指针身份时应使用 `StringPool`。
+    /// This raw constructor is crate-internal so external production code
+    /// cannot bypass canonical `StringPool` interning.
     #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Self {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
         Self::from_byte_string(ByteString::from_bytes(bytes))
-    }
-
-    /// 从 UTF-8 文本创建字符串，保留其原始 UTF-8 编码。
-    ///
-    #[must_use]
-    pub fn from_utf8_text(text: &str) -> Self {
-        Self::from_byte_string(ByteString::from_utf8_text(text))
     }
 
     fn from_byte_string(bytes: ByteString) -> Self {
@@ -217,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_gc_string_from_utf8_text() {
-        let s = GcString::from_utf8_text("hello");
+        let s = GcString::from_bytes(b"hello");
         assert_eq!(s.len(), 5);
         assert_eq!(s.as_bytes(), b"hello");
         assert_eq!(s.to_utf8(), Ok("hello"));
@@ -314,7 +308,7 @@ mod tests {
     #[test]
     fn utf8_constructor_preserves_encoded_bytes() {
         let text = "Lua 字节";
-        let value = GcString::from_utf8_text(text);
+        let value = GcString::from_bytes(text.as_bytes());
 
         assert_eq!(value.as_bytes(), text.as_bytes());
         assert_eq!(value.to_utf8(), Ok(text));

@@ -13,17 +13,15 @@ fn parse(source: &[u8]) -> lua_compiler::ast::stmt::Chunk {
         .expect("test source should parse")
 }
 
-fn string_constant(proto: &Proto, expected: &[u8]) -> GcRef<GcString> {
+fn string_constant(gc: &GarbageCollector, proto: &Proto, expected: &[u8]) -> GcRef<GcString> {
     proto
         .constants()
         .iter()
         .find_map(|value| match value {
-            Value::String(string) => {
-                // SAFETY: every test keeps the owning collector alive while
-                // inspecting its generated Proto.
-                let bytes = unsafe { string.as_ref() }?.as_bytes();
-                (bytes == expected).then_some(*string)
-            }
+            Value::String(string) => gc
+                .with_string_bytes(*string, |bytes| (bytes == expected).then_some(*string))
+                .ok()
+                .flatten(),
             _ => None,
         })
         .expect("expected string constant should exist")
@@ -41,7 +39,7 @@ fn compiler_reuses_the_explicit_pool_identity() {
         .generate(&chunk, "@pool-identity")
         .expect("code generation should succeed");
 
-    assert_eq!(string_constant(&proto, &expected), canonical);
+    assert_eq!(string_constant(&gc, &proto, &expected), canonical);
     assert_eq!(pool.find_bytes(&expected), Some(canonical));
 }
 
@@ -60,8 +58,8 @@ fn independent_compilers_do_not_cross_heaps_or_pools() {
         .generate(&chunk, "@second")
         .expect("second code generation should succeed");
 
-    let first = string_constant(&first_proto, b"heap-local");
-    let second = string_constant(&second_proto, b"heap-local");
+    let first = string_constant(&first_gc, &first_proto, b"heap-local");
+    let second = string_constant(&second_gc, &second_proto, b"heap-local");
     assert_ne!(first, second);
     assert_eq!(first_pool.find_bytes(b"heap-local"), Some(first));
     assert_eq!(second_pool.find_bytes(b"heap-local"), Some(second));
@@ -72,13 +70,12 @@ fn proto_source_preserves_arbitrary_lua_bytes() {
     let chunk = parse(b"return 1");
     let source_name = [0x00, 0x80, 0xff];
     let mut gc = GarbageCollector::new();
+    let mut pool = StringPool::new();
 
-    let proto = CodeGenerator::new(&mut gc)
+    let proto = CodeGenerator::new_with_pool(&mut gc, &mut pool)
         .generate_with_source_bytes(&chunk, &source_name)
         .expect("code generation should succeed");
     let source = proto.source().expect("Proto should retain its source name");
-    // SAFETY: the collector remains live for this assertion.
-    let source = unsafe { source.as_ref() }.expect("source string should be live");
-
-    assert_eq!(source.as_bytes(), source_name);
+    gc.with_string_bytes(source, |bytes| assert_eq!(bytes, source_name))
+        .expect("source string should be live");
 }

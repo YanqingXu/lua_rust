@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::gc_string::GcString;
 use lua_core::proto::Proto;
 use lua_core::state_handle::StateHandle;
 use lua_core::string_pool::StringPool;
@@ -217,6 +218,51 @@ impl LuaState {
             gc_step_remaining: 0,
             auto_gc_countdown: 0,
         }
+    }
+
+    /// Read one live Lua string only within the owner collector's validation
+    /// scope. The callback cannot return a borrow tied to the managed object.
+    pub fn with_string_bytes<R>(
+        &self,
+        string: GcRef<GcString>,
+        read: impl for<'a> FnOnce(&'a [u8]) -> R,
+    ) -> Result<R, GcRefValidationError> {
+        let gc = self.gc.ok_or(GcRefValidationError::CollectorUnavailable)?;
+        // SAFETY: Runtime installs this transitional backpointer for the
+        // complete state turn; the returned borrow is confined to `read`.
+        unsafe { &*gc }.with_string_bytes(string, read)
+    }
+
+    /// Copy one live Lua string after collector validation.
+    pub fn copy_string_bytes(
+        &self,
+        string: GcRef<GcString>,
+    ) -> Result<Vec<u8>, GcRefValidationError> {
+        self.with_string_bytes(string, <[u8]>::to_vec)
+    }
+
+    /// Resolve an already-interned name without allocating or dereferencing
+    /// candidate object memory before collector validation.
+    pub fn find_interned_string(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Option<GcRef<GcString>>, GcRefValidationError> {
+        let pool = self
+            .string_pool
+            .ok_or(GcRefValidationError::StringPoolUnavailable)?;
+        let Some(candidate) = (
+            // SAFETY: Runtime installs the live pool for the complete state
+            // turn; `find_bytes` returns a copied identity handle only.
+            unsafe { &*pool }
+        )
+        .find_bytes(bytes) else {
+            return Ok(None);
+        };
+        let gc = self.gc.ok_or(GcRefValidationError::CollectorUnavailable)?;
+        // SAFETY: same scoped Runtime backpointer invariant as
+        // `with_string_bytes`; no object borrow escapes this validation.
+        unsafe { &*gc }.with_ref(candidate, |_| ())?;
+        Ok(Some(candidate))
     }
 
     /// 创建带全局表的 Lua 线程

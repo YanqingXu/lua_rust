@@ -1,6 +1,6 @@
 ---
 status: accepted-for-migration
-last_updated: 2026-07-26
+last_updated: 2026-07-29
 scope: M1.1 ByteString design and M1.2-M1.3 migration contract
 cpp_oracle: 87c15e69ceb94eb74e28226ccbefb7e196635711
 ---
@@ -97,6 +97,35 @@ The migration is staged to keep representation changes reviewable:
 No temporary dual representation may become a public compatibility promise.
 GC ownership, automatic sweeping, and the C API are separate milestones and
 must not be folded into this representation change.
+
+## Production identity and access boundary
+
+The M1 production string identity/access slice is locally complete:
+
+- `GcString::from_bytes` is an internal construction primitive; production
+  compiler, VM, standard-library, app, argument, error, field, and name paths
+  obtain strings from the owning `StringPool`;
+- two live production strings with equal Lua bytes therefore share one
+  `GcRef` identity, and `Value::String` equality/hashing can use that identity
+  without reading managed memory;
+- operations that require bytes—comparison, ordering, numeric conversion,
+  length, output, diagnostics, or copies—run inside collector/state-scoped
+  validation;
+- internal Table/metamethod/library/name lookup interns the lookup bytes in the
+  same pool before using identity lookup.
+
+The normative path list is
+[`tests/compatibility/string_access_inventory.json`](../../tests/compatibility/string_access_inventory.json).
+[`tools/check_string_contract.ps1`](../../tools/check_string_contract.ps1)
+rejects production raw constructors, common unscoped string dereferences,
+compiler no-pool fallbacks, and a content-dereferencing `Value` Eq/Hash
+implementation. Regression tests cover duplicate bytes, foreign/stale handles,
+embedded NUL and high-byte Table keys, and address reuse.
+
+This local closure does not close all of M1.1–M1.3: persistent binary
+dump/load, the future C API pointer-plus-length surface, and their full oracle
+matrix remain open. It also does not authorize live sweep; unique Heap
+ownership and the remaining root/tracer contracts are separate prerequisites.
 
 ## Acceptance criteria
 

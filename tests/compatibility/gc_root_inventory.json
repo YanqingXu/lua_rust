@@ -3,7 +3,7 @@
   "description": "Fail-closed inventory of every runtime or collector root required before lua_rust may sweep a live VM.",
   "provenance_audit": {
     "implemented": "GcRef carries a process-global non-reused ObjectId; each collector validates address, ObjectId, and concrete tag in an authoritative live table. LightUserdata is a separate arbitrary-pointer type, and collector explicit roots retain erased pointer + ObjectId + tag handles.",
-    "remaining_sweep_blocker": "Safe Value::String equality and hashing still preserve byte-content semantics by dereferencing without a collector borrow. Transitional unsafe GcRef::as_ref call sites, the absent unique Heap owner, and the lack of a Runtime-only collector entry point keep live sweep disabled. Current compiler, library/package, IO, VM/app, and result-construction publication slices are transactional, but allocation-triggered collection remains intentionally off until those separate blockers close."
+    "remaining_sweep_blocker": "Production strings now use canonical StringPool identity, safe Value::String equality/hash never dereference, and byte-content operations use collector/state-scoped validation under a separate 17-path contract gate. The absent unique Heap/service owner, incomplete fixed-string/finalizer roots, broader transitional non-string GcRef::as_ref call sites, and the lack of a Runtime-only collector entry point still keep live sweep disabled. Current compiler, library/package, IO, VM/app, and result-construction publication slices are transactional, but allocation-triggered collection remains intentionally off until those separate blockers close."
   },
   "status_values": [
     "implemented",
@@ -665,7 +665,7 @@
         "current": "GarbageCollector::begin_mark_only validates and seeds active temporary object roots, with separate seeded/rejected counts.",
         "target": "RuntimeRootTracer seeds every active temporary-root scope."
       },
-      "missing_risk": "The current compiler, coroutine, library/package, IO, VM/app, and result-construction slices are migrated, and the M1 gate rejects direct production gc.create in the target paths. Allocation-triggered collection remains disabled because Value::String Eq/Hash and unsafe reads are not scoped/canonical, one unique Heap owner is absent, finalizer/fixed-string roots remain incomplete, and the live collector is not wired to the Runtime root tracer.",
+      "missing_risk": "The current compiler, coroutine, library/package, IO, VM/app, result-construction, and production string identity/access slices are migrated. The M1 gate rejects direct production gc.create in publication targets and separately enforces canonical construction plus scoped string reads. Allocation-triggered collection remains disabled because one unique Heap/service owner is absent, finalizer/fixed-string roots remain incomplete, broader non-string object access still has transitional escape hatches, and the live collector is not wired to the Runtime root tracer.",
       "planned_test": {
         "name": "compiler_proto_tree_publishes_atomically_into_a_lua_function; open_all_publishes_every_library_graph_from_the_global_root; standard_file_graph_is_reachable_from_global_and_fully_collectable; result_slice_foreign_failure_and_panic_cleanup_exact_roots; protected_call_results_are_published_before_stack_window_restores; script_argument_table_and_varargs_survive_runtime_publication_handoff",
         "layer": "lua_core/lua_stdlib/lua_vm publication and runtime root tracing",
@@ -700,7 +700,7 @@
         "current": "RuntimeRootTracer snapshots validated temporary StateHandles independently from ordinary arena membership and object-publication roots, labels them TEMPORARY_STATE_ROOTS, and feeds them into the state/object fixed-point queues.",
         "target": "RuntimeRootTracer seeds validated temporary StateHandles independently from temporary GC-object roots."
       },
-      "missing_risk": "This root kind is locally complete for coroutine create/wrap. Live sweep remains blocked by the separate production object-publication migration, unique Heap owner, fixed strings, finalizers, and scoped execution-borrow work.",
+      "missing_risk": "This root kind is locally complete for coroutine create/wrap, and the production object-publication plus string identity/access slices are migrated. Live sweep remains blocked by the unique Heap/service owner, fixed strings, finalizers, broader non-string scoped object access, and Runtime-only tracer wiring.",
       "planned_test": {
         "name": "pending_state_rolls_back_or_publishes_atomically",
         "layer": "lua_vm runtime_ownership",

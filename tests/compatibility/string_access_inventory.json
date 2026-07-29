@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "scope": "M1 production string canonicalization and scoped content access",
+  "identityContract": {
+    "rule": "Every Lua-visible string is canonical within one Runtime StringPool; Value equality, hashing, and Table keys use GcRef address plus ObjectId identity.",
+    "implementation": [
+      "crates/lua_core/src/value.rs",
+      "crates/lua_core/src/string_pool.rs",
+      "crates/lua_core/src/table.rs"
+    ]
+  },
+  "constructionBoundaries": [
+    {
+      "kind": "canonical-pool",
+      "path": "crates/lua_core/src/string_pool.rs",
+      "symbol": "StringPool::intern_bytes"
+    },
+    {
+      "kind": "transactional-canonical-pool",
+      "path": "crates/lua_core/src/gc/publication.rs",
+      "symbol": "PublicationTxn::intern_bytes"
+    },
+    {
+      "kind": "compiler-requires-pool",
+      "path": "crates/lua_compiler/src/codegen/mod.rs",
+      "symbol": "CodeGenerator::{new_with_pool,new_in_publication_with_pool}"
+    }
+  ],
+  "contentAccessBoundaries": [
+    {
+      "kind": "collector-scoped",
+      "path": "crates/lua_core/src/gc/collector.rs",
+      "symbols": [
+        "GarbageCollector::with_string_bytes",
+        "GarbageCollector::string_refs_equal",
+        "GarbageCollector::compare_string_refs"
+      ]
+    },
+    {
+      "kind": "state-scoped",
+      "path": "crates/lua_vm/src/state/lua_state.rs",
+      "symbols": [
+        "LuaState::with_string_bytes",
+        "LuaState::copy_string_bytes",
+        "LuaState::find_interned_string"
+      ]
+    }
+  ],
+  "lookupPolicies": [
+    {
+      "surface": "Value Eq/Hash and ordinary Table keys",
+      "policy": "canonical-identity"
+    },
+    {
+      "surface": "global/library/metamethod/internal field names",
+      "policy": "StringPool find_bytes followed by identity Table lookup"
+    },
+    {
+      "surface": "collector mark/finalizer field discovery without a StringPool borrow",
+      "policy": "validated collector-scoped byte scan"
+    },
+    {
+      "surface": "ordering, numeric coercion, formatting, IO and host text conversion",
+      "policy": "collector-scoped bytes"
+    }
+  ],
+  "productionReadPaths": [
+    "crates/lua_bytecode/src/main.rs",
+    "crates/lua_core/src/gc/finalize.rs",
+    "crates/lua_core/src/gc/mark.rs",
+    "crates/lua_vm/src/execute.rs",
+    "crates/lua_vm/src/runtime.rs",
+    "crates/lua_vm/src/state/lua_state.rs",
+    "crates/lua_app/src/main.rs",
+    "crates/lua_stdlib/src/base.rs",
+    "crates/lua_stdlib/src/coroutine.rs",
+    "crates/lua_stdlib/src/debug.rs",
+    "crates/lua_stdlib/src/io.rs",
+    "crates/lua_stdlib/src/math.rs",
+    "crates/lua_stdlib/src/os.rs",
+    "crates/lua_stdlib/src/package.rs",
+    "crates/lua_stdlib/src/registration.rs",
+    "crates/lua_stdlib/src/string.rs",
+    "crates/lua_stdlib/src/table.rs"
+  ],
+  "requiredRegressionCoverage": [
+    "duplicate canonical bytes share identity and hash",
+    "embedded NUL and high-byte Table keys",
+    "foreign and stale handles fail scoped access",
+    "address reuse fails ObjectId validation",
+    "stale and reused handles remain safe to compare and hash"
+  ]
+}

@@ -91,29 +91,19 @@ mod allocator_sealed {
 
 /// Allocation substrate used by the compiler's Proto builder.
 ///
-/// The trait is sealed so production callers select either direct legacy
-/// allocation or a lexical publication transaction.
+/// The trait is sealed so production callers select either direct test
+/// allocation or a lexical publication transaction. String allocation always
+/// requires the canonical pool.
 #[doc(hidden)]
 pub trait CodegenObjectAllocator: allocator_sealed::Sealed {
-    fn allocate_string(
-        &mut self,
-        string_pool: Option<&mut StringPool>,
-        bytes: &[u8],
-    ) -> GcRef<GcString>;
+    fn allocate_string(&mut self, string_pool: &mut StringPool, bytes: &[u8]) -> GcRef<GcString>;
 
     fn allocate_proto(&mut self, proto: Proto) -> GcRef<Proto>;
 }
 
 impl CodegenObjectAllocator for GarbageCollector {
-    fn allocate_string(
-        &mut self,
-        string_pool: Option<&mut StringPool>,
-        bytes: &[u8],
-    ) -> GcRef<GcString> {
-        match string_pool {
-            Some(pool) => pool.intern_bytes(self, bytes),
-            None => self.create(GcString::from_bytes(bytes)),
-        }
+    fn allocate_string(&mut self, string_pool: &mut StringPool, bytes: &[u8]) -> GcRef<GcString> {
+        string_pool.intern_bytes(self, bytes)
     }
 
     fn allocate_proto(&mut self, proto: Proto) -> GcRef<Proto> {
@@ -122,17 +112,10 @@ impl CodegenObjectAllocator for GarbageCollector {
 }
 
 impl CodegenObjectAllocator for PublicationTxn<'_> {
-    fn allocate_string(
-        &mut self,
-        string_pool: Option<&mut StringPool>,
-        bytes: &[u8],
-    ) -> GcRef<GcString> {
-        let rooted = if let Some(pool) = string_pool {
-            self.intern_bytes(pool, bytes)
-                .expect("compiler StringPool entry belongs to the publication collector")
-        } else {
-            self.alloc(GcString::from_bytes(bytes))
-        };
+    fn allocate_string(&mut self, string_pool: &mut StringPool, bytes: &[u8]) -> GcRef<GcString> {
+        let rooted = self
+            .intern_bytes(string_pool, bytes)
+            .expect("compiler StringPool entry belongs to the publication collector");
         // SAFETY: CodeGenerator attaches this handle only to the unpublished
         // Proto tree owned by the same transaction.
         unsafe { self.retain_string_for_proto(rooted) }
@@ -174,43 +157,31 @@ pub struct CodeGenerator<'services, A: CodegenObjectAllocator + ?Sized = Garbage
     /// 编译期间借用的对象分配服务；生命周期保证服务不会先于编译器失效。
     allocator: &'services mut A,
 
-    /// 可选的字符串驻留池，只在本次编译期间安全借用。
-    string_pool: Option<&'services mut StringPool>,
+    /// Canonical string pool, borrowed for the complete compilation pass.
+    string_pool: &'services mut StringPool,
 }
 
 impl<'services> CodeGenerator<'services, GarbageCollector> {
-    pub fn new(gc: &'services mut GarbageCollector) -> Self {
-        Self::from_services(gc, None)
-    }
-
     pub fn new_with_pool(
         gc: &'services mut GarbageCollector,
         string_pool: &'services mut StringPool,
     ) -> Self {
-        Self::from_services(gc, Some(string_pool))
+        Self::from_services(gc, string_pool)
     }
 }
 
 impl<'services, 'scope> CodeGenerator<'services, PublicationTxn<'scope>> {
-    /// Create a compiler whose every GC allocation remains a transaction root.
-    pub fn new_in_publication(transaction: &'services mut PublicationTxn<'scope>) -> Self {
-        Self::from_services(transaction, None)
-    }
-
     /// Create a publication-rooted compiler with canonical string interning.
     pub fn new_in_publication_with_pool(
         transaction: &'services mut PublicationTxn<'scope>,
         string_pool: &'services mut StringPool,
     ) -> Self {
-        Self::from_services(transaction, Some(string_pool))
+        Self::from_services(transaction, string_pool)
     }
 }
 
 impl<'services, A: CodegenObjectAllocator + ?Sized> CodeGenerator<'services, A> {
-    fn from_services(
-        allocator: &'services mut A,
-        string_pool: Option<&'services mut StringPool>,
-    ) -> Self {
+    fn from_services(allocator: &'services mut A, string_pool: &'services mut StringPool) -> Self {
         let mut proto = Proto::new();
         proto.set_max_stack_size(2);
         Self {
@@ -244,7 +215,7 @@ impl<'services, A: CodegenObjectAllocator + ?Sized> CodeGenerator<'services, A> 
     ) -> Result<Proto, CodegenError> {
         let source = self
             .allocator
-            .allocate_string(self.string_pool.as_deref_mut(), source_name);
+            .allocate_string(self.string_pool, source_name);
         self.builder.set_source(Some(source));
         self.builder.set_vararg(true);
 
@@ -273,9 +244,7 @@ impl<'services, A: CodegenObjectAllocator + ?Sized> CodeGenerator<'services, A> 
     }
 
     pub(crate) fn add_byte_string_constant(&mut self, value: &[u8]) -> Option<i32> {
-        let string = self
-            .allocator
-            .allocate_string(self.string_pool.as_deref_mut(), value);
+        let string = self.allocator.allocate_string(self.string_pool, value);
         Some(self.builder.add_gc_string_constant(string))
     }
 

@@ -10,12 +10,12 @@ fn compile_and_run(source: &str) -> Runtime {
     let mut runtime = Runtime::new();
     {
         let mut parts = runtime.parts_mut().expect("runtime parts are available");
-        let (state, gc, _) = parts.split_mut();
+        let (state, gc, string_pool) = parts.split_mut();
         open_all(state, gc);
 
         let mut parser = Parser::new(source);
         let chunk = parser.parse().expect("parse should succeed");
-        let cg = CodeGenerator::new(gc);
+        let cg = CodeGenerator::new_with_pool(gc, string_pool);
         let proto = cg
             .generate(&chunk, "<io-byte-test>")
             .expect("codegen should succeed");
@@ -32,13 +32,11 @@ fn returned_bytes(runtime: &Runtime) -> Vec<u8> {
         .cloned()
         .unwrap_or(Value::Nil)
     {
-        Value::String(value) => {
-            // SAFETY: the returned string remains rooted by the live Runtime.
-            unsafe { value.as_ref() }
-                .expect("returned string should be live")
-                .as_bytes()
-                .to_vec()
-        }
+        Value::String(value) => runtime
+            .main_state()
+            .expect("main state remains live")
+            .copy_string_bytes(value)
+            .expect("returned string should be live"),
         value => panic!("expected returned string, got {value:?}"),
     }
 }

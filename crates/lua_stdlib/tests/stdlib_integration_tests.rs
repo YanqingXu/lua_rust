@@ -11,12 +11,12 @@ fn compile_and_run(source: &str) -> (Runtime, ()) {
     let mut runtime = Runtime::new();
     let proto = {
         let mut parts = runtime.parts_mut().expect("runtime parts are available");
-        let (state, gc, _) = parts.split_mut();
+        let (state, gc, string_pool) = parts.split_mut();
         open_all(state, gc);
 
         let mut parser = Parser::new(source);
         let chunk = parser.parse().expect("parse should succeed");
-        let cg = CodeGenerator::new(gc);
+        let cg = CodeGenerator::new_with_pool(gc, string_pool);
         let proto = cg
             .generate(&chunk, "<stdlib-test>")
             .expect("codegen should succeed");
@@ -38,27 +38,26 @@ fn return_value(runtime: &Runtime) -> Value {
 
 fn returned_string(runtime: &Runtime) -> String {
     match return_value(runtime) {
-        Value::String(s) => {
-            // SAFETY: the returned string is owned by the live test Runtime.
-            unsafe { s.as_ref() }
-                .expect("string ref should be valid")
-                .to_utf8()
-                .expect("returned test string should be UTF-8 text")
-                .to_string()
-        }
+        Value::String(s) => runtime
+            .main_state()
+            .expect("main state is live")
+            .with_string_bytes(s, |bytes| {
+                std::str::from_utf8(bytes)
+                    .expect("returned test string should be UTF-8 text")
+                    .to_string()
+            })
+            .expect("string ref should be valid"),
         value => panic!("expected string, got {value:?}"),
     }
 }
 
 fn returned_bytes(runtime: &Runtime) -> Vec<u8> {
     match return_value(runtime) {
-        Value::String(s) => {
-            // SAFETY: the returned string is owned by the live test Runtime.
-            unsafe { s.as_ref() }
-                .expect("string ref should be valid")
-                .as_bytes()
-                .to_vec()
-        }
+        Value::String(s) => runtime
+            .main_state()
+            .expect("main state is live")
+            .copy_string_bytes(s)
+            .expect("string ref should be valid"),
         value => panic!("expected string, got {value:?}"),
     }
 }
@@ -189,24 +188,18 @@ fn io_lines_graph_is_traced_from_the_runtime_main_stack() {
             .expect("iterator environment should publish")
     };
     let file = {
+        let state = runtime.main_state().expect("main state remains live");
+        let file_key = state
+            .find_interned_string(b"__file")
+            .expect("string services remain live")
+            .expect("__file is interned");
         // SAFETY: the iterator Function retains the environment Table.
         let environment =
             unsafe { environment.as_ref() }.expect("iterator environment should remain live");
-        environment
-            .hash_entries()
-            .find_map(|(key, value)| {
-                let Value::String(key) = key else {
-                    return None;
-                };
-                // SAFETY: the environment owns each key while it is scanned.
-                let is_file =
-                    unsafe { key.as_ref() }.is_some_and(|key| key.as_bytes() == b"__file");
-                match (is_file, value) {
-                    (true, Value::Userdata(file)) => Some(*file),
-                    _ => None,
-                }
-            })
-            .expect("iterator environment should retain its file")
+        let Value::Userdata(file) = environment.get(&Value::String(file_key)) else {
+            panic!("iterator environment should retain its file")
+        };
+        file
     };
     let file_state = {
         // SAFETY: the environment retains the file Userdata.

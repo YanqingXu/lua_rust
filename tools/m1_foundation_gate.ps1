@@ -152,8 +152,10 @@ function Test-RequiredFiles {
         "docs/rust_migration/byte_string_rfc.md",
         "docs/rust_migration/runtime_ownership_rfc.md",
         "tests/compatibility/gc_root_inventory.json",
+        "tests/compatibility/string_access_inventory.json",
         "tests/compatibility/m1-byte-differential-cases.json",
         "tools/check_gc_root_inventory.ps1",
+        "tools/check_string_contract.ps1",
         "tools/run_lua51_differential.ps1"
     )
     $missing = @($required | Where-Object {
@@ -443,6 +445,14 @@ try {
         -Pattern "thread_local!\s*\{|(?:DUMPS|SOURCES)\s*:" `
         -Paths @("crates/lua_stdlib")
 
+    $stringContractArtifact =
+        Resolve-RootedPath "target/compatibility/string-contract.json"
+    Invoke-PowerShellStep `
+        -Name "canonical-scoped-string-contract" `
+        -Script (Join-Path $Root "tools/check_string_contract.ps1") `
+        -Arguments @("-Root", $Root, "-ResultPath", $stringContractArtifact) `
+        -Artifact $stringContractArtifact
+
     $inventoryArtifact =
         Resolve-RootedPath "target/compatibility/gc-root-inventory.json"
     Invoke-PowerShellStep `
@@ -579,9 +589,9 @@ $openDebts = @(
         detail = "LuaState still stores transitional raw GC/StringPool service pointers."
     },
     [ordered]@{
-        id = "production-publication-roots"
+        id = "unique-heap-service-owner"
         blocks = "destructive sweep"
-        detail = "Active/debug Proto identities, open Upvalue owners, coroutine activation buffers, and PendingState handles are canonical roots; coroutine create/wrap, compiler, library/package, IO, VM temporaries, app arguments, and synchronous result publication are transactional. String equality/canonicalization, unique Heap ownership, and live collector integration still block destructive sweep."
+        detail = "Publication and production string identity/access slices are locally complete. One Heap must still own collector, StringPool, allocator/accounting, and services; fixed/finalizer roots and Runtime-only live collector integration also remain open."
     },
     [ordered]@{
         id = "deterministic-runtime-shutdown"
@@ -596,12 +606,7 @@ $openDebts = @(
     [ordered]@{
         id = "generational-gc-handles-and-publication-roots"
         blocks = "destructive sweep"
-        detail = "GcRef carries non-reused ObjectId provenance, and StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement; lexical object roots plus coroutine, compiler, library/package, IO, VM/app, and result publication are implemented. Unique Heap ownership and live collector integration remain open."
-    },
-    [ordered]@{
-        id = "string-content-equality-without-collector-borrow"
-        blocks = "destructive sweep"
-        detail = "Safe Value::String equality and hashing still preserve byte-content semantics through transitional unscoped dereferences; production string canonicalization/scoped access is not complete."
+        detail = "GcRef carries non-reused ObjectId provenance, StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement, lexical publication roots are implemented, and production string Eq/Hash is identity-only with scoped byte access. Unique Heap ownership, fixed/finalizer roots, broader non-string object contexts, and live collector integration remain open."
     }
 )
 
@@ -613,7 +618,7 @@ $result = [ordered]@{
         "m1-foundation-gate"
     }
     mode = if ($Smoke) { "smoke" } else { "full" }
-    scope = "ByteString, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, compiler, library/package, IO, VM/app, and synchronous result publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
+    scope = "ByteString and canonical/scoped production string access, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, compiler, library/package, IO, VM/app, and synchronous result publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, and byte differential"
     checksPassed = $failures.Count -eq 0
     foundationPassed = (
         $failures.Count -eq 0 -and
