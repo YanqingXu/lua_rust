@@ -4,8 +4,8 @@
 //! releases its current state turn. The atomic phase consumes the canonical
 //! Runtime root tracer, prepares finalizers, propagates resurrected graphs,
 //! reconciles weak tables, closes unreachable coroutine states before object
-//! destruction, and then sweeps. Allocation-triggered and incremental entry
-//! points remain disabled.
+//! destruction, and then sweeps. Explicit incremental collection shares these
+//! Runtime safe points; allocation-triggered automatic entry remains disabled.
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::state_handle::{RuntimeId, StateHandle};
@@ -103,7 +103,9 @@ impl Runtime {
         // SAFETY: RuntimeStorage is pinned and the access checks above prove
         // there is no active state turn.
         let storage = unsafe { std::pin::Pin::get_unchecked_mut(self.heap.as_mut()) };
+        storage.incremental_trace = None;
         let (gc, strings) = storage.heap.parts_mut();
+        gc.abort_incremental_cycle();
         collect_full_stw_at_safe_point(
             RuntimeRootSet {
                 runtime_id: self.id,
@@ -200,7 +202,7 @@ pub(super) fn collect_full_stw_at_safe_point(
     })
 }
 
-fn ensure_sweep_safe(mark: &MarkOnlyReport) -> Result<(), RuntimeFullCollectionError> {
+pub(super) fn ensure_sweep_safe(mark: &MarkOnlyReport) -> Result<(), RuntimeFullCollectionError> {
     let failed_states = mark.failed_state_handles.len();
     let unsafe_gaps = mark.unsafe_gaps.len();
     let unresolved_edges = mark.unresolved_object_edges.len();

@@ -1126,21 +1126,23 @@ fn execute_proto_inner(
                 } else {
                     l.top.saturating_sub(base_idx + a + 1)
                 };
-                if let Some(table_val) = l.stack.at_mut(base_idx + a) {
-                    if let Value::Table(_table_ref) = table_val {
-                        let table_ptr = _table_ref.as_ptr() as *mut Table;
-                        // SAFETY: We hold exclusive access via &mut LuaState, GC is not
-                        // running during VM execution, and the table is kept alive by the
-                        // LuaState stack. The raw pointer is derived from a valid GcRef.
-                        unsafe {
-                            for i in 1..=count {
-                                let val =
-                                    l.stack.at(base_idx + a + i).cloned().unwrap_or(Value::Nil);
-                                let idx = ((c - 1) * 50) as i32 + i as i32;
-                                (*table_ptr).set_array(idx, &val);
-                            }
+                if let Some(Value::Table(table_ref)) = l.stack.at(base_idx + a).cloned() {
+                    let values = (1..=count)
+                        .map(|i| {
+                            (
+                                ((c - 1) * 50) as i32 + i as i32,
+                                l.stack.at(base_idx + a + i).cloned().unwrap_or(Value::Nil),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    gc.with_mut(table_ref, |table| {
+                        for (index, value) in &values {
+                            table.set_array(*index, value);
                         }
-                    }
+                    })
+                    .map_err(|error| {
+                        RuntimeError::new(format!("VM: invalid SETLIST table: {error}"))
+                    })?;
                 }
             }
 
@@ -1305,7 +1307,11 @@ fn run_debug_instruction_hooks(
 }
 
 fn run_auto_weak_gc(l: &mut LuaState, gc: &mut GarbageCollector) {
-    if l.gc_stopped || l.debug_hook_active || !gc.has_seen_weak_table() {
+    if gc.is_automatic_stopped()
+        || gc.incremental_phase() != lua_core::gc::collector::IncrementalPhase::Pause
+        || l.debug_hook_active
+        || !gc.has_seen_weak_table()
+    {
         return;
     }
 
@@ -2853,30 +2859,42 @@ fn invoke_collectgarbage_runtime_native(l: &mut LuaState, gc: &mut GarbageCollec
         }
         b"collect" => publish_full_collection_request(l, gc, FullCollectionResult::Collect),
         b"step" => {
-            let size = match l.at(2) {
-                Some(Value::Number(value)) => *value,
-                _ => 0.0,
+            let size = match collect_garbage_control_argument(l) {
+                Ok(size) => size,
+                Err(message) => {
+                    return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message);
+                }
             };
-            if collection_step_completed(l, size) {
-                publish_full_collection_request(l, gc, FullCollectionResult::StepComplete)
-            } else {
-                l.push_boolean(false);
-                1
-            }
+            publish_full_collection_request(l, gc, FullCollectionResult::Step { size })
         }
         b"stop" => {
-            l.gc_stopped = true;
+            gc.stop_automatic();
             l.push_number(0.0);
             1
         }
         b"restart" => {
-            l.gc_stopped = false;
-            l.gc_step_remaining = 0;
+            gc.restart_automatic();
             l.push_number(0.0);
             1
         }
-        b"setpause" | b"setstepmul" => {
-            l.push_number(0.0);
+        b"setpause" => {
+            let value = match collect_garbage_control_argument(l) {
+                Ok(value) => value,
+                Err(message) => {
+                    return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message);
+                }
+            };
+            l.push_number(gc.set_pause(value) as f64);
+            1
+        }
+        b"setstepmul" => {
+            let value = match collect_garbage_control_argument(l) {
+                Ok(value) => value,
+                Err(message) => {
+                    return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message);
+                }
+            };
+            l.push_number(gc.set_step_multiplier(value) as f64);
             1
         }
         _ => publish_runtime_native_error(
@@ -2912,25 +2930,27 @@ fn publish_full_collection_request(
     }
 }
 
-fn collection_step_completed(l: &mut LuaState, size: f64) -> bool {
-    if l.gc_step_remaining <= 0 {
-        l.gc_step_remaining = if size >= 10_000.0 {
-            1
-        } else if size >= 6.0 {
-            3
-        } else if size >= 2.0 {
-            8
-        } else {
-            12
-        };
+fn collect_garbage_control_argument(l: &LuaState) -> Result<i32, &'static [u8]> {
+    let value = match l.at(2) {
+        None | Some(Value::Nil) => return Ok(0),
+        Some(Value::Number(value)) => *value,
+        Some(Value::String(value)) => l
+            .copy_string_bytes(*value)
+            .ok()
+            .and_then(|bytes| parse_lua_number_bytes(&bytes))
+            .ok_or(b"bad argument #2 to 'collectgarbage' (number expected)".as_slice())?,
+        Some(_) => {
+            return Err(b"bad argument #2 to 'collectgarbage' (number expected)");
+        }
+    };
+    if !value.is_finite() {
+        return Err(b"bad argument #2 to 'collectgarbage' (finite number expected)");
     }
-    l.gc_step_remaining -= 1;
-    if l.gc_step_remaining <= 0 {
-        l.gc_stopped = false;
-        true
-    } else {
-        false
+    let truncated = value.trunc();
+    if truncated < i32::MIN as f64 || truncated > i32::MAX as f64 {
+        return Err(b"bad argument #2 to 'collectgarbage' (number out of range)");
     }
+    Ok(truncated as i32)
 }
 
 fn publish_runtime_native_error(
@@ -3299,7 +3319,6 @@ fn set_table_value(
                     return Err(RuntimeError::new("table index is NaN"));
                 }
 
-                let table_ptr = t.as_ptr() as *mut Table;
                 // SAFETY: the table is reachable and GC does not run during this VM
                 // instruction. We only take a shared view to test raw presence.
                 let has_raw_key = unsafe { t.as_ref() }.is_some_and(|table| table.has(key));
@@ -3335,11 +3354,10 @@ fn set_table_value(
                     }
                 }
 
-                // SAFETY: The table is GC-managed and kept alive by the LuaState stack.
-                // GC does not run during VM execution, ensuring the pointer remains valid.
-                unsafe {
-                    (*table_ptr).set(key, value);
-                }
+                gc.with_mut(*t, |table| table.set(key, value))
+                    .map_err(|error| {
+                        RuntimeError::new(format!("VM: invalid table mutation: {error}"))
+                    })?;
                 return Ok(());
             }
             _ => {

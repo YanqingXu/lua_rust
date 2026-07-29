@@ -74,9 +74,11 @@ use crate::state::{
 };
 
 mod full_collection;
+mod incremental_collection;
 mod root_trace;
 use full_collection::collect_full_stw_at_safe_point;
-use root_trace::RuntimeRootSet;
+use incremental_collection::collect_incremental_step_at_safe_point;
+use root_trace::{IncrementalRootTrace, RuntimeRootSet};
 pub use root_trace::{
     MarkOnlyReport, RootEdgeCount, RuntimeRootKind, StateTraceFailure, UnresolvedObjectEdge,
     UnsafeTraceGap, UnsafeTraceGapKind,
@@ -1657,6 +1659,7 @@ struct RuntimeStorage {
     state_arena: StateArena,
     heap: Heap,
     native_activations: NativeActivationStack,
+    incremental_trace: Option<IncrementalRootTrace>,
     _pin: PhantomPinned,
 }
 
@@ -1669,6 +1672,7 @@ impl RuntimeStorage {
             state_arena: StateArena::new(handle_issuer),
             heap: Heap::new(),
             native_activations: NativeActivationStack::default(),
+            incremental_trace: None,
             _pin: PhantomPinned,
         }
     }
@@ -2097,6 +2101,7 @@ impl Runtime {
         let mut arena = NonNull::from(&mut heap.state_arena);
         let (gc, string_pool) = heap.heap.parts_mut();
         let activations = &mut heap.native_activations;
+        let incremental_trace = &mut heap.incremental_trace;
         let _activation_cleanup = NativeActivationSessionGuard {
             activations: NonNull::from(&mut *activations),
             gc: NonNull::from(&mut *gc),
@@ -2217,26 +2222,76 @@ impl Runtime {
                                 current_finalizer: None,
                                 response: None,
                             });
-                            let response = collect_full_stw_at_safe_point(
-                                RuntimeRootSet {
-                                    runtime_id: self.id,
-                                    main_handle: initial,
-                                    global_root: self.global_root,
-                                    registry_root: self.registry_root,
-                                    fixed_strings: &self.fixed_strings,
-                                },
-                                // SAFETY: the state turn ended before this match
-                                // and the arena remains pinned for the session.
-                                unsafe { arena.as_mut() },
-                                activations,
-                                gc,
-                                string_pool,
-                            )
-                            .map(|_| CollectionResponse::Success(request.result.values()))
-                            .unwrap_or_else(|error| {
-                                CollectionResponse::ErrorMessage(error.to_string())
-                            });
+                            let roots = RuntimeRootSet {
+                                runtime_id: self.id,
+                                main_handle: initial,
+                                global_root: self.global_root,
+                                registry_root: self.registry_root,
+                                fixed_strings: &self.fixed_strings,
+                            };
+                            let (response, cycle_completed) = match request.result {
+                                crate::native::FullCollectionResult::Collect => {
+                                    *incremental_trace = None;
+                                    gc.abort_incremental_cycle();
+                                    let collection = collect_full_stw_at_safe_point(
+                                        roots,
+                                        // SAFETY: the state turn ended before
+                                        // this match and the arena remains
+                                        // pinned for the session.
+                                        unsafe { arena.as_mut() },
+                                        activations,
+                                        gc,
+                                        string_pool,
+                                    );
+                                    if collection.is_ok() {
+                                        // Pinned C++/Lua 5.1 compatibility:
+                                        // a successful explicit full cycle
+                                        // resumes automatic collection even
+                                        // after a preceding `stop`.
+                                        gc.restart_automatic();
+                                    }
+                                    let response = collection
+                                        .map(|_| {
+                                            CollectionResponse::Success(request.result.values(true))
+                                        })
+                                        .unwrap_or_else(|error| {
+                                            CollectionResponse::ErrorMessage(error.to_string())
+                                        });
+                                    let completed =
+                                        matches!(response, CollectionResponse::Success(_));
+                                    (response, completed)
+                                }
+                                crate::native::FullCollectionResult::Step { size } => {
+                                    match collect_incremental_step_at_safe_point(
+                                        roots,
+                                        // SAFETY: same scheduler safe point as
+                                        // the full-collection branch.
+                                        unsafe { arena.as_mut() },
+                                        activations,
+                                        gc,
+                                        string_pool,
+                                        incremental_trace,
+                                        size,
+                                    ) {
+                                        Ok(report) => (
+                                            CollectionResponse::Success(
+                                                request.result.values(report.cycle_finished),
+                                            ),
+                                            report.cycle_finished,
+                                        ),
+                                        Err(error) => {
+                                            *incremental_trace = None;
+                                            gc.abort_incremental_cycle();
+                                            (
+                                                CollectionResponse::ErrorMessage(error.to_string()),
+                                                false,
+                                            )
+                                        }
+                                    }
+                                }
+                            };
                             if matches!(response, CollectionResponse::Success(_))
+                                && cycle_completed
                                 && matches!(resume, NativeDriverRole::Program)
                                 && gc.pending_finalizer_count() != 0
                                 && gc.begin_finalizer_drain()
@@ -2476,7 +2531,8 @@ impl Runtime {
                             .gc_frames
                             .last_mut()
                             .expect("collection activation remains after drain");
-                        let response = CollectionResponse::Success(frame.request.result.values());
+                        let response =
+                            CollectionResponse::Success(frame.request.result.values(true));
                         frame.response = Some(response.clone());
                         action = NativeDriverAction::DeliverCollection {
                             request: frame.request.clone(),

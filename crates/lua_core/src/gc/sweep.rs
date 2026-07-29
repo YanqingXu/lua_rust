@@ -145,6 +145,7 @@ impl GarbageCollector {
 
         // 更新统计信息
         self.total_memory = self.total_memory.saturating_sub(obj_size);
+        self.subtract_gc_debt(obj_size);
         if self.object_count > 0 {
             self.object_count -= 1;
         }

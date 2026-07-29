@@ -315,6 +315,277 @@ pub(super) struct RuntimeRootSet<'a> {
     pub(super) fixed_strings: &'a [GcRef<GcString>],
 }
 
+/// Persistent half of an incremental Runtime root traversal.
+///
+/// Collector object colors/work live in `GarbageCollector`; this structure
+/// retains the separate validated `StateHandle` queue and diagnostics between
+/// public `collectgarbage("step")` calls.
+pub(super) struct IncrementalRootTrace {
+    runtime_id: RuntimeId,
+    main_handle: StateHandle,
+    total_objects: usize,
+    collector_roots_seeded: usize,
+    collector_roots_rejected: usize,
+    root_counts: BTreeMap<RuntimeRootKind, usize>,
+    state_queue: VecDeque<StateHandle>,
+    attempted_states: HashSet<StateHandle>,
+    traced_states: Vec<StateHandle>,
+    failed_state_handles: Vec<StateTraceFailure>,
+    unsafe_gaps: Vec<UnsafeTraceGap>,
+    unresolved_object_edges: Vec<UnresolvedObjectEdge>,
+    object_trace_steps: usize,
+    collector_cycle_serial: u64,
+}
+
+impl IncrementalRootTrace {
+    /// Seed one new Runtime/collector incremental cycle.
+    pub(super) fn begin(
+        roots: RuntimeRootSet<'_>,
+        state_arena: &StateArena,
+        native_activations: &NativeActivationStack,
+        gc: &mut GarbageCollector,
+    ) -> Self {
+        debug_assert!(state_arena.turn_borrow.is_none());
+        let total_objects = gc.object_count();
+        let seed_report = gc.begin_incremental_mark();
+        let mut trace = Self {
+            runtime_id: roots.runtime_id,
+            main_handle: roots.main_handle,
+            total_objects,
+            collector_roots_seeded: seed_report.seeded,
+            collector_roots_rejected: seed_report.rejected,
+            root_counts: BTreeMap::new(),
+            state_queue: VecDeque::new(),
+            attempted_states: HashSet::new(),
+            traced_states: Vec::new(),
+            failed_state_handles: Vec::new(),
+            unsafe_gaps: Vec::new(),
+            unresolved_object_edges: Vec::new(),
+            object_trace_steps: 0,
+            collector_cycle_serial: gc.incremental_cycle_serial(),
+        };
+        increment(
+            &mut trace.root_counts,
+            RuntimeRootKind::CollectorExplicitRoot,
+            seed_report
+                .seeded
+                .saturating_sub(seed_report.temporary_seeded)
+                .saturating_sub(seed_report.pending_finalizers_seeded),
+        );
+        increment(
+            &mut trace.root_counts,
+            RuntimeRootKind::TemporaryProtectedRoots,
+            seed_report.temporary_seeded,
+        );
+        increment(
+            &mut trace.root_counts,
+            RuntimeRootKind::PendingFinalizers,
+            seed_report.pending_finalizers_seeded,
+        );
+        trace.seed_runtime_snapshot(roots, state_arena, native_activations, gc, false);
+        trace
+    }
+
+    /// Whether this state queue still belongs to the collector's active cycle.
+    pub(super) fn matches_collector(&self, gc: &GarbageCollector) -> bool {
+        self.collector_cycle_serial == gc.incremental_cycle_serial()
+    }
+
+    /// Re-scan all known Runtime roots at the atomic boundary.
+    pub(super) fn atomic_rescan(
+        &mut self,
+        roots: RuntimeRootSet<'_>,
+        state_arena: &StateArena,
+        native_activations: &NativeActivationStack,
+        gc: &mut GarbageCollector,
+    ) {
+        self.attempted_states.clear();
+        self.seed_runtime_snapshot(roots, state_arena, native_activations, gc, true);
+    }
+
+    fn seed_runtime_snapshot(
+        &mut self,
+        roots: RuntimeRootSet<'_>,
+        state_arena: &StateArena,
+        native_activations: &NativeActivationStack,
+        gc: &mut GarbageCollector,
+        include_known_states: bool,
+    ) {
+        let fixed_strings_seeded = roots
+            .fixed_strings
+            .iter()
+            .copied()
+            .filter(|string| gc.mark_registered(*string))
+            .count();
+        increment(
+            &mut self.root_counts,
+            RuntimeRootKind::FixedStrings,
+            fixed_strings_seeded,
+        );
+        increment(
+            &mut self.root_counts,
+            RuntimeRootKind::CoroutineActivationBuffer,
+            native_activations.frames.len()
+                + native_activations.upvalue_transfers.len()
+                + native_activations.gc_frames.len(),
+        );
+        native_activations.seed_roots(gc);
+        mark_runtime_table(
+            gc,
+            roots.global_root,
+            RuntimeRootKind::GlobalTable,
+            &mut self.root_counts,
+            &mut self.unresolved_object_edges,
+        );
+        mark_runtime_table(
+            gc,
+            roots.registry_root,
+            RuntimeRootKind::Registry,
+            &mut self.root_counts,
+            &mut self.unresolved_object_edges,
+        );
+
+        let temporary_state_roots = state_arena.temporary_state_roots();
+        increment(
+            &mut self.root_counts,
+            RuntimeRootKind::TemporaryStateRoots,
+            temporary_state_roots.len(),
+        );
+        self.state_queue.push_back(roots.main_handle);
+        self.state_queue.extend(temporary_state_roots);
+        if include_known_states {
+            self.state_queue.extend(self.traced_states.iter().copied());
+        }
+        increment(&mut self.root_counts, RuntimeRootKind::MainStateEntry, 1);
+    }
+
+    /// Consume at most `budget` validated state snapshots or gray objects.
+    pub(super) fn step(
+        &mut self,
+        state_arena: &StateArena,
+        gc: &mut GarbageCollector,
+        budget: usize,
+    ) -> usize {
+        debug_assert!(state_arena.turn_borrow.is_none());
+        let mut completed = 0usize;
+        let budget = budget.max(1);
+        while completed < budget {
+            let mut traced_state = false;
+            while let Some(handle) = self.state_queue.pop_front() {
+                if !self.attempted_states.insert(handle) {
+                    continue;
+                }
+                match state_arena.resolve_for_trace(handle) {
+                    Ok(state_pointer) => {
+                        // SAFETY: StateArena validates the handle and the
+                        // scheduler has released its turn borrow.
+                        let snapshot = unsafe {
+                            snapshot_state(
+                                state_pointer.as_ref(),
+                                handle,
+                                handle == self.main_handle,
+                            )
+                        };
+                        self.traced_states.push(handle);
+                        self.unsafe_gaps.extend(snapshot.gaps);
+                        mark_snapshot(
+                            gc,
+                            handle,
+                            snapshot.edges,
+                            &mut self.root_counts,
+                            &mut self.unresolved_object_edges,
+                        );
+                    }
+                    Err(error) => self
+                        .failed_state_handles
+                        .push(StateTraceFailure { handle, error }),
+                }
+                completed = completed.saturating_add(1);
+                traced_state = true;
+                break;
+            }
+            if traced_state {
+                continue;
+            }
+
+            let Some(step) = gc.propagate_one_marked_object() else {
+                break;
+            };
+            self.object_trace_steps = self.object_trace_steps.saturating_add(1);
+            if step.traced_thread_caller {
+                increment(&mut self.root_counts, RuntimeRootKind::ThreadCallerChain, 1);
+            }
+            if let Some(handle) = step.thread_state_handle {
+                increment(&mut self.root_counts, RuntimeRootKind::CoroutineStack, 1);
+                self.state_queue.push_back(handle);
+            }
+            if let Some(handle) = step.upvalue_state_handle {
+                increment(&mut self.root_counts, RuntimeRootKind::OpenUpvalues, 1);
+                self.state_queue.push_back(handle);
+            }
+            completed = completed.saturating_add(1);
+        }
+        completed
+    }
+
+    /// Drain all remaining atomic work.
+    pub(super) fn drain(&mut self, state_arena: &StateArena, gc: &mut GarbageCollector) {
+        while !self.is_complete(gc) {
+            let budget = gc
+                .object_count()
+                .saturating_add(self.state_queue.len())
+                .saturating_add(1);
+            if self.step(state_arena, gc, budget) == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Whether both the state and collector work queues are empty.
+    pub(super) fn is_complete(&self, gc: &GarbageCollector) -> bool {
+        self.state_queue.is_empty() && gc.pending_mark_count() == 0
+    }
+
+    /// Current sweep-safe diagnostics.
+    pub(super) fn report(&self, gc: &GarbageCollector) -> MarkOnlyReport {
+        let mut traced_states = self.traced_states.clone();
+        traced_states.sort_unstable();
+        traced_states.dedup();
+        let mut failed_state_handles = self.failed_state_handles.clone();
+        failed_state_handles.sort_by_key(|failure| failure.handle);
+        failed_state_handles.dedup_by_key(|failure| failure.handle);
+        let mut unsafe_gaps = self.unsafe_gaps.clone();
+        unsafe_gaps.sort_unstable();
+        unsafe_gaps.dedup();
+        let mut unresolved_object_edges = self.unresolved_object_edges.clone();
+        unresolved_object_edges.sort_unstable();
+        unresolved_object_edges.dedup();
+
+        MarkOnlyReport {
+            runtime_id: self.runtime_id,
+            total_objects: self.total_objects,
+            marked_objects: gc.marked_object_count(),
+            object_trace_steps: self.object_trace_steps,
+            traced_states,
+            failed_state_handles,
+            collector_roots_seeded: self.collector_roots_seeded,
+            collector_roots_rejected: self.collector_roots_rejected,
+            rejected_child_edges: gc.rejected_mark_edge_count(),
+            root_edges: self
+                .root_counts
+                .iter()
+                .map(|(kind, edges)| RootEdgeCount {
+                    kind: *kind,
+                    edges: *edges,
+                })
+                .collect(),
+            unsafe_gaps,
+            unresolved_object_edges,
+            pending_objects: gc.pending_mark_count(),
+        }
+    }
+}
+
 /// Canonical Runtime root traversal while the scheduler has released every
 /// StateArena turn borrow. The caller owns the stop-the-world invariant.
 pub(super) fn trace_roots_mark_only_at_safe_point(

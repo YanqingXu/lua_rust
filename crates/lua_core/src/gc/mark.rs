@@ -9,7 +9,7 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use crate::gc::collector::GarbageCollector;
+use crate::gc::collector::{GarbageCollector, IncrementalPhase};
 use crate::gc::gc_object::GcObject;
 use crate::gc::gc_ref::GcRef;
 use crate::gc::header::GcObjectHeader;
@@ -184,7 +184,7 @@ impl GarbageCollector {
             if object_type == GcObjectType::Table {
                 self.mark_table(obj);
             } else {
-                self.mark_object_children(obj, object_type);
+                self.trace_object_children_for_barrier(obj, object_type);
             }
 
             Some(MarkTraceStep {
@@ -200,7 +200,7 @@ impl GarbageCollector {
     ///
     /// # Safety
     /// `header_ptr` 必须指向有效的 GC 对象。
-    unsafe fn mark_object_children(
+    pub(crate) unsafe fn trace_object_children_for_barrier(
         &mut self,
         header_ptr: *mut GcObjectHeader,
         object_type: GcObjectType,
@@ -212,10 +212,7 @@ impl GarbageCollector {
                     // GcString 的 mark_children 为空操作
                 }
                 GcObjectType::Table => {
-                    // Table: 在 propagate_marks 中通过 mark_table 调用
-                    // 这里作为 fallback 调用标准 mark_children
-                    let table_ptr = header_ptr as *const Table;
-                    (*table_ptr).mark_children(self);
+                    self.mark_table(header_ptr);
                 }
                 GcObjectType::Function => {
                     let func_ptr = header_ptr as *const crate::function::Function;
@@ -288,6 +285,30 @@ impl GarbageCollector {
         unsafe {
             let table = table_pointer.as_ref();
             self.mark_table_contents(table, weak_keys, weak_values);
+        }
+    }
+
+    /// Re-read weak modes for every live, marked table at the atomic boundary.
+    pub fn reconcile_weak_table_modes(&mut self) {
+        let mut tables = Vec::new();
+        let mut current = self.all_objects;
+        while !current.is_null() {
+            let Some(live) = self.live_allocations.get(&(current as usize)).copied() else {
+                self.rejected_mark_edges = self.rejected_mark_edges.saturating_add(1);
+                break;
+            };
+            // SAFETY: side-table membership establishes a live list node.
+            let next = unsafe { (*current).next() };
+            if live.object_type == GcObjectType::Table
+                // SAFETY: the same membership check permits reading color.
+                && unsafe { !(*current).is_white() }
+            {
+                tables.push(current);
+            }
+            current = next;
+        }
+        for table in tables {
+            self.mark_table(table);
         }
     }
 
@@ -435,6 +456,10 @@ impl GarbageCollector {
         };
         let owner = owner.as_ptr().cast::<GcObjectHeader>();
         let child = child.as_ptr().cast::<GcObjectHeader>();
+        if self.incremental_phase() == IncrementalPhase::Sweep {
+            self.abort_incremental_cycle();
+            return true;
+        }
 
         // SAFETY: both handles matched collector, allocation identity, and
         // concrete type before either header is read.
@@ -445,7 +470,9 @@ impl GarbageCollector {
         }
 
         self.mark_live_object(child);
-        self.propagate_marks();
+        if self.incremental_phase() == IncrementalPhase::Pause {
+            self.propagate_marks();
+        }
         true
     }
 
@@ -470,6 +497,10 @@ impl GarbageCollector {
             return false;
         };
         let child = child.as_ptr().cast::<GcObjectHeader>();
+        if self.incremental_phase() == IncrementalPhase::Sweep {
+            self.abort_incremental_cycle();
+            return true;
+        }
         // SAFETY: validation matched address, identity, and concrete tag.
         unsafe {
             if !(*child).is_white() {
@@ -478,7 +509,9 @@ impl GarbageCollector {
         }
 
         self.mark_live_object(child);
-        self.propagate_marks();
+        if self.incremental_phase() == IncrementalPhase::Pause {
+            self.propagate_marks();
+        }
         true
     }
 }

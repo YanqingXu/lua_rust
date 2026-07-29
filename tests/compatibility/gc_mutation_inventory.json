@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "description": "Fail-closed production inventory for GC graph and Runtime-root mutations used by incremental collection.",
+  "mutation_context": {
+    "symbol": "GarbageCollector::with_mut",
+    "barrier_symbol": "GarbageCollector::after_managed_mutation",
+    "sweep_policy": "A checked managed-object write during Sweep abandons the remaining cursor. Propagate/Atomic writes re-trace black owners; a changed cross-StateArena edge abandons Propagate.",
+    "allocation_policy": "Objects allocated during an active cycle are black and publish their complete initial object graph. Thread/Upvalue allocation conservatively restarts because lua_core cannot enqueue StateHandles.",
+    "automatic_trigger": "disabled"
+  },
+  "families": [
+    {
+      "family": "TABLE_EDGES",
+      "status": "implemented",
+      "owner_symbols": ["Table::set", "Table::set_array", "Table::set_metatable"],
+      "production_locations": [
+        {"path": "crates/lua_vm/src/execute.rs", "symbol": "SETLIST and set_table_value"},
+        {"path": "crates/lua_stdlib/src/base.rs", "symbol": "rawset and setmetatable"},
+        {"path": "crates/lua_stdlib/src/table.rs", "symbol": "insert/remove/sort"},
+        {"path": "crates/lua_core/src/gc/publication.rs", "symbol": "PublicationTxn table publication"}
+      ],
+      "mechanism": "Every post-publication write uses GarbageCollector::with_mut; the post-write barrier re-scans the complete Table under its current weak mode."
+    },
+    {
+      "family": "FUNCTION_EDGES",
+      "status": "implemented",
+      "owner_symbols": ["Function::set_env", "Function::set_upvalue", "Function::add_upvalue"],
+      "production_locations": [
+        {"path": "crates/lua_stdlib/src/base.rs", "symbol": "set_function_env"},
+        {"path": "crates/lua_stdlib/src/debug.rs", "symbol": "set_function_env"},
+        {"path": "crates/lua_stdlib/src/package.rs", "symbol": "set_caller_env"},
+        {"path": "crates/lua_core/src/gc/publication.rs", "symbol": "PublicationTxn Function construction/publication"}
+      ],
+      "mechanism": "Live Function writes use GarbageCollector::with_mut. Direct add_upvalue calls in PublicationTxn occur before the Function allocation is registered."
+    },
+    {
+      "family": "PROTO_EDGES",
+      "status": "construction_only",
+      "owner_symbols": ["Proto::set_source", "Proto::add_constant", "Proto::add_proto", "Proto::add_loc_var", "Proto::add_upvalue_name"],
+      "production_locations": [
+        {"path": "crates/lua_compiler/src/codegen/mod.rs", "symbol": "CodeGenerator unpublished Proto assembly"},
+        {"path": "crates/lua_core/src/gc/publication.rs", "symbol": "alloc_lua_function validated Proto edge"}
+      ],
+      "mechanism": "Compiler Proto mutation is confined to an unpublished Rust value; active-cycle create publishes its complete initial graph before returning."
+    },
+    {
+      "family": "UPVALUE_EDGES",
+      "status": "implemented",
+      "owner_symbols": ["Upvalue::set_closed_value", "Upvalue::close"],
+      "production_locations": [
+        {"path": "crates/lua_vm/src/state/lua_state.rs", "symbol": "close_upvalues"},
+        {"path": "crates/lua_vm/src/execute.rs", "symbol": "closed Upvalue write"},
+        {"path": "crates/lua_stdlib/src/debug.rs", "symbol": "debug.setupvalue"}
+      ],
+      "mechanism": "Closed-value and close transitions use GarbageCollector::with_mut. A changed StateHandle edge restarts Propagate; Atomic closure re-traces the resulting Value."
+    },
+    {
+      "family": "USERDATA_EDGES",
+      "status": "implemented",
+      "owner_symbols": ["Userdata::set_metatable"],
+      "production_locations": [
+        {"path": "crates/lua_stdlib/src/debug.rs", "symbol": "debug.setmetatable userdata branch"},
+        {"path": "crates/lua_core/src/gc/publication.rs", "symbol": "PublicationTxn userdata metatable publication"}
+      ],
+      "mechanism": "Live metatable writes use GarbageCollector::with_mut. Typed payload mutation is non-GC data and is not an object edge."
+    },
+    {
+      "family": "THREAD_EDGES",
+      "status": "implemented",
+      "owner_symbols": ["Thread::set_caller", "Thread::set_state_handle"],
+      "production_locations": [
+        {"path": "crates/lua_vm/src/runtime.rs", "symbol": "coroutine publication and activation link maintenance"}
+      ],
+      "mechanism": "Runtime Thread writes use PublicationTxn::with_mut or GarbageCollector::with_mut. Changed StateHandle edges restart Propagate; caller edges use the normal owner scan."
+    },
+    {
+      "family": "STATE_ROOTS",
+      "status": "atomic_rescan",
+      "owner_symbols": ["LuaState stack/root fields", "CallInfo", "open_upvalues"],
+      "production_locations": [
+        {"path": "crates/lua_vm/src/runtime/root_trace.rs", "symbol": "snapshot_state"},
+        {"path": "crates/lua_vm/src/runtime/root_trace.rs", "symbol": "IncrementalRootTrace::atomic_rescan"}
+      ],
+      "mechanism": "State writes occur only during scheduler turns. Every cycle snapshots reachable states initially and re-scans all known reachable states plus temporary roots at Atomic."
+    },
+    {
+      "family": "RUNTIME_ROOTS",
+      "status": "atomic_rescan",
+      "owner_symbols": ["Runtime roots", "NativeActivationStack", "temporary State roots"],
+      "production_locations": [
+        {"path": "crates/lua_vm/src/runtime/root_trace.rs", "symbol": "IncrementalRootTrace::seed_runtime_snapshot"},
+        {"path": "crates/lua_vm/src/runtime.rs", "symbol": "NativeActivationStack::seed_roots"}
+      ],
+      "mechanism": "The safe-point driver seeds global/registry/fixed roots, native activation buffers, and temporary State roots at cycle start and Atomic."
+    }
+  ]
+}

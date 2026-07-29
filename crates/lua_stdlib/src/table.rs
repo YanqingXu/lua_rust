@@ -452,14 +452,23 @@ unsafe extern "C" fn lua_table_insert(l_ptr: *mut std::ffi::c_void) -> i32 {
         return -1;
     }
 
-    let table_ptr = table_ref.as_ptr() as *mut Table;
-    // SAFETY: table argument is on the active Lua stack and GC does not run here.
-    let len = unsafe { (*table_ptr).length() as i32 };
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        return -1;
+    };
+    // SAFETY: the VM installs this scoped service pointer for the callback.
+    let gc = unsafe { &mut *gc_ptr };
+    let Ok(len) = gc.with_ref(table_ref, |table| table.length() as i32) else {
+        return -1;
+    };
     if nargs == 2 {
         let value = l.at(2).cloned().unwrap_or(Value::Nil);
-        // SAFETY: table_ptr points to the active table argument.
-        unsafe {
-            (*table_ptr).set(&Value::Number((len + 1) as f64), &value);
+        if gc
+            .with_mut(table_ref, |table| {
+                table.set(&Value::Number((len + 1) as f64), &value);
+            })
+            .is_err()
+        {
+            return -1;
         }
         return 0;
     }
@@ -469,13 +478,17 @@ unsafe extern "C" fn lua_table_insert(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     let pos = pos_num as i32;
     let value = l.at(3).cloned().unwrap_or(Value::Nil);
-    // SAFETY: table_ptr points to the active table argument.
-    unsafe {
-        for i in (pos..=len).rev() {
-            let shifted = (*table_ptr).get(&Value::Number(i as f64));
-            (*table_ptr).set(&Value::Number((i + 1) as f64), &shifted);
-        }
-        (*table_ptr).set(&Value::Number(pos as f64), &value);
+    if gc
+        .with_mut(table_ref, |table| {
+            for i in (pos..=len).rev() {
+                let shifted = table.get(&Value::Number(i as f64));
+                table.set(&Value::Number((i + 1) as f64), &shifted);
+            }
+            table.set(&Value::Number(pos as f64), &value);
+        })
+        .is_err()
+    {
+        return -1;
     }
     0
 }
@@ -487,9 +500,14 @@ unsafe extern "C" fn lua_table_remove(l_ptr: *mut std::ffi::c_void) -> i32 {
     let Some(table_ref) = table_arg(l, 1) else {
         return -1;
     };
-    let table_ptr = table_ref.as_ptr() as *mut Table;
-    // SAFETY: table argument is on the active Lua stack and GC does not run here.
-    let len = unsafe { (*table_ptr).length() as i32 };
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        return -1;
+    };
+    // SAFETY: the VM installs this scoped service pointer for the callback.
+    let gc = unsafe { &mut *gc_ptr };
+    let Ok(len) = gc.with_ref(table_ref, |table| table.length() as i32) else {
+        return -1;
+    };
     let pos = if nargs >= 2 {
         number_arg(l, 2).unwrap_or(0.0) as i32
     } else {
@@ -501,16 +519,17 @@ unsafe extern "C" fn lua_table_remove(l_ptr: *mut std::ffi::c_void) -> i32 {
         return 1;
     }
 
-    // SAFETY: table_ptr points to the active table argument.
-    let removed = unsafe { (*table_ptr).get(&Value::Number(pos as f64)) };
-    // SAFETY: table_ptr points to the active table argument.
-    unsafe {
+    let Ok(removed) = gc.with_mut(table_ref, |table| {
+        let removed = table.get(&Value::Number(pos as f64));
         for i in pos..len {
-            let shifted = (*table_ptr).get(&Value::Number((i + 1) as f64));
-            (*table_ptr).set(&Value::Number(i as f64), &shifted);
+            let shifted = table.get(&Value::Number((i + 1) as f64));
+            table.set(&Value::Number(i as f64), &shifted);
         }
-        (*table_ptr).remove(&Value::Number(len as f64));
-    }
+        table.remove(&Value::Number(len as f64));
+        removed
+    }) else {
+        return -1;
+    };
     l.push_value(removed);
     1
 }
@@ -600,12 +619,15 @@ unsafe extern "C" fn lua_table_sort(l_ptr: *mut std::ffi::c_void) -> i32 {
         return push_sort_error(l, err);
     }
 
-    let table_ptr = table_ref.as_ptr() as *mut Table;
-    // SAFETY: table_ref points to the active table argument and VM execution is single-threaded.
-    unsafe {
-        for (idx, value) in values.iter().enumerate() {
-            (*table_ptr).set(&Value::Number((idx + 1) as f64), value);
-        }
+    if gc
+        .with_mut(table_ref, |table| {
+            for (idx, value) in values.iter().enumerate() {
+                table.set(&Value::Number((idx + 1) as f64), value);
+            }
+        })
+        .is_err()
+    {
+        return table_error(l, "invalid table");
     }
     0
 }

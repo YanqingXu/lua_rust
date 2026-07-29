@@ -121,6 +121,9 @@ impl<'scope> PublicationTxn<'scope> {
             replaced.is_none(),
             "temporary publication root identity was unexpectedly reused"
         );
+        if self.collector.incremental_phase() != crate::gc::collector::IncrementalPhase::Pause {
+            self.collector.write_root_barrier(reference);
+        }
 
         Ok(Rooted {
             reference,

@@ -611,9 +611,13 @@ fn set_caller_env(l: &mut LuaState, module_ref: GcRef<Table>) -> bool {
             return true;
         }
     };
-    // SAFETY: the caller frame keeps the function live.
-    unsafe { &mut *(func_ref.as_ptr() as *mut Function) }.set_env(Some(module_ref));
-    true
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        return false;
+    };
+    // SAFETY: the VM installs this scoped service pointer for the callback.
+    unsafe { &mut *gc_ptr }
+        .with_mut(func_ref, |function| function.set_env(Some(module_ref)))
+        .is_ok()
 }
 
 fn table_string_field(l: &LuaState, table: GcRef<Table>, key: &str) -> Option<String> {

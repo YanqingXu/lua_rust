@@ -48,33 +48,37 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   collector shutdown。
 - **Rust 位置：** `crates/lua_stdlib/src/base.rs`；
   `crates/lua_vm/src/runtime/full_collection.rs`；
-  `crates/lua_vm/src/state/lua_state.rs`；`crates/lua_core/src/gc/`。
+  `crates/lua_vm/src/runtime/incremental_collection.rs`；
+  `crates/lua_core/src/gc/`。
 - **当前行为：** Runtime safe-point full STW 已消费 canonical tracer，按
   mark→finalizer prepare/resurrection propagation→weak reconciliation→state
   prepass→sweep→protected callback 执行，对任何 root gap/foreign edge
   fail-closed。Lua `collectgarbage("collect")` 已调用真实回收，`gcinfo/count`
   读取 collector accounted bytes，weak v/k/kv、exactly-once、异常隔离、
   reentrant collect、resurrection/再次死亡和 close drain 均有回归。
-  `collectgarbage("step")` 仍由固定倒计时决定何时触发一次 full STW，尚无
-  incremental phase/debt/work-unit；allocator live/peak 也未实现。
+  `collectgarbage("step")` 已使用 pause→propagate→atomic→sweep→finalize、
+  Runtime 持久 object/StateHandle 双队列、debt/pause/stepmul 和有界 work
+  unit；8-family production mutation barrier 与 active-allocation publication
+  已接线。allocator live/peak 和 allocation-triggered automatic checkpoint
+  尚未实现。
 - **Oracle：** stock Lua 5.1 的可达性和 GC API；`lua_cpp@87c15e6` 的
   `tests/unit/gc/test_gc.cpp`、official suite GC probe 与 shutdown/lifecycle
   行为。
 - **测试与任务：** `tests/lua/differential/gc-weak-value.lua`；
   full STW 的两轮全图、weak/finalizer/resurrection、typed Drop、
   state/upvalue prepass、stale handle、cross-collector/root-gap/phase 回归；
-  M1.7–M1.13，当前重点为 M1.10/M1.11/M1.13。
+  M1.7–M1.13，当前重点为 M1.13。
 - **当前最小证据：** M0 weak-value probe 在官方 Lua 与 C++ oracle 两条 lane
   均通过；Rust 另有 13 项新增 workspace 回归覆盖公开 full collection 和上述
-  weak/finalizer 生命周期。它们不证明 incremental、automatic collection 或
-  allocator live/peak 合同。
-- **影响：** Lua 脚本已能显式触发真实 full STW 并观察实际 collector
-  accounted bytes；但 step 完成时机、pause/stepmul、自动回收和 allocator
-  指标仍不能视为兼容，长生命周期自动运行路径仍可能积累对象。
+  weak/finalizer 生命周期，另有 12 项增量/屏障/控制回归。它们不证明
+  automatic collection 或 allocator live/peak 合同。
+- **影响：** Lua 脚本已能显式触发真实 full/增量回收并观察 collector
+  accounted bytes；但自动回收和 allocator 指标仍不能视为兼容，长生命周期
+  未显式 step/collect 的运行路径仍可能积累对象。
 - **处置状态：** `open`。full STW、weak/finalizer/resurrection、public
-  `collectgarbage("collect")`、实际 `gcinfo/count` 和 close drain 子项已关闭；
-  automatic/incremental integration、barrier、allocator 与完整 shutdown 验收
-  全部通过前，Phase 1 与 GC 相关的 Phase 3/4 能力保持 partial。
+  `collectgarbage("collect"/"step")`、mutation barrier、实际 `gcinfo/count`
+  和 close drain 子项已关闭；automatic integration、allocator 与完整
+  shutdown 验收全部通过前，Phase 1 与 GC 相关的 Phase 3/4 能力保持 partial。
 
 ### NOTE-003: `string.dump` 不是 Lua 5.1 binary chunk
 
@@ -257,7 +261,7 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   {GarbageCollector, StringPool}` owner 图现以 HeapId 防错配；LuaState 不再
   保存 GC/StringPool backpointer，而是在单 state turn 内使用可展开的动态
   service scope。固定字符串、pending-finalizer root seed 与 activation
-  service 已由 canonical Runtime tracer 标记，53-path heap contract 防止生产
+  service 已由 canonical Runtime tracer 标记，54-path heap contract 防止生产
   路径恢复 standalone 构造或提前公开/接线 STW。
   Runtime full STW 现消费该 tracer；对 gap/foreign edge fail-closed，在
   object sweep 前完成 finalizer prepare/resurrection propagation、weak
@@ -265,9 +269,9 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   再通过 Heap/StringPool sweep 全图和 protected callback delivery。
   但 main state 仍是 external arena slot，debug/protected-helper 跨 state
   open-Upvalue 访问尚未纳入同一调度协议；IO/module service drain、
-  allocator live/peak、production barrier 与 automatic/incremental collection
-  合同也未闭环。生产字符串 Eq/Hash/canonical/scoped access 已由独立
-  inventory 和静态门本地闭合。
+  allocator live/peak 与 allocation-triggered automatic collection 合同也未
+  闭环。production barrier、explicit incremental collection 和生产字符串
+  Eq/Hash/canonical/scoped access 已由独立 inventory、静态门和回归本地闭合。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
   close、coroutine lifecycle 和 allocator live-byte 合同。
 - **测试与任务：** 1000 轮 state/coroutine create-close、fixed/ordinary

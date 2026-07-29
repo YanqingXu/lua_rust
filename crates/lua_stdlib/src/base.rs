@@ -989,8 +989,17 @@ unsafe extern "C" fn lua_b_rawset_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
         return -1;
     }
     let value = l.at(3).cloned().unwrap_or(Value::Nil);
-    // SAFETY: table argument is on the active Lua stack and VM execution is single-threaded.
-    unsafe { &mut *(table_ref.as_ptr() as *mut Table) }.set(&key, &value);
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        return -1;
+    };
+    // SAFETY: the VM installs this scoped service pointer for the callback.
+    let gc = unsafe { &mut *gc_ptr };
+    if gc
+        .with_mut(table_ref, |table| table.set(&key, &value))
+        .is_err()
+    {
+        return -1;
+    }
     l.push_value(Value::Table(table_ref));
     1
 }
@@ -1038,7 +1047,7 @@ unsafe extern "C" fn lua_b_setfenv_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
         }
         Value::Number(level) if level > 0.0 => {
             if let Some(func_ref) = function_ref_at_level(l, level as usize) {
-                set_function_env(func_ref, env);
+                set_function_env(l, func_ref, env);
                 Value::Function(func_ref)
             } else if is_thread_env_stack_level(l, level as usize) {
                 l.chunk_env = Some(env);
@@ -1048,7 +1057,7 @@ unsafe extern "C" fn lua_b_setfenv_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
             }
         }
         Value::Function(func_ref) => {
-            set_function_env(func_ref, env);
+            set_function_env(l, func_ref, env);
             Value::Function(func_ref)
         }
         _ => return -1,
@@ -1146,14 +1155,20 @@ unsafe extern "C" fn lua_b_setmetatable_raw(_l_ptr: *mut std::ffi::c_void) -> i3
         let _ = push_lua_string(l, "cannot change a protected metatable");
         return -1;
     }
-    // SAFETY: table argument is on the active Lua stack and VM execution is single-threaded.
-    unsafe { &mut *(table_ref.as_ptr() as *mut Table) }.set_metatable(mt);
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        return -1;
+    };
+    // SAFETY: the VM installs this scoped service pointer for the callback.
+    let gc = unsafe { &mut *gc_ptr };
+    if gc
+        .with_mut(table_ref, |table| table.set_metatable(mt))
+        .is_err()
+    {
+        return -1;
+    }
     if let Some(mt_ref) = mt
         && let Some((weak_keys, weak_values)) = weak_mode(l, mt_ref)
-        && let Some(gc_ptr) = l.active_gc_ptr()
     {
-        // SAFETY: LuaState::gc is installed by the VM before calling C functions.
-        let gc = unsafe { &mut *gc_ptr };
         gc.register_weak_table(table_ref, weak_keys, weak_values);
     }
     l.push_value(Value::Table(table_ref));
@@ -1292,9 +1307,12 @@ fn function_env(func_ref: GcRef<Function>, l: &LuaState) -> Option<GcRef<Table>>
         .or(l.global_table)
 }
 
-fn set_function_env(func_ref: GcRef<Function>, env: GcRef<Table>) {
-    // SAFETY: function refs passed here are held by a Lua stack, closure, or caller argument.
-    unsafe { &mut *(func_ref.as_ptr() as *mut Function) }.set_env(Some(env));
+fn set_function_env(l: &LuaState, func_ref: GcRef<Function>, env: GcRef<Table>) {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        return;
+    };
+    // SAFETY: the VM installs this scoped service pointer for the callback.
+    let _ = unsafe { &mut *gc_ptr }.with_mut(func_ref, |function| function.set_env(Some(env)));
 }
 
 fn raw_equal(a: &Value, b: &Value) -> bool {

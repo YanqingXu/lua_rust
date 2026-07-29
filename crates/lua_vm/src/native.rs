@@ -174,14 +174,14 @@ impl ResumeRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FullCollectionResult {
     Collect,
-    StepComplete,
+    Step { size: i32 },
 }
 
 impl FullCollectionResult {
-    pub(crate) fn values(self) -> Vec<Value> {
+    pub(crate) fn values(self, cycle_finished: bool) -> Vec<Value> {
         match self {
             Self::Collect => vec![Value::Number(0.0)],
-            Self::StepComplete => vec![Value::Boolean(true)],
+            Self::Step { .. } => vec![Value::Boolean(cycle_finished)],
         }
     }
 }

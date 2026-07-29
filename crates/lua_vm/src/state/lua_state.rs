@@ -154,10 +154,6 @@ pub struct LuaState {
     pub yield_wanted_results: Option<usize>,
     /// Last runtime error value that terminated this coroutine.
     pub last_error: Option<Value>,
-    /// Whether automatic GC progress is stopped by collectgarbage("stop").
-    pub gc_stopped: bool,
-    /// Remaining steps in the current collectgarbage("step") cycle.
-    pub gc_step_remaining: i32,
     /// Countdown for lightweight automatic weak-table cleanup.
     pub auto_gc_countdown: i32,
 }
@@ -202,8 +198,6 @@ impl LuaState {
             yield_result_base: None,
             yield_wanted_results: None,
             last_error: None,
-            gc_stopped: false,
-            gc_step_remaining: 0,
             auto_gc_countdown: 0,
         }
     }

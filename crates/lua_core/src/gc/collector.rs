@@ -108,6 +108,22 @@ impl GcDestroyAllReport {
     }
 }
 
+/// Observable phase of the Runtime-driven incremental collector.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IncrementalPhase {
+    /// No incremental cycle is active.
+    #[default]
+    Pause,
+    /// Runtime roots and gray objects are being traced with a bounded budget.
+    Propagate,
+    /// The Runtime must perform the atomic root re-scan and weak/finalizer work.
+    Atomic,
+    /// White objects are being removed with a bounded list cursor.
+    Sweep,
+    /// Sweeping is complete and pending finalizers may be delivered.
+    Finalize,
+}
+
 /// 垃圾回收器
 ///
 /// 管理侵入式 GC 对象链表和根集合。
@@ -172,6 +188,44 @@ pub struct GarbageCollector {
     /// 估算总内存使用量（字节）
     pub(crate) total_memory: usize,
 
+    /// Whether allocation-triggered automatic progress is administratively stopped.
+    ///
+    /// M1.11 exposes the control state but intentionally leaves allocation
+    /// checkpoints disabled until the mutation and incremental gates pass.
+    pub(crate) automatic_stopped: bool,
+
+    /// Next automatic-cycle threshold. It is diagnostic-only while automatic
+    /// allocation checkpoints remain disabled.
+    pub(crate) automatic_threshold_bytes: usize,
+
+    /// Saturating allocation/work debt in bytes.
+    pub(crate) gc_debt_bytes: i64,
+
+    /// Lua 5.1 pause percentage.
+    pub(crate) pause: i32,
+
+    /// Lua 5.1 incremental step multiplier percentage.
+    pub(crate) step_multiplier: i32,
+
+    /// Current incremental phase.
+    pub(crate) incremental_phase: IncrementalPhase,
+
+    /// Current node of the bounded intrusive-list sweep.
+    pub(crate) incremental_sweep_current: *mut GcObjectHeader,
+
+    /// Retained predecessor of `incremental_sweep_current`.
+    pub(crate) incremental_sweep_previous: *mut GcObjectHeader,
+
+    /// Objects reclaimed by the active incremental cycle.
+    pub(crate) incremental_collected: usize,
+
+    /// Objects reclaimed by the most recently completed incremental cycle.
+    pub(crate) last_completed_collected: usize,
+
+    /// Monotonic serial changed whenever an incremental cycle starts or is
+    /// abandoned. Runtime uses it to discard a stale cross-StateArena trace.
+    pub(crate) incremental_cycle_serial: u64,
+
     /// 当前 GC 策略
     #[allow(dead_code)]
     strategy: Box<dyn GcStrategy>,
@@ -202,6 +256,17 @@ impl GarbageCollector {
             finalizers_running: false,
             object_count: 0,
             total_memory: 0,
+            automatic_stopped: false,
+            automatic_threshold_bytes: 64 * 1024,
+            gc_debt_bytes: -(64 * 1024),
+            pause: 200,
+            step_multiplier: 200,
+            incremental_phase: IncrementalPhase::Pause,
+            incremental_sweep_current: std::ptr::null_mut(),
+            incremental_sweep_previous: std::ptr::null_mut(),
+            incremental_collected: 0,
+            last_completed_collected: 0,
+            incremental_cycle_serial: 0,
             strategy: Box::new(MarkSweepGc),
         }
     }
@@ -262,26 +327,44 @@ impl GarbageCollector {
         }
 
         // 加入侵入式链表
+        let allocation_color = if self.incremental_phase == IncrementalPhase::Pause {
+            GcColor::White
+        } else {
+            GcColor::Black
+        };
         // SAFETY: header_ptr points into `boxed`, which is converted to a raw
         // allocation before this function returns and therefore does not move.
         unsafe {
             (*header_ptr).set_next(self.all_objects);
-            (*header_ptr).set_color(GcColor::White);
+            (*header_ptr).set_color(allocation_color);
         }
         self.all_objects = header_ptr;
+        if self.incremental_phase == IncrementalPhase::Sweep
+            && self.incremental_sweep_previous.is_null()
+        {
+            // The cursor still names the old list head. Preserve this new,
+            // black allocation as its predecessor so unlinking the old head
+            // cannot overwrite `all_objects`.
+            self.incremental_sweep_previous = header_ptr;
+        }
         let raw = Box::into_raw(boxed);
 
         self.object_count = next_object_count;
         self.total_memory = next_total_memory;
+        self.add_gc_debt(object_size);
 
         // SAFETY: the side table and intrusive list now register this exact
         // allocation identity and concrete layout.
-        unsafe {
+        let reference = unsafe {
             GcRef::from_registered(
                 NonNull::new(raw).expect("Box::into_raw never returns null"),
                 object_id,
             )
+        };
+        if self.incremental_phase != IncrementalPhase::Pause {
+            self.publish_new_allocation(header_ptr, T::expected_gc_type());
         }
+        reference
     }
 
     /// 创建并添加到根集
@@ -301,6 +384,9 @@ impl GarbageCollector {
         let erased = gc_ref.erase();
         if !self.roots.contains(&erased) {
             self.roots.push(erased);
+            if self.incremental_phase != IncrementalPhase::Pause {
+                self.write_root_barrier(gc_ref);
+            }
         }
     }
 
@@ -325,6 +411,7 @@ impl GarbageCollector {
     /// 返回回收的对象数量。
     pub fn collect(&mut self, string_pool: &mut StringPool) -> usize {
         string_pool.bind_or_assert_owner(self.heap_id);
+        self.abort_incremental_cycle();
         // 1. 标记阶段：重置标记，标记根集，传播标记
         self.mark();
 
@@ -345,6 +432,7 @@ impl GarbageCollector {
     /// 强制删除所有 GC 对象、清空根集和所有内部列表。
     pub fn clear_all(&mut self, string_pool: &mut StringPool) {
         string_pool.bind_or_assert_owner(self.heap_id);
+        self.abort_incremental_cycle();
         assert!(
             self.temporary_roots.is_empty(),
             "cannot clear collector while publication roots are active"
@@ -405,6 +493,7 @@ impl GarbageCollector {
     /// second, and fixed objects last.
     pub fn destroy_all(&mut self, string_pool: &mut StringPool) -> GcDestroyAllReport {
         string_pool.bind_or_assert_owner(self.heap_id);
+        self.abort_incremental_cycle();
         assert!(
             self.temporary_roots.is_empty(),
             "cannot destroy collector while publication roots are active"
@@ -437,6 +526,8 @@ impl GarbageCollector {
         self.finalizers_running = false;
         self.object_count = 0;
         self.total_memory = 0;
+        self.gc_debt_bytes = 0;
+        self.automatic_threshold_bytes = 64 * 1024;
         string_pool.clear();
 
         report
@@ -631,10 +722,16 @@ impl GarbageCollector {
         write: impl for<'a> FnOnce(&'a mut T) -> R,
     ) -> Result<R, GcRefValidationError> {
         let mut pointer = self.validate_ref(value)?;
+        let header = pointer.as_ptr().cast::<GcObjectHeader>();
+        let previous_state_edge = self.managed_state_edge(header, T::expected_gc_type());
         // SAFETY: the side table matched address, identity, and concrete tag.
         // `&mut self` prevents collection and other collector-mediated
         // mutation while the callback is running.
-        Ok(write(unsafe { pointer.as_mut() }))
+        let result = write(unsafe { pointer.as_mut() });
+        let state_edge_changed =
+            previous_state_edge != self.managed_state_edge(header, T::expected_gc_type());
+        self.after_managed_mutation(header, T::expected_gc_type(), state_edge_changed);
+        Ok(result)
     }
 
     /// Read a live Lua string's bytes for exactly the duration of `read`.

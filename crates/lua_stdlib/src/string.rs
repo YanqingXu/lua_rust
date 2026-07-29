@@ -467,9 +467,7 @@ unsafe extern "C" fn lua_string_gmatch_iter(l_ptr: *mut std::ffi::c_void) -> i32
     } else {
         found.end
     };
-    // SAFETY: state table is held by the generic-for state register and VM is single-threaded.
-    let state_mut = unsafe { &mut *(state_ref.as_ptr() as *mut Table) };
-    if set_state_value(l, state_mut, "next", Value::Number(new_next as f64)).is_none() {
+    if set_state_value(l, state_ref, "next", Value::Number(new_next as f64)).is_none() {
         return -1;
     }
 
@@ -1002,10 +1000,13 @@ fn find_gsub_match(source: &[u8], pattern: &[u8], start_idx: usize) -> Option<Pa
     }
 }
 
-fn set_state_value(l: &LuaState, state: &mut Table, key: &str, value: Value) -> Option<()> {
+fn set_state_value(l: &LuaState, state: GcRef<Table>, key: &str, value: Value) -> Option<()> {
     let key = l.find_interned_string(key.as_bytes()).ok().flatten()?;
-    state.set(&Value::String(key), &value);
-    Some(())
+    let gc_ptr = l.active_gc_ptr()?;
+    // SAFETY: the VM installs this scoped service pointer for the callback.
+    unsafe { &mut *gc_ptr }
+        .with_mut(state, |table| table.set(&Value::String(key), &value))
+        .ok()
 }
 
 fn state_value(l: &LuaState, state: &Table, key: &str) -> Option<Value> {

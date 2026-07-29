@@ -697,7 +697,7 @@ unsafe extern "C" fn lua_debug_setfenv(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
 
     match target.clone() {
-        Value::Function(func_ref) => set_function_env(func_ref, env),
+        Value::Function(func_ref) => set_function_env(l, func_ref, env),
         Value::Thread(thread_ref) => {
             let Some(()) = with_thread_state_mut(l, thread_ref, |state| {
                 state.thread_env = Some(env);
@@ -729,23 +729,20 @@ unsafe extern "C" fn lua_debug_setmetatable(l_ptr: *mut std::ffi::c_void) -> i32
         }
     };
 
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        l.push_nil();
+        return 1;
+    };
+    // SAFETY: the VM installs this scoped service pointer for the callback.
+    let gc = unsafe { &mut *gc_ptr };
     match target.clone() {
         Value::Table(table_ref) => {
-            // SAFETY: target is an active argument.
-            if let Some(table) = unsafe { (table_ref.as_ptr() as *mut Table).as_mut() } {
-                table.set_metatable(metatable);
-            }
+            let _ = gc.with_mut(table_ref, |table| table.set_metatable(metatable));
         }
         Value::Userdata(userdata_ref) => {
-            if let Some(userdata) =
-                // SAFETY: target is an active argument and GC does not run while
-                // this C function mutates the userdata metatable.
-                unsafe {
-                    (userdata_ref.as_ptr() as *mut lua_core::userdata::Userdata).as_mut()
-                }
-            {
+            let _ = gc.with_mut(userdata_ref, |userdata| {
                 userdata.set_metatable(metatable);
-            }
+            });
         }
         Value::Nil => l.nil_metatable = metatable,
         Value::Boolean(_) => l.boolean_metatable = metatable,
@@ -1540,9 +1537,12 @@ fn function_env(func_ref: GcRef<Function>) -> Option<GcRef<Table>> {
     unsafe { func_ref.as_ref() }.and_then(|function| function.env())
 }
 
-fn set_function_env(func_ref: GcRef<Function>, env: GcRef<Table>) {
-    // SAFETY: function refs are held by a Lua stack or GC object.
-    unsafe { &mut *(func_ref.as_ptr() as *mut Function) }.set_env(Some(env));
+fn set_function_env(l: &LuaState, func_ref: GcRef<Function>, env: GcRef<Table>) {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        return;
+    };
+    // SAFETY: the VM installs this scoped service pointer for the callback.
+    let _ = unsafe { &mut *gc_ptr }.with_mut(func_ref, |function| function.set_env(Some(env)));
 }
 
 fn thread_env(current: &mut LuaState, thread_ref: GcRef<Thread>) -> Option<GcRef<Table>> {

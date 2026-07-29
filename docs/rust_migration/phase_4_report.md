@@ -2,7 +2,7 @@
 status: partial
 phase: 4
 phase_name: Standard Library
-last_updated: 2026-07-26
+last_updated: 2026-07-29
 rust_baseline: 62841357939b2992a8e5eaf715d603c11d2d6a2d
 cpp_oracle: 87c15e69ceb94eb74e28226ccbefb7e196635711
 ---
@@ -37,7 +37,7 @@ cpp_oracle: 87c15e69ceb94eb74e28226ccbefb7e196635711
 | 阻塞 | 现场证据 | 跟踪 |
 |---|---|---|
 | `_VERSION` 与 stock 不同 | 项目目标跟随 C++ 扩展值 | [NOTE-001](deviation_log.md#note-001-项目扩展-_version-值)，M0.5、M2.8 |
-| GC API 的 incremental/allocator 部分未闭环 | collect 已真实 full sweep，count 使用 collector accounted bytes；step 仍是 compatibility 倒计时，且没有 allocator live/peak | [NOTE-002](deviation_log.md#note-002-gc-增量与-allocator-可观察行为尚未闭环)，M1.10–M1.13、M2.9 |
+| GC API 的 automatic/allocator 部分未闭环 | collect 已真实 full sweep，step 驱动五阶段 explicit incremental cycle，count 使用 collector accounted bytes；尚无 allocation-triggered automatic checkpoint 和 allocator live/peak | [NOTE-002](deviation_log.md#note-002-gc-增量与-allocator-可观察行为尚未闭环)，M1.13、M2.9 |
 | `string.dump` / binary chunk 未实现 | M1.6 已删除 thread-local ID registry，并改为显式 unsupported | [NOTE-003](deviation_log.md#note-003-stringdump-不是-lua-51-binary-chunk)，M2.10、M3.1–M3.3 |
 | 默认 stdio 基线不可观察，当前修复待集成 | 本地 process tests 与双 oracle 4/4 已通过；完整 fixture/CI/合入仍待验收 | [NOTE-004](deviation_log.md#note-004-默认标准流从-memory-file-迁移到宿主流)，M0.5、M2.12 |
 | Native module unsupported | `package.loadlib` 直接返回 unsupported | [NOTE-005](deviation_log.md#note-005-packageloadlib-明确不支持动态库)，M2.15、M3.9 |

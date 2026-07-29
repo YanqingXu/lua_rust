@@ -1,6 +1,6 @@
 ---
 status: accepted-design
-implementation_status: incomplete
+implementation_status: implemented-explicit-collection-slice
 schema_version: 1
 last_updated: 2026-07-29
 cpp_oracle: 87c15e69ceb94eb74e28226ccbefb7e196635711
@@ -17,20 +17,21 @@ runtime-scoped host services. `Heap` owns the allocator/accounting layer,
 
 This document and
 [`gc_root_inventory.json`](../../tests/compatibility/gc_root_inventory.json)
-are design and audit artifacts. The unique Heap/service owner, M1.7 mark-only
-tracing, fixed/finalizer root seeds, and the M1.8 partial shutdown substrate
-described below are implemented, but their presence does **not** mean live-VM
-collection or complete Lua shutdown semantics are enabled.
-
-The current public Lua `collectgarbage("collect")` path must not be connected
-to a destructive sweep until every prerequisite in section 10 is green.
-Low-level mark/sweep unit tests are not evidence that a live VM can be swept
-safely.
+and
+[`gc_mutation_inventory.json`](../../tests/compatibility/gc_mutation_inventory.json)
+are design and audit artifacts. The unique Heap/service owner, canonical
+Runtime root tracer, explicit full collection, checked production mutation
+context, and Runtime-owned incremental phases are implemented. Public
+`collectgarbage("collect")` and `collectgarbage("step")` run only after the
+scheduler releases its current state turn. Allocation-triggered automatic
+collection remains disabled until allocator live/peak accounting and its
+separate gates are complete.
 
 ## 2. Why this is a hard prerequisite
 
-The audited implementation now has one owner graph, but the complete
-live-collection contract is not closed:
+The audited implementation now has one owner graph and an explicit
+safe-point collection contract. The broader automatic/allocation contract is
+not closed:
 
 - `GarbageCollector` stores an intrusive raw-pointer list and raw-pointer work
   queues in `crates/lua_core/src/gc/collector.rs:22-59`.
@@ -78,7 +79,9 @@ Standalone collector Drop and Runtime/Heap shutdown no longer leak registered
 objects. Runtime close has an explicit shutdown-only reclamation path; wiring
 the same destruction into a live sweep before closing the remaining scoped
 non-string access, mutation, weak/finalizer, and unreachable-state contracts
-would still turn those defects into use-after-free.
+would still turn those defects into use-after-free. Explicit full and
+incremental requests avoid that expansion by entering only at Runtime
+scheduler safe points and failing closed on trace gaps.
 
 ## 3. Oracle contract
 
@@ -461,13 +464,14 @@ That gate rejects production raw constructors, common unscoped string
 dereferences, compiler no-pool fallbacks, and regressions in the `Value`
 identity trait implementation.
 
-This still does **not** authorize allocation-triggered or incremental sweep.
+This still does **not** authorize allocation-triggered automatic sweep.
 The unique Runtime/Heap lifetime, fixed strings, pending-finalizer root seed,
 canonical tracer, Runtime safe-point full collection, weak reconciliation,
 protected finalizers and Lua-visible `collectgarbage("collect")` are
-implemented. Full STW refuses every trace gap/rejection. General non-string
-`GcRef::as_ref` migration, allocator live/peak accounting and production
-mutation barriers remain broader M1 work.
+implemented. Explicit incremental collection uses the same fail-closed tracer,
+the checked production mutation contract, and bounded Runtime safe points.
+General non-string `GcRef::as_ref` migration, allocator live/peak accounting,
+and automatic allocation checkpoints remain broader M1 work.
 
 ## 5. Root tracing contract
 
@@ -534,9 +538,15 @@ The mutation audit includes:
 - global, registry, metatable, stack, debug, yielded-value, and error root
   assignments.
 
-The existing barrier helper at `crates/lua_core/src/gc/mark.rs:308-377` is a
-component, not a completed contract: production mutation paths do not call it,
-it does not validate heap ownership, and it has no complete phase policy.
+`GarbageCollector::with_mut` is the implemented `MutationContext`: it validates
+address/ObjectId/type, performs the write, detects changed cross-StateArena
+edges, and invokes `after_managed_mutation`. Production post-publication
+Table/Function/Upvalue/Userdata/Thread writes use this entry; Proto mutation is
+construction-only. Active-cycle barriers publish gray work for the Runtime
+object/state queues, while Sweep-time writes abandon the cursor. The complete
+inventory and static enforcement live in
+`tests/compatibility/gc_mutation_inventory.json` and
+`tools/check_gc_mutation_contract.ps1`.
 
 Incremental phases are `Pause`, `Propagate`, `Atomic`, `Sweep`, and `Finalize`.
 The initial snapshot and atomic boundary rescan wide stack roots. New
@@ -690,7 +700,8 @@ This is a completed local trampoline slice, not completion of Phase B:
 - raw GC/StringPool backpointers are removed and the activation buffer is a
   canonical Runtime root provider. Lua-visible full STW now runs at released
   state-turn safe points and supports nested collection during finalization;
-  automatic/incremental collection remains prohibited.
+  explicit incremental collection now uses the same safe points, while
+  allocation-triggered automatic collection remains prohibited.
 
 #### B.4 Implemented checked open-Upvalue ownership (local-complete slice)
 
@@ -810,9 +821,10 @@ destruction. Existing weak-maintenance scanners now use managed Proto roots
 and checked metadata reads. Runtime full STW consumes this exact report at a
 released state-turn safe point and rejects every reported gap/invalid edge
 before weak reconciliation, sweep, or protected callback delivery.
-Automatic/incremental sweep remains blocked on broader scoped non-string
-borrows, production mutation barriers, allocator accounting, and the
-remaining shutdown semantics.
+Allocation-triggered automatic sweep remains blocked on broader scoped
+non-string borrows, allocator accounting, and the remaining shutdown
+semantics. Explicit incremental sweep is enabled only at released Runtime
+safe points and uses the checked mutation contract.
 
 #### D.2 Implemented temporary-object root foundation (partial)
 
@@ -928,8 +940,9 @@ This closes the inventory entry for coroutine state publication. Compiler
 Proto→Function builders, library/package, IO, VM/app, synchronous result
 construction, string identity/scoped access, unique Heap ownership, fixed
 strings, pending-finalizer roots, and Runtime state pre-sweep are now
-migrated. Broader non-string/mutation contracts remain blockers for
-allocation-triggered and incremental collection.
+migrated. The checked mutation inventory and explicit incremental collector
+are now implemented. Broader non-string access and allocator accounting remain
+blockers for allocation-triggered automatic collection.
 
 ### E. Shutdown substrate — M1.8
 
@@ -1035,8 +1048,9 @@ nested collect, resurrection/second death, close drain, phase and
 active-execution gates have focused regressions.
 
 Lua `collectgarbage("collect")` now uses this route, and `gcinfo/count` read
-collector accounted bytes. Allocation-triggered collection and true
-incremental step semantics remain gated while phase H is incomplete.
+collector accounted bytes. Lua-visible `step`, `stop`, `restart`, `setpause`,
+and `setstepmul` now drive the explicit incremental collector. Automatic
+allocation-triggered collection remains gated on allocator accounting.
 
 ### G. Weak tables, finalizers, and public full collection — M1.9/M1.12 (implemented)
 
@@ -1057,25 +1071,34 @@ close-time Runtime-native reentry remain explicit fail-closed boundaries.
 Weak-key/value behavior follows the pinned C++/Lua 5.1 oracle; Lua 5.2+
 ephemeron assumptions must not be imported without a differential test.
 
-### H. Mutation API, barriers, and accounting — M1.11
+### H. Mutation API and barriers — M1.11 (implemented)
 
-- make edge-bearing fields private;
-- require `MutationContext` for every object/root write;
-- validate both owner and child heap identities;
+- route production managed-edge writes through the checked
+  `GarbageCollector::with_mut` post-write barrier;
+- validate owner and child identities through typed setters and collector
+  tracing;
 - publish new allocation graphs during active cycles;
-- update accounted size and debt after container capacity changes.
+- abort unsafe sweep cursors rather than permitting a stale-color mutation;
+- maintain a fail-closed eight-family mutation inventory and static gate.
 
 Acceptance: directed black-to-white tests for every mutation family, root
-changes, new allocations, weak-mode changes, and cross-heap rejection.
+changes, new allocations, weak-mode changes, and cross-heap rejection. The
+local implementation covers Table, Function, Proto, Upvalue, Userdata, Thread,
+State roots, and Runtime roots. Dynamic container capacity and allocator
+live/peak accounting remain in M1.13.
 
-### I. Incremental collector — M1.10
+### I. Incremental collector — M1.10 (implemented)
 
 - implement real phases, budgeted work, debt threshold, pause, multiplier,
   stop/restart, and cycle-completion reporting;
 - rescan wide roots at initial and atomic boundaries;
 - test mutation and allocation in every phase.
 
-Incremental collection remains disabled until H is complete.
+The explicit collector is enabled through Lua `collectgarbage("step")`.
+Runtime persists both object and `StateHandle` queues across calls, performs
+weak/finalizer reconciliation at Atomic, and reports completion only after
+Finalize. Allocation-triggered automatic progress remains disabled until
+M1.13.
 
 ### J. Durability and unsafe validation — M1.13
 
@@ -1105,11 +1128,11 @@ update.
 | U-11 | States/upvalues and services are closed while the GC objects they need are still alive. | Explicit close phase and thread-first heap teardown. |
 | U-12 | Every published edge preserves heap provenance, tri-color, and memory-accounting invariants. | Private mutation fields and mandatory `MutationContext`. |
 
-## 10. Hard gate before automatic/incremental destructive sweep
+## 10. Hard gate before allocation-triggered automatic sweep
 
-All boxes are required before mutation-interleaved automatic or incremental
-sweep. The explicit Runtime safe-point full collector is narrower and fails
-closed when an unchecked root/provenance box is relevant:
+The explicit Runtime safe-point full and incremental collectors are narrower
+and fail closed when an unchecked root/provenance box is relevant. All
+remaining boxes are required before allocation-triggered automatic sweep:
 
 - [x] one unique `Runtime`/`Heap` owner and verified dependency lifetime;
 - [x] no standalone collector drop path that lacks a live string pool and
@@ -1120,19 +1143,20 @@ closed when an unchecked root/provenance box is relevant:
 - [x] the thread-local dump Proto registry is removed and pseudo-dump loading is rejected;
 - [ ] every handle is provenance/liveness checked and cross-heap publication is
       rejected;
-- [ ] the complete root inventory is traced through one implementation;
+- [x] the complete root inventory is traced through one implementation;
 - [x] active Function/Proto and open-Upvalue owners are handles, not lifetime
       placeholders;
-- [ ] temporary allocation/publication roots are enforced by API shape;
+- [x] temporary allocation/publication roots are enforced by API shape;
 - [x] pending finalizers are roots and all work queues are pruned on destroy;
 - [x] unreachable coroutine states close before Thread/object sweep;
 - [x] ordinary and fixed objects have a deterministic shutdown destruction route;
 - [x] mark-only root tests, shutdown Drop probes, and inventory validation pass.
 
-Complete write barriers are not required for the stop-the-world Runtime
-safe-point collector. They are an absolute prerequisite for incremental and
-allocation-triggered collection. Complete weak/finalizer behavior is now
-implemented for Lua-visible explicit full collection.
+The production mutation inventory, checked post-write barriers, explicit
+incremental phase/debt controls, and weak/finalizer behavior are implemented
+for Lua-visible explicit collection. Allocation-triggered entry remains
+disabled; allocator live/peak accounting and the remaining unchecked boxes
+still block it.
 
 ## 11. Acceptance commands
 
@@ -1141,6 +1165,9 @@ The documentation and inventory gate is available immediately:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass `
   -File tools/check_gc_root_inventory.ps1
+
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File tools/check_gc_mutation_contract.ps1
 ```
 
 The existing repository gates remain mandatory:

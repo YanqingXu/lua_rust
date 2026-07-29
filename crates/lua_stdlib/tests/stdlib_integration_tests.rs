@@ -129,6 +129,55 @@ fn base_collectgarbage_and_global_self_are_available() {
 }
 
 #[test]
+fn collectgarbage_controls_return_previous_oracle_values() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local p0 = collectgarbage("setpause", 150)
+        local p1 = collectgarbage("setpause", 175)
+        local m0 = collectgarbage("setstepmul", 50)
+        local m1 = collectgarbage("setstepmul", 125)
+        assert(collectgarbage("stop") == 0)
+        assert(collectgarbage("restart") == 0)
+        return p0 + p1 + m0 + m1
+        "#,
+    );
+    assert_eq!(return_value(&runtime), Value::Number(600.0));
+    let mut parts = runtime.parts_mut().expect("runtime parts remain available");
+    let (_, gc, _) = parts.split_mut();
+    assert_eq!(gc.pause(), 175);
+    assert_eq!(gc.step_multiplier(), 125);
+    assert!(!gc.is_automatic_stopped());
+}
+
+#[test]
+fn collectgarbage_control_arguments_and_collect_restart_match_oracle() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local previous = collectgarbage("setpause", "123.9")
+        assert(previous == 200)
+
+        local function expect_error(value, expected)
+            local ok, message = pcall(collectgarbage, "step", value)
+            assert(not ok)
+            assert(string.find(message, expected, 1, true))
+        end
+        expect_error({}, "number expected")
+        expect_error("1e9999", "finite number expected")
+        expect_error(2147483648, "number out of range")
+
+        collectgarbage("stop")
+        collectgarbage("collect")
+        return 1
+        "#,
+    );
+    assert_eq!(return_value(&runtime), Value::Number(1.0));
+    let mut parts = runtime.parts_mut().expect("runtime parts remain available");
+    let (_, gc, _) = parts.split_mut();
+    assert_eq!(gc.pause(), 123);
+    assert!(!gc.is_automatic_stopped());
+}
+
+#[test]
 fn math_random_and_os_clock_support_sort_scripts() {
     let (state, _gc) = compile_and_run(
         "math.randomseed(123); local a = math.random(); local b = math.random(10); local c = math.random(5, 8); local t = os.clock(); if a >= 0 and a < 1 and b >= 1 and b <= 10 and c >= 5 and c <= 8 and type(t) == 'number' then return 1 end return 0",
@@ -884,6 +933,34 @@ fn official_gc_step_and_weak_value_patterns_work() {
         assert(count == 2 * lim, "weak value count mismatch")
 
         return 1
+        "#,
+    );
+    assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
+fn incremental_cycle_clears_weak_values_and_delivers_finalizers_on_completion() {
+    let (state, _) = compile_and_run(
+        r#"
+        collectgarbage("collect")
+        collectgarbage("setstepmul", 100)
+        local weak = setmetatable({}, {__mode = "v"})
+        weak[1] = {}
+        local calls = 0
+        local u = newproxy(true)
+        getmetatable(u).__gc = function(value)
+            calls = calls + 1
+            assert(type(value) == "userdata")
+        end
+        u = nil
+        local steps = 0
+        repeat
+            steps = steps + 1
+        until collectgarbage("step", 0)
+        assert(steps > 4)
+        assert(weak[1] == nil)
+        assert(calls == 1)
+        return calls
         "#,
     );
     assert_eq!(return_value(&state), Value::Number(1.0));

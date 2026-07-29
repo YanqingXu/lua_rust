@@ -7,8 +7,8 @@ last_updated: 2026-07-29
 rust_baseline: 6284135
 cpp_oracle: 87c15e6
 lua_oracle: Lua 5.1.5
-implementation_checkpoint: working-tree@c7ea95bc7a7c450ef15fcd9bfa0dee933ec1ba6a+m1-public-stw-finalizers
-next_primary_task: M1 write-barrier mutation inventory and incremental GC
+implementation_checkpoint: working-tree@c7ea95bc7a7c450ef15fcd9bfa0dee933ec1ba6a+m1-incremental-gc-barriers
+next_primary_task: M1.13 allocator live/peak accounting and allocation-triggered GC gate
 ---
 
 # lua_rust 完整复刻 lua_cpp 开发计划
@@ -54,9 +54,10 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
   基础、`TEMPORARY_STATE_ROOTS/PendingState`、Runtime coroutine activation
   trampoline、compiler/stdlib/VM/app publication、production string contract、
   唯一 Heap/service owner、全图 STW、weak/finalizer/resurrection 与
-  Lua-visible `collectgarbage("collect")` 完成后，803 个
+  Lua-visible `collectgarbage("collect"/"step")` 完成后，815 个
   workspace tests 已枚举；当前 fmt、定向 tests、24/24 root inventory、
-  17-path string contract 与 53-path heap contract 已通过，完整质量门结果见
+  8/8 mutation inventory、17-path string contract 与 54-path heap contract
+  已通过，完整质量门结果见
   本节最新续接记录。
 - fixture manifest 当前共 131 项：101 个 non-official、24 个 official 和
   6 个 differential（4 个 M0 focused cases，加 2 个 M1 raw-byte cases）。
@@ -76,10 +77,10 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
 | 验证 | M0 runner 已建立且 fail-closed；当前 non-official 仍有 88 个语义差异 | P0 |
 | CI | 本地统一质量/M0 门已通过，远程 workflow 尚待首次运行 | P1 |
 | 字符串 | ByteString/GcString/StringPool、编译器和宿主边界已迁移 arbitrary bytes；当前生产构造强制 canonical interning，`Value::String` Eq/Hash 使用身份，内容语义走 collector/state-scoped bytes 并受静态合同门保护；binary chunk 与未来 C API 仍待后续里程碑 | P0 |
-| GC | Runtime safe-point STW 已真实回收 weak/strong 全图、交付 protected finalizer 并更新 object/accounted-byte 计账；VM `collectgarbage("collect")` 与 `gcinfo/count` 已接线。`step` 仍以 compatibility 倒计时触发 full STW，尚无真实 incremental work unit | P0 |
+| GC | Runtime safe-point full STW 与五阶段 explicit incremental collector 已真实回收 weak/strong 全图、交付 protected finalizer 并更新 object/accounted-byte 计账；VM `collectgarbage("collect"/"step")`、`stop/restart/setpause/setstepmul` 与 `gcinfo/count` 已接线。allocator live/peak 和 allocation-triggered automatic checkpoint 尚未闭环 | P0 |
 | 生命周期 | Runtime/StateArena 已有确定性 Lua `__gc` drain、state→Thread→ordinary→fixed 销毁与 1000 轮归零测试；唯一 Heap/HeapId、scoped service context 与 standalone Drop reclaim 已闭环。显式服务 drain、main-state arena owner 和 allocator live/peak 仍开放 | P0 |
-| GC 引用安全 | `GcRef` 已携带进程级不复用 `ObjectId`，collector live table 在解引用前校验地址、身份与类型；managed Proto、checked open-Upvalue owner、临时对象/状态根、publication、canonical/scoped string、fixed/pending-finalizer roots、Runtime canonical tracer 与不可达 state prepass 已落地。全图 sweep 会拒绝所有 tracer gap/foreign edge；通用非字符串 scoped access、production mutation barrier 与自动/增量入口仍未闭环 | P0 |
-| GC 安全 | table/function/upvalue 等写入路径尚未接入 write barrier | P0 |
+| GC 引用安全 | `GcRef` 已携带进程级不复用 `ObjectId`，collector live table 在解引用前校验地址、身份与类型；managed Proto、checked open-Upvalue owner、临时对象/状态根、publication、canonical/scoped string、fixed/pending-finalizer roots、Runtime canonical tracer、不可达 state prepass 与 explicit incremental 双队列已落地。全图 sweep 会拒绝所有 tracer gap/foreign edge；通用非字符串 scoped access、allocator accounting 与 automatic 入口仍未闭环 | P0 |
+| GC 安全 | 8-family production mutation inventory、checked post-write barrier、active-allocation publication 与 sweep-phase fail-closed abort 已落地；动态容器容量对账和 allocation-triggered automatic collection 仍由 M1.13 门控 | P0 |
 | IO | raw stdin/stdout/stderr、文件/tmpfile 与 scoped userdata access 已通过本地 byte/process 测试；text mode、popen 与显式 shutdown 服务语义仍待 M2/M1.8/M1.13 | P1 |
 | Bytecode parity | schema v2 已补齐 constant/sub-Proto/function/line/upvalue 证据；原两例 opcode/constant/metadata 已完全一致，各只剩 2 项由固定 C++ printer 不输出 local names 导致的 fail-closed 证据差异。扩展 closure case 仍触发 500 条真实差异上限 | P0 |
 | VM trace parity | runner 自检通过，但两端真实 `--trace-diff` 支持仍缺失 | P0 |
@@ -147,7 +148,7 @@ M4 必须建立在 M1 和 M3 的生命周期、allocator 和公开状态合同�
 | 里程碑 | 状态 | 当前证据或入口 |
 |---|---|---|
 | M0 | `completed` | 本地统一 M0 gate 通过，0 hard failure、3 项已登记债务；详见 [M0 收口报告](docs/rust_migration/m0_report.md)。 |
-| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline、checked open-Upvalue owner、compiler/library/package/IO/VM/app/result publication、production string contract、唯一 Heap/service owner，以及 weak/finalizer/resurrection + Lua-visible full STW 已完成；write-barrier mutation inventory 与 incremental phase/debt/step 是下一条主线。 |
+| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline、checked open-Upvalue owner、compiler/library/package/IO/VM/app/result publication、production string contract、唯一 Heap/service owner、weak/finalizer/resurrection、Lua-visible full STW、write-barrier mutation inventory 与 explicit incremental phase/debt/step 已完成；allocator live/peak accounting 与 allocation-triggered automatic gate 是下一条主线。 |
 | M2 | `active-limited` | 原两例 bytecode 指令/常量/metadata 已对齐；C++ local-name 证据缺口、nested Proto 大量差异、88 个 non-official 差异和真实 VM trace 仍开放。 |
 | M3 | `pending` | 等待 M1 的字节表示和生命周期合同稳定。 |
 | M4 | `pending` | 等待 M1/M3 的 runtime、allocator 与公开状态合同。 |
@@ -584,11 +585,11 @@ bytecode parity 差异和真实 VM trace unsupported；它们不会把报告误�
 | M1.4 Runtime owner | `completed-slice` | pinned `RuntimeStorage` 唯一持有 Heap、StateArena 与 activation service；Heap 以不复用 HeapId 共同持有 collector/accounting 和 canonical StringPool，生产 app/bytecode/compiler/stdlib/VM 无 standalone 构造。LuaState 的 GC/StringPool raw backpointer 已删除，单 state turn 使用 nested/panic-safe 动态 service context；Heap/standalone collector Drop 都回收对象。自定义 Lua allocator 与 live/peak 指标仍由 M1.13 跟踪。 |
 | M1.5 Coroutine state | `partial` | StateArena 独占 coroutine Box；handle identity/generation、retirement 与关闭前 arena 校验已 fail-closed。`PendingState` 以 exact-id `TEMPORARY_STATE_ROOTS` 保护未发布槽，Drop 回滚并推进/退休 generation；create/wrap 在对象临时根内完成 State↔Thread 双向绑定并仅在直接压栈后提交。sealed `RuntimeNativeFunction`、scoped mailbox、独立 VM exit、deferred C frame、Runtime activation/upvalue transfer stack、rooted transfer seed 和 generic-for continuation 已接入生产 resume/wrap。open Upvalue 现为 `StateHandle + stack index`，远端 GET/SET 通过 Runtime 单-state turns 访问，state drain 在 generation advance/retirement 前关闭节点；reachable Upvalue 也会入队 owner state。精确 C++ `A→B→A` `Normal` 祖先 continuation、protected `pcall`、wrap yield/error 和 suspended-coroutine closure 读写均有回归。main state 仍是 external arena slot，debug/protected-helper 跨 state open-Upvalue、深链/完整 fault 矩阵仍开放。 |
 | M1.6 悬垂 registry | `completed-local` | pseudo dump/source thread-local registry 已删除，`string.dump` 在 M3 serializer 前稳定返回 unsupported。 |
-| M1.7 Root inventory | `partial` | 24/24 inventory schema 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO`、checked `OPEN_UPVALUES` owner、temporary object/state roots、activation/GC maintenance service、compiler/library/package/IO/VM/app/result publication、pending-finalizer seed 与 Runtime fixed strings 已接入同一 tracer，并由 full STW 强制消费。当前为 21 partial、3 implemented（`OPEN_UPVALUES`、`TEMPORARY_STATE_ROOTS`、`FIXED_STRINGS`）、0 missing、0 unsafe；另有 17-path string 与 53-path heap 静态门。非字符串 scope、production mutation barrier 与自动/增量入口仍未闭环。 |
+| M1.7 Root inventory | `partial` | 24/24 root inventory schema 与 8/8 mutation inventory 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO`、checked `OPEN_UPVALUES` owner、temporary object/state roots、activation/GC maintenance service、compiler/library/package/IO/VM/app/result publication、pending-finalizer seed 与 Runtime fixed strings 已接入 full/explicit incremental tracer。另有 17-path string、54-path heap 与 production managed-edge mutation 静态门。非字符串 scoped access 和 allocation-triggered automatic 入口仍未闭环。 |
 | M1.8 确定性 shutdown | `partial` | Runtime close/Drop 先隔离错误并持续 drain 剩余/新分配 Lua `__gc`，再以 state→非 fixed Thread→其余非 fixed→fixed 顺序释放，object/root/string/queue/state/count 均归零；7 layout、fixed/ordinary DropProbe、open-upvalue close、finalizer error/continue 与 1000 轮耐久测试通过。显式 IO/module service drain 和 allocator live bytes 仍是公开 debt。 |
-| M1.9 真实 full collection | `completed-local` | Runtime safe-point STW 消费 canonical tracer，执行 finalizer prepare/resurrection propagation、weak reconciliation、不可达 state prepass 和真实 sweep；Lua `collectgarbage("collect")` 已接线，`gcinfo`/`count` 使用 collector 实际计账。`step` 的真实增量工作量仍由 M1.10 跟踪。 |
-| M1.10 Incremental GC | `pending` | phase、debt、pause、stepmul 和真实 step 尚未实现。 |
-| M1.11 Write barrier | `pending` | helper 存在但 production mutation 尚未统一接线，部分 raw barrier 在 provenance 基座前仍不安全。 |
+| M1.9 真实 full collection | `completed-local` | Runtime safe-point STW 消费 canonical tracer，执行 finalizer prepare/resurrection propagation、weak reconciliation、不可达 state prepass 和真实 sweep；Lua `collectgarbage("collect")` 已接线，`gcinfo`/`count` 使用 collector 实际计账。 |
+| M1.10 Incremental GC | `completed-local` | collector 持有 pause→propagate→atomic→sweep→finalize、debt/threshold、pause/stepmul 与有界 sweep cursor；Runtime 持久保存 StateHandle/object 双队列，`step` 推进真实预算，大步可完成整轮，周期完成才返回 true。allocation-triggered checkpoint 仍由 M1.13 门控。 |
+| M1.11 Write barrier | `completed-local` | 8-family mutation inventory 与 fail-closed gate 已落地；`GarbageCollector::with_mut` 统一验证 owner 并执行 post-write barrier，活动周期分配发布初始图，Sweep 期变更保守放弃游标，Proto 保持 construction-only。 |
 | M1.12 Weak/finalizer/resurrection | `completed-local` | atomic weak key/value/kv、pending-finalizer weak 语义、protected callback delivery、nested collect 非递归 drain、异常隔离/保留队列、exactly-once、resurrection→再次不可达和 close drain 已有回归。finalizer 内跨 state resume/open-Upvalue 与 close-time Runtime-native 重入当前明确 fail-closed。 |
 | M1.13 内存与耐久 | `partial` | 1000 runtime/coroutine close、两轮全图 collection、weak/finalizer 多周期、typed DropProbe 与 object/accounted-byte 下降已通过；allocator live/peak、Miri/ASan 和 binary dump 生命周期待补。 |
 
@@ -1213,8 +1214,9 @@ PR-5 完成前不得合并 PR-6。
 M0 已在本地完成，M1 基础层已经完成 coroutine activation trampoline、compiler
 Proto→Function、library/package、IO construction、VM/app/result publication
 切片、production string canonicalization/scoped Eq/Hash 合同、唯一
-Heap/service owner，以及 weak/finalizer/resurrection + Lua-visible full STW。
-下一步闭合 production mutation/write barrier，再推进 incremental GC：
+Heap/service owner、weak/finalizer/resurrection、Lua-visible full STW、production
+mutation barrier 与 Runtime-owned incremental GC。下一步闭合 allocator live/peak
+计账和 allocation-triggered automatic GC 门：
 
 1. 已完成 LightUserdata 拆型、`ObjectId + collector live table` 与字符串
    identity/scoped access 合同；唯一 HeapId owner、fixed strings、
@@ -1238,15 +1240,16 @@ Heap/service owner，以及 weak/finalizer/resurrection + Lua-visible full STW�
    `Value::String` Eq/Hash 使用 canonical identity，内容读取经 collector/state
    作用域验证；pending finalizers 与 fixed strings 已进入 canonical roots。
 4. 已建立唯一 `Heap` owner，移除 LuaState GC/StringPool backpointer，并以
-   HeapId/53-path gate 拒绝 production standalone collector/pool 错配。full STW
+HeapId/54-path gate 拒绝 production standalone collector/pool 错配。full STW
    在 owner-thread Runtime safe point 消费 canonical tracer，按
    mark→finalizer prepare/resurrection propagation→weak reconcile→state
    prepass→sweep→protected callback 执行，并拒绝任何 trace gap/foreign edge。
 5. weak key/value/kv、protected finalizer、nested collect 非递归 drain、异常
-   隔离、exactly-once、resurrection/再次不可达、close drain 与 Lua-visible
-   `collectgarbage("collect")` 已闭合；`count`/`gcinfo` 使用实际 collector
-   计账。下一步盘点并接通 production mutation/write barrier，再实现
-   incremental phase/debt/pause/stepmul/真实 step。
+   隔离、exactly-once、resurrection/再次不可达、close drain、Lua-visible
+   `collectgarbage("collect")` 和五阶段 `step` 已闭合；`count`/`gcinfo`
+   使用 collector 计账。8-family production mutation inventory、checked
+   `with_mut` barrier、active-allocation publication、debt/pause/stepmul 和
+   Runtime StateHandle/object 双队列已有静态门与回归。
 6. managed owner/publication-root 树稳定后重跑完整 M0/M1 gate、raw-byte 双 oracle、fresh
    101-case non-official 与代表性 bytecode parity，并更新精确 artifact/
    SHA；远程 CI 首次运行必须实际执行 cargo audit。
@@ -1302,9 +1305,10 @@ Heap/service owner，以及 weak/finalizer/resurrection + Lua-visible full STW�
   Rust process regression 已逐字节匹配固定 C++ 输出；该 manifest 仍是
   non-gating characterization、无 approved deviation，因为 stock Lua 行为
   仍与项目目标不同。
-- 最新验证：fmt/check、803 个 workspace tests、all-targets Clippy、
+- 最新验证：fmt/check、Debug/Release 各 815 个 workspace tests、all-targets Clippy、
   warning-free rustdoc、24/24 root inventory、17-path string contract、
-  53-path heap contract、差分比较器与 parity runner 自测全部通过；
+  8/8 mutation inventory、54-path heap contract、差分比较器与 parity runner
+  自测全部通过；
   fixture manifest 校验为 131 项；两个 coroutine oracle
   各重复 3 次通过精确字节校验。characterization checker 已同时通过
   Windows PowerShell 5.1 与 PowerShell 7，并将实际执行文件的 SHA-256
@@ -1352,9 +1356,10 @@ Heap/service owner，以及 weak/finalizer/resurrection + Lua-visible full STW�
    Eq/Hash、作用域 byte access 与静态 inventory/gate 均已落地；继续维持
    allocation-triggered collection 禁用。
 6. 已完成唯一 Heap/service owner、fixed/pending-finalizer roots、Runtime
-   tracer、全图 STW、weak/finalizer/resurrection 和 Lua-visible
-   `collectgarbage("collect")`；下一步闭合 mutation barrier 和 incremental
-   phase/debt/step，allocation-triggered collection 在对应门通过前继续禁用。
+   tracer、全图 STW、weak/finalizer/resurrection、Lua-visible
+   `collectgarbage("collect")`、8-family mutation barrier 与 explicit
+   incremental phase/debt/step；下一步闭合 allocator live/peak accounting
+   和 allocation checkpoint，automatic collection 在对应门通过前继续禁用。
 7. M2 并行下一步是为固定 C++ bytecode printer 的 local-name 证据建立受审计
    方案，并从 closure artifact 的第一个 Proto/PC 差异开始修，不能直接处理
    截断后的 500 条列表。
@@ -1385,9 +1390,10 @@ pwsh -NoProfile -File tools/run_lua51_differential.ps1 -ComparatorSelfTestOnly
   (`Implement runtime-only stop-the-world full collection`)；
   交接时必须先运行 `git status --short`，保留用户与未提交实现改动，不得用
   reset/checkout 清除。
-- 当前仍是 M1 `active`，不是 GC 完成状态。weak/finalizer/resurrection 与
-  Lua-visible full STW 已完成；allocation-triggered collection、production
-  write barrier 与 incremental phase/debt/step 仍未启用。
+- 当前仍是 M1 `active`，不是 GC/allocator 完成状态。weak/finalizer/
+  resurrection、Lua-visible full STW、production write barrier 与 explicit
+  incremental phase/debt/step 已完成；allocation-triggered automatic
+  collection 与 allocator live/peak 仍未启用。
 - 已关闭与待办边界如下：
 
 | publication/owner 子项 | 状态 | 当前证据或下一入口 |
@@ -1398,14 +1404,16 @@ pwsh -NoProfile -File tools/run_lua51_differential.ps1 -ComparatorSelfTestOnly
 | IO construction/publication graph | `completed-slice` | file Userdata/metatable/method 与 lines Function/environment/file 图已事务化；生产 `io.rs` 直接 `gc.create` 为 0，故障清理、mark-only、全回收与行为回归已通过 |
 | VM/app/result publication | `completed-slice` | VM Table/closure/string/open-Upvalue、Runtime roots/errors、CLI args 与同步 call/top-level result publication 已事务化；目标生产 direct-create 为 0 |
 | production string canonicalization/scoped Eq/Hash | `completed-local` | 生产构造强制 StringPool canonical identity；`Value::String` Eq/Hash 不解引用；内容比较/排序/展示走 collector/state-scoped bytes；17-path inventory、静态门与 duplicate/foreign/stale/NUL/high-byte/address-reuse 回归已落地 |
-| 唯一 Heap/service owner | `completed-slice` | `RuntimeStorage` 唯一持有 Heap/StateArena/activation service；HeapId 绑定 collector/accounting 与 canonical StringPool；LuaState 无 service backpointer；fixed/pending-finalizer roots 与 53-path heap gate 已落地 |
+| 唯一 Heap/service owner | `completed-slice` | `RuntimeStorage` 唯一持有 Heap/StateArena/activation service；HeapId 绑定 collector/accounting 与 canonical StringPool；LuaState 无 service backpointer；fixed/pending-finalizer roots 与 54-path heap gate 已落地 |
 | Runtime full collection | `completed-local` | direct crate-private 与 Runtime-native safe-point STW 均强制消费 canonical tracer，在 generation 失效前预关闭不可达 state/open Upvalue，并真实 sweep 全图、更新 object/accounted-byte 计账；所有 gap/foreign edge fail-closed |
-| Weak/finalizer/resurrection + Lua-visible full collection | `completed-local` | weak key/value/kv、pending/finalized userdata、protected `__gc`、nested collect、异常隔离/保留队列、exactly-once、resurrection/再次不可达与 close drain 回归已通过；`collectgarbage("collect")` 和完成一个 compatibility step cycle 均触发真实 full STW |
-| Write barrier + incremental GC | `next` | 建立 production mutation inventory，统一接入 barrier，再实现 phase/debt/pause/stepmul 与真实 `step`；门完成前 allocation-triggered collection 继续禁用 |
+| Weak/finalizer/resurrection + Lua-visible collection | `completed-local` | weak key/value/kv、pending/finalized userdata、protected `__gc`、nested collect、异常隔离/保留队列、exactly-once、resurrection/再次不可达与 close drain 回归已通过；full 与 incremental 完成阶段都使用同一 protected finalizer delivery |
+| Write barrier + incremental GC | `completed-local` | 8-family mutation inventory、checked post-write barrier、active-allocation initial graph、五阶段、debt/pause/stepmul、真实 work unit、Thread→StateHandle 双队列与 weak/finalizer 多周期回归已落地；allocation-triggered collection 继续禁用 |
+| Allocator accounting + automatic GC | `next` | 实现 allocator live/peak、对象动态大小对账、阈值 checkpoint 与自动推进门；完成前不得把 collector estimated bytes 称为 allocator 合同 |
 
-当前 803 个 workspace tests、fmt、all-targets check/Clippy、warning-free
-rustdoc、24/24 root inventory、17-path string contract 与 53-path heap
-contract 均通过。当前 M1 smoke 为
+当前 Debug/Release 各 815 个 workspace tests、fmt、all-targets
+check/Clippy、warning-free rustdoc、24/24 root inventory、8/8 mutation
+inventory、17-path string contract 与 54-path heap contract 均通过。当前
+M1 smoke 为
 `checksPassed=true`、`hardFailures=[]`；`foundationPassed=false` 是因为这是显式
 skip quality/differential/audit 的 smoke 且 M1 未完成；质量门和双-lane
 raw-byte differential 已在独立命令中通过，不能把该 smoke 改写为完整 M1
@@ -1525,9 +1533,10 @@ git diff --check
   混入同一改动；
 - 不因 mark-only reachability 测试通过而宣称 destructive GC 安全。
 
-IO 收口后的固定顺序已经执行到 weak/finalizer/resurrection 与真实
-`collectgarbage("collect")`。下一步先完成 production mutation inventory 和
-write barrier，再推进 incremental phase/debt/step。
+IO 收口后的固定顺序已经执行到 weak/finalizer/resurrection、真实
+`collectgarbage("collect")`、production mutation inventory/write barrier
+与 explicit incremental phase/debt/step。下一步推进 allocator live/peak
+accounting 和 allocation-triggered automatic gate。
 
 ### 16.3 已完成主任务：VM/app/result publication
 
@@ -1666,17 +1675,35 @@ write barrier，再推进 incremental phase/debt/step。
    `hardFailures=[]`；因显式 skip quality/differential/audit 且 M1 尚未完成，
    `foundationPassed=false`。
 
-#### 16.3.7 下一主任务
+#### 16.3.7 已完成主任务：write barrier mutation inventory 与 incremental GC
 
-闭合 write-barrier mutation inventory 与 incremental GC：
+1. 新增 8-family `gc_mutation_inventory.json` 与 fail-closed
+   `check_gc_mutation_contract.ps1`，覆盖 Table、Function、Proto、Upvalue、
+   Userdata、Thread、LuaState roots 与 Runtime roots；门拒绝 raw managed-edge
+   setter、旧 `gc_step_remaining/gc_stopped` 和缺失 phase/root anchors。
+2. `GarbageCollector::with_mut` 成为统一 `MutationContext`：先验证
+   address/ObjectId/type，再执行写入并发布 post-write barrier；cross-heap/stale
+   继续 fail-closed，black→white、weak-value 与 Thread→StateHandle 路径有定向回归。
+3. collector 实现 Pause→Propagate→Atomic→Sweep→Finalize、debt/threshold、
+   pause/stepmul、stop/restart、active-allocation initial graph 与有界 intrusive
+   sweep cursor；Runtime 持有跨调用 StateHandle/object 双队列和 Atomic wide
+   re-scan。`collectgarbage("step")` 不再使用倒计时，大步一次完成，小步按真实
+   state/object/sweep unit 推进。
+4. explicit incremental cycle 与 full collection 共用 weak-mode reconcile、
+   finalizer resurrection、unreachable-state prepass 和 protected callback
+   delivery；weak 清理、finalizer exactly-once、五阶段顺序、控制参数旧值和
+   barrier-published coroutine state 均有回归。
+5. allocation-triggered collection 按计划继续禁用；当前 debt/threshold 只为
+   explicit step 与诊断服务，不夸大为 allocator live/peak 合同。
 
-1. 枚举 Table、Function/environment、Upvalue、Userdata/metatable、Thread/state
-   及 Runtime root 的全部 production mutation site，建立 fail-closed 静态门；
-2. 统一经 `MutationContext`/barrier helper 发布 collector edge，验证
-   cross-heap/stale edge、black→white mutation 与 weak-mode 变化；
-3. 实现 pause→propagate→atomic→sweep→finalize phase、debt、pause/stepmul
-   参数和可审计 work unit，用真实进度替换 compatibility step 倒计时；
-4. barrier inventory、增量 root snapshot 与多周期回归全部通过前，
-   allocation-triggered collection 继续禁用；
-5. 同步推进 M1.13 allocator live/peak 计账与 soak/Miri/ASan，避免把当前
-   collector 估算 bytes 误称为完整 allocator 合同。
+#### 16.3.8 下一主任务
+
+推进 M1.13 allocator accounting 与 automatic GC gate：
+
+1. 建立 allocator live/peak/total allocation 计账，覆盖对象动态容器增长、
+   StringPool、StateArena 与 shutdown 归零；
+2. 将 collector estimated bytes 与 allocator authoritative bytes 分栏，并为
+   `count`/`gcinfo` 的 oracle 语义建立差分；
+3. 只有 allocator、mutation、root、weak/finalizer 与耐久门全部通过后，才在
+   审计过的 allocation checkpoint 启用 automatic incremental progress；
+4. 增加 1000-cycle soak、Miri/ASan lifecycle job 与 fault-injection 矩阵。
