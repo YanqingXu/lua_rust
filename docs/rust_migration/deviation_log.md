@@ -229,10 +229,14 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   C/Runtime-native Function 与 environment；catalog library Table 以及
   package/loaded/preload/nested-module/metadata/metatable/error string 也只在
   traced Table 或 stack 接管后释放，foreign edge 在 mutation 前拒绝。
+  IO file Userdata、state/metatable、method Function/key、`__index` self-edge
+  以及 lines Function→environment→file 图也已在同一事务内构造并直接发布到
+  rooted `io` Table 或活动 stack；IO 后续字段/result/error string 通过 typed
+  Table/stack publication，生产 `io.rs` 已无直接 `gc.create`。
   但 main state 仍是 external arena slot，LuaState 仍保存 transitional
   GC/StringPool backpointer，debug/protected-helper 跨 state open-Upvalue
   访问尚未纳入同一调度协议；Lua `__gc`、IO/module service drain 与
-  allocator live-byte 合同也未闭环，IO、VM/app/results publication 路径仍待
+  allocator live-byte 合同也未闭环，VM/app/results publication 路径仍待
   迁移。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
   close、coroutine lifecycle 和 allocator live-byte 合同。
@@ -245,15 +249,18 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   Upvalue→owner-state root fixed point、集合去重/排序与
   close-before-generation-invalidation 回归；PendingState 故障注入还覆盖
   Thread 分配、slot 插入、双向绑定、压栈提交、exact-id mismatch、panic
-  cleanup 与 MAX-generation 单次退休。
+  cleanup 与 MAX-generation 单次退休。IO 回归另覆盖 file/iterator 图的
+  mark-only 可达性与全回收、method/`__index`/metatable/environment 故障点、
+  early return/panic 临时根归零、foreign/stale mutation rejection，以及从
+  Runtime main stack 出发的 canonical mark-only tracing。
   allocator live/peak、真实 finalizer/service close、Miri/ASan 等仍在
   M1.4、M1.5、M1.7、M1.8、M1.13。
 - **影响：** 已移除 resume/wrap 递归跨 state 借用和 raw open-Upvalue
   owner 风险，并能声称当前 Rust-owned 对象的 deterministic shutdown
   substrate；剩余 service/backpointer 与未迁移 publication 路径仍不允许
   声称完整 Lua close 或 live collection。
-- **处置状态：** `open`。temporary state、compiler Proto→Function 与
-  library/package publication 子项已关闭；唯一 Heap/service owner、其余生产
+- **处置状态：** `open`。temporary state、compiler Proto→Function、
+  library/package 与 IO publication 子项已关闭；唯一 Heap/service owner、其余生产
   publication、debug/protected-helper 跨 state、Lua-visible close 与 lifecycle
   验收全部完成前保持开放。
 

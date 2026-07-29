@@ -1,8 +1,10 @@
 use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::parser::Parser;
+use lua_core::gc::gc_object::GcObject;
 use lua_core::value::Value;
 use lua_stdlib::catalog::open_all;
 use lua_vm::Runtime;
+use lua_vm::runtime::RuntimeRootKind;
 use std::path::{Path, PathBuf};
 
 fn compile_and_run(source: &str) -> (Runtime, ()) {
@@ -171,6 +173,65 @@ fn io_file_handles_lines_and_os_file_helpers_work() {
     assert_eq!(return_value(&state), Value::Number(1.0));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&other);
+}
+
+#[test]
+fn io_lines_graph_is_traced_from_the_runtime_main_stack() {
+    let (mut runtime, ()) = compile_and_run(
+        "local f = assert(io.tmpfile()); assert(f:write('one\\ntwo\\n')); assert(f:seek('set', 0)); return f:lines()",
+    );
+    let iterator = return_value(&runtime).as_function();
+    let environment = {
+        // SAFETY: the returned iterator is held by the live Runtime main stack.
+        unsafe { iterator.as_ref() }
+            .expect("iterator Function should remain live")
+            .env()
+            .expect("iterator environment should publish")
+    };
+    let file = {
+        // SAFETY: the iterator Function retains the environment Table.
+        let environment =
+            unsafe { environment.as_ref() }.expect("iterator environment should remain live");
+        environment
+            .hash_entries()
+            .find_map(|(key, value)| {
+                let Value::String(key) = key else {
+                    return None;
+                };
+                // SAFETY: the environment owns each key while it is scanned.
+                let is_file =
+                    unsafe { key.as_ref() }.is_some_and(|key| key.as_bytes() == b"__file");
+                match (is_file, value) {
+                    (true, Value::Userdata(file)) => Some(*file),
+                    _ => None,
+                }
+            })
+            .expect("iterator environment should retain its file")
+    };
+    let file_state = {
+        // SAFETY: the environment retains the file Userdata.
+        unsafe { file.as_ref() }
+            .expect("iterator file should remain live")
+            .metatable()
+            .expect("file state/metatable should publish")
+    };
+
+    let report = runtime
+        .trace_roots_mark_only()
+        .expect("Runtime main-stack tracing should succeed");
+
+    assert!(report.root_edge_count(RuntimeRootKind::MainStack) >= 1);
+    assert_eq!(report.rejected_child_edges, 0);
+    assert!(report.unresolved_object_edges.is_empty());
+    assert!(report.unsafe_gaps.is_empty());
+    // SAFETY: mark-only tracing is non-destructive and all handles remain
+    // retained by the Runtime main-stack object graph.
+    unsafe {
+        assert!(iterator.as_ref().unwrap().gc_header().is_black());
+        assert!(environment.as_ref().unwrap().gc_header().is_black());
+        assert!(file.as_ref().unwrap().gc_header().is_black());
+        assert!(file_state.as_ref().unwrap().gc_header().is_black());
+    }
 }
 
 #[test]

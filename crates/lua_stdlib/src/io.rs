@@ -3,9 +3,10 @@
 //! 当前实现提供 Lua 5.1 `io.tmpfile()` 所需的内存文件对象，覆盖
 //! 官方 `math.lua` 生成临时代码再 `loadstring` 的工作流。
 
-use lua_core::function::Function;
-use lua_core::gc::collector::GarbageCollector;
+use lua_core::function::{CFunction, Function};
+use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::gc::publication::{PublicationTxn, Rooted};
 use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::userdata::Userdata;
@@ -28,21 +29,61 @@ struct IoFileData {
     standard_stream: Option<StandardStream>,
 }
 
+struct FileConstruction {
+    path: Option<String>,
+    mode: Vec<u8>,
+    writable: bool,
+    standard_stream: Option<StandardStream>,
+    initial: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IoPublicationStage {
+    FileMethod(usize),
+    BeforeIndexEdge,
+    AfterIndexEdge,
+    BeforeUserdataMetatable,
+    AfterUserdataMetatable,
+    IteratorEnvironmentReady,
+    IteratorFileEdgeReady,
+    IteratorFunctionEnvironmentReady,
+}
+
 pub fn open_io(l: &mut LuaState, gc: &mut GarbageCollector) {
     let io_table = find_lib_table(l, "io");
     if io_table.is_null() {
         return;
     }
 
-    let table_ptr = io_table.as_ptr() as *mut Table;
-    let stdout = create_standard_file(gc, b"w", true, StandardStream::Stdout);
-    let stdin = create_standard_file(gc, b"r", false, StandardStream::Stdin);
-    let stderr = create_standard_file(gc, b"w", true, StandardStream::Stderr);
-    set_table_value(table_ptr, gc, "stdout", &Value::Userdata(stdout));
-    set_table_value(table_ptr, gc, "stdin", &Value::Userdata(stdin));
-    set_table_value(table_ptr, gc, "stderr", &Value::Userdata(stderr));
-    set_table_value(table_ptr, gc, "__output", &Value::Userdata(stdout));
-    set_table_value(table_ptr, gc, "__input", &Value::Userdata(stdin));
+    gc.with_publication(|transaction| {
+        let io_table = transaction.protect(io_table)?;
+        let mut checkpoint = |_| Ok(());
+        let stdout = build_file(
+            l,
+            transaction,
+            memory_file_construction(None, b"w", true, Some(StandardStream::Stdout)),
+            &mut checkpoint,
+        )?;
+        let stdin = build_file(
+            l,
+            transaction,
+            memory_file_construction(None, b"r", false, Some(StandardStream::Stdin)),
+            &mut checkpoint,
+        )?;
+        let stderr = build_file(
+            l,
+            transaction,
+            memory_file_construction(None, b"w", true, Some(StandardStream::Stderr)),
+            &mut checkpoint,
+        )?;
+        set_rooted_userdata_field(l, transaction, &io_table, b"stdout", &stdout)?;
+        set_rooted_userdata_field(l, transaction, &io_table, b"stdin", &stdin)?;
+        set_rooted_userdata_field(l, transaction, &io_table, b"stderr", &stderr)?;
+        set_rooted_userdata_field(l, transaction, &io_table, b"__output", &stdout)?;
+        set_rooted_userdata_field(l, transaction, &io_table, b"__input", &stdin)
+    })
+    .expect("IO standard file graph publication must remain collector-valid");
+
     reg(l, gc, io_table, "close", lua_io_close);
     reg(l, gc, io_table, "flush", lua_io_flush);
     reg(l, gc, io_table, "input", lua_io_input);
@@ -66,21 +107,6 @@ fn reg(
         .expect("IO Function publication must remain collector-valid");
 }
 
-fn reg_unpublished_table(
-    gc: &mut GarbageCollector,
-    table: *mut Table,
-    name: &str,
-    func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
-) {
-    let name = gc.create(GcString::from_bytes(name.as_bytes()));
-    let function = gc.create(Function::new_c(func));
-    // SAFETY: this is the remaining IO construction graph tracked by the
-    // TEMPORARY_PROTECTED_ROOTS inventory entry.
-    unsafe {
-        (*table).set(&Value::String(name), &Value::Function(function));
-    }
-}
-
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
     if let Some(gt) = l.global_table
         // SAFETY: global table is rooted for the duration of library init.
@@ -100,32 +126,12 @@ fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
     GcRef::null()
 }
 
-fn create_memory_file(
-    gc: &mut GarbageCollector,
-    path: Option<String>,
-    mode: &[u8],
-    writable: bool,
-) -> GcRef<Userdata> {
-    create_file(gc, path, mode, writable, None)
-}
-
-fn create_standard_file(
-    gc: &mut GarbageCollector,
-    mode: &[u8],
-    writable: bool,
-    standard_stream: StandardStream,
-) -> GcRef<Userdata> {
-    create_file(gc, None, mode, writable, Some(standard_stream))
-}
-
-fn create_file(
-    gc: &mut GarbageCollector,
+fn memory_file_construction(
     path: Option<String>,
     mode: &[u8],
     writable: bool,
     standard_stream: Option<StandardStream>,
-) -> GcRef<Userdata> {
-    let mut state = Table::new();
+) -> FileConstruction {
     let initial = if mode.contains(&b'a') || (mode.starts_with(b"r") && !mode.starts_with(b"w")) {
         path.as_deref()
             .and_then(|path| std::fs::read(path).ok())
@@ -133,52 +139,93 @@ fn create_file(
     } else {
         Vec::new()
     };
-    let initial_len = initial.len();
-    set_bytes_field(&mut state, gc, "__content", &initial);
-    set_number_field(
-        &mut state,
-        gc,
-        "__pos",
-        if mode.contains(&b'a') {
+    FileConstruction {
+        path,
+        mode: mode.to_vec(),
+        writable,
+        standard_stream,
+        initial,
+    }
+}
+
+fn build_file<'scope>(
+    state: &LuaState,
+    transaction: &mut PublicationTxn<'scope>,
+    construction: FileConstruction,
+    checkpoint: &mut impl FnMut(IoPublicationStage) -> Result<(), GcRefValidationError>,
+) -> Result<Rooted<'scope, Userdata>, GcRefValidationError> {
+    let file_state = transaction.alloc(Table::new());
+    let initial_len = construction.initial.len();
+    set_rooted_bytes_field(
+        state,
+        transaction,
+        &file_state,
+        b"__content",
+        &construction.initial,
+    )?;
+    set_rooted_number_field(
+        state,
+        transaction,
+        &file_state,
+        b"__pos",
+        if construction.mode.contains(&b'a') {
             initial_len as f64
         } else {
             0.0
         },
-    );
-    set_bool_field(&mut state, gc, "__closed", false);
-    set_bool_field(&mut state, gc, "__writable", writable);
-    set_bool_field(
-        &mut state,
-        gc,
-        "__readable",
-        mode.starts_with(b"r") || mode.contains(&b'+'),
-    );
-    set_bytes_field(&mut state, gc, "__mode", mode);
-    set_bytes_field(&mut state, gc, "__buffer", b"full");
-    set_bool_field(&mut state, gc, "__buffer_explicit", false);
-    set_bool_field(&mut state, gc, "__direct", false);
-    set_bool_field(&mut state, gc, "__stdin_eof", false);
-    if let Some(path) = path {
-        set_bytes_field(&mut state, gc, "__path", path.as_bytes());
+    )?;
+    set_rooted_bool_field(state, transaction, &file_state, b"__closed", false)?;
+    set_rooted_bool_field(
+        state,
+        transaction,
+        &file_state,
+        b"__writable",
+        construction.writable,
+    )?;
+    set_rooted_bool_field(
+        state,
+        transaction,
+        &file_state,
+        b"__readable",
+        construction.mode.starts_with(b"r") || construction.mode.contains(&b'+'),
+    )?;
+    set_rooted_bytes_field(
+        state,
+        transaction,
+        &file_state,
+        b"__mode",
+        &construction.mode,
+    )?;
+    set_rooted_bytes_field(state, transaction, &file_state, b"__buffer", b"full")?;
+    set_rooted_bool_field(state, transaction, &file_state, b"__buffer_explicit", false)?;
+    set_rooted_bool_field(state, transaction, &file_state, b"__direct", false)?;
+    set_rooted_bool_field(state, transaction, &file_state, b"__stdin_eof", false)?;
+    if let Some(path) = construction.path.as_deref() {
+        set_rooted_bytes_field(state, transaction, &file_state, b"__path", path.as_bytes())?;
     }
 
-    let file_ptr = &mut state as *mut Table;
-    reg_unpublished_table(gc, file_ptr, "write", lua_io_file_write);
-    reg_unpublished_table(gc, file_ptr, "read", lua_io_file_read);
-    reg_unpublished_table(gc, file_ptr, "seek", lua_io_file_seek);
-    reg_unpublished_table(gc, file_ptr, "close", lua_io_file_close);
-    reg_unpublished_table(gc, file_ptr, "setvbuf", lua_io_file_setvbuf);
-    reg_unpublished_table(gc, file_ptr, "lines", lua_io_file_lines);
-    reg_unpublished_table(gc, file_ptr, "flush", lua_io_file_flush);
-    reg_unpublished_table(gc, file_ptr, "__gc", lua_io_file_gc);
-    reg_unpublished_table(gc, file_ptr, "__tostring", lua_io_file_tostring);
-    let index_key = gc.create(GcString::from_bytes(b"__index"));
-    let state_ref = gc.create(state);
-    // SAFETY: state_ref points to the freshly allocated metatable.
-    unsafe {
-        let state_table = &mut *(state_ref.as_ptr() as *mut Table);
-        state_table.set(&Value::String(index_key), &Value::Table(state_ref));
+    let methods: [(&[u8], CFunction); 9] = [
+        (b"write", lua_io_file_write),
+        (b"read", lua_io_file_read),
+        (b"seek", lua_io_file_seek),
+        (b"close", lua_io_file_close),
+        (b"setvbuf", lua_io_file_setvbuf),
+        (b"lines", lua_io_file_lines),
+        (b"flush", lua_io_file_flush),
+        (b"__gc", lua_io_file_gc),
+        (b"__tostring", lua_io_file_tostring),
+    ];
+    for (index, (name, operation)) in methods.into_iter().enumerate() {
+        let name = crate::registration::rooted_bytes(state, transaction, name)?;
+        let function = transaction.alloc_c_function(operation);
+        transaction.set_table_function(&file_state, &name, &function)?;
+        checkpoint(IoPublicationStage::FileMethod(index))?;
     }
+
+    checkpoint(IoPublicationStage::BeforeIndexEdge)?;
+    let index_key = crate::registration::rooted_bytes(state, transaction, b"__index")?;
+    transaction.set_table_table(&file_state, &index_key, &file_state)?;
+    checkpoint(IoPublicationStage::AfterIndexEdge)?;
 
     let mut userdata = Userdata::new(std::mem::size_of::<IoFileData>());
     // SAFETY: the userdata was allocated with enough space for IoFileData and
@@ -186,36 +233,69 @@ fn create_file(
     unsafe {
         userdata.write_typed(IoFileData {
             direct_handle: None,
-            standard_stream,
+            standard_stream: construction.standard_stream,
         });
     }
-    userdata.set_metatable(Some(state_ref));
-    gc.create(userdata)
+    let userdata = transaction.alloc(userdata);
+    checkpoint(IoPublicationStage::BeforeUserdataMetatable)?;
+    transaction.set_userdata_metatable(&userdata, Some(&file_state))?;
+    checkpoint(IoPublicationStage::AfterUserdataMetatable)?;
+    Ok(userdata)
 }
 
-fn set_table_value(table: *mut Table, gc: &mut GarbageCollector, key: &str, value: &Value) {
-    let key = gc.create(GcString::from_bytes(key.as_bytes()));
-    // SAFETY: table points to a live library/file table during registration.
-    unsafe {
-        (*table).set(&Value::String(key), value);
-    }
+fn set_rooted_bytes_field<'scope>(
+    state: &LuaState,
+    transaction: &mut PublicationTxn<'scope>,
+    table: &Rooted<'scope, Table>,
+    name: &[u8],
+    value: &[u8],
+) -> Result<(), GcRefValidationError> {
+    let name = crate::registration::rooted_bytes(state, transaction, name)?;
+    let value = crate::registration::rooted_bytes(state, transaction, value)?;
+    transaction.set_table_string(table, &name, &value)
 }
 
-fn set_table_ref_string(
-    table_ref: GcRef<Table>,
+fn set_rooted_number_field<'scope>(
+    state: &LuaState,
+    transaction: &mut PublicationTxn<'scope>,
+    table: &Rooted<'scope, Table>,
+    name: &[u8],
+    value: f64,
+) -> Result<(), GcRefValidationError> {
+    let name = crate::registration::rooted_bytes(state, transaction, name)?;
+    transaction.set_table_value(table, &name, &Value::Number(value))
+}
+
+fn set_rooted_bool_field<'scope>(
+    state: &LuaState,
+    transaction: &mut PublicationTxn<'scope>,
+    table: &Rooted<'scope, Table>,
+    name: &[u8],
+    value: bool,
+) -> Result<(), GcRefValidationError> {
+    let name = crate::registration::rooted_bytes(state, transaction, name)?;
+    transaction.set_table_value(table, &name, &Value::Boolean(value))
+}
+
+fn set_rooted_userdata_field<'scope>(
+    state: &LuaState,
+    transaction: &mut PublicationTxn<'scope>,
+    table: &Rooted<'scope, Table>,
+    name: &[u8],
+    value: &Rooted<'scope, Userdata>,
+) -> Result<(), GcRefValidationError> {
+    let name = crate::registration::rooted_bytes(state, transaction, name)?;
+    transaction.set_table_userdata(table, &name, value)
+}
+
+fn set_table_ref_value(
+    state: &LuaState,
     gc: &mut GarbageCollector,
-    key: &str,
+    table_ref: GcRef<Table>,
+    key: &[u8],
     value: &Value,
-) {
-    if table_ref.is_null() {
-        return;
-    }
-    let key = gc.create(GcString::from_bytes(key.as_bytes()));
-    // SAFETY: table_ref is reachable from globals while IO functions execute.
-    unsafe {
-        let table = &mut *(table_ref.as_ptr() as *mut Table);
-        table.set(&Value::String(key), value);
-    }
+) -> Result<(), GcRefValidationError> {
+    crate::registration::set_value(state, gc, table_ref, key, value)
 }
 
 fn table_get_string(table_ref: GcRef<Table>, key: &str) -> Value {
@@ -245,6 +325,7 @@ fn current_input(l: &LuaState) -> Option<GcRef<Userdata>> {
 }
 
 fn set_current_output(
+    state: &LuaState,
     gc: &mut GarbageCollector,
     io_table: GcRef<Table>,
     file_ref: GcRef<Userdata>,
@@ -254,11 +335,19 @@ fn set_current_output(
     {
         let _ = flush_file_to_disk(previous);
     }
-    set_table_ref_string(io_table, gc, "__output", &Value::Userdata(file_ref));
+    set_table_ref_value(state, gc, io_table, b"__output", &Value::Userdata(file_ref))
+        .expect("current output publication must remain collector-valid");
 }
 
 fn table_to_file_userdata(_table_ref: GcRef<Table>) -> Option<GcRef<Userdata>> {
     None
+}
+
+fn file_state_ref(
+    gc: &GarbageCollector,
+    file_ref: GcRef<Userdata>,
+) -> Result<Option<GcRef<Table>>, GcRefValidationError> {
+    gc.with_ref(file_ref, |file| file.metatable())
 }
 
 fn with_file_state<R>(
@@ -274,25 +363,7 @@ fn with_file_state<R>(
     Some(access(state))
 }
 
-fn with_file_state_mut<R>(
-    file_ref: GcRef<Userdata>,
-    access: impl for<'state> FnOnce(&'state mut Table) -> R,
-) -> Option<R> {
-    // SAFETY: file_ref is rooted for this call and IO operations are serialized on
-    // the VM thread. The HRTB callback prevents the mutable reference from escaping.
-    let userdata = unsafe { file_ref.as_ref() }?;
-    let metatable = userdata.metatable()?;
-    // SAFETY: the userdata keeps its metatable alive, and access is scoped to the
-    // callback so no mutable table reference is returned to the caller.
-    let state = unsafe { (metatable.as_ptr() as *mut Table).as_mut() }?;
-    Some(access(state))
-}
-
-fn open_file_handle(
-    gc: &mut GarbageCollector,
-    path: &str,
-    mode: &[u8],
-) -> std::io::Result<GcRef<Userdata>> {
+fn prepare_open_file(path: &str, mode: &[u8]) -> std::io::Result<FileConstruction> {
     let read_mode = mode.starts_with(b"r");
     let append_mode = mode.starts_with(b"a");
     let write_mode = mode.starts_with(b"w") || append_mode || mode.contains(&b'+');
@@ -334,12 +405,52 @@ fn open_file_handle(
         options.open(path)?;
     }
 
-    Ok(create_memory_file(
-        gc,
+    Ok(memory_file_construction(
         Some(path.to_string()),
         &normalized_mode,
         write_mode,
+        None,
     ))
+}
+
+fn publish_file_to_stack(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    construction: FileConstruction,
+) -> Result<(), GcRefValidationError> {
+    gc.with_publication(|transaction| {
+        let mut checkpoint = |_| Ok(());
+        let file = build_file(state, transaction, construction, &mut checkpoint)?;
+        // SAFETY: the callback installs the Userdata on the active Lua stack
+        // before its temporary root is released.
+        unsafe {
+            transaction.publish_userdata_value(file, |value| {
+                state.push_value(value);
+            })
+        }
+    })
+}
+
+fn publish_file_to_table_and_stack(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    table: GcRef<Table>,
+    key: &[u8],
+    construction: FileConstruction,
+) -> Result<(), GcRefValidationError> {
+    gc.with_publication(|transaction| {
+        let table = transaction.protect(table)?;
+        let mut checkpoint = |_| Ok(());
+        let file = build_file(state, transaction, construction, &mut checkpoint)?;
+        set_rooted_userdata_field(state, transaction, &table, key, &file)?;
+        // SAFETY: the callback adds a second durable edge from the active
+        // stack before the file's temporary root is released.
+        unsafe {
+            transaction.publish_userdata_value(file, |value| {
+                state.push_value(value);
+            })
+        }
+    })
 }
 
 unsafe extern "C" fn lua_io_tmpfile(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -352,9 +463,13 @@ unsafe extern "C" fn lua_io_tmpfile(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
 
-    let file_ref = create_memory_file(gc, None, b"w+", true);
-    l.push_value(Value::Userdata(file_ref));
-    1
+    match publish_file_to_stack(l, gc, memory_file_construction(None, b"w+", true, None)) {
+        Ok(()) => 1,
+        Err(_) => {
+            l.push_nil();
+            1
+        }
+    }
 }
 
 unsafe extern "C" fn lua_io_input(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -383,11 +498,16 @@ unsafe extern "C" fn lua_io_input(l_ptr: *mut std::ffi::c_void) -> i32 {
                 Ok(path) => path,
                 Err(message) => return push_io_error_tuple(l, gc, message, 0),
             };
-            match open_file_handle(gc, &path, b"r") {
-                Ok(file_ref) => {
-                    set_table_ref_string(io_table, gc, "__input", &Value::Userdata(file_ref));
-                    l.push_value(Value::Userdata(file_ref));
-                    1
+            match prepare_open_file(&path, b"r") {
+                Ok(construction) => {
+                    match publish_file_to_table_and_stack(l, gc, io_table, b"__input", construction)
+                    {
+                        Ok(()) => 1,
+                        Err(_) => {
+                            l.push_nil();
+                            1
+                        }
+                    }
                 }
                 Err(err) => {
                     l.push_nil();
@@ -398,7 +518,8 @@ unsafe extern "C" fn lua_io_input(l_ptr: *mut std::ffi::c_void) -> i32 {
             }
         }
         Value::Userdata(file_ref) => {
-            set_table_ref_string(io_table, gc, "__input", &Value::Userdata(file_ref));
+            set_table_ref_value(l, gc, io_table, b"__input", &Value::Userdata(file_ref))
+                .expect("current input publication must remain collector-valid");
             l.push_value(Value::Userdata(file_ref));
             1
         }
@@ -430,11 +551,14 @@ unsafe extern "C" fn lua_io_open(l_ptr: *mut std::ffi::c_void) -> i32 {
     if !mode.is_ascii() {
         return push_io_error_tuple(l, gc, "invalid file mode", 0);
     }
-    match open_file_handle(gc, &path, &mode) {
-        Ok(file_ref) => {
-            l.push_value(Value::Userdata(file_ref));
-            1
-        }
+    match prepare_open_file(&path, &mode) {
+        Ok(construction) => match publish_file_to_stack(l, gc, construction) {
+            Ok(()) => 1,
+            Err(_) => {
+                l.push_nil();
+                1
+            }
+        },
         Err(err) => {
             l.push_nil();
             push_lua_string(l, gc, &err.to_string());
@@ -519,8 +643,8 @@ unsafe extern "C" fn lua_io_lines(l_ptr: *mut std::ffi::c_void) -> i32 {
                 Ok(path) => path,
                 Err(message) => return push_io_error_tuple(l, gc, message, 0),
             };
-            match open_file_handle(gc, &path, b"r") {
-                Ok(file_ref) => push_lines_iterator(l, gc, file_ref, true),
+            match prepare_open_file(&path, b"r") {
+                Ok(construction) => push_new_file_lines_iterator(l, gc, construction, true),
                 Err(err) => {
                     l.push_nil();
                     push_lua_string(l, gc, &err.to_string());
@@ -563,11 +687,24 @@ unsafe extern "C" fn lua_io_output(l_ptr: *mut std::ffi::c_void) -> i32 {
                 Ok(path) => path,
                 Err(message) => return push_io_error_tuple(l, gc, message, 0),
             };
-            match open_file_handle(gc, &path, b"w") {
-                Ok(file_ref) => {
-                    set_current_output(gc, io_table, file_ref);
-                    l.push_value(Value::Userdata(file_ref));
-                    1
+            match prepare_open_file(&path, b"w") {
+                Ok(construction) => {
+                    if let Value::Userdata(previous) = table_get_string(io_table, "__output") {
+                        let _ = flush_file_to_disk(previous);
+                    }
+                    match publish_file_to_table_and_stack(
+                        l,
+                        gc,
+                        io_table,
+                        b"__output",
+                        construction,
+                    ) {
+                        Ok(()) => 1,
+                        Err(_) => {
+                            l.push_nil();
+                            1
+                        }
+                    }
                 }
                 Err(err) => {
                     l.push_nil();
@@ -578,7 +715,7 @@ unsafe extern "C" fn lua_io_output(l_ptr: *mut std::ffi::c_void) -> i32 {
             }
         }
         Value::Userdata(file_ref) => {
-            set_current_output(gc, io_table, file_ref);
+            set_current_output(l, gc, io_table, file_ref);
             l.push_value(Value::Userdata(file_ref));
             1
         }
@@ -687,9 +824,9 @@ fn write_to_file(
     if let Some(stream) = file_standard_stream(file_ref) {
         match write_standard_stream(stream, &appended) {
             Ok(()) => {
-                let _ = with_file_state_mut(file_ref, |file| {
-                    set_number_field(file, gc, "__pos", (pos + appended.len()) as f64);
-                });
+                if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+                    let _ = set_number_field(file, gc, "__pos", (pos + appended.len()) as f64);
+                }
                 l.push_value(Value::Userdata(file_ref));
                 return 1;
             }
@@ -708,9 +845,9 @@ fn write_to_file(
     if direct_write {
         match write_direct(gc, file_ref, &content, pos, &appended) {
             Ok(new_pos) => {
-                let _ = with_file_state_mut(file_ref, |file| {
-                    set_number_field(file, gc, "__pos", new_pos as f64);
-                });
+                if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+                    let _ = set_number_field(file, gc, "__pos", new_pos as f64);
+                }
                 l.push_value(Value::Userdata(file_ref));
                 return 1;
             }
@@ -725,10 +862,10 @@ fn write_to_file(
 
     let new_content = write_at(&content, pos, &appended);
     let new_pos = pos + appended.len();
-    let _ = with_file_state_mut(file_ref, |file| {
-        set_bytes_field(file, gc, "__content", &new_content);
-        set_number_field(file, gc, "__pos", new_pos as f64);
-    });
+    if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+        let _ = set_bytes_field(file, gc, "__content", &new_content);
+        let _ = set_number_field(file, gc, "__pos", new_pos as f64);
+    }
 
     if buffer_mode == b"no" || (buffer_mode == b"line" && appended.contains(&b'\n')) {
         let _ = flush_file_to_disk(file_ref);
@@ -805,9 +942,9 @@ unsafe extern "C" fn lua_io_file_seek(l_ptr: *mut std::ffi::c_void) -> i32 {
         _ => current,
     };
     let new_pos = (base + offset).clamp(0, content_len) as usize;
-    let _ = with_file_state_mut(file_ref, |file| {
-        set_number_field(file, gc, "__pos", new_pos as f64);
-    });
+    if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+        let _ = set_number_field(file, gc, "__pos", new_pos as f64);
+    }
     l.push_value(Value::Number(new_pos as f64));
     1
 }
@@ -866,15 +1003,17 @@ unsafe extern "C" fn lua_io_file_setvbuf(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let updated = with_file_state_mut(file_ref, |file| match mode.as_slice() {
+    let updated = match mode.as_slice() {
         b"no" | b"full" | b"line" => {
-            set_bytes_field(file, gc, "__buffer", &mode);
-            set_bool_field(file, gc, "__buffer_explicit", true);
-            true
+            if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+                set_bytes_field(file, gc, "__buffer", &mode).is_ok()
+                    && set_bool_field(file, gc, "__buffer_explicit", true).is_ok()
+            } else {
+                false
+            }
         }
         _ => false,
-    })
-    .unwrap_or(false);
+    };
     l.push_value(Value::Boolean(updated));
     1
 }
@@ -954,9 +1093,7 @@ unsafe extern "C" fn lua_io_lines_iter(l_ptr: *mut std::ffi::c_void) -> i32 {
             if auto_close {
                 let _ = close_file_silent(gc, file_ref);
             }
-            // SAFETY: env_ref is the current iterator's private environment table.
-            let env = unsafe { &mut *(env_ref.as_ptr() as *mut Table) };
-            set_bool_field(env, gc, "__dead", true);
+            let _ = set_bool_field(env_ref, gc, "__dead", true);
             0
         }
         Err(message) => push_error(l, gc, &message),
@@ -985,9 +1122,9 @@ fn close_file_handle(l: &mut LuaState, file_ref: GcRef<Userdata>) -> i32 {
     }
 
     close_direct_handle(file_ref);
-    let _ = with_file_state_mut(file_ref, |file| {
-        set_bool_field(file, gc, "__closed", true);
-    });
+    if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+        let _ = set_bool_field(file, gc, "__closed", true);
+    }
     l.push_value(Value::Boolean(true));
     1
 }
@@ -1001,11 +1138,12 @@ fn close_file_silent(gc: &mut GarbageCollector, file_ref: GcRef<Userdata>) -> Re
     }
     flush_file_to_disk(file_ref).map_err(|err| err.to_string())?;
     close_direct_handle(file_ref);
-    let Some(()) = with_file_state_mut(file_ref, |file| {
-        set_bool_field(file, gc, "__closed", true);
-    }) else {
+    let Some(file) =
+        file_state_ref(gc, file_ref).map_err(|error| format!("invalid file: {error}"))?
+    else {
         return Err("invalid file".to_string());
     };
+    set_bool_field(file, gc, "__closed", true).map_err(|error| format!("invalid file: {error}"))?;
     Ok(())
 }
 
@@ -1071,9 +1209,9 @@ fn read_from_file(l: &mut LuaState, file_ref: GcRef<Userdata>, first_arg: i32) -
         }
     }
 
-    let _ = with_file_state_mut(file_ref, |file| {
-        set_number_field(file, gc, "__pos", pos as f64);
-    });
+    if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+        let _ = set_number_field(file, gc, "__pos", pos as f64);
+    }
 
     let count = values.len();
     for value in values {
@@ -1109,9 +1247,9 @@ fn read_line_from_file(
     };
     match read_one(&content, pos, &ReadFormat::Line) {
         (ReadValue::Bytes(line), new_pos) => {
-            let _ = with_file_state_mut(file_ref, |file| {
-                set_number_field(file, gc, "__pos", new_pos as f64);
-            });
+            if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+                let _ = set_number_field(file, gc, "__pos", new_pos as f64);
+            }
             Ok(Some(line))
         }
         (ReadValue::Nil, _) => Ok(None),
@@ -1200,18 +1338,21 @@ fn prepare_standard_input(
         }
     };
 
-    let Some(()) = with_file_state_mut(file_ref, |file| {
-        if !bytes.is_empty() {
-            let mut updated = get_bytes_field(file, "__content");
-            updated.extend_from_slice(&bytes);
-            set_bytes_field(file, gc, "__content", &updated);
-        }
-        if reached_eof {
-            set_bool_field(file, gc, "__stdin_eof", true);
-        }
-    }) else {
+    let Some(file) =
+        file_state_ref(gc, file_ref).map_err(|error| format!("invalid file: {error}"))?
+    else {
         return Err("invalid file".to_string());
     };
+    if !bytes.is_empty() {
+        let mut updated = content;
+        updated.extend_from_slice(&bytes);
+        set_bytes_field(file, gc, "__content", &updated)
+            .map_err(|error| format!("invalid file: {error}"))?;
+    }
+    if reached_eof {
+        set_bool_field(file, gc, "__stdin_eof", true)
+            .map_err(|error| format!("invalid file: {error}"))?;
+    }
     Ok(())
 }
 
@@ -1358,10 +1499,10 @@ fn refresh_file_from_disk(gc: &mut GarbageCollector, file_ref: GcRef<Userdata>) 
     };
     if let Ok(bytes) = std::fs::read(&path) {
         let len = bytes.len();
-        let _ = with_file_state_mut(file_ref, |file| {
-            set_bytes_field(file, gc, "__content", &bytes);
-            set_number_field(file, gc, "__pos", old_pos.min(len) as f64);
-        });
+        if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+            let _ = set_bytes_field(file, gc, "__content", &bytes);
+            let _ = set_number_field(file, gc, "__pos", old_pos.min(len) as f64);
+        }
     }
 }
 
@@ -1457,14 +1598,24 @@ fn write_direct(
     };
     if !direct {
         std::fs::write(&path, content)?;
-        let Some(()) = with_file_state_mut(file_ref, |file| {
-            set_bool_field(file, gc, "__direct", true);
-        }) else {
+        let Some(file) = file_state_ref(gc, file_ref).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("file state is invalid: {error}"),
+            )
+        })?
+        else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "file state is missing",
             ));
         };
+        set_bool_field(file, gc, "__direct", true).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("file state is invalid: {error}"),
+            )
+        })?;
     }
 
     if let Some(result) = with_file_data_mut(file_ref, |data| -> std::io::Result<()> {
@@ -1559,19 +1710,78 @@ fn push_lines_iterator(
     file_ref: GcRef<Userdata>,
     auto_close: bool,
 ) -> i32 {
-    let mut env = Table::new();
-    set_bytes_field(&mut env, gc, "__kind", b"io.lines");
-    set_bool_field(&mut env, gc, "__auto_close", auto_close);
-    set_bool_field(&mut env, gc, "__dead", false);
-    let env_ptr = &mut env as *mut Table;
-    set_table_value(env_ptr, gc, "__file", &Value::Userdata(file_ref));
-    let env_ref = gc.create(env);
+    let published = gc.with_publication(|transaction| {
+        let file = transaction.protect(file_ref)?;
+        let mut checkpoint = |_| Ok(());
+        let iterator = build_lines_iterator(l, transaction, &file, auto_close, &mut checkpoint)?;
+        // SAFETY: the callback installs the Function on the active Lua stack
+        // before its temporary root is released.
+        unsafe {
+            transaction.publish_function_value(iterator, |value| {
+                l.push_value(value);
+            })
+        }
+    });
+    if published.is_ok() {
+        1
+    } else {
+        l.push_nil();
+        1
+    }
+}
 
-    let mut iter = Function::new_c(lua_io_lines_iter);
-    iter.set_env(Some(env_ref));
-    let iter_ref = gc.create(iter);
-    l.push_value(Value::Function(iter_ref));
-    1
+fn push_new_file_lines_iterator(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    construction: FileConstruction,
+    auto_close: bool,
+) -> i32 {
+    let published = gc.with_publication(|transaction| {
+        let mut checkpoint = |_| Ok(());
+        let file = build_file(l, transaction, construction, &mut checkpoint)?;
+        let iterator = build_lines_iterator(l, transaction, &file, auto_close, &mut checkpoint)?;
+        // SAFETY: the callback installs the complete
+        // Function -> environment -> Userdata graph on the active stack before
+        // releasing the iterator's temporary root.
+        unsafe {
+            transaction.publish_function_value(iterator, |value| {
+                l.push_value(value);
+            })
+        }
+    });
+    if published.is_ok() {
+        1
+    } else {
+        l.push_nil();
+        1
+    }
+}
+
+fn build_lines_iterator<'scope>(
+    state: &LuaState,
+    transaction: &mut PublicationTxn<'scope>,
+    file: &Rooted<'scope, Userdata>,
+    auto_close: bool,
+    checkpoint: &mut impl FnMut(IoPublicationStage) -> Result<(), GcRefValidationError>,
+) -> Result<Rooted<'scope, Function>, GcRefValidationError> {
+    let environment = transaction.alloc(Table::new());
+    set_rooted_bytes_field(state, transaction, &environment, b"__kind", b"io.lines")?;
+    set_rooted_bool_field(
+        state,
+        transaction,
+        &environment,
+        b"__auto_close",
+        auto_close,
+    )?;
+    set_rooted_bool_field(state, transaction, &environment, b"__dead", false)?;
+    checkpoint(IoPublicationStage::IteratorEnvironmentReady)?;
+    set_rooted_userdata_field(state, transaction, &environment, b"__file", file)?;
+    checkpoint(IoPublicationStage::IteratorFileEdgeReady)?;
+
+    let iterator = transaction.alloc_c_function(lua_io_lines_iter);
+    transaction.set_function_rooted_environment(&iterator, Some(&environment))?;
+    checkpoint(IoPublicationStage::IteratorFunctionEnvironmentReady)?;
+    Ok(iterator)
 }
 
 fn current_c_function_env(l: &LuaState) -> Option<GcRef<Table>> {
@@ -1691,30 +1901,54 @@ fn get_bool_field(table: &Table, name: &str) -> bool {
     }
 }
 
-fn set_bytes_field(table: &mut Table, gc: &mut GarbageCollector, name: &str, value: &[u8]) {
-    let key = gc.create(GcString::from_bytes(name.as_bytes()));
-    let text = gc.create(GcString::from_bytes(value));
-    table.set(&Value::String(key), &Value::String(text));
+fn set_bytes_field(
+    table: GcRef<Table>,
+    gc: &mut GarbageCollector,
+    name: &str,
+    value: &[u8],
+) -> Result<(), GcRefValidationError> {
+    gc.with_publication(|transaction| {
+        let table = transaction.protect(table)?;
+        let key = transaction.alloc(GcString::from_bytes(name.as_bytes()));
+        let text = transaction.alloc(GcString::from_bytes(value));
+        transaction.set_table_string(&table, &key, &text)
+    })
 }
 
-fn set_number_field(table: &mut Table, gc: &mut GarbageCollector, name: &str, value: f64) {
-    let key = gc.create(GcString::from_bytes(name.as_bytes()));
-    table.set(&Value::String(key), &Value::Number(value));
+fn set_number_field(
+    table: GcRef<Table>,
+    gc: &mut GarbageCollector,
+    name: &str,
+    value: f64,
+) -> Result<(), GcRefValidationError> {
+    gc.with_publication(|transaction| {
+        let table = transaction.protect(table)?;
+        let key = transaction.alloc(GcString::from_bytes(name.as_bytes()));
+        transaction.set_table_value(&table, &key, &Value::Number(value))
+    })
 }
 
-fn set_bool_field(table: &mut Table, gc: &mut GarbageCollector, name: &str, value: bool) {
-    let key = gc.create(GcString::from_bytes(name.as_bytes()));
-    table.set(&Value::String(key), &Value::Boolean(value));
+fn set_bool_field(
+    table: GcRef<Table>,
+    gc: &mut GarbageCollector,
+    name: &str,
+    value: bool,
+) -> Result<(), GcRefValidationError> {
+    gc.with_publication(|transaction| {
+        let table = transaction.protect(table)?;
+        let key = transaction.alloc(GcString::from_bytes(name.as_bytes()));
+        transaction.set_table_value(&table, &key, &Value::Boolean(value))
+    })
 }
 
 fn push_lua_string(l: &mut LuaState, gc: &mut GarbageCollector, text: &str) {
-    let s = gc.create(GcString::from_utf8_text(text));
-    l.push_value(Value::String(s));
+    crate::registration::push_string(l, gc, text.as_bytes())
+        .expect("IO string stack publication must remain collector-valid");
 }
 
 fn push_lua_bytes(l: &mut LuaState, gc: &mut GarbageCollector, bytes: &[u8]) {
-    let s = gc.create(GcString::from_bytes(bytes));
-    l.push_value(Value::String(s));
+    crate::registration::push_string(l, gc, bytes)
+        .expect("IO byte-string stack publication must remain collector-valid");
 }
 
 fn push_io_error_tuple(
@@ -1788,6 +2022,26 @@ fn number_to_lua_string(n: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lua_core::string_pool::StringPool;
+
+    fn state_with_services(gc: &mut GarbageCollector, pool: &mut StringPool) -> LuaState {
+        let mut state = LuaState::new();
+        state.gc = Some(gc);
+        state.string_pool = Some(pool);
+        state
+    }
+
+    fn state_with_io_table(
+        gc: &mut GarbageCollector,
+        pool: &mut StringPool,
+    ) -> (LuaState, GcRef<Table>, GcRef<Table>) {
+        let global = gc.create_root(Table::new());
+        let mut state = state_with_services(gc, pool);
+        state.global_table = Some(global);
+        let io = crate::registration::publish_new_table(&state, gc, global, b"io")
+            .expect("IO table should publish");
+        (state, global, io)
+    }
 
     #[test]
     fn userdata_payload_meets_io_file_data_alignment() {
@@ -1807,5 +2061,297 @@ mod tests {
         }
         // SAFETY: the preceding call constructed IoFileData in this payload.
         assert!(unsafe { userdata.data_as::<IoFileData>() }.is_some());
+    }
+
+    #[test]
+    fn standard_file_graph_is_reachable_from_global_and_fully_collectable() {
+        let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let (mut state, global, io) = state_with_io_table(&mut gc, &mut pool);
+
+        open_io(&mut state, &mut gc);
+
+        assert_eq!(gc.temporary_root_count(), 0);
+        for name in [b"stdin".as_slice(), b"stdout", b"stderr"] {
+            let file = table_get_string(io, std::str::from_utf8(name).unwrap()).as_userdata();
+            let metatable = file_state_ref(&gc, file)
+                .expect("file Userdata should validate")
+                .expect("file metatable should publish");
+            assert!(matches!(
+                table_get_string(metatable, "__index"),
+                Value::Table(index) if index == metatable
+            ));
+            assert!(matches!(
+                table_get_string(metatable, "write"),
+                Value::Function(_)
+            ));
+        }
+
+        let seed = gc.begin_mark_only();
+        assert_eq!(seed.rejected, 0);
+        gc.propagate_marks();
+        assert_eq!(gc.rejected_mark_edge_count(), 0);
+        assert_eq!(gc.marked_object_count(), gc.object_count());
+
+        let object_count = gc.object_count();
+        gc.remove_root(global);
+        gc.mark();
+        assert_eq!(gc.sweep(&mut pool), object_count);
+        assert_eq!(gc.object_count(), 0);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn file_builder_failure_stages_release_exact_temporary_roots() {
+        let stages = [
+            IoPublicationStage::FileMethod(4),
+            IoPublicationStage::BeforeIndexEdge,
+            IoPublicationStage::AfterIndexEdge,
+            IoPublicationStage::BeforeUserdataMetatable,
+            IoPublicationStage::AfterUserdataMetatable,
+        ];
+
+        for target in stages {
+            let mut gc = GarbageCollector::new();
+            let mut pool = StringPool::new();
+            let state = state_with_services(&mut gc, &mut pool);
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gc.with_publication(|transaction| {
+                    let mut checkpoint = |stage| {
+                        if stage == target {
+                            panic!("injected file graph publication failure");
+                        }
+                        Ok(())
+                    };
+                    let _file = build_file(
+                        &state,
+                        transaction,
+                        memory_file_construction(None, b"w+", true, None),
+                        &mut checkpoint,
+                    )
+                    .expect("pre-injection construction should validate");
+                });
+            }));
+
+            assert!(unwind.is_err(), "stage {target:?} should inject a panic");
+            assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
+            assert_eq!(
+                gc.rejected_temporary_root_release_count(),
+                0,
+                "stage {target:?}"
+            );
+            let object_count = gc.object_count();
+            let seed = gc.begin_mark_only();
+            assert_eq!(seed.seeded, 0, "stage {target:?}");
+            gc.propagate_marks();
+            assert_eq!(gc.marked_object_count(), 0, "stage {target:?}");
+            assert_eq!(gc.sweep(&mut pool), object_count, "stage {target:?}");
+            assert_eq!(gc.object_count(), 0, "stage {target:?}");
+            assert!(pool.is_empty(), "stage {target:?}");
+        }
+    }
+
+    #[test]
+    fn file_builder_early_return_drops_all_temporary_roots() {
+        let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let state = state_with_services(&mut gc, &mut pool);
+
+        let result: Result<(), GcRefValidationError> = gc.with_publication(|transaction| {
+            let mut checkpoint = |_| Ok(());
+            let _file = build_file(
+                &state,
+                transaction,
+                memory_file_construction(None, b"w+", true, None),
+                &mut checkpoint,
+            )?;
+            Err(GcRefValidationError::Null)
+        });
+
+        assert!(result.is_err());
+        assert_eq!(gc.temporary_root_count(), 0);
+        assert_eq!(gc.rejected_temporary_root_release_count(), 0);
+        let object_count = gc.object_count();
+        gc.mark();
+        assert_eq!(gc.sweep(&mut pool), object_count);
+        assert_eq!(gc.object_count(), 0);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn ordinary_file_and_iterator_failures_drop_all_temporary_roots() {
+        for target in [
+            IoPublicationStage::BeforeUserdataMetatable,
+            IoPublicationStage::IteratorFileEdgeReady,
+        ] {
+            let mut gc = GarbageCollector::new();
+            let mut pool = StringPool::new();
+            let state = state_with_services(&mut gc, &mut pool);
+
+            let result: Result<(), GcRefValidationError> = gc.with_publication(|transaction| {
+                let mut checkpoint = |stage| {
+                    if stage == target {
+                        Err(GcRefValidationError::Null)
+                    } else {
+                        Ok(())
+                    }
+                };
+                let file = build_file(
+                    &state,
+                    transaction,
+                    memory_file_construction(None, b"r", false, None),
+                    &mut checkpoint,
+                )?;
+                let _iterator =
+                    build_lines_iterator(&state, transaction, &file, true, &mut checkpoint)?;
+                Ok(())
+            });
+
+            assert!(result.is_err(), "stage {target:?} should return an error");
+            assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
+            assert_eq!(
+                gc.rejected_temporary_root_release_count(),
+                0,
+                "stage {target:?}"
+            );
+            let object_count = gc.object_count();
+            gc.mark();
+            assert_eq!(gc.sweep(&mut pool), object_count, "stage {target:?}");
+            assert_eq!(gc.object_count(), 0, "stage {target:?}");
+            assert!(pool.is_empty(), "stage {target:?}");
+        }
+    }
+
+    #[test]
+    fn lines_iterator_graph_is_reachable_and_fully_collectable() {
+        let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let mut state = state_with_services(&mut gc, &mut pool);
+
+        assert_eq!(
+            push_new_file_lines_iterator(
+                &mut state,
+                &mut gc,
+                memory_file_construction(None, b"r", false, None),
+                true,
+            ),
+            1
+        );
+        assert_eq!(gc.temporary_root_count(), 0);
+        let iterator = match state.at(-1) {
+            Some(Value::Function(iterator)) => *iterator,
+            value => panic!("expected iterator Function, got {value:?}"),
+        };
+        let environment = gc
+            .with_ref(iterator, |iterator| iterator.env())
+            .expect("iterator should remain live")
+            .expect("iterator environment should publish");
+        let file = match table_get_string(environment, "__file") {
+            Value::Userdata(file) => file,
+            value => panic!("expected iterator file Userdata, got {value:?}"),
+        };
+        assert!(
+            file_state_ref(&gc, file)
+                .expect("file Userdata should validate")
+                .is_some()
+        );
+
+        gc.add_root(iterator);
+        let seed = gc.begin_mark_only();
+        assert_eq!(seed.seeded, 1);
+        assert_eq!(seed.rejected, 0);
+        gc.propagate_marks();
+        assert_eq!(gc.rejected_mark_edge_count(), 0);
+        assert_eq!(gc.marked_object_count(), gc.object_count());
+
+        let object_count = gc.object_count();
+        state.pop();
+        gc.remove_root(iterator);
+        gc.mark();
+        assert_eq!(gc.sweep(&mut pool), object_count);
+        assert_eq!(gc.object_count(), 0);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn iterator_failure_stages_release_exact_temporary_roots() {
+        let stages = [
+            IoPublicationStage::IteratorEnvironmentReady,
+            IoPublicationStage::IteratorFileEdgeReady,
+            IoPublicationStage::IteratorFunctionEnvironmentReady,
+        ];
+
+        for target in stages {
+            let mut gc = GarbageCollector::new();
+            let mut pool = StringPool::new();
+            let state = state_with_services(&mut gc, &mut pool);
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gc.with_publication(|transaction| {
+                    let mut checkpoint = |stage| {
+                        if stage == target {
+                            panic!("injected iterator graph publication failure");
+                        }
+                        Ok(())
+                    };
+                    let file = build_file(
+                        &state,
+                        transaction,
+                        memory_file_construction(None, b"r", false, None),
+                        &mut checkpoint,
+                    )
+                    .expect("file should build before iterator injection");
+                    let _iterator =
+                        build_lines_iterator(&state, transaction, &file, true, &mut checkpoint)
+                            .expect("pre-injection iterator construction should validate");
+                });
+            }));
+
+            assert!(unwind.is_err(), "stage {target:?} should inject a panic");
+            assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
+            assert_eq!(
+                gc.rejected_temporary_root_release_count(),
+                0,
+                "stage {target:?}"
+            );
+            let object_count = gc.object_count();
+            gc.mark();
+            assert_eq!(gc.sweep(&mut pool), object_count, "stage {target:?}");
+            assert_eq!(gc.object_count(), 0, "stage {target:?}");
+            assert!(pool.is_empty(), "stage {target:?}");
+        }
+    }
+
+    #[test]
+    fn foreign_and_stale_file_edges_are_rejected_before_table_mutation() {
+        let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let (state, global, io) = state_with_io_table(&mut gc, &mut pool);
+        let mut foreign_gc = GarbageCollector::new();
+        let foreign = foreign_gc.create_root(Userdata::new(0));
+
+        let foreign_result =
+            set_table_ref_value(&state, &mut gc, io, b"foreign", &Value::Userdata(foreign));
+        assert!(foreign_result.is_err());
+        assert!(file_state_ref(&gc, foreign).is_err());
+        assert!(matches!(table_get_string(io, "foreign"), Value::Nil));
+        assert_eq!(gc.temporary_root_count(), 0);
+
+        let stale = gc.create_root(Userdata::new(0));
+        gc.remove_root(stale);
+        gc.mark();
+        assert!(gc.sweep(&mut pool) >= 1);
+        let stale_result =
+            set_table_ref_value(&state, &mut gc, io, b"stale", &Value::Userdata(stale));
+        assert!(stale_result.is_err());
+        assert!(file_state_ref(&gc, stale).is_err());
+        assert!(matches!(table_get_string(io, "stale"), Value::Nil));
+        assert_eq!(gc.temporary_root_count(), 0);
+
+        gc.remove_root(global);
+        gc.mark();
+        let remaining = gc.object_count();
+        assert_eq!(gc.sweep(&mut pool), remaining);
+        assert_eq!(gc.object_count(), 0);
+        assert!(pool.is_empty());
     }
 }

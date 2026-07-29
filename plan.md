@@ -7,6 +7,8 @@ last_updated: 2026-07-29
 rust_baseline: 6284135
 cpp_oracle: 87c15e6
 lua_oracle: Lua 5.1.5
+implementation_checkpoint: fe8bc2be0010bd1cbbce165c536c578007fe8843
+next_primary_task: M1 VM/app/results publication inventory and migration
 ---
 
 # lua_rust 完整复刻 lua_cpp 开发计划
@@ -50,9 +52,9 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
 - base、math、string、table、io、os、coroutine、debug、package 已有较宽的函数表面。
 - M1.8 shutdown、P1 collector provenance、managed Proto、publication-root
   基础、`TEMPORARY_STATE_ROOTS/PendingState` 及 Runtime coroutine activation
-  trampoline、compiler Proto→Function、library registration 与 package
+  trampoline、compiler Proto→Function、library/package 与 IO construction
   publication 切片完成后，fmt、all-targets Clippy、warning-free rustdoc、
-  `cargo check --workspace --all-targets` 和 758 个
+  `cargo check --workspace --all-targets` 和 766 个
   全 workspace Debug tests 已再次通过；远程 CI 不再允许隐式跳过
   security audit。
 - fixture manifest 当前共 131 项：101 个 non-official、24 个 official 和
@@ -144,7 +146,7 @@ M4 必须建立在 M1 和 M3 的生命周期、allocator 和公开状态合同�
 | 里程碑 | 状态 | 当前证据或入口 |
 |---|---|---|
 | M0 | `completed` | 本地统一 M0 gate 通过，0 hard failure、3 项已登记债务；详见 [M0 收口报告](docs/rust_migration/m0_report.md)。 |
-| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline、checked open-Upvalue owner、compiler Proto→Function 与 library/package publication 切片已完成；IO construction graph 是下一条 publication 主线。 |
+| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline、checked open-Upvalue owner、compiler Proto→Function、library/package 与 IO construction publication 切片已完成；VM/app/results 是下一条 publication 主线。 |
 | M2 | `active-limited` | 原两例 bytecode 指令/常量/metadata 已对齐；C++ local-name 证据缺口、nested Proto 大量差异、88 个 non-official 差异和真实 VM trace 仍开放。 |
 | M3 | `pending` | 等待 M1 的字节表示和生命周期合同稳定。 |
 | M4 | `pending` | 等待 M1/M3 的 runtime、allocator 与公开状态合同。 |
@@ -581,7 +583,7 @@ bytecode parity 差异和真实 VM trace unsupported；它们不会把报告误�
 | M1.4 Runtime owner | `partial` | pinned RuntimeHeap、owner-thread/phase/active guard、main roots 与 scoped parts 已实现；P1 `ObjectId + live table + checked borrow` 已拒绝 foreign/stale/address-reuse handle，LightUserdata 也已拆型。LuaState 仍保存 transitional GC/StringPool backpointer，尚无统一 Heap/allocator/services owner。 |
 | M1.5 Coroutine state | `partial` | StateArena 独占 coroutine Box；handle identity/generation、retirement 与关闭前 arena 校验已 fail-closed。`PendingState` 以 exact-id `TEMPORARY_STATE_ROOTS` 保护未发布槽，Drop 回滚并推进/退休 generation；create/wrap 在对象临时根内完成 State↔Thread 双向绑定并仅在直接压栈后提交。sealed `RuntimeNativeFunction`、scoped mailbox、独立 VM exit、deferred C frame、Runtime activation/upvalue transfer stack、rooted transfer seed 和 generic-for continuation 已接入生产 resume/wrap。open Upvalue 现为 `StateHandle + stack index`，远端 GET/SET 通过 Runtime 单-state turns 访问，state drain 在 generation advance/retirement 前关闭节点；reachable Upvalue 也会入队 owner state。精确 C++ `A→B→A` `Normal` 祖先 continuation、protected `pcall`、wrap yield/error 和 suspended-coroutine closure 读写均有回归。main state 仍是 external arena slot，debug/protected-helper 跨 state open-Upvalue、深链/完整 fault 矩阵仍开放。 |
 | M1.6 悬垂 registry | `completed-local` | pseudo dump/source thread-local registry 已删除，`string.dump` 在 M3 serializer 前稳定返回 unsupported。 |
-| M1.7 Root inventory | `partial` | 24/24 inventory schema 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO`、checked `OPEN_UPVALUES` owner、临时对象根 registry、`TEMPORARY_STATE_ROOTS/PendingState`、`COROUTINE_ACTIVATION_BUFFER` seed、compiler Proto→Function、library registration 与 package graph 事务发布已实现。当前为 21 partial、2 implemented（`OPEN_UPVALUES`、`TEMPORARY_STATE_ROOTS`）、1 missing（fixed strings），无 unsafe 条目；IO、VM/app/results 仍阻止 destructive sweep。 |
+| M1.7 Root inventory | `partial` | 24/24 inventory schema 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO`、checked `OPEN_UPVALUES` owner、临时对象根 registry、`TEMPORARY_STATE_ROOTS/PendingState`、`COROUTINE_ACTIVATION_BUFFER` seed、compiler Proto→Function、library/package 与 IO graph 事务发布已实现。当前为 21 partial、2 implemented（`OPEN_UPVALUES`、`TEMPORARY_STATE_ROOTS`）、1 missing（fixed strings），无 unsafe 条目；VM/app/results 仍阻止 destructive sweep。 |
 | M1.8 确定性 shutdown | `partial` | Runtime close/Drop 以 state→非 fixed Thread→其余非 fixed→fixed 顺序释放，object/root/string/queue/state/count 均归零；7 layout、fixed/ordinary DropProbe、open-upvalue close 与 1000 轮耐久测试通过。关闭期 Lua `__gc`、显式 IO/module service drain 和 allocator live bytes 仍是公开 debt。 |
 | M1.9 真实 full collection | `pending` | `collectgarbage("collect")` 仍只做兼容 mark/weak/finalizer 路径，不 sweep。 |
 | M1.10 Incremental GC | `pending` | phase、debt、pause、stepmul 和真实 step 尚未实现。 |
@@ -1207,8 +1209,9 @@ PR-5 完成前不得合并 PR-6。
 
 ## 16. 下一步
 
-M0 已在本地完成，M1 基础层已推进到 coroutine activation trampoline 收口。下一步按依赖
-顺序执行：
+M0 已在本地完成，M1 基础层已经完成 coroutine activation trampoline、compiler
+Proto→Function、library/package 以及 IO construction publication 切片。下一步从
+VM/app/results publication 静态盘点开始，按以下依赖顺序执行：
 
 1. 已完成 LightUserdata 拆型与 `ObjectId + collector live table`；继续保持
    live sweep 禁用，直到 `Value::String` 内容 Eq/Hash、执行层 scoped borrow
@@ -1225,8 +1228,8 @@ M0 已在本地完成，M1 基础层已推进到 coroutine activation trampoline
    cleanup、mark seed 与 `TEMPORARY_STATE_ROOTS/PendingState` 已完成；
    coroutine create/wrap 的 State→Thread→stack、compiler 内部 string/child
    Proto builder、顶层 Proto→Function 以及 CLI/bytecode/base/package loader
-   handoff、全部标准库注册和 package/loaded/preload/nested-module graph 均已
-   事务化。下一步按 IO → VM/app/results 顺序迁移；pending finalizers 与
+   handoff、全部标准库注册、package/loaded/preload/nested-module graph 以及
+   IO file/lines 两张对象图均已事务化。下一步迁移 VM/app/results；pending finalizers 与
    fixed strings 仍须进入 canonical roots。
 4. 建立唯一 `Heap` owner，移除 LuaState GC/StringPool backpointer 与
    standalone collector/pool 错配，然后实现 Runtime-only、Thread/state
@@ -1261,8 +1264,8 @@ M0 已在本地完成，M1 基础层已推进到 coroutine activation trampoline
   rollback/commit、独立 state root seed 和 coroutine create/wrap 直接压栈发布；
   compiler 的 interned string/child Proto/top Proto/Function 也已在同一事务
   中构造，并由 explicit root 或活动 Lua stack 接管；标准库 Table/key/
-  C-or-runtime-native Function 注册与 package 对象图也已由 traced Table/stack
-  接管；IO、VM/app/results 尚未迁移；
+  C-or-runtime-native Function 注册、package 对象图以及 IO file/lines 图也已由
+  traced Table/stack 接管；VM/app/results 尚未迁移；
 - bytecode schema v2 和首个指令形状切片。证据位于
   `target/compatibility/bytecode-schema-v2-original-two/report.json` 与
   `target/compatibility/bytecode-closure-schema-v2/report.json`（target
@@ -1288,7 +1291,7 @@ M0 已在本地完成，M1 基础层已推进到 coroutine activation trampoline
   Rust process regression 已逐字节匹配固定 C++ 输出；该 manifest 仍是
   non-gating characterization、无 approved deviation，因为 stock Lua 行为
   仍与项目目标不同。
-- 最新验证：fmt/check、758 个 workspace tests、all-targets Clippy、
+- 最新验证：fmt/check、766 个 workspace tests、all-targets Clippy、
   warning-free rustdoc、24/24 root inventory、差分比较器与 parity runner
   自测全部通过；fixture manifest 校验为 131 项；两个 coroutine oracle
   各重复 3 次通过精确字节校验。characterization checker 已同时通过
@@ -1322,9 +1325,11 @@ M0 已在本地完成，M1 基础层已推进到 coroutine activation trampoline
    第二开发项 library/package 也已完成：共享注册层保护 destination Table、
    canonical key、C/Runtime-native Function 与 environment；catalog library
    Table、package/loaded/preload、嵌套 module path、metadata/metatable 与错误
-   string 仅在 traced Table/stack 接管后释放。下一开发项是 IO construction
-   graph，之后推进 VM/app/results；继续维持 allocation-triggered collection
-   禁用。
+   string 仅在 traced Table/stack 接管后释放。第三开发项 IO construction graph
+   也已完成：file Userdata/metatable/method 与 lines
+   Function→environment→file 图均事务发布，字段/result/error string 走 typed
+   Table/stack publication，`io.rs` 生产 `gc.create` 为 0。下一开发项是
+   VM/app/results；继续维持 allocation-triggered collection 禁用。
 6. 完成所有生产字符串 canonical interning 或 scoped Eq/Hash，建立唯一 Heap
    owner后，才接 Runtime-only full collection；incremental/barrier/weak/
    finalizer 最后推进。
@@ -1343,3 +1348,153 @@ pwsh -NoProfile -File tools/check_gc_root_inventory.ps1
 pwsh -NoProfile -File tools/check_coroutine_normal_ancestor_characterization.ps1
 pwsh -NoProfile -File tools/run_lua51_differential.ps1 -ComparatorSelfTestOnly
 ```
+
+### 16.2 新会话恢复执行单
+
+本节是新会话的权威接力入口。开始工作时先读本节，再按需回看 16.1 和 M1.7–M1.13；
+不要重新推断已经关闭的 compiler、library/package、coroutine 或 open-Upvalue 任务。
+
+#### 16.2.1 当前实现快照
+
+- 实现检查点：
+  `fe8bc2be0010bd1cbbce165c536c578007fe8843`
+  (`Refactor standard library registration for transactional publication`)。
+- 2026-07-29 写入本交接记录前，工作区相对该提交为 clean；新会话必须先运行
+  `git status --short`，保留此后出现的用户改动，不得用 reset/checkout 清除。
+- 当前仍是 M1 `active`，不是 GC 完成状态。allocation-triggered collection、
+  live VM sweep、真实 `collectgarbage`、incremental barrier、weak/finalizer/
+  resurrection 都未启用。
+- 已关闭与待办边界如下：
+
+| publication/owner 子项 | 状态 | 当前证据或下一入口 |
+|---|---|---|
+| temporary object/state roots、managed Proto、coroutine activation、open Upvalue owner | `completed-slice` | 见 16.1；对应 root seed、rollback、远端 owner turn 和 shutdown 回归已通过 |
+| compiler Proto→Function publication | `completed-slice` | compiler builder 与 CLI/bytecode/base/package loader handoff 已事务化 |
+| library registration 与 package graph | `completed-slice` | `registration.rs` 共享层；catalog、package/loaded/preload、nested module、metadata/metatable 已事务化 |
+| IO construction/publication graph | `completed-slice` | file Userdata/metatable/method 与 lines Function/environment/file 图已事务化；生产 `io.rs` 直接 `gc.create` 为 0，故障清理、mark-only、全回收与行为回归已通过 |
+| VM/app/result publication | `next` | 重新静态盘点生产 `gc.create`，按 durable destination 分批迁移 |
+| 唯一 Heap owner 与 Runtime-only full collection | `blocked` | 等 production publication、字符串 Eq/Hash/intern 与 owner 图闭环 |
+
+最近一次完整基线是 766 个 workspace tests；fmt、all-targets check/Clippy、
+warning-free rustdoc、24/24 root inventory 均通过。M1 smoke 为
+`checksPassed=true`、`hardFailures=[]`；`foundationPassed=false` 是因为这是显式
+skip audit/differential 的 smoke 且 M1 未完成，不能把它改写为 M1 通过。
+
+#### 16.2.2 已完成主任务：IO construction graph
+
+目标：关闭 `io.rs` 在“分配对象”到“被活动 Lua stack、traced Table、Function
+environment 或显式 root 接管”之间的窗口。核心不变量是：任何新 GC 对象在
+`PublicationTxn` 临时根释放前，必须已经形成可由 canonical tracer 到达的 durable
+edge；不能先返回裸 `GcRef` 再由调用方择机发布。
+
+先锁定以下两张生产对象图：
+
+```text
+global Table
+  -> io Table
+     -> __stdin/__stdout/__stderr
+        -> Userdata
+           -> file-state/metatable Table
+              -> __index (self)
+              -> method-name GcString -> C Function
+              -> state-field-name GcString -> field Value
+
+active Lua stack
+  -> lines iterator Function
+     -> environment Table
+        -> __file -> file Userdata
+        -> __auto_close/__dead -> scalar Value
+```
+
+迁移前窗口都在 `crates/lua_stdlib/src/io.rs`，按函数名追踪而不是依赖易漂移的
+行号：
+
+1. `reg_unpublished_table` 在本地 `Table` 尚未受管时直接分配 method key 和
+   C Function；
+2. `create_file` 先用直接分配填充 file-state Table，再分配 `__index`、state
+   Table 和 Userdata，并把裸 Userdata `GcRef` 返回给稍后才压栈/入表的调用方；
+3. `push_lines_iterator` 分别分配 environment Table 和 iterator Function，
+   Function→environment→file 以及 stack→Function 的接管不在同一事务；
+4. `set_*_field`、`set_table_*` 与 `push_lua_*` helper 仍含生产
+   `gc.create`。它们是 IO 第二小切片，必须在宣布“IO publication 全部完成”前
+   一并清零。
+
+#### 16.2.3 已执行顺序
+
+1. **先写失败测试和对象图断言。**
+   为 file graph 与 lines iterator graph 分别增加 mark-only reachability、
+   transaction-drop、panic/failure cleanup 和最终全回收测试。至少覆盖在 method
+   注册中途、`__index` self-edge 前后、Userdata metatable 接线前后、iterator
+   environment 接线前后的故障点。
+2. **补最小 typed publication API。**
+   优先复用 `lua_core::gc::PublicationTxn` 和
+   `lua_stdlib::registration`。只在缺失时增加 Userdata 分配/metatable、
+   `Table -> Userdata/Value`、`Function -> environment`、stack publication
+   helper；所有 helper 必须校验 collector provenance，并保持 HRTB
+   `Rooted` 不可逃逸。
+3. **IO-1：迁移构造器。**
+   删除 `reg_unpublished_table`；把 file-state Table、keys、method Functions、
+   self `__index`、Userdata 和 metatable edge 放进同一 transaction。重构
+   `create_file`/`open_file_handle` 的合同，使成功路径在事务结束前直接发布到
+   明确 destination。若文件系统打开逻辑需要提前返回，先返回非 GC payload，
+   再由 destination-aware 构造器分配 GC 图。
+4. **IO-1：迁移 iterator。**
+   在同一 transaction 中建立
+   `Function -> environment -> file Userdata`，随后把 Function 压入活动栈，
+   再释放临时根。auto-close 与 error 路径也必须保留准确的接管/清理语义。
+5. **IO-2：清理 IO 内其余生产分配。**
+   把 field mutation 的 key/value strings 和结果/error strings 改为 typed
+   table/stack publication；最终 `io.rs` 的生产代码不得再直接调用
+   `gc.create`。若测试自身需要 direct create，必须限制在 `#[cfg(test)]`
+   并由静态 gate 明确排除，不能让生产例外混入 allowlist。
+6. **接入静态门和更新证据。**
+   在 `tools/m1_foundation_gate.ps1` 增加 IO direct-publication 检查，更新
+   `tests/compatibility/gc_root_inventory.json`、ownership RFC、phase report、
+   deviation log 和本节测试计数。不要只改 `plan.md` 宣布完成。
+
+#### 16.2.4 IO 完成证据
+
+以下条件已全部成立，IO 行已改为 `completed-slice`，下一入口为 VM/app/results：
+
+- `reg_unpublished_table` 已删除，`io.rs` 生产路径直接 `gc.create` 命中为 0；
+- file Userdata、metatable/state Table、method Functions/keys、iterator
+  Function/environment/file 的每条强边均由 typed API 建立；
+- success、early return、foreign/stale collector、panic/failure injection 后
+  temporary root 数都精确归零，且 foreign edge 在 mutation 前被拒绝；
+- 从 global Table 或活动 Lua stack 开始 mark-only tracing 时，新图全部可达、
+  无 rejected mark edge；移除 durable roots 后对象可完整回收；
+- stdin/stdout/stderr、`io.open/tmpfile/input/output/lines`、file methods、
+  auto-close 与 arbitrary-byte string 现有行为不回归；
+- workspace 测试数为 766，且新增 8 项 IO 测试全部进入默认 test run；
+- fmt、workspace all-targets check/test、Clippy `-D warnings`、warning-free
+  rustdoc、24/24 root inventory、M1 smoke 全部通过，`git diff --check` 为 0。
+
+建议使用独立验证目录，避免误用旧构建产物：
+
+```powershell
+cargo fmt --all -- --check
+cargo check --target-dir target/verify-io-publication --workspace --all-targets
+cargo test --target-dir target/verify-io-publication --workspace --all-targets --quiet
+cargo clippy --target-dir target/verify-io-publication --workspace --all-targets -- -D warnings
+$env:RUSTDOCFLAGS = "-D warnings"
+cargo doc --target-dir target/verify-io-publication --workspace --no-deps
+pwsh -NoProfile -File tools/check_gc_root_inventory.ps1
+pwsh -NoProfile -File tools/m1_foundation_gate.ps1 `
+  -Smoke -SkipQualityGate -SkipDifferential -SkipAudit `
+  -ResultPath target/compatibility/m1-foundation-io-publication-smoke.json
+git diff --check
+```
+
+#### 16.2.5 本切片保持的边界
+
+- 不启用 allocation-triggered collection 或把单元测试中的 sweep 接入 live VM；
+- 不在 IO 迁移中顺带实现唯一 Heap owner、write barrier、weak table、finalizer、
+  resurrection、真实内存计数或 `collectgarbage`；
+- 不把 IO 行为近似修复、M2 的 88 个进程差异、C API、binary chunk 或动态模块
+  混入同一改动；
+- 不因 mark-only reachability 测试通过而宣称 destructive GC 安全。
+
+IO 收口后的固定顺序是：重新盘点并迁移 VM/app/results publication →
+完成生产字符串 canonical interning 或 scoped Eq/Hash → 建立唯一 Heap owner →
+实现 Runtime-only stop-the-world full collection → weak/finalizer/resurrection →
+替换 `collectgarbage` 模拟行为 → 最后推进 incremental phase/write barrier。

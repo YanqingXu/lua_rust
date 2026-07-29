@@ -45,7 +45,7 @@ chunk、动态 C 模块加载、真实 GC 闭环、任意字节字符串和完�
 | 范围 | 状态 | 证据驱动结论 |
 |---|---|---|
 | Phase 0: Project Infrastructure | ✅ M0 本地完成 | 固定双 oracle、统一质量/兼容门、当前 131-file manifest、进程 runner 与 parity 工具均已建立；M0 收口时完整 gate 通过，新增 M1 fixtures 的外部 cwd Smoke 复验通过，远程 CI 尚待首次运行。 |
-| [Phase 1: Runtime Core](docs/rust_migration/phase_1_report.md) | 🟡 partial | ByteString、GcRef ObjectId provenance、managed Proto roots、checked open-Upvalue owner、确定性 shutdown、临时对象根与 `PendingState` 状态根已落地；其余生产 publication、真实 sweep/barrier/finalizer 仍开放。 |
+| [Phase 1: Runtime Core](docs/rust_migration/phase_1_report.md) | 🟡 partial | ByteString、GcRef ObjectId provenance、managed Proto roots、checked open-Upvalue owner、确定性 shutdown、临时对象/状态根以及 compiler、library/package、IO publication 已落地；VM/app/results publication 与真实 sweep/barrier/finalizer 仍开放。 |
 | [Phase 2: Compiler](docs/rust_migration/phase_2_report.md) | 🟡 partial | Byte lexer/parser/codegen、38-opcode metadata 与简单 bytecode 形状已对齐；nested Proto、结构化极限错误和逐 opcode parity 未完成。 |
 | [Phase 3: VM](docs/rust_migration/phase_3_report.md) | 🟡 partial | 主要 dispatch、调用、闭包、metamethod、coroutine、managed active Proto、checked open-Upvalue owner 与 Runtime coroutine trampoline 路径存在；debug/protected-helper 跨 state、全量 trace parity 和 host ABI 未完成。 |
 | [Phase 4: Standard Library](docs/rust_migration/phase_4_report.md) | 🟡 partial | 9 个库入口和大量函数有项目内测试；GC/dump/OS/string/native module 等已登记差异仍开放。 |

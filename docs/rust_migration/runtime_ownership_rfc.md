@@ -802,12 +802,26 @@ handoff. Tests prove the complete `open_all` graph is reachable from the
 global root, aliases retain one Function identity, foreign edges fail before
 mutation, and panic cleanup releases every temporary identity.
 
+IO construction is the next migrated graph. File state/metatable Tables,
+method keys and C Functions, the `__index` self-edge, typed file Userdata, and
+the Userdata metatable edge are built under one `PublicationTxn`. Standard
+files publish directly into the rooted `io` Table; `io.open`, `tmpfile`,
+`input`, and `output` publish directly to their destination Table and/or the
+active stack instead of returning an unowned `GcRef`. The lines iterator is
+likewise constructed as one protected
+Function→environment→file-Userdata graph before the Function reaches the
+active stack. All later IO field/string mutations use protected Table or
+stack publication, and the M1 gate rejects any production `gc.create` in
+`io.rs`. Mark-only/full-reclaim tests cover both graphs; checkpoint injection
+covers partial method registration, `__index`, Userdata metatable, iterator
+environment/file/Function edges, normal early return, panic cleanup, and
+foreign/stale rejection before mutation.
+
 This is an API/registry foundation, not completion of publication safety.
-IO construction graphs, VM temporaries, app arguments, general result
-construction, and returned `Vec<Value>` paths still use unprotected production
-allocation. Coroutine create/wrap, compiler Proto publication, library
-registration, and package graphs are migrated. Allocation-triggered
-collection remains disabled.
+VM temporaries, app arguments, general result construction, and returned
+`Vec<Value>` paths still use unprotected production allocation. Coroutine
+create/wrap, compiler Proto publication, library/package, and IO graphs are
+migrated. Allocation-triggered collection remains disabled.
 
 #### D.3 Implemented temporary-state root transaction (local-complete slice)
 
@@ -838,8 +852,8 @@ shutdown leave both at zero.
 
 This closes the inventory entry for coroutine state publication, not the
 broader production publication program. Compiler Proto→Function builders are
-now migrated together with library registration and package graphs, while IO
-construction, VM temporaries, app arguments/results, unique Heap ownership,
+now migrated together with library/package and IO construction graphs, while
+VM temporaries, app arguments/results, unique Heap ownership,
 fixed strings, and finalizer roots remain blockers for live destructive
 collection.
 

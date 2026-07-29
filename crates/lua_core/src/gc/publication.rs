@@ -23,6 +23,7 @@ use crate::string_pool::StringPool;
 use crate::table::Table;
 use crate::thread::Thread;
 use crate::upvalue::Upvalue;
+use crate::userdata::Userdata;
 use crate::value::Value;
 
 /// A collector-managed object protected for one publication transaction.
@@ -273,6 +274,24 @@ impl<'scope> PublicationTxn<'scope> {
             .with_mut(function.reference, |function| function.set_env(environment))
     }
 
+    /// Install a protected Table as the environment of a protected Function.
+    pub fn set_function_rooted_environment(
+        &mut self,
+        function: &Rooted<'scope, Function>,
+        environment: Option<&Rooted<'scope, Table>>,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(function)?;
+        let environment = match environment {
+            Some(environment) => {
+                self.validate_protection(environment)?;
+                Some(environment.reference)
+            }
+            None => None,
+        };
+        self.collector
+            .with_mut(function.reference, |function| function.set_env(environment))
+    }
+
     /// Install a validated environment on a protected Lua Function.
     pub fn set_lua_function_environment(
         &mut self,
@@ -334,6 +353,17 @@ impl<'scope> PublicationTxn<'scope> {
         self.set_table_value(table, key, &Value::Function(value.reference))
     }
 
+    /// Attach a protected Userdata to a protected Table.
+    pub fn set_table_userdata(
+        &mut self,
+        table: &Rooted<'scope, Table>,
+        key: &Rooted<'scope, GcString>,
+        value: &Rooted<'scope, Userdata>,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(value)?;
+        self.set_table_value(table, key, &Value::Userdata(value.reference))
+    }
+
     /// Set a protected Table's metatable to another protected Table.
     pub fn set_table_metatable(
         &mut self,
@@ -350,6 +380,25 @@ impl<'scope> PublicationTxn<'scope> {
         };
         self.collector
             .with_mut(table.reference, |table| table.set_metatable(metatable))
+    }
+
+    /// Set a protected Userdata's metatable to a protected Table.
+    pub fn set_userdata_metatable(
+        &mut self,
+        userdata: &Rooted<'scope, Userdata>,
+        metatable: Option<&Rooted<'scope, Table>>,
+    ) -> Result<(), GcRefValidationError> {
+        self.validate_protection(userdata)?;
+        let metatable = match metatable {
+            Some(metatable) => {
+                self.validate_protection(metatable)?;
+                Some(metatable.reference)
+            }
+            None => None,
+        };
+        self.collector.with_mut(userdata.reference, |userdata| {
+            userdata.set_metatable(metatable)
+        })
     }
 
     /// Check that a protected Function retains a protected Thread through one
@@ -485,6 +534,24 @@ impl<'scope> PublicationTxn<'scope> {
     ) -> Result<R, GcRefValidationError> {
         self.validate_protection(&rooted)?;
         let result = publish(Value::Table(rooted.reference));
+        self.release_owned_root(rooted.temporary_root_id);
+        Ok(result)
+    }
+
+    /// Publish a protected Userdata Value while its temporary root remains
+    /// installed for the entire callback.
+    ///
+    /// # Safety
+    ///
+    /// On normal return, `publish` must install the supplied Value in an
+    /// independently traced owner or consume it synchronously.
+    pub unsafe fn publish_userdata_value<R>(
+        &mut self,
+        rooted: Rooted<'scope, Userdata>,
+        publish: impl FnOnce(Value) -> R,
+    ) -> Result<R, GcRefValidationError> {
+        self.validate_protection(&rooted)?;
+        let result = publish(Value::Userdata(rooted.reference));
         self.release_owned_root(rooted.temporary_root_id);
         Ok(result)
     }

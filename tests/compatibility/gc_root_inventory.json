@@ -622,8 +622,13 @@
         },
         {
           "path": "crates/lua_stdlib/src/io.rs",
-          "line": 116,
-          "symbol": "create_file unregistered construction graph"
+          "line": 151,
+          "symbol": "build_file typed Userdata/metatable publication"
+        },
+        {
+          "path": "crates/lua_stdlib/src/io.rs",
+          "line": 1760,
+          "symbol": "build_lines_iterator typed Function/environment/file publication"
         },
         {
           "path": "crates/lua_compiler/src/codegen/mod.rs",
@@ -633,18 +638,18 @@
       ],
       "status": "partial",
       "owner": {
-        "current": "GarbageCollector::with_publication provides a higher-ranked PublicationTxn and branded Rooted handle. New allocations enter an ObjectId-bearing temporary-root registry before the handle is exposed; panic/nested-scope Drop removes exact identities. Compiler Proto graphs, standard-library Table/key/C-or-runtime-native Function registration, package/loaded/preload/nested-module graphs, and package strings now remain protected until an explicit root, traced Table, or active Lua stack owns them.",
+        "current": "GarbageCollector::with_publication provides a higher-ranked PublicationTxn and branded Rooted handle. New allocations enter an ObjectId-bearing temporary-root registry before the handle is exposed; panic/nested-scope Drop removes exact identities. Compiler Proto graphs, standard-library Table/key/C-or-runtime-native Function registration, package/loaded/preload/nested-module graphs, package strings, IO file Userdata/metatable graphs, and IO lines Function/environment/file graphs now remain protected until an explicit root, traced Table, or active Lua stack owns them.",
         "target": "Heap owns publication transactions with typed Table/Function/Proto/Userdata edge-publish operations and makes unprotected production allocation unavailable."
       },
       "tracer": {
         "current": "GarbageCollector::begin_mark_only validates and seeds active temporary object roots, with separate seeded/rejected counts.",
         "target": "RuntimeRootTracer seeds every active temporary-root scope."
       },
-      "missing_risk": "Compiler, coroutine create/wrap, library registration, and package object graphs are migrated, but IO construction graphs, VM temporaries, app argument/result buffers, general result construction, and remaining direct production gc.create calls have not migrated. Allocation-triggered collection therefore remains disabled.",
+      "missing_risk": "Compiler, coroutine create/wrap, library/package, and IO construction graphs are migrated, but VM temporaries, app argument/result buffers, general result construction, and remaining direct production gc.create calls have not migrated. Allocation-triggered collection therefore remains disabled.",
       "planned_test": {
-        "name": "compiler_proto_tree_publishes_atomically_into_a_lua_function; open_all_publishes_every_library_graph_from_the_global_root; panic_after_partial_library_edges_releases_only_temporary_roots; allocation_during_object_construction_preserves_temporaries",
-        "layer": "lua_vm runtime_gc_roots",
-        "assertion": "Compiler and library/package graphs retain exact temporary identities until explicit-root, Table, or stack publication; future forced-GC-at-every-allocation tests must preserve IO, VM, app/result, and remaining closure construction intermediates."
+        "name": "compiler_proto_tree_publishes_atomically_into_a_lua_function; open_all_publishes_every_library_graph_from_the_global_root; standard_file_graph_is_reachable_from_global_and_fully_collectable; file_builder_failure_stages_release_exact_temporary_roots; ordinary_file_and_iterator_failures_drop_all_temporary_roots; io_lines_graph_is_traced_from_the_runtime_main_stack",
+        "layer": "lua_core/lua_stdlib/lua_vm publication and runtime root tracing",
+        "assertion": "Compiler, library/package, and IO graphs retain exact temporary identities until explicit-root, Table, or stack publication; file and iterator failure stages release every temporary root, foreign/stale edges fail before mutation, and the Runtime main-stack tracer reaches the full iterator graph. Future forced-GC-at-every-allocation tests must preserve VM, app/result, and remaining closure construction intermediates."
       }
     },
     {
