@@ -1194,6 +1194,66 @@ fn finalizer_error_leaves_later_queue_entries_for_the_next_collection() {
 }
 
 #[test]
+fn one_thousand_combined_coroutine_weak_finalizer_and_upvalue_lifetimes_reach_zero() {
+    let (mut runtime, _gc) = compile_and_run(
+        r#"
+        local finalized = 0
+        local weak = setmetatable({}, {__mode = "v"})
+
+        for cycle = 1, 1000 do
+            local captured = cycle
+            local function worker()
+                coroutine.yield(captured)
+                return captured + 1
+            end
+
+            local thread = coroutine.create(worker)
+            local first_ok, first_value = coroutine.resume(thread)
+            assert(first_ok and first_value == cycle, "coroutine yield mismatch")
+            local second_ok, second_value = coroutine.resume(thread)
+            assert(second_ok and second_value == cycle + 1, "coroutine return mismatch")
+            assert(coroutine.status(thread) == "dead", "coroutine did not finish")
+            thread, worker = nil, nil
+
+            weak[cycle] = {cycle}
+            local finalizable = newproxy(true)
+            getmetatable(finalizable).__gc = function()
+                finalized = finalized + 1
+            end
+            finalizable = nil
+
+            if cycle % 25 == 0 then
+                collectgarbage("collect")
+            end
+        end
+
+        collectgarbage("collect")
+        collectgarbage("collect")
+        assert(next(weak) == nil, "weak values survived the durability matrix")
+        assert(finalized == 1000, "finalizer count mismatch")
+        return finalized
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(1_000.0));
+    assert_eq!(runtime.live_coroutine_state_count(), 0);
+    assert_eq!(runtime.temporary_state_root_count(), 0);
+
+    let report = runtime
+        .close()
+        .expect("combined lifecycle durability Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_roots, 0);
+    assert_eq!(report.remaining_interned_strings, 0);
+    assert_eq!(report.remaining_estimated_bytes, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_temporary_state_roots, 0);
+    assert_eq!(report.remaining_collector_queue_entries, 0);
+    assert_eq!(report.pending_lua_finalizers_discarded, 0);
+}
+
+#[test]
 fn base_xpcall_invokes_error_handlers() {
     let (state, _gc) = compile_and_run(
         "local ok, a, b = xpcall(function() return 7, 8 end, function(err) return err end); if ok then return a * 10 + b end return 0",

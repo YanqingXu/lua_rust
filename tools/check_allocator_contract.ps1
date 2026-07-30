@@ -23,6 +23,7 @@ $knownFamilies = @(
     "AUTOMATIC_SAFE_POINT",
     "ALLOCATOR_FAILURE_MATRIX",
     "STATE_ARENA_FAILURE_MATRIX",
+    "LIFECYCLE_DURABILITY_MATRIX",
     "SANITIZER_CI"
 )
 $resolvedInventory = [System.IO.Path]::GetFullPath((Join-Path $Root $InventoryPath))

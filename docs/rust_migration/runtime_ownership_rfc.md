@@ -1,6 +1,6 @@
 ---
 status: accepted-design
-implementation_status: implemented-failure-injection-and-local-miri-slice
+implementation_status: implemented-windows-asan-and-combined-lifecycle-slice
 schema_version: 1
 last_updated: 2026-07-30
 cpp_oracle: 87c15e69ceb94eb74e28226ccbefb7e196635711
@@ -1112,7 +1112,8 @@ Lua-visible completion result.
 
 - add 1,000-cycle runtime/state/coroutine/weak/finalizer/upvalue/dump tests;
 - require zero live state/object/accounted/allocator/pending counts at close;
-- run targeted Miri and Linux ASan jobs over the unsafe lifecycle paths;
+- run targeted Miri and available-platform ASan jobs over the unsafe lifecycle
+  paths;
 - run Lua 5.1 and pinned C++ GC/lifecycle differential fixtures.
 
 The managed allocator and automatic-GC slice now includes transactional
@@ -1131,9 +1132,20 @@ transfer, while the pinned Runtime stores StateArena in `UnsafeCell` and
 LuaState retains the cell identity; scoped arena references still follow the
 existing dynamic borrow protocol.
 
-Pinned Linux Miri and ASan jobs are present in CI. Their first remote execution
-is still required before claiming cross-platform sanitizer completion.
-Binary-dump lifecycle evidence remains gated on the M3 serializer.
+The installed Visual Studio ASan runtime is
+`clang_rt.asan_dynamic-x86_64.dll`. Adding its `Hostx64/x64` directory to the
+test process `PATH` lets the pinned nightly Windows target pass all three core
+allocator-failure cases, both Runtime durability cases, and the combined
+1,000-cycle production matrix. That matrix creates, resumes, and drops real
+coroutines while exercising captured closure/upvalue values, weak-value
+cleanup, and exactly 1,000 Lua `__gc` callbacks; Runtime close then reports
+zero live objects, roots, strings, allocator bytes, coroutine states, temporary
+state roots, and collector queue entries.
+
+Pinned Linux Miri and ASan jobs remain present in CI, but their execution is
+deferred under the current Windows-only validation policy. Cross-platform
+sanitizer completion is therefore not claimed. Binary-dump lifecycle evidence
+remains gated on the M3 serializer.
 
 ## 9. Unsafe invariants
 
@@ -1188,9 +1200,10 @@ requirements:
       ownership separate, and cover stop/restart, weak cleanup, and finalizers.
 
 The remaining risk is broader than this automatic entry: generic non-string
-scoped access, the first remote Linux ASan/Miri run, public allocator
-callbacks, binary-dump lifecycle, and explicit IO/module service drain still
-gate later production milestones.
+scoped access, debug/protected-helper cross-state open-Upvalue coverage,
+deferred cross-platform sanitizer execution, public allocator callbacks,
+binary-dump lifecycle, and explicit IO/module service drain still gate later
+production milestones.
 
 ## 11. Acceptance commands
 
@@ -1229,7 +1242,24 @@ cargo test -p lua_stdlib --test gc_semantics
 cargo test -p lua_app --test runtime_durability --release
 ```
 
-Targeted unsafe checks should run in a Linux CI lane:
+The current Windows validation lane uses the installed Visual Studio ASan
+runtime without `-Zbuild-std`:
+
+```powershell
+$env:PATH = "D:\VS2026\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64;$env:PATH"
+$env:RUSTFLAGS = "-Zsanitizer=address"
+$env:ASAN_OPTIONS = "halt_on_error=1"
+
+cargo +nightly-2026-07-29 test --target x86_64-pc-windows-msvc `
+  -p lua_core --test allocator_failure
+cargo +nightly-2026-07-29 test --target x86_64-pc-windows-msvc `
+  -p lua_vm --test runtime_durability
+cargo +nightly-2026-07-29 test --target x86_64-pc-windows-msvc `
+  -p lua_stdlib --test stdlib_integration_tests `
+  one_thousand_combined_coroutine_weak_finalizer_and_upvalue_lifetimes_reach_zero
+```
+
+The deferred cross-platform lane remains:
 
 ```bash
 cargo +nightly-2026-07-29 miri test -p lua_core --test allocator_failure

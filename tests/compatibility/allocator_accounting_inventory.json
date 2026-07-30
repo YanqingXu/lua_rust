@@ -57,6 +57,12 @@
       "anchors": ["AllocationSite::StateArenaSlot", "one_thousand_pending_state_lifetimes_close_at_zero", "remaining_allocator_live_bytes"]
     },
     {
+      "family": "LIFECYCLE_DURABILITY_MATRIX",
+      "status": "implemented",
+      "path": "crates/lua_stdlib/tests/stdlib_integration_tests.rs",
+      "anchors": ["one_thousand_combined_coroutine_weak_finalizer_and_upvalue_lifetimes_reach_zero", "coroutine.create", "finalized == 1000", "remaining_allocator_live_bytes"]
+    },
+    {
       "family": "SANITIZER_CI",
       "status": "implemented",
       "path": ".github/workflows/ci.yml",
