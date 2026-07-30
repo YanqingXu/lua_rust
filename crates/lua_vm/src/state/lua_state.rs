@@ -20,8 +20,9 @@ use lua_core::value::Value;
 use super::call_info::CallInfo;
 use super::stack::Stack;
 use crate::native::{
-    DeferredNativeCall, DeferredVmContinuation, FullCollectionRequest, FullCollectionResult,
-    NativeRequestId, NativeRequestPublishError, ResumeEnvelope, ResumeRequest, RuntimeRequest,
+    DebugUpvalueOperation, DebugUpvalueRequest, DeferredNativeCall, DeferredVmContinuation,
+    FullCollectionRequest, FullCollectionResult, NativeRequestId, NativeRequestPublishError,
+    ResumeEnvelope, ResumeRequest, RuntimeRequest,
 };
 use crate::runtime::StateArena;
 use thiserror::Error;
@@ -670,6 +671,44 @@ impl LuaState {
         Ok(id)
     }
 
+    pub(crate) fn publish_debug_upvalue_request(
+        &mut self,
+        upvalue: GcRef<Upvalue>,
+        owner: StateHandle,
+        stack_index: usize,
+        name: Value,
+        operation: DebugUpvalueOperation,
+    ) -> Result<NativeRequestId, NativeRequestPublishError> {
+        if !self.native_request_scope {
+            return Err(NativeRequestPublishError::ScopeUnavailable);
+        }
+        if self.pending_native_request.is_some() {
+            return Err(NativeRequestPublishError::MailboxOccupied);
+        }
+        let requester = self
+            .state_handle
+            .ok_or(NativeRequestPublishError::ScopeUnavailable)?;
+        let id = NativeRequestId::new(self.next_native_request_id);
+        self.next_native_request_id = self
+            .next_native_request_id
+            .checked_add(1)
+            .ok_or(NativeRequestPublishError::IdExhausted)?;
+        self.pending_native_request = Some(RuntimeRequest::DebugUpvalue(Box::new(
+            DebugUpvalueRequest {
+                id,
+                requester,
+                upvalue,
+                owner,
+                stack_index,
+                name,
+                operation,
+                protected: false,
+                deferred: None,
+            },
+        )));
+        Ok(id)
+    }
+
     pub(crate) fn pending_native_request_id(&self) -> Option<NativeRequestId> {
         self.pending_native_request.as_ref().map(RuntimeRequest::id)
     }
@@ -742,6 +781,13 @@ impl LuaState {
                 request.deferred = None;
             }
             RuntimeRequest::FullCollection(request) => {
+                if request.protected {
+                    return false;
+                }
+                request.protected = true;
+                request.deferred = None;
+            }
+            RuntimeRequest::DebugUpvalue(request) => {
                 if request.protected {
                     return false;
                 }

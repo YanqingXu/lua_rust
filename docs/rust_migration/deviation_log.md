@@ -1,6 +1,6 @@
 ---
 status: living
-last_updated: 2026-07-29
+last_updated: 2026-07-30
 applies_to: Lua 5.1.5 compatibility, lua_cpp project extensions, and runtime safety
 oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 ---
@@ -238,7 +238,10 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   state 维护非 intrusive、按索引降序且去重的集合；跨 state GET/SET 通过
   Runtime upvalue transfer turns 顺序访问 owner/requester，reachable Upvalue
   会向 canonical tracer 发布 owner handle，arena drain 在 generation
-  advance/retirement 前完成关闭。
+  advance/retirement 前完成关闭。`debug.getupvalue/setupvalue` 也已成为
+  sealed Runtime-native operation：remote open-Upvalue 使用 boxed request
+  释放 requester 后借 owner，`pcall` retarget 为 protected 回包，foreign/
+  stale owner 先经 arena fail-closed 校验再转为 Lua-visible error response。
   coroutine create/wrap 现由 exact-id `PendingState` 事务持有未发布 arena
   slot；Thread/closed Upvalue/wrapper Function 同时保留对象临时根，完成
   State↔Thread 双向绑定并直接压入 caller stack 后才提交。提前返回或 panic
@@ -272,11 +275,12 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   object sweep 前完成 finalizer prepare/resurrection propagation、weak
   reconciliation，并关闭不可达 state 的 open Upvalue/失效 handle generation，
   再通过 Heap/StringPool sweep 全图和 protected callback delivery。
-  但 main state 仍是 external arena slot，debug/protected-helper 跨 state
-  open-Upvalue 访问尚未纳入同一调度协议；IO/module service drain、
-  allocator live/peak 与 allocation-triggered automatic collection 合同也未
-  闭环。production barrier、explicit incremental collection 和生产字符串
-  Eq/Hash/canonical/scoped access 已由独立 inventory、静态门和回归本地闭合。
+  但 main state 仍是 external arena slot；任意 Lua 函数在 protected helper
+  内的 Runtime-native/ordinary Upvalue suspension、深链 coroutine fault
+  matrix、IO/module service drain 与公开 allocator callback 合同仍未闭环。
+  production barrier、explicit/automatic collection、allocator accounting 和
+  生产字符串 Eq/Hash/canonical/scoped access 已由独立 inventory、静态门和
+  回归本地闭合。
 - **Oracle：** `lua_cpp@87c15e6` 的 EngineContext/state ownership、
   close、coroutine lifecycle 和 allocator live-byte 合同。
 - **测试与任务：** 1000 轮 state/coroutine create-close、fixed/ordinary
@@ -286,7 +290,9 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   stock Lua 拒绝 `Normal` 祖先的差异；Rust process regression 已逐字节
   对齐该 C++ 行为。另有 suspended-coroutine closure 远端读写、
   Upvalue→owner-state root fixed point、集合去重/排序与
-  close-before-generation-invalidation 回归；PendingState 故障注入还覆盖
+  close-before-generation-invalidation 回归；debug direct/`pcall` 跨 state
+  get/setup、closed access、foreign/stale response、shutdown 归零与两条新增
+  Windows ASan 回归也已通过。PendingState 故障注入还覆盖
   Thread 分配、slot 插入、双向绑定、压栈提交、exact-id mismatch、panic
   cleanup 与 MAX-generation 单次退休。IO 回归另覆盖 file/iterator 图的
   mark-only 可达性与全回收、method/`__index`/metatable/environment 故障点、
@@ -313,9 +319,10 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 - **处置状态：** `open`。temporary state、compiler Proto→Function、
   library/package、IO、VM/app/result publication、字符串 identity/access 与
   唯一 Heap/service owner、全图 collection、weak/finalizer/resurrection、
-  public collection 与 Lua `__gc` close drain 子项已关闭；debug/protected-helper
-  跨 state、service/allocator close、barrier/incremental 与完整 lifecycle 验收
-  全部完成前保持开放。
+  public collection、Lua `__gc` close drain 与 sealed debug/protected
+  cross-state Upvalue 子项已关闭；main-state ownership、arbitrary protected
+  suspension、deep-chain fault matrix、service/allocator public contract 与完整
+  lifecycle 验收全部完成前保持开放。
 
 ### NOTE-010: Lua 字符串 intern hash 选择固定 C++ 的前向采样
 

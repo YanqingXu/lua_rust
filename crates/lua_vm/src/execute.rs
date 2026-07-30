@@ -18,9 +18,9 @@ use lua_core::value::Value;
 use std::cmp::Ordering;
 
 use crate::native::{
-    DeferredNativeCall, DeferredVmContinuation, FullCollectionResult, NativeRequestId,
-    NativeRequestPublishError, ResumeEnvelope, ResumeResponse, UpvalueAccessOperation,
-    UpvalueAccessRequest,
+    DebugUpvalueOperation, DeferredNativeCall, DeferredVmContinuation, FullCollectionResult,
+    NativeRequestId, NativeRequestPublishError, ResumeEnvelope, ResumeResponse,
+    UpvalueAccessOperation, UpvalueAccessRequest,
 };
 use crate::state::{LUA_MULTRET, LuaState, ThreadStatus};
 
@@ -2684,7 +2684,7 @@ pub(crate) fn finish_deferred_native_values(
     }
 }
 
-pub(crate) fn finish_deferred_full_collection(
+pub(crate) fn finish_deferred_runtime_result(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     deferred: &DeferredNativeCall,
@@ -2735,7 +2735,7 @@ pub(crate) fn finish_deferred_full_collection(
         | VmExit::NativeRequest(_)
         | VmExit::UpvalueAccess(_)
         | VmExit::AutomaticGc => Err(RuntimeError::new(
-            "VM: full collection completion produced a second suspension",
+            "VM: deferred Runtime-native completion produced a second suspension",
         )),
     }
 }
@@ -2818,8 +2818,17 @@ fn invoke_runtime_native(
     gc: &mut GarbageCollector,
     operation: RuntimeNativeFunction,
 ) -> i32 {
-    if operation == RuntimeNativeFunction::CollectGarbage {
-        return invoke_collectgarbage_runtime_native(l, gc);
+    match operation {
+        RuntimeNativeFunction::CollectGarbage => {
+            return invoke_collectgarbage_runtime_native(l, gc);
+        }
+        RuntimeNativeFunction::DebugGetUpvalue => {
+            return invoke_debug_upvalue_runtime_native(l, gc, false);
+        }
+        RuntimeNativeFunction::DebugSetUpvalue => {
+            return invoke_debug_upvalue_runtime_native(l, gc, true);
+        }
+        RuntimeNativeFunction::CoroutineResume | RuntimeNativeFunction::CoroutineWrapRunner => {}
     }
 
     let (thread_ref, args, envelope) = match operation {
@@ -2845,7 +2854,9 @@ fn invoke_runtime_native(
             };
             (thread_ref, native_args_from(l, 1), ResumeEnvelope::Wrap)
         }
-        RuntimeNativeFunction::CollectGarbage => unreachable!("handled above"),
+        RuntimeNativeFunction::CollectGarbage
+        | RuntimeNativeFunction::DebugGetUpvalue
+        | RuntimeNativeFunction::DebugSetUpvalue => unreachable!("handled above"),
     };
 
     let (status, target) = match gc.with_ref(thread_ref, |thread: &Thread| {
@@ -2880,6 +2891,149 @@ fn invoke_runtime_native(
                 }
             };
             publish_runtime_native_error(l, gc, envelope, message)
+        }
+    }
+}
+
+fn invoke_debug_upvalue_runtime_native(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    write: bool,
+) -> i32 {
+    let Some(Value::Function(function_ref)) = l.at(1).cloned() else {
+        l.push_nil();
+        return 1;
+    };
+    let index = match l.at(2).cloned().unwrap_or(Value::Nil) {
+        Value::Number(index) if index >= 1.0 => index as usize - 1,
+        _ => {
+            l.push_nil();
+            return 1;
+        }
+    };
+    let Some((proto_ref, upvalue_ref)) = gc
+        .with_ref(function_ref, |function| {
+            Some((function.proto()?, function.upvalue(index)?))
+        })
+        .ok()
+        .flatten()
+    else {
+        l.push_nil();
+        return 1;
+    };
+    let Some(name_ref) = gc
+        .with_ref(proto_ref, |proto| proto.upvalue_name(index))
+        .ok()
+        .flatten()
+    else {
+        l.push_nil();
+        return 1;
+    };
+    let name = Value::String(name_ref);
+    let operation = if write {
+        DebugUpvalueOperation::Write {
+            value: l.at(3).cloned().unwrap_or(Value::Nil),
+        }
+    } else {
+        DebugUpvalueOperation::Read
+    };
+
+    let (location, closed_value) = match gc.with_ref(upvalue_ref, |upvalue| {
+        (
+            upvalue.open_location(),
+            upvalue
+                .is_closed()
+                .then(|| upvalue.get_closed_value().clone()),
+        )
+    }) {
+        Ok(state) => state,
+        Err(_) => {
+            let operation = if write { b"setupvalue" } else { b"getupvalue" };
+            let mut message = b"debug.".to_vec();
+            message.extend_from_slice(operation);
+            message.extend_from_slice(b" received an invalid Upvalue");
+            return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, &message);
+        }
+    };
+
+    let Some((owner, stack_index)) = location else {
+        return match operation {
+            DebugUpvalueOperation::Read => {
+                l.push_value(name);
+                l.push_value(closed_value.unwrap_or(Value::Nil));
+                2
+            }
+            DebugUpvalueOperation::Write { value } => {
+                if gc
+                    .with_mut(upvalue_ref, |upvalue| upvalue.set_closed_value(value))
+                    .is_err()
+                {
+                    return publish_runtime_native_error(
+                        l,
+                        gc,
+                        ResumeEnvelope::Wrap,
+                        b"debug.setupvalue received an invalid Upvalue",
+                    );
+                }
+                l.push_value(name);
+                1
+            }
+        };
+    };
+
+    if l.state_handle() == Some(owner) {
+        if !l.open_upvalues.contains(&upvalue_ref) {
+            let operation = if write { b"setupvalue" } else { b"getupvalue" };
+            let mut message = b"debug.".to_vec();
+            message.extend_from_slice(operation);
+            message.extend_from_slice(b" owner state lost its open Upvalue");
+            return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, &message);
+        }
+        return match operation {
+            DebugUpvalueOperation::Read => {
+                let Some(value) = l.stack.at(stack_index).cloned() else {
+                    return publish_runtime_native_error(
+                        l,
+                        gc,
+                        ResumeEnvelope::Wrap,
+                        b"debug.getupvalue open stack index is out of range",
+                    );
+                };
+                l.push_value(name);
+                l.push_value(value);
+                2
+            }
+            DebugUpvalueOperation::Write { value } => {
+                let Some(slot) = l.stack.at_mut(stack_index) else {
+                    return publish_runtime_native_error(
+                        l,
+                        gc,
+                        ResumeEnvelope::Wrap,
+                        b"debug.setupvalue open stack index is out of range",
+                    );
+                };
+                *slot = value;
+                l.push_value(name);
+                1
+            }
+        };
+    }
+
+    match l.publish_debug_upvalue_request(upvalue_ref, owner, stack_index, name, operation) {
+        Ok(_) => 0,
+        Err(error) => {
+            let message = match error {
+                NativeRequestPublishError::ScopeUnavailable => {
+                    b"runtime-native dispatcher unavailable".as_slice()
+                }
+                NativeRequestPublishError::MailboxOccupied => {
+                    b"runtime-native mailbox already occupied".as_slice()
+                }
+                NativeRequestPublishError::IdExhausted => {
+                    b"runtime-native request id exhausted".as_slice()
+                }
+            };
+            publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message)
         }
     }
 }

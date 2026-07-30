@@ -38,7 +38,7 @@ pub type CFunction = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
 /// Sealed VM-native operations that require Runtime scheduling support.
 ///
 /// Unlike a [`CFunction`], these operations are interpreted by `lua_vm` and
-/// never receive a raw `LuaState` pointer. This keeps coroutine state switching
+/// never receive a raw `LuaState` pointer. This keeps scheduler-owned work
 /// behind the Runtime's scoped native-request capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -50,6 +50,10 @@ pub enum RuntimeNativeFunction {
     /// Base-library `collectgarbage`, whose destructive modes must suspend at
     /// a Runtime-owned stop-the-world safe point.
     CollectGarbage = 2,
+    /// `debug.getupvalue`, including cross-state open-Upvalue reads.
+    DebugGetUpvalue = 3,
+    /// `debug.setupvalue`, including cross-state open-Upvalue writes.
+    DebugSetUpvalue = 4,
 }
 
 // =====================================================================

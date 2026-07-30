@@ -642,7 +642,8 @@ The StateHandle issuance/exhaustion slice is complete locally:
   have focused regressions.
 
 Phase B remains incomplete because arena ownership of the main state and the
-debug/protected-helper cross-state scheduling matrix are still outstanding.
+deep-chain/broader coroutine fault matrix are still outstanding. The
+debug/protected-helper cross-state scheduling slice is described in B.5.
 
 #### B.2 Implemented Runtime turn-borrow substrate (partial)
 
@@ -699,7 +700,8 @@ with the sealed-function unit test, this increases the workspace total from
 
 This is a completed local trampoline slice, not completion of Phase B:
 
-- debug cross-state operations remain outside the request protocol;
+- debug cross-state Upvalue operations now use the sealed request protocol
+  described in B.5;
 - deep-chain and broader fault-injection matrices remain open;
 - main-state external ownership remains;
 - raw GC/StringPool backpointers are removed and the activation buffer is a
@@ -734,8 +736,35 @@ Focused tests cover duplicate-slot reuse and ordering, detached-state
 rejection, cross-state read/write through a closure yielded by a suspended
 coroutine, owner-state root fixed point without a Thread edge, close before
 handle invalidation, and exact preservation of the pinned-C++ `A -> B -> A`
-characterization. Debug and protected-helper cross-state access remains an
-explicit later protocol extension; it no longer uses a raw pointer fallback.
+characterization. Debug and protected-helper access now extends this same
+single-owner-turn protocol; it never uses a raw pointer fallback.
+
+#### B.5 Implemented debug/protected-helper open-Upvalue scheduling
+
+`debug.getupvalue` and `debug.setupvalue` are sealed
+`RuntimeNativeFunction` operations. Closed and requester-local Upvalues finish
+inside the current state turn. A remote open Upvalue publishes a boxed
+`DebugUpvalueRequest` containing only owned handles/values plus deferred call
+metadata; boxing keeps the dormant mailbox from increasing every
+`LuaState`'s allocator payload and changing automatic-GC cadence.
+
+Runtime releases the requester state, resolves the owner generation, performs
+one checked slot read/write, then delivers the name/value result back through
+the ordinary deferred-native continuation. A native request retargeted by
+`pcall` carries the protected result envelope, so owner resolution errors are
+returned as Lua `(false, error)` values rather than escaping the Runtime
+driver. Foreign and stale owner handles are converted into that response only
+after fail-closed arena validation.
+
+The debug request, name, write value, continuation snapshot, and response are
+seeded through `COROUTINE_ACTIVATION_BUFFER`. Focused regressions cover direct
+and protected cross-state read/write, mutation observed by ordinary bytecode,
+owner completion and close-before-invalidate, closed-Upvalue access,
+foreign/stale owner errors, zero-state/root shutdown, and Windows ASan. The
+remaining protected-helper boundary is arbitrary Lua code executed inside
+`pcall`: an ordinary bytecode `VmExit::UpvalueAccess` still cannot suspend
+through that synchronous helper and belongs to the broader helper/continuation
+redesign, not this sealed debug operation.
 
 ### C. Registry and dump lifetime — M1.6
 
@@ -1200,10 +1229,10 @@ requirements:
       ownership separate, and cover stop/restart, weak cleanup, and finalizers.
 
 The remaining risk is broader than this automatic entry: generic non-string
-scoped access, debug/protected-helper cross-state open-Upvalue coverage,
-deferred cross-platform sanitizer execution, public allocator callbacks,
-binary-dump lifecycle, and explicit IO/module service drain still gate later
-production milestones.
+scoped access, arbitrary-Lua protected-helper suspension, deep-chain/broader
+coroutine fault coverage, deferred cross-platform sanitizer execution, public
+allocator callbacks, binary-dump lifecycle, and explicit IO/module service
+drain still gate later production milestones.
 
 ## 11. Acceptance commands
 
@@ -1257,6 +1286,11 @@ cargo +nightly-2026-07-29 test --target x86_64-pc-windows-msvc `
 cargo +nightly-2026-07-29 test --target x86_64-pc-windows-msvc `
   -p lua_stdlib --test stdlib_integration_tests `
   one_thousand_combined_coroutine_weak_finalizer_and_upvalue_lifetimes_reach_zero
+cargo +nightly-2026-07-29 test --target x86_64-pc-windows-msvc `
+  -p lua_vm debug_upvalue_requests_convert_foreign_and_stale_owners_to_error_responses
+cargo +nightly-2026-07-29 test --target x86_64-pc-windows-msvc `
+  -p lua_stdlib --test stdlib_integration_tests `
+  debug_upvalue_operations_schedule_cross_state_and_protected_calls
 ```
 
 The deferred cross-platform lane remains:

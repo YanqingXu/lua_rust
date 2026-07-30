@@ -206,11 +206,49 @@ impl FullCollectionRequest {
     }
 }
 
+/// Owned transfer published by a debug-library open-Upvalue operation.
+#[derive(Clone, Debug)]
+pub(crate) struct DebugUpvalueRequest {
+    pub id: NativeRequestId,
+    pub requester: StateHandle,
+    pub upvalue: GcRef<Upvalue>,
+    pub owner: StateHandle,
+    pub stack_index: usize,
+    pub name: Value,
+    pub operation: DebugUpvalueOperation,
+    pub protected: bool,
+    pub deferred: Option<DeferredNativeCall>,
+}
+
+impl DebugUpvalueRequest {
+    pub(crate) fn seed_roots(&self, gc: &mut GarbageCollector) {
+        gc.mark_registered(self.upvalue);
+        gc.mark_value(&self.name);
+        if let DebugUpvalueOperation::Write { value } = &self.operation {
+            gc.mark_value(value);
+        }
+        if let Some(deferred) = &self.deferred {
+            if let Some(proto) = deferred.caller_proto {
+                gc.mark_registered(proto);
+            }
+            deferred.snapshot.seed_roots(gc);
+        }
+    }
+}
+
+/// Lua debug-library operation carried by a [`DebugUpvalueRequest`].
+#[derive(Clone, Debug)]
+pub(crate) enum DebugUpvalueOperation {
+    Read,
+    Write { value: Value },
+}
+
 /// One sealed Runtime-native mailbox payload.
 #[derive(Clone, Debug)]
 pub(crate) enum RuntimeRequest {
     Resume(ResumeRequest),
     FullCollection(FullCollectionRequest),
+    DebugUpvalue(Box<DebugUpvalueRequest>),
 }
 
 impl RuntimeRequest {
@@ -218,6 +256,7 @@ impl RuntimeRequest {
         match self {
             Self::Resume(request) => request.id,
             Self::FullCollection(request) => request.id,
+            Self::DebugUpvalue(request) => request.id,
         }
     }
 
@@ -225,6 +264,7 @@ impl RuntimeRequest {
         match self {
             Self::Resume(request) => request.deferred.as_ref(),
             Self::FullCollection(request) => request.deferred.as_ref(),
+            Self::DebugUpvalue(request) => request.deferred.as_ref(),
         }
     }
 
@@ -232,6 +272,7 @@ impl RuntimeRequest {
         match self {
             Self::Resume(request) => &mut request.deferred,
             Self::FullCollection(request) => &mut request.deferred,
+            Self::DebugUpvalue(request) => &mut request.deferred,
         }
     }
 }

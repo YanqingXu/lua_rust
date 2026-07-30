@@ -7,8 +7,8 @@ last_updated: 2026-07-30
 rust_baseline: 6284135
 cpp_oracle: 87c15e6
 lua_oracle: Lua 5.1.5
-implementation_checkpoint: working-tree@ae29541+m1-windows-asan-combined-lifecycle
-next_primary_task: M1.5 debug/protected-helper cross-state open-Upvalue lifecycle matrix
+implementation_checkpoint: working-tree@871fc1+m1-debug-upvalue-runtime-native
+next_primary_task: M1.5 deep-chain and broader coroutine fault matrix
 ---
 
 # lua_rust 完整复刻 lua_cpp 开发计划
@@ -148,7 +148,7 @@ M4 必须建立在 M1 和 M3 的生命周期、allocator 和公开状态合同�
 | 里程碑 | 状态 | 当前证据或入口 |
 |---|---|---|
 | M0 | `completed` | 本地统一 M0 gate 通过，0 hard failure、3 项已登记债务；详见 [M0 收口报告](docs/rust_migration/m0_report.md)。 |
-| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline、checked open-Upvalue owner、compiler/library/package/IO/VM/app/result publication、production string contract、唯一 Heap/service owner、weak/finalizer/resurrection、Lua-visible full STW、write-barrier mutation inventory、explicit incremental phase/debt/step、managed allocator live/peak/total、allocation-triggered automatic gate、四点 allocator failure injection、本地 Miri、Windows ASan 与 1000 轮组合生命周期矩阵已完成；Linux 验证按当前环境策略延期，下一条主线是 debug/protected-helper 跨 state open-Upvalue 矩阵。 |
+| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline、checked open-Upvalue owner、debug/protected Runtime-native upvalue scheduling、compiler/library/package/IO/VM/app/result publication、production string contract、唯一 Heap/service owner、weak/finalizer/resurrection、Lua-visible full STW、write-barrier mutation inventory、explicit incremental phase/debt/step、managed allocator live/peak/total、allocation-triggered automatic gate、四点 allocator failure injection、本地 Miri、Windows ASan 与 1000 轮组合生命周期矩阵已完成；Linux 验证按当前环境策略延期，下一条主线是 M1.5 深链与 broader coroutine fault 矩阵。 |
 | M2 | `active-limited` | 原两例 bytecode 指令/常量/metadata 已对齐；C++ local-name 证据缺口、nested Proto 大量差异、88 个 non-official 差异和真实 VM trace 仍开放。 |
 | M3 | `pending` | 等待 M1 的字节表示和生命周期合同稳定。 |
 | M4 | `pending` | 等待 M1/M3 的 runtime、allocator 与公开状态合同。 |
@@ -583,9 +583,9 @@ bytecode parity 差异和真实 VM trace unsupported；它们不会把报告误�
 | M1.2 GcString/StringPool | `completed-local` | 单一 ByteString payload、byte-key interning、0x00–0xff/NUL/invalid UTF-8/identity/hash 测试通过，旧 text API 静态扫描为零。 |
 | M1.3 编译器和宿主边界 | `partial` | lexer/parser/codegen、string/io/package、CLI source 与 chunk name 已迁移并有 raw-byte 双 oracle case；当前生产 GcString 构造已强制走 StringPool，内容读取已迁移到 collector/state-scoped API。真实 dump/load 与未来 C API 尚未完成。 |
 | M1.4 Runtime owner | `completed-slice` | pinned `RuntimeStorage` 唯一持有 Heap、StateArena 与 activation service；Heap 以不复用 HeapId 共同持有 collector、managed allocator ledger 和 canonical StringPool，生产 app/bytecode/compiler/stdlib/VM 无 standalone 构造。LuaState 的 GC/StringPool raw backpointer 已删除，单 state turn 使用 nested/panic-safe 动态 service context；Heap/standalone collector Drop 都回收对象。未来公开 Lua allocator callback 由 M3/M4 跟踪。 |
-| M1.5 Coroutine state | `partial` | StateArena 独占 coroutine Box；handle identity/generation、retirement 与关闭前 arena 校验已 fail-closed。`PendingState` 以 exact-id `TEMPORARY_STATE_ROOTS` 保护未发布槽，Drop 回滚并推进/退休 generation；create/wrap 在对象临时根内完成 State↔Thread 双向绑定并仅在直接压栈后提交。sealed `RuntimeNativeFunction`、scoped mailbox、独立 VM exit、deferred C frame、Runtime activation/upvalue transfer stack、rooted transfer seed 和 generic-for continuation 已接入生产 resume/wrap。open Upvalue 现为 `StateHandle + stack index`，远端 GET/SET 通过 Runtime 单-state turns 访问，state drain 在 generation advance/retirement 前关闭节点；reachable Upvalue 也会入队 owner state。精确 C++ `A→B→A` `Normal` 祖先 continuation、protected `pcall`、wrap yield/error 和 suspended-coroutine closure 读写均有回归。main state 仍是 external arena slot，debug/protected-helper 跨 state open-Upvalue、深链/完整 fault 矩阵仍开放。 |
+| M1.5 Coroutine state | `partial` | StateArena 独占 coroutine Box；handle identity/generation、retirement 与关闭前 arena 校验已 fail-closed。`PendingState` 以 exact-id `TEMPORARY_STATE_ROOTS` 保护未发布槽，Drop 回滚并推进/退休 generation；create/wrap 在对象临时根内完成 State↔Thread 双向绑定并仅在直接压栈后提交。sealed `RuntimeNativeFunction`、scoped mailbox、独立 VM exit、deferred C frame、Runtime activation/upvalue/debug-upvalue transfer stack、rooted transfer seed 和 generic-for continuation 已接入生产 resume/wrap/debug。open Upvalue 现为 `StateHandle + stack index`，远端 GET/SET 与 `debug.getupvalue/setupvalue` 通过 Runtime 单-state turns 访问；`pcall` 使用 protected 回包，foreign/stale owner fail-closed，state drain 在 generation advance/retirement 前关闭节点；reachable Upvalue 也会入队 owner state。精确 C++ `A→B→A` `Normal` 祖先 continuation、wrap yield/error、普通/protected debug access 和 suspended-coroutine closure 读写均有回归。main state 仍是 external arena slot；任意 Lua 函数在 protected helper 内的 suspension、深链/完整 fault 矩阵仍开放。 |
 | M1.6 悬垂 registry | `completed-local` | pseudo dump/source thread-local registry 已删除，`string.dump` 在 M3 serializer 前稳定返回 unsupported。 |
-| M1.7 Root inventory | `partial` | 24/24 root inventory、8/8 mutation inventory 与 6/6 allocator inventory 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO`、checked `OPEN_UPVALUES` owner、temporary object/state roots、activation/GC maintenance service、compiler/library/package/IO/VM/app/result publication、pending-finalizer seed 与 Runtime fixed strings 已接入 full/explicit/automatic tracer。另有 string、heap、mutation 与 allocator 静态门。非字符串 scoped access仍未闭环。 |
+| M1.7 Root inventory | `partial` | 24/24 root inventory、8/8 mutation inventory 与 10/10 allocator inventory 校验通过；canonical 双队列、identity-aware collector 队列、managed `ACTIVE_PROTO/DEBUG_PROTO`、checked `OPEN_UPVALUES` owner、temporary object/state roots、activation/debug-upvalue/GC maintenance service、compiler/library/package/IO/VM/app/result publication、pending-finalizer seed 与 Runtime fixed strings 已接入 full/explicit/automatic tracer。另有 string、heap、mutation 与 allocator 静态门。非字符串 scoped access仍未闭环。 |
 | M1.8 确定性 shutdown | `partial` | Runtime close/Drop 先隔离错误并持续 drain 剩余/新分配 Lua `__gc`，再以 state→非 fixed Thread→其余非 fixed→fixed 顺序释放，object/root/string/queue/state/count/allocator live 均归零；7 layout、fixed/ordinary DropProbe、open-upvalue close、finalizer error/continue 与 1000 轮耐久测试通过。显式 IO/module service drain 仍是公开 debt。 |
 | M1.9 真实 full collection | `completed-local` | Runtime safe-point STW 消费 canonical tracer，执行 finalizer prepare/resurrection propagation、weak reconciliation、不可达 state prepass 和真实 sweep；Lua `collectgarbage("collect")` 已接线，`gcinfo`/`count` 使用 collector 实际计账。 |
 | M1.10 Incremental GC | `completed-local` | collector 持有 pause→propagate→atomic→sweep→finalize、debt/threshold、pause/stepmul 与有界 sweep cursor；Runtime 持久保存 StateHandle/object 双队列，`step` 推进真实预算，大步可完成整轮，周期完成才返回 true；explicit 与 automatic 周期所有权相互隔离。 |
@@ -1217,8 +1217,9 @@ Proto→Function、library/package、IO construction、VM/app/result publication
 Heap/service owner、weak/finalizer/resurrection、Lua-visible full STW、production
 mutation barrier、Runtime-owned incremental GC、managed allocator 计账、
 allocation-triggered automatic GC、四点 allocator failure injection、本地
-Miri、Windows ASan 与 1000 轮组合生命周期矩阵。Linux 验证按当前环境策略
-延期；下一步补 debug/protected-helper 跨 state open-Upvalue 生命周期矩阵：
+Miri、Windows ASan、1000 轮组合生命周期矩阵与 debug/protected Runtime-native
+open-Upvalue 调度。Linux 验证按当前环境策略延期；下一步补 M1.5 深链与 broader
+coroutine fault 矩阵：
 
 1. 已完成 LightUserdata 拆型、`ObjectId + collector live table` 与字符串
    identity/scoped access 合同；唯一 HeapId owner、fixed strings、
@@ -1229,8 +1230,9 @@ Miri、Windows ASan 与 1000 轮组合生命周期矩阵。Linux 验证按当前
    与 activation stack 已把生产 resume/wrap 接入 Runtime 调度，并保持每
    turn 单 state 借用和 release-before-switch。open Upvalue 已改为
    `StateHandle + stack index`，远端读写、owner-state root 入队和
-   close-before-generation-advance 均已接入；debug/protected-helper 跨
-   state 访问仍作为后续矩阵。
+   close-before-generation-advance 均已接入；`debug.getupvalue/setupvalue`
+   已通过 sealed Runtime-native mailbox 调度远端 owner turn，`pcall` 使用
+   protected 回包，foreign/stale owner 转为 fail-closed 错误响应。
 3. lexical temporary-object registry、HRTB `PublicationTxn/Rooted`、panic/nested
    cleanup、mark seed 与 `TEMPORARY_STATE_ROOTS/PendingState` 已完成；
    coroutine create/wrap 的 State→Thread→stack、compiler 内部 string/child
@@ -1336,8 +1338,9 @@ HeapId/54-path gate 拒绝 production standalone collector/pool 错配。full ST
 3. 已完成 open Upvalue 的
    `Open { owner: StateHandle, index }`、非 intrusive state-owned 集合、
    reachable owner-state 入队、远端 Runtime turn 和
-   close-before-generation-advance；debug/protected-helper 跨 state
-   行为保留为显式后续矩阵。
+   close-before-generation-advance；debug get/setup 已复用 boxed
+   Runtime-native owner turn 和 protected 回包。任意 Lua protected helper
+   suspension 与深链/fault matrix 是下一入口。
 4. 已完成 `TEMPORARY_STATE_ROOTS/PendingState`：未发布状态可独立追踪，
    插入/绑定/压栈故障会 exact-id 回滚，`u64::MAX` 仅退休一次；create/wrap
    已用 typed Thread/Upvalue/Function publication 接入生产路径。
@@ -1388,21 +1391,23 @@ pwsh -NoProfile -File tools/run_lua51_differential.ps1 -ComparatorSelfTestOnly
 #### 16.2.1 当前实现快照
 
 - 当前工作树基于
-  `ae29541` (`Refactor state arena handling and implement allocator failure
-  injection`) 并包含 M1.13 Windows-ASan 与组合生命周期工作树切片；
+  `871fc1` (`Implement lifecycle durability tests and update allocator contract
+  checks`) 并包含 M1.5 debug/protected open-Upvalue 工作树切片；
   交接时必须先运行 `git status --short`，保留用户与未提交实现改动，不得用
   reset/checkout 清除。
 - 当前仍是 M1 `active`。weak/finalizer/resurrection、Lua-visible full STW、
   production write barrier、explicit incremental phase/debt/step、managed
   allocator accounting、allocation-triggered automatic collection、四点
   allocator failure injection、本地 Miri、Windows ASan 与 1000 轮组合
-  lifecycle matrix 已完成；Linux 验证按当前环境策略延期，下一入口是
-  debug/protected-helper 跨 state open-Upvalue matrix。
+  lifecycle matrix，以及 debug/protected Runtime-native open-Upvalue matrix
+  已完成；Linux 验证按当前环境策略延期，下一入口是 M1.5 深链与 broader
+  coroutine fault matrix。
 - 已关闭与待办边界如下：
 
 | publication/owner 子项 | 状态 | 当前证据或下一入口 |
 |---|---|---|
 | temporary object/state roots、managed Proto、coroutine activation、open Upvalue owner | `completed-slice` | 见 16.1；对应 root seed、rollback、远端 owner turn 和 shutdown 回归已通过 |
+| debug/protected open-Upvalue scheduling | `completed-local-slice` | `debug.getupvalue/setupvalue` 通过 boxed Runtime-native request 执行远端 owner turn；direct/`pcall`、foreign/stale、close-before-invalidate、shutdown 与 Windows ASan 定向回归已通过 |
 | compiler Proto→Function publication | `completed-slice` | compiler builder 与 CLI/bytecode/base/package loader handoff 已事务化 |
 | library registration 与 package graph | `completed-slice` | `registration.rs` 共享层；catalog、package/loaded/preload、nested module、metadata/metatable 已事务化 |
 | IO construction/publication graph | `completed-slice` | file Userdata/metatable/method 与 lines Function/environment/file 图已事务化；生产 `io.rs` 直接 `gc.create` 为 0，故障清理、mark-only、全回收与行为回归已通过 |
@@ -1415,9 +1420,11 @@ pwsh -NoProfile -File tools/run_lua51_differential.ps1 -ComparatorSelfTestOnly
 | Allocator accounting + automatic GC | `completed-local` | allocator live/peak/total、对象动态大小对账、阈值 checkpoint、自动推进门与 10/10 allocator contract 已落地 |
 | Allocator failure + sanitizer durability | `completed-local-slice` | GC object/StringPool key/publication root/StateArena slot one-shot failure 均在 owner mutation 前触发并可重试；3 个 core + 2 个 Runtime tests 和 1000 轮 pending-state soak 在本地 Miri 通过；Windows ASan 通过相同 5 个 cases 及 1000 轮 coroutine/weak/finalizer/closure-upvalue 组合矩阵。Linux 验证延期 |
 
-当前 Debug/Release 各 827 个 workspace tests、fmt、all-targets
+当前 Debug/Release 各 829 个 workspace tests、fmt、all-targets
 check/Clippy、warning-free rustdoc、24/24 root inventory、8/8 mutation
-inventory、17-path string contract 与 54-path heap contract 均通过。当前
+inventory、10/10 allocator、17-path string contract 与 54-path heap contract
+均通过。本次新增的 debug normal/protected 与 foreign/stale 两条路径也已通过
+Windows ASan。当前
 M1 smoke 为
 `checksPassed=true`、`hardFailures=[]`；`foundationPassed=false` 是因为这是显式
 skip quality/differential/audit 的 smoke 且 M1 未完成；质量门和双-lane
@@ -1542,8 +1549,8 @@ IO 收口后的固定顺序已经执行到 weak/finalizer/resurrection、真实
 `collectgarbage("collect")`、production mutation inventory/write barrier
 与 explicit incremental phase/debt/step、allocator accounting、automatic GC、
 fault injection、本地 Miri、Windows ASan 和组合 lifecycle matrix。Linux
-验证按当前策略延期；下一步补 debug/protected-helper 跨 state open-Upvalue
-矩阵。
+验证按当前策略延期；debug/protected Runtime-native open-Upvalue 矩阵也已
+完成，下一步补 M1.5 深链与 broader coroutine fault 矩阵。
 
 ### 16.3 已完成主任务：VM/app/result publication
 
@@ -1735,10 +1742,34 @@ fault injection、本地 Miri、Windows ASan 和组合 lifecycle matrix。Linux
    17-path string 与 54-path heap contract 均通过；
 8. binary dump 生命周期等待 M3 serializer，不在本切片伪造证据。
 
-#### 16.3.10 当前主任务：debug/protected-helper 跨 state open-Upvalue
+#### 16.3.10 已完成主任务：debug/protected-helper 跨 state open-Upvalue
 
-1. 补齐 debug/protected helper 驱动的跨 state open-Upvalue 访问、错误传播、
-   generation 失效与 close-before-invalidate 矩阵；
-2. 保持每 turn 单 state 独占借用、release-before-switch 与 owner-state
-   root tracing，不新增长生命周期 `&mut LuaState` 或裸 arena pointer；
-3. 对正常、protected error、stale/foreign owner 和 shutdown 路径补定向回归。
+1. `debug.getupvalue/setupvalue` 已改为 sealed `RuntimeNativeFunction`；关闭或
+   requester-local 上值仍在当前 turn 完成，远端 open-Upvalue 通过 boxed
+   `DebugUpvalueRequest`、deferred native frame 与 Runtime owner turn 读写；
+2. `pcall(debug.getupvalue/setupvalue, ...)` 会 retarget 为 protected 回包；
+   owner generation/Runtime 校验失败先转为 owned error response，再由 requester
+   state 构造 Lua error value，不让 stale/foreign handle 逃出调度器；
+3. debug request 的 Upvalue、name、write value、continuation snapshot 与 response
+   已进入 `COROUTINE_ACTIVATION_BUFFER` canonical root seed，driver delivery 后
+   exact pop，session unwind/close 清空新 transfer buffer；
+4. boxed request 避免扩大所有 `LuaState` 的 dormant mailbox 尺寸；首次未盒装
+   实现改变 allocator/automatic-GC cadence 并使 1000 轮 finalizer 矩阵暴露
+   1001 次回调，盒装后定向与完整 Debug/Release 均恢复 exactly 1000；
+5. direct/protected cross-state read/write、普通 closure 观察写值、owner 完成后
+   closed access、foreign/stale response、close-before-invalidate 与 shutdown
+   归零已有回归；Windows ASan 通过两条新增路径；
+6. 当前 Windows 门禁：Debug/Release 各 829 项，fmt、all-targets check/Clippy、
+   warning-free rustdoc、24/24 root、8/8 mutation、10/10 allocator、17-path
+   string、54-path heap 与 `git diff --check` 全部通过。Linux 验证继续按当前
+   环境策略延期。
+
+#### 16.3.11 当前主任务：M1.5 深链与 broader coroutine fault 矩阵
+
+1. 为多层 resume/wrap/Normal ancestor 与 open-Upvalue owner turn 组合建立
+   深链回归，锁定最大活动深度、恢复顺序和 activation buffer 归零；
+2. 在 mailbox publish/seal、owner resolve、response delivery、unwind 与
+   shutdown 边界补 fault injection，验证状态/Thread/Upvalue 链接可恢复；
+3. 任意 Lua 函数在 `pcall/xpcall` 内产生 Runtime-native 或 ordinary
+   `VmExit::UpvalueAccess` 的同步 helper 限制仍需单独设计 continuation，
+   不把当前 sealed debug 成功误写为通用 protected suspension 已完成。

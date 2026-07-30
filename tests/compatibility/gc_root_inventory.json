@@ -712,29 +712,29 @@
       "source_locations": [
         {
           "path": "crates/lua_vm/src/runtime.rs",
-          "line": 142,
+          "line": 192,
           "symbol": "NativeActivationStack"
         },
         {
           "path": "crates/lua_vm/src/native.rs",
-          "line": 44,
-          "symbol": "ResumeRequest and StateContinuationSnapshot"
+          "line": 211,
+          "symbol": "ResumeRequest, DebugUpvalueRequest, and StateContinuationSnapshot"
         }
       ],
       "status": "partial",
       "owner": {
-        "current": "The unique RuntimeStorage lifecycle owns Heap and NativeActivationStack together. It retains every active RuntimeRequest, deferred native frame, caller/target Thread edge, continuation snapshot, GC maintenance/finalizer frame, and pending response until delivery; NativeActivationSessionGuard restores links and drains the buffer on success, error, or panic.",
+        "current": "The unique RuntimeStorage lifecycle owns Heap and NativeActivationStack together. It retains every active RuntimeRequest, deferred native frame, caller/target Thread edge, continuation snapshot, ordinary/debug open-Upvalue transfer, GC maintenance/finalizer frame, and pending response until delivery; NativeActivationSessionGuard restores links and drains the buffer on success, error, or panic.",
         "target": "The unique Runtime owner exposes the activation buffer as a canonical root provider to full and incremental collection."
       },
       "tracer": {
-        "current": "RuntimeRootTracer invokes NativeActivationStack::seed_roots and labels the provider. It marks request arguments, Thread handles, caller Proto, saved active stack/call-frame values, yielded/error values, GC request/current-finalizer/response edges, and pending responses at every state-turn boundary before the next state is borrowed.",
+        "current": "RuntimeRootTracer invokes NativeActivationStack::seed_roots and labels the provider. It marks request arguments, Thread handles, caller Proto, saved active stack/call-frame values, yielded/error values, debug Upvalue/name/write payloads, GC request/current-finalizer/response edges, and pending responses at every state-turn boundary before the next state is borrowed.",
         "target": "RuntimeRootTracer labels activation-buffer edges and invokes the provider during every stop-the-world and incremental root seed."
       },
-      "missing_risk": "Lua-visible full and explicit incremental collection call this canonical provider after releasing the current state turn, including during finalizer reentry. Allocation-triggered automatic collection and cross-state finalizer resume/open-Upvalue transfers remain gated.",
+      "missing_risk": "Lua-visible full, explicit incremental, and allocation-triggered automatic collection call this canonical provider after releasing the current state turn, including during finalizer reentry. Cross-state finalizer resume/open-Upvalue transfers remain deliberately fail-closed.",
       "planned_test": {
-        "name": "runtime_native_activation_roots_survive_switch_delivery_and_unwind",
+        "name": "runtime_native_activation_roots_survive_switch_delivery_and_unwind; debug_upvalue_operations_schedule_cross_state_and_protected_calls",
         "layer": "lua_vm runtime coroutine trampoline",
-        "assertion": "Request arguments, continuation values, pending results/errors, and caller/target Threads remain marked while peak borrowed StateArena slots stays one; success, VM error, and panic all leave the activation buffer empty."
+        "assertion": "Request arguments, debug Upvalue/name/write payloads, continuation values, pending results/errors, and caller/target Threads remain marked while peak borrowed StateArena slots stays one; success, protected delivery, VM error, and panic all leave the activation buffer empty."
       }
     },
     {

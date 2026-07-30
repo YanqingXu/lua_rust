@@ -429,6 +429,7 @@ impl IncrementalRootTrace {
             RuntimeRootKind::CoroutineActivationBuffer,
             native_activations.frames.len()
                 + native_activations.upvalue_transfers.len()
+                + native_activations.debug_upvalue_transfers.len()
                 + native_activations.gc_frames.len(),
         );
         native_activations.seed_roots(gc);
@@ -635,6 +636,7 @@ pub(super) fn trace_roots_mark_only_at_safe_point(
         RuntimeRootKind::CoroutineActivationBuffer,
         native_activations.frames.len()
             + native_activations.upvalue_transfers.len()
+            + native_activations.debug_upvalue_transfers.len()
             + native_activations.gc_frames.len(),
     );
     native_activations.seed_roots(gc);

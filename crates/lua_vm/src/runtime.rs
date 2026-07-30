@@ -65,13 +65,13 @@ use thiserror::Error;
 
 use crate::execute::{
     ExecResult, RuntimeError, VmExit, abort_finalizer_callback, call_value_with_results,
-    execute_proto, finish_deferred_full_collection, finish_deferred_native_call,
-    finish_deferred_native_values, resume_after_deferred_native_call, resume_finalizer_callback,
+    execute_proto, finish_deferred_native_call, finish_deferred_native_values,
+    finish_deferred_runtime_result, resume_after_deferred_native_call, resume_finalizer_callback,
     resume_lua_thread, start_finalizer_callback, start_lua_call_at_stack,
 };
 use crate::native::{
-    DeferredNativeCall, FullCollectionRequest, ResumeRequest, ResumeResponse, RuntimeRequest,
-    UpvalueAccessOperation, UpvalueAccessRequest,
+    DebugUpvalueOperation, DebugUpvalueRequest, DeferredNativeCall, FullCollectionRequest,
+    ResumeRequest, ResumeResponse, RuntimeRequest, UpvalueAccessOperation, UpvalueAccessRequest,
 };
 use crate::state::lua_state::LuaStateShutdownReport;
 use crate::state::{
@@ -192,6 +192,7 @@ struct NativeActivationFrame {
 struct NativeActivationStack {
     frames: Vec<NativeActivationFrame>,
     upvalue_transfers: Vec<UpvalueTransferFrame>,
+    debug_upvalue_transfers: Vec<DebugUpvalueTransferFrame>,
     gc_frames: Vec<GcActivationFrame>,
 }
 
@@ -207,6 +208,12 @@ impl NativeActivationStack {
             }
         }
         for transfer in &self.upvalue_transfers {
+            transfer.request.seed_roots(gc);
+            if let Some(response) = &transfer.response {
+                response.seed_roots(gc);
+            }
+        }
+        for transfer in &self.debug_upvalue_transfers {
             transfer.request.seed_roots(gc);
             if let Some(response) = &transfer.response {
                 response.seed_roots(gc);
@@ -282,6 +289,12 @@ struct UpvalueTransferFrame {
 }
 
 #[derive(Clone, Debug)]
+struct DebugUpvalueTransferFrame {
+    request: DebugUpvalueRequest,
+    response: Option<DebugUpvalueResponse>,
+}
+
+#[derive(Clone, Debug)]
 enum UpvalueAccessResponse {
     Read(Value),
     Written,
@@ -291,6 +304,22 @@ impl UpvalueAccessResponse {
     fn seed_roots(&self, gc: &mut GarbageCollector) {
         if let Self::Read(value) = self {
             gc.mark_value(value);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum DebugUpvalueResponse {
+    Success(Vec<Value>),
+    ErrorMessage(String),
+}
+
+impl DebugUpvalueResponse {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        if let Self::Success(values) = self {
+            for value in values {
+                gc.mark_value(value);
+            }
         }
     }
 }
@@ -308,6 +337,7 @@ enum NativeDriverAction {
         replay_dead_ancestor: bool,
     },
     DeliverUpvalue(UpvalueTransferFrame),
+    DeliverDebugUpvalue(DebugUpvalueTransferFrame),
     DeliverCollection {
         request: FullCollectionRequest,
         response: CollectionResponse,
@@ -2286,6 +2316,7 @@ impl Runtime {
         let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
         if !heap.native_activations.frames.is_empty()
             || !heap.native_activations.upvalue_transfers.is_empty()
+            || !heap.native_activations.debug_upvalue_transfers.is_empty()
             || !heap.native_activations.gc_frames.is_empty()
         {
             return Err(RuntimeExecutionError::Protocol(
@@ -2324,6 +2355,8 @@ impl Runtime {
             };
             let completed_upvalue_transfer =
                 matches!(&action, NativeDriverAction::DeliverUpvalue(_));
+            let completed_debug_upvalue_transfer =
+                matches!(&action, NativeDriverAction::DeliverDebugUpvalue(_));
             let completed_collection =
                 matches!(&action, NativeDriverAction::DeliverCollection { .. });
             let mut event = StateArena::with_turn_state_mut(arena, current, |state| {
@@ -2346,6 +2379,13 @@ impl Runtime {
                 activations.upvalue_transfers.pop().ok_or_else(|| {
                     RuntimeExecutionError::Protocol(
                         "Upvalue delivery lost its rooted transfer frame".to_string(),
+                    )
+                })?;
+            }
+            if completed_debug_upvalue_transfer {
+                activations.debug_upvalue_transfers.pop().ok_or_else(|| {
+                    RuntimeExecutionError::Protocol(
+                        "debug Upvalue delivery lost its rooted transfer frame".to_string(),
                     )
                 })?;
             }
@@ -2567,6 +2607,67 @@ impl Runtime {
                                 response,
                                 resume,
                             };
+                            continue;
+                        }
+                        RuntimeRequest::DebugUpvalue(request) => {
+                            let request = *request;
+                            if request.deferred.is_none() {
+                                return Err(RuntimeExecutionError::Protocol(
+                                    "debug Upvalue request reached Runtime without deferred metadata"
+                                        .to_string(),
+                                ));
+                            }
+                            if let Some(NativeDriverRole::Finalizer { stop_ci }) =
+                                active_finalizer_role(activations, current)
+                            {
+                                action = NativeDriverAction::FailFinalizer {
+                                    message:
+                                        "cross-state debug Upvalue access is not supported from a __gc metamethod"
+                                            .to_string(),
+                                    stop_ci,
+                                    saved_top: active_finalizer_saved_top(activations, current)
+                                        .expect("active finalizer has a caller snapshot"),
+                                };
+                                continue;
+                            }
+                            if request.requester != current {
+                                return Err(RuntimeExecutionError::Protocol(
+                                    "debug Upvalue request named a different requester state"
+                                        .to_string(),
+                                ));
+                            }
+                            if request.owner == request.requester {
+                                return Err(RuntimeExecutionError::Protocol(
+                                    "local debug Upvalue request escaped into the Runtime scheduler"
+                                        .to_string(),
+                                ));
+                            }
+
+                            activations
+                                .debug_upvalue_transfers
+                                .push(DebugUpvalueTransferFrame {
+                                    request: request.clone(),
+                                    response: None,
+                                });
+                            let response = resolve_debug_upvalue_request(
+                                arena,
+                                gc,
+                                string_pool,
+                                runtime_id,
+                                &request,
+                            );
+                            let transfer = activations
+                                .debug_upvalue_transfers
+                                .last_mut()
+                                .ok_or_else(|| {
+                                    RuntimeExecutionError::Protocol(
+                                        "debug Upvalue access lost its rooted transfer frame"
+                                            .to_string(),
+                                    )
+                                })?;
+                            transfer.response = Some(response);
+                            action = NativeDriverAction::DeliverDebugUpvalue(transfer.clone());
+                            current = request.requester;
                             continue;
                         }
                         RuntimeRequest::Resume(request) => request,
@@ -2810,6 +2911,7 @@ impl Runtime {
                 NativeTurnEvent::Main(result) => {
                     if !activations.frames.is_empty()
                         || !activations.upvalue_transfers.is_empty()
+                        || !activations.debug_upvalue_transfers.is_empty()
                         || !activations.gc_frames.is_empty()
                     {
                         return Err(RuntimeExecutionError::Protocol(
@@ -2994,6 +3096,7 @@ impl Runtime {
         let heap = self.heap.as_ref().get_ref();
         if !heap.native_activations.frames.is_empty()
             || !heap.native_activations.upvalue_transfers.is_empty()
+            || !heap.native_activations.debug_upvalue_transfers.is_empty()
             || !heap.native_activations.gc_frames.is_empty()
         {
             return Err(StateResolveError::ArenaInvariant {
@@ -3323,6 +3426,29 @@ fn execute_native_driver_action(
             }
             resume_after_upvalue_access(state, gc)
         }
+        NativeDriverAction::DeliverDebugUpvalue(frame) => {
+            if state.state_handle() != Some(frame.request.requester) {
+                return Err(RuntimeError::new(
+                    "debug Upvalue response reached a different requester state",
+                ));
+            }
+            let deferred = frame.request.deferred.as_ref().ok_or_else(|| {
+                RuntimeError::new("debug Upvalue activation lost its deferred call")
+            })?;
+            let response = match frame.response {
+                Some(DebugUpvalueResponse::Success(values)) => Ok(values),
+                Some(DebugUpvalueResponse::ErrorMessage(message)) => {
+                    Err(runtime_error_value(state, gc, &RuntimeError::new(message)))
+                }
+                None => {
+                    return Err(RuntimeError::new(
+                        "debug Upvalue transfer has no owner-state response",
+                    ));
+                }
+            };
+            finish_deferred_runtime_result(state, gc, deferred, frame.request.protected, response)?;
+            resume_after_deferred_native_call(state, gc, deferred)
+        }
         NativeDriverAction::DeliverCollection {
             request,
             response,
@@ -3338,7 +3464,7 @@ fn execute_native_driver_action(
                 }
                 CollectionResponse::ErrorValue(error) => Err(error),
             };
-            finish_deferred_full_collection(state, gc, deferred, request.protected, response)?;
+            finish_deferred_runtime_result(state, gc, deferred, request.protected, response)?;
             match resume {
                 NativeDriverRole::Program => resume_after_deferred_native_call(state, gc, deferred),
                 NativeDriverRole::Finalizer { stop_ci } => {
@@ -3408,6 +3534,71 @@ fn execute_upvalue_owner_access(
             *slot = value.clone();
             Ok(UpvalueAccessResponse::Written)
         }
+    }
+}
+
+fn execute_debug_upvalue_owner_access(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    request: &DebugUpvalueRequest,
+) -> Result<Vec<Value>, RuntimeError> {
+    if state.state_handle() != Some(request.owner) {
+        return Err(RuntimeError::new(
+            "debug Upvalue owner-state handle did not match the resolved state",
+        ));
+    }
+    if !state.open_upvalues.contains(&request.upvalue) {
+        return Err(RuntimeError::new(
+            "debug Upvalue owner state no longer contains the requested Upvalue",
+        ));
+    }
+    let location = gc
+        .with_ref(request.upvalue, Upvalue::open_location)
+        .map_err(|error| RuntimeError::new(format!("invalid debug Upvalue request: {error}")))?;
+    if location != Some((request.owner, request.stack_index)) {
+        return Err(RuntimeError::new(
+            "debug Upvalue location changed before owner-state access",
+        ));
+    }
+
+    match &request.operation {
+        DebugUpvalueOperation::Read => {
+            let value = state
+                .stack
+                .at(request.stack_index)
+                .cloned()
+                .ok_or_else(|| {
+                    RuntimeError::new("debug Upvalue owner stack index is out of range")
+                })?;
+            Ok(vec![request.name.clone(), value])
+        }
+        DebugUpvalueOperation::Write { value } => {
+            let slot = state.stack.at_mut(request.stack_index).ok_or_else(|| {
+                RuntimeError::new("debug Upvalue owner stack index is out of range")
+            })?;
+            *slot = value.clone();
+            Ok(vec![request.name.clone()])
+        }
+    }
+}
+
+fn resolve_debug_upvalue_request(
+    arena: NonNull<StateArena>,
+    gc: &mut GarbageCollector,
+    string_pool: &mut StringPool,
+    runtime_id: RuntimeId,
+    request: &DebugUpvalueRequest,
+) -> DebugUpvalueResponse {
+    match StateArena::with_turn_state_mut(arena, request.owner, |owner_state| {
+        with_vm_context_parts(owner_state, gc, string_pool, |owner_state, gc, _| {
+            execute_debug_upvalue_owner_access(owner_state, gc, request)
+        })
+    }) {
+        Ok(Ok(values)) => DebugUpvalueResponse::Success(values),
+        Ok(Err(error)) => DebugUpvalueResponse::ErrorMessage(error.to_string()),
+        Err(source) => DebugUpvalueResponse::ErrorMessage(
+            RuntimeAccessError::StateArena { runtime_id, source }.to_string(),
+        ),
     }
 }
 
@@ -3714,6 +3905,7 @@ impl Drop for NativeActivationSessionGuard {
             });
         }
         activations.upvalue_transfers.clear();
+        activations.debug_upvalue_transfers.clear();
         if activations
             .gc_frames
             .iter()
@@ -4315,6 +4507,63 @@ mod tests {
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
         assert!(heap.state_arena_mut().release(main));
         assert!(heap.state_arena().slots.iter().all(|slot| !slot.borrowed));
+    }
+
+    #[test]
+    fn debug_upvalue_requests_convert_foreign_and_stale_owners_to_error_responses() {
+        let mut runtime = Runtime::new();
+        let requester = runtime
+            .main_state_handle
+            .expect("main state handle is registered");
+        let foreign_runtime = Runtime::new();
+        let foreign_owner = foreign_runtime
+            .main_state_handle
+            .expect("foreign main state handle is registered");
+        let stale_owner = {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (state, _, _) = parts.split_mut();
+            state
+                .insert_coroutine_state(LuaState::new())
+                .expect("child is inserted")
+        };
+        let runtime_id = runtime.id;
+
+        // SAFETY: RuntimeStorage is pinned and no execution guard is live.
+        let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
+        heap.state_arena_mut()
+            .remove_owned(stale_owner)
+            .expect("test child can be removed");
+        let arena =
+            NonNull::new(heap.state_arena.get()).expect("pinned StateArena cell is non-null");
+        let (gc, string_pool) = heap.heap.parts_mut();
+        let upvalue = gc.create(Upvalue::new_closed(Value::Nil));
+
+        for (owner, expected) in [
+            (foreign_owner, "belongs to runtime"),
+            (stale_owner, "generation is"),
+        ] {
+            let request = DebugUpvalueRequest {
+                id: crate::native::NativeRequestId::new(1),
+                requester,
+                upvalue,
+                owner,
+                stack_index: 0,
+                name: Value::Nil,
+                operation: DebugUpvalueOperation::Read,
+                protected: true,
+                deferred: None,
+            };
+            let response =
+                resolve_debug_upvalue_request(arena, gc, string_pool, runtime_id, &request);
+            assert!(
+                matches!(
+                    response,
+                    DebugUpvalueResponse::ErrorMessage(ref message)
+                        if message.contains(expected)
+                ),
+                "owner resolution must become a protected Lua-visible response: {response:?}"
+            );
+        }
     }
 
     #[test]

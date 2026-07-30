@@ -657,6 +657,64 @@ fn debug_setupvalue_updates_lua_function_upvalues() {
 }
 
 #[test]
+fn debug_upvalue_operations_schedule_cross_state_and_protected_calls() {
+    let (mut runtime, _gc) = compile_and_run(
+        r#"
+        local thread = coroutine.create(function()
+            local captured = 41
+            local function read() return captured end
+            coroutine.yield(read)
+            return captured
+        end)
+
+        local started, read = coroutine.resume(thread)
+        assert(started and type(read) == "function")
+
+        local name, value = debug.getupvalue(read, 1)
+        assert(name == "captured" and value == 41)
+        assert(debug.setupvalue(read, 1, 73) == "captured")
+        assert(read() == 73)
+
+        local get_ok, protected_name, protected_value =
+            pcall(debug.getupvalue, read, 1)
+        assert(get_ok and protected_name == "captured" and protected_value == 73)
+        local set_ok, protected_set_name =
+            pcall(debug.setupvalue, read, 1, 77)
+        assert(set_ok and protected_set_name == "captured")
+        assert(read() == 77)
+
+        local finished, result = coroutine.resume(thread)
+        assert(finished and result == 77)
+        assert(coroutine.status(thread) == "dead")
+
+        local closed_name, closed_value = debug.getupvalue(read, 1)
+        assert(closed_name == "captured" and closed_value == 77)
+        local closed_ok, closed_set_name =
+            pcall(debug.setupvalue, read, 1, 81)
+        assert(closed_ok and closed_set_name == "captured")
+        assert(read() == 81)
+
+        thread, read = nil, nil
+        collectgarbage("collect")
+        return 81
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(81.0));
+    assert_eq!(runtime.live_coroutine_state_count(), 0);
+    assert_eq!(runtime.temporary_state_root_count(), 0);
+    let report = runtime
+        .close()
+        .expect("cross-state debug Upvalue Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_roots, 0);
+    assert_eq!(report.remaining_interned_strings, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_temporary_state_roots, 0);
+}
+
+#[test]
 fn base_loadfile_and_dofile_compile_and_execute_files() {
     let load_path = write_temp_lua_file(
         "loadfile",
@@ -1230,7 +1288,7 @@ fn one_thousand_combined_coroutine_weak_finalizer_and_upvalue_lifetimes_reach_ze
         collectgarbage("collect")
         collectgarbage("collect")
         assert(next(weak) == nil, "weak values survived the durability matrix")
-        assert(finalized == 1000, "finalizer count mismatch")
+        assert(finalized == 1000, "finalizer count mismatch: " .. finalized)
         return finalized
         "#,
     );

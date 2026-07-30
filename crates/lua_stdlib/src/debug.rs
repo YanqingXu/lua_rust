@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::ptr::NonNull;
 
 use lua_compiler::opcode::{self, OpCode};
-use lua_core::function::Function;
+use lua_core::function::{Function, RuntimeNativeFunction};
 use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc::publication::{PublicationTxn, Rooted};
@@ -12,7 +12,6 @@ use lua_core::gc_string::GcString;
 use lua_core::proto::Proto;
 use lua_core::table::Table;
 use lua_core::thread::Thread;
-use lua_core::upvalue::Upvalue;
 use lua_core::value::Value;
 use lua_vm::state::LuaState;
 
@@ -51,12 +50,24 @@ pub fn open_debug(l: &mut LuaState, gc: &mut GarbageCollector) {
     reg(l, gc, debug_table, "getinfo", lua_debug_getinfo);
     reg(l, gc, debug_table, "getlocal", lua_debug_getlocal);
     reg(l, gc, debug_table, "getregistry", lua_debug_getregistry);
-    reg(l, gc, debug_table, "getupvalue", lua_debug_getupvalue);
+    reg_runtime_native(
+        l,
+        gc,
+        debug_table,
+        "getupvalue",
+        RuntimeNativeFunction::DebugGetUpvalue,
+    );
     reg(l, gc, debug_table, "setfenv", lua_debug_setfenv);
     reg(l, gc, debug_table, "sethook", lua_debug_sethook);
     reg(l, gc, debug_table, "setlocal", lua_debug_setlocal);
     reg(l, gc, debug_table, "setmetatable", lua_debug_setmetatable);
-    reg(l, gc, debug_table, "setupvalue", lua_debug_setupvalue);
+    reg_runtime_native(
+        l,
+        gc,
+        debug_table,
+        "setupvalue",
+        RuntimeNativeFunction::DebugSetUpvalue,
+    );
     reg(l, gc, debug_table, "traceback", lua_debug_traceback);
 }
 
@@ -69,6 +80,17 @@ fn reg(
 ) {
     crate::registration::register_c_function(state, gc, table, name.as_bytes(), func, None)
         .expect("debug Function publication must remain collector-valid");
+}
+
+fn reg_runtime_native(
+    state: &LuaState,
+    gc: &mut GarbageCollector,
+    table: GcRef<Table>,
+    name: &str,
+    operation: RuntimeNativeFunction,
+) {
+    crate::registration::register_runtime_native(state, gc, table, name.as_bytes(), operation)
+        .expect("debug Runtime-native publication must remain collector-valid");
 }
 
 fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
@@ -220,89 +242,6 @@ fn push_name_info(
         l.push_nil();
     }
     1
-}
-
-unsafe extern "C" fn lua_debug_setupvalue(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
-    let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.active_gc_ptr() else {
-        l.push_nil();
-        return 1;
-    };
-    // SAFETY: LuaState::gc is installed by the VM before calling C functions.
-    let gc = unsafe { &mut *gc_ptr };
-
-    let Some(Value::Function(func_ref)) = l.at(1).cloned() else {
-        l.push_nil();
-        return 1;
-    };
-    let index = match l.at(2).cloned().unwrap_or(Value::Nil) {
-        Value::Number(n) if n >= 1.0 => n as usize - 1,
-        _ => {
-            l.push_nil();
-            return 1;
-        }
-    };
-    let value = l.at(3).cloned().unwrap_or(Value::Nil);
-
-    let Some(name) = upvalue_name(gc, func_ref, index) else {
-        l.push_nil();
-        return 1;
-    };
-    let Some(upvalue_ref) = function_upvalue(func_ref, index) else {
-        l.push_nil();
-        return 1;
-    };
-    if let Err(message) = set_upvalue_value(l, gc, upvalue_ref, value) {
-        let _ = crate::registration::push_string(l, gc, message.as_bytes());
-        return -1;
-    }
-
-    let _ = crate::registration::push_string(l, gc, &name);
-    1
-}
-
-unsafe extern "C" fn lua_debug_getupvalue(l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
-    let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(gc_ptr) = l.active_gc_ptr() else {
-        l.push_nil();
-        return 1;
-    };
-    // SAFETY: LuaState::gc is installed by the VM before calling C functions.
-    let gc = unsafe { &mut *gc_ptr };
-
-    let Some(Value::Function(func_ref)) = l.at(1).cloned() else {
-        l.push_nil();
-        return 1;
-    };
-    let index = match l.at(2).cloned().unwrap_or(Value::Nil) {
-        Value::Number(n) if n >= 1.0 => n as usize - 1,
-        _ => {
-            l.push_nil();
-            return 1;
-        }
-    };
-
-    let Some(name) = upvalue_name(gc, func_ref, index) else {
-        l.push_nil();
-        return 1;
-    };
-    let Some(upvalue_ref) = function_upvalue(func_ref, index) else {
-        l.push_nil();
-        return 1;
-    };
-
-    let _ = crate::registration::push_string(l, gc, &name);
-    let value = match get_upvalue_value(l, gc, upvalue_ref) {
-        Ok(value) => value,
-        Err(message) => {
-            let _ = crate::registration::push_string(l, gc, message.as_bytes());
-            return -1;
-        }
-    };
-    l.push_value(value);
-    2
 }
 
 unsafe extern "C" fn lua_debug_getregistry(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -1452,84 +1391,6 @@ fn active_lines_table<'scope>(
         transaction.set_table_entry(&table, &Value::Number(*line as f64), &Value::Boolean(true))?;
     }
     Ok(table)
-}
-
-fn upvalue_name(gc: &GarbageCollector, func_ref: GcRef<Function>, index: usize) -> Option<Vec<u8>> {
-    let proto_ref = gc.with_ref(func_ref, Function::proto).ok().flatten()?;
-    let proto_ptr = gc.validate_ref(proto_ref).ok()?;
-    // SAFETY: validated above; destructive sweep is disabled throughout this
-    // debug C callback.
-    let proto = unsafe { proto_ptr.as_ref() };
-    let name_ref = proto.upvalue_name(index)?;
-    gc.with_string_bytes(name_ref, <[u8]>::to_vec).ok()
-}
-
-fn function_upvalue(
-    func_ref: GcRef<Function>,
-    index: usize,
-) -> Option<GcRef<lua_core::upvalue::Upvalue>> {
-    // SAFETY: function argument is on the active Lua stack.
-    let func = unsafe { func_ref.as_ref() }?;
-    func.upvalue(index)
-}
-
-fn get_upvalue_value(
-    l: &LuaState,
-    gc: &GarbageCollector,
-    upvalue_ref: GcRef<Upvalue>,
-) -> Result<Value, &'static str> {
-    let (location, closed) = gc
-        .with_ref(upvalue_ref, |upvalue| {
-            (
-                upvalue.open_location(),
-                upvalue
-                    .is_closed()
-                    .then(|| upvalue.get_closed_value().clone()),
-            )
-        })
-        .map_err(|_| "debug.getupvalue received an invalid Upvalue")?;
-    if let Some((owner, stack_index)) = location {
-        if l.state_handle() != Some(owner) {
-            return Err("debug.getupvalue cross-state open Upvalue access is not yet scheduled");
-        }
-        if !l.open_upvalues.contains(&upvalue_ref) {
-            return Err("debug.getupvalue owner state lost its open Upvalue");
-        }
-        l.stack
-            .at(stack_index)
-            .cloned()
-            .ok_or("debug.getupvalue open stack index is out of range")
-    } else {
-        Ok(closed.unwrap_or(Value::Nil))
-    }
-}
-
-fn set_upvalue_value(
-    l: &mut LuaState,
-    gc: &mut GarbageCollector,
-    upvalue_ref: GcRef<Upvalue>,
-    value: Value,
-) -> Result<(), &'static str> {
-    let location = gc
-        .with_ref(upvalue_ref, Upvalue::open_location)
-        .map_err(|_| "debug.setupvalue received an invalid Upvalue")?;
-    if let Some((owner, stack_index)) = location {
-        if l.state_handle() != Some(owner) {
-            return Err("debug.setupvalue cross-state open Upvalue access is not yet scheduled");
-        }
-        if !l.open_upvalues.contains(&upvalue_ref) {
-            return Err("debug.setupvalue owner state lost its open Upvalue");
-        }
-        let slot = l
-            .stack
-            .at_mut(stack_index)
-            .ok_or("debug.setupvalue open stack index is out of range")?;
-        *slot = value;
-    } else {
-        gc.with_mut(upvalue_ref, |upvalue| upvalue.set_closed_value(value))
-            .map_err(|_| "debug.setupvalue received an invalid Upvalue")?;
-    }
-    Ok(())
 }
 
 fn function_env(func_ref: GcRef<Function>) -> Option<GcRef<Table>> {
