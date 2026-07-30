@@ -32,6 +32,7 @@
 //! full/incremental collection plus allocation-triggered collection at
 //! Runtime-owned instruction boundaries.
 
+use std::cell::UnsafeCell;
 use std::collections::HashSet;
 use std::marker::{PhantomData, PhantomPinned};
 use std::num::NonZeroU64;
@@ -40,7 +41,9 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::thread::{self, ThreadId};
 
-use lua_core::allocator::{AllocationAccount, AllocationLedger, AllocatorStats};
+use lua_core::allocator::{
+    AllocationAccount, AllocationLedger, AllocationSite, AllocatorStats, ManagedAllocationError,
+};
 use lua_core::function::Function;
 use lua_core::gc::collector::{GarbageCollector, GcRefValidationError, IncrementalPhase};
 use lua_core::gc::gc_ref::GcRef;
@@ -543,6 +546,9 @@ pub enum StateResolveError {
         /// Stable diagnostic describing the rejected invariant.
         reason: &'static str,
     },
+    /// A checked StateArena allocation failed before publishing a slot.
+    #[error(transparent)]
+    Allocation(#[from] ManagedAllocationError),
 }
 
 /// Failure while publishing one Runtime-owned coroutine state.
@@ -646,7 +652,7 @@ impl StateArena {
         self.handle_issuer.runtime_id()
     }
 
-    fn reserve_slot(&mut self) -> StateHandle {
+    fn reserve_slot(&mut self) -> Result<StateHandle, ManagedAllocationError> {
         let slot = loop {
             match self.free_slots.pop() {
                 Some(slot_index)
@@ -666,6 +672,16 @@ impl StateArena {
                     // permanently retired slot.
                 }
                 None => {
+                    let requested_bytes = std::mem::size_of::<StateSlot>();
+                    self.allocation_account
+                        .allocation_checkpoint(AllocationSite::StateArenaSlot, requested_bytes)?;
+                    self.slots.try_reserve(1).map_err(|source| {
+                        ManagedAllocationError::capacity(
+                            AllocationSite::StateArenaSlot,
+                            requested_bytes,
+                            source,
+                        )
+                    })?;
                     self.slots.push(StateSlot {
                         generation: 1,
                         state: None,
@@ -679,7 +695,7 @@ impl StateArena {
                 }
             }
         };
-        self.issue_handle(slot)
+        Ok(self.issue_handle(slot))
     }
 
     fn issue_handle(&self, slot: usize) -> StateHandle {
@@ -689,7 +705,9 @@ impl StateArena {
     }
 
     fn attach_external(&mut self, state: NonNull<LuaState>) -> StateHandle {
-        let handle = self.reserve_slot();
+        let handle = self
+            .reserve_slot()
+            .expect("fresh Runtime main-state slot allocation cannot be fault-injected");
         // SAFETY: Runtime passes its live, uniquely owned main-state Box.
         let accounted_bytes = unsafe { state.as_ref() }.allocator_payload_bytes();
         let slot = &mut self.slots[handle.slot()];
@@ -702,12 +720,14 @@ impl StateArena {
 
     #[cfg(test)]
     fn insert_owned(&mut self, state: Box<LuaState>) -> StateHandle {
-        self.insert_owned_with_temporary_root(state, None)
+        self.insert_owned_with_temporary_root(state, None, None)
+            .expect("test-owned StateArena insertion succeeds")
     }
 
     fn insert_pending_owned(
         &mut self,
         state: Box<LuaState>,
+        owner_cell: Option<NonNull<UnsafeCell<StateArena>>>,
     ) -> Result<(StateHandle, u64), StateResolveError> {
         if state.state_handle.is_some()
             || state.state_arena.is_some()
@@ -718,13 +738,15 @@ impl StateArena {
             });
         }
         let temporary_root_id = self.next_temporary_root_id;
-        self.next_temporary_root_id =
+        let next_temporary_root_id =
             temporary_root_id
                 .checked_add(1)
                 .ok_or(StateResolveError::ArenaInvariant {
                     reason: "temporary state-root identity space exhausted",
                 })?;
-        let handle = self.insert_owned_with_temporary_root(state, Some(temporary_root_id));
+        let handle =
+            self.insert_owned_with_temporary_root(state, Some(temporary_root_id), owner_cell)?;
+        self.next_temporary_root_id = next_temporary_root_id;
         Ok((handle, temporary_root_id))
     }
 
@@ -732,14 +754,14 @@ impl StateArena {
         &mut self,
         mut state: Box<LuaState>,
         temporary_root_id: Option<u64>,
-    ) -> StateHandle {
+        owner_cell: Option<NonNull<UnsafeCell<StateArena>>>,
+    ) -> Result<StateHandle, ManagedAllocationError> {
         let next_live_owned_states = self
             .live_owned_states
             .checked_add(1)
             .expect("StateArena live owned-state count overflow");
-        let handle = self.reserve_slot();
-        let arena = NonNull::from(&mut *self);
-        state.attach_runtime_state(handle, arena);
+        let handle = self.reserve_slot()?;
+        state.attach_runtime_state(handle, owner_cell);
         let accounted_bytes = state.allocator_payload_bytes();
         let state =
             NonNull::new(Box::into_raw(state)).expect("Box::into_raw never returns a null pointer");
@@ -751,7 +773,7 @@ impl StateArena {
         slot.temporary_root_id = temporary_root_id;
         self.live_owned_states = next_live_owned_states;
         self.reconcile_allocation_account();
-        handle
+        Ok(handle)
     }
 
     fn validate_pending(
@@ -1652,9 +1674,13 @@ impl Drop for StateBorrow {
 }
 
 impl LuaState {
-    pub(crate) fn attach_runtime_state(&mut self, handle: StateHandle, arena: NonNull<StateArena>) {
+    pub(crate) fn attach_runtime_state(
+        &mut self,
+        handle: StateHandle,
+        arena: Option<NonNull<UnsafeCell<StateArena>>>,
+    ) {
         self.state_handle = Some(handle);
-        self.state_arena = Some(arena);
+        self.state_arena = arena;
     }
 
     /// Return this state's runtime-scoped generational handle.
@@ -1671,13 +1697,22 @@ impl LuaState {
         &mut self,
         state: LuaState,
     ) -> Result<StateHandle, StateResolveError> {
-        let mut arena = self
+        let arena_cell = self
             .state_arena
             .ok_or(StateResolveError::ArenaUnavailable)?;
-        // SAFETY: Runtime attaches only pointers to its pinned StateArena.
+        // SAFETY: Runtime attaches only its pinned StateArena UnsafeCell.
         // The current LuaState is alive for this call, so the Runtime and arena
         // cannot be dropped while the child Box is transferred.
-        Ok(unsafe { arena.as_mut() }.insert_owned(Box::new(state)))
+        let mut arena = NonNull::new(unsafe { arena_cell.as_ref() }.get())
+            .expect("UnsafeCell::get never returns null");
+        // SAFETY: `arena` was derived from this state's attached `UnsafeCell`,
+        // and the runtime arena protocol gives this call exclusive access.
+        let handle = unsafe { arena.as_mut() }.insert_owned_with_temporary_root(
+            Box::new(state),
+            None,
+            Some(arena_cell),
+        )?;
+        Ok(handle)
     }
 
     /// Execute one branded coroutine-state publication transaction.
@@ -1691,13 +1726,18 @@ impl LuaState {
         state: LuaState,
         publish: impl for<'scope> FnOnce(&mut PendingState<'scope>, &mut LuaState) -> R,
     ) -> Result<R, StateResolveError> {
-        let mut arena = self
+        let arena_cell = self
             .state_arena
             .ok_or(StateResolveError::ArenaUnavailable)?;
-        // SAFETY: Runtime installs only its pinned StateArena pointer. The
-        // branded guard is dropped before this method returns or unwinds.
+        // SAFETY: Runtime installs only its pinned StateArena UnsafeCell. The
+        // branded guard is dropped before this method returns or unwinds, and
+        // Runtime's dynamic arena protocol excludes another mutable borrow.
+        let mut arena = NonNull::new(unsafe { arena_cell.as_ref() }.get())
+            .expect("UnsafeCell::get never returns null");
+        // SAFETY: `arena` was derived from this state's attached `UnsafeCell`,
+        // and no other mutable arena access can overlap the branded guard.
         let (handle, temporary_root_id) =
-            unsafe { arena.as_mut() }.insert_pending_owned(Box::new(state))?;
+            unsafe { arena.as_mut() }.insert_pending_owned(Box::new(state), Some(arena_cell))?;
         let mut pending = PendingState {
             arena,
             publisher: NonNull::from(&mut *self),
@@ -1712,22 +1752,22 @@ impl LuaState {
 
     /// Number of lexical temporary state roots in this Runtime arena.
     pub fn temporary_state_root_count(&self) -> usize {
-        let Some(arena) = self.state_arena else {
+        let Some(arena_cell) = self.state_arena else {
             return 0;
         };
         // SAFETY: StateArena is pinned and this shared diagnostic does not
         // create a LuaState reference or mutate arena state.
-        unsafe { arena.as_ref() }.temporary_state_root_count()
+        unsafe { &*arena_cell.as_ref().get() }.temporary_state_root_count()
     }
 
     /// Number of temporary state-root release mismatches observed by this
     /// Runtime arena.
     pub fn rejected_temporary_state_root_release_count(&self) -> usize {
-        let Some(arena) = self.state_arena else {
+        let Some(arena_cell) = self.state_arena else {
             return 0;
         };
         // SAFETY: same pinned shared diagnostic invariant as above.
-        unsafe { arena.as_ref() }.rejected_temporary_root_releases
+        unsafe { &*arena_cell.as_ref().get() }.rejected_temporary_root_releases
     }
 
     /// Resolve another state and confine its mutable reference to `f`.
@@ -1740,20 +1780,23 @@ impl LuaState {
         handle: StateHandle,
         f: impl for<'state> FnOnce(&'state mut LuaState) -> R,
     ) -> Result<R, StateResolveError> {
-        let arena = self
+        let arena_cell = self
             .state_arena
             .ok_or(StateResolveError::ArenaUnavailable)?;
         let current_state = NonNull::from(&mut *self);
-        // SAFETY: state_arena is installed only from the pinned RuntimeStorage.
+        // SAFETY: state_arena is installed only from the pinned RuntimeStorage
+        // UnsafeCell. Runtime's arena borrow protocol excludes overlap.
         // StateArena validates target identity and guards the mutable borrow
         // until the higher-ranked closure returns.
+        let arena = NonNull::new(unsafe { arena_cell.as_ref() }.get())
+            .expect("UnsafeCell::get never returns null");
         StateArena::with_state_mut(arena, handle, current_state, f)
     }
 }
 
 /// Stable allocation for the Heap, state arena, and Runtime-scoped services.
 struct RuntimeStorage {
-    state_arena: StateArena,
+    state_arena: UnsafeCell<StateArena>,
     heap: Heap,
     native_activations: NativeActivationStack,
     incremental_trace: Option<IncrementalRootTrace>,
@@ -1768,12 +1811,26 @@ impl RuntimeStorage {
         let heap = Heap::new();
         let allocator = heap.allocation_ledger();
         Self {
-            state_arena: StateArena::new(handle_issuer, allocator),
+            state_arena: UnsafeCell::new(StateArena::new(handle_issuer, allocator)),
             heap,
             native_activations: NativeActivationStack::default(),
             incremental_trace: None,
             _pin: PhantomPinned,
         }
+    }
+
+    fn state_arena(&self) -> &StateArena {
+        // SAFETY: shared diagnostics never overlap a Runtime-owned mutable
+        // arena operation.
+        unsafe { &*self.state_arena.get() }
+    }
+
+    fn state_arena_mut(&mut self) -> &mut StateArena {
+        self.state_arena.get_mut()
+    }
+
+    fn state_arena_cell(&self) -> NonNull<UnsafeCell<StateArena>> {
+        NonNull::from(&self.state_arena)
     }
 }
 
@@ -1860,9 +1917,9 @@ impl Runtime {
         let mut main_state = Box::new(LuaState::with_global_table(global_root));
         main_state.registry = Some(registry_root);
         let main_state_ptr = NonNull::from(main_state.as_mut());
-        let main_state_handle = heap_mut.state_arena.attach_external(main_state_ptr);
-        main_state
-            .attach_runtime_state(main_state_handle, NonNull::from(&mut heap_mut.state_arena));
+        let arena_cell = heap_mut.state_arena_cell();
+        let main_state_handle = heap_mut.state_arena_mut().attach_external(main_state_ptr);
+        main_state.attach_runtime_state(main_state_handle, Some(arena_cell));
 
         Ok(Self {
             id,
@@ -1961,7 +2018,7 @@ impl Runtime {
         self.heap
             .as_ref()
             .get_ref()
-            .state_arena
+            .state_arena()
             .live_owned_state_count()
     }
 
@@ -1970,12 +2027,40 @@ impl Runtime {
         self.heap.as_ref().get_ref().heap.allocator_stats()
     }
 
+    /// Install a one-shot managed-allocation failure plan for durability tests.
+    ///
+    /// The selected checkpoint fails before changing its object publication or
+    /// StateArena owner graph. This is intentionally separate from the future
+    /// public Lua allocator callback.
+    #[doc(hidden)]
+    pub fn inject_allocator_failure_after(
+        &self,
+        site: AllocationSite,
+        successful_matching_checkpoints: usize,
+    ) {
+        self.heap
+            .as_ref()
+            .get_ref()
+            .heap
+            .inject_allocator_failure_after(site, successful_matching_checkpoints);
+    }
+
+    /// Remove a durability-test allocation failure plan.
+    #[doc(hidden)]
+    pub fn clear_allocator_failure_injection(&self) {
+        self.heap
+            .as_ref()
+            .get_ref()
+            .heap
+            .clear_allocator_failure_injection();
+    }
+
     /// Return active lexical temporary state roots.
     pub fn temporary_state_root_count(&self) -> usize {
         self.heap
             .as_ref()
             .get_ref()
-            .state_arena
+            .state_arena()
             .temporary_state_root_count()
     }
 
@@ -1984,7 +2069,7 @@ impl Runtime {
         self.heap
             .as_ref()
             .get_ref()
-            .state_arena
+            .state_arena()
             .rejected_temporary_root_releases
     }
 
@@ -2036,7 +2121,11 @@ impl Runtime {
             .checked_add(1)
             .expect("runtime active-execution counter overflow");
         let state_ptr = NonNull::from(&mut *state);
-        heap.state_arena
+        let mut arena = NonNull::new(heap.state_arena.get())
+            .expect("pinned StateArena UnsafeCell never returns null");
+        // SAFETY: parts_mut holds the exclusive Runtime borrow, and this guard
+        // releases the arena slot before that borrow ends.
+        unsafe { arena.as_mut() }
             .begin_direct_borrow(state_handle, state_ptr)
             .map_err(|source| RuntimeAccessError::StateArena {
                 runtime_id: self.id,
@@ -2059,7 +2148,7 @@ impl Runtime {
             gc,
             string_pool,
             vm_context: Some(vm_context),
-            state_arena: NonNull::from(&mut heap.state_arena),
+            state_arena: arena,
             state_handle,
             active_executions: &mut self.active_executions,
         })
@@ -2124,7 +2213,8 @@ impl Runtime {
         // its fields. The arena and service fields are disjoint, and state
         // references are confined to one HRTB callback at a time.
         let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
-        let arena = NonNull::from(&mut heap.state_arena);
+        let arena = NonNull::new(heap.state_arena.get())
+            .expect("pinned StateArena UnsafeCell never returns null");
         let (gc, string_pool) = heap.heap.parts_mut();
         let mut current = initial;
 
@@ -2202,7 +2292,8 @@ impl Runtime {
                 "activation stack was not empty at execution entry".to_string(),
             ));
         }
-        let mut arena = NonNull::from(&mut heap.state_arena);
+        let mut arena = NonNull::new(heap.state_arena.get())
+            .expect("pinned StateArena UnsafeCell never returns null");
         let (gc, string_pool) = heap.heap.parts_mut();
         let activations = &mut heap.native_activations;
         let incremental_trace = &mut heap.incremental_trace;
@@ -2909,9 +3000,9 @@ impl Runtime {
                 reason: "native activation stack is not empty at shutdown",
             });
         }
-        heap.state_arena
+        heap.state_arena()
             .validate_external_detach(handle, state_pointer)?;
-        heap.state_arena.validate_owned_drain()
+        heap.state_arena().validate_owned_drain()
     }
 
     fn shutdown_contents(
@@ -2922,7 +3013,9 @@ impl Runtime {
             // SAFETY: RuntimeStorage remains pinned and shutdown has exclusive
             // owner-thread access with no execution guard.
             let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
-            heap.state_arena.drain_owned(heap.heap.collector_mut())?
+            // SAFETY: shutdown has exclusive Runtime access and the arena and
+            // collector are disjoint RuntimeStorage fields.
+            unsafe { &mut *heap.state_arena.get() }.drain_owned(heap.heap.collector_mut())?
         };
 
         let mut state_shutdown = arena_report.state_shutdown;
@@ -2958,8 +3051,8 @@ impl Runtime {
     fn close_report(&self, already_closed: bool) -> RuntimeCloseReport {
         let heap = self.heap.as_ref().get_ref();
         let remaining_objects = heap.heap.object_count();
-        let remaining_coroutine_states = heap.state_arena.live_owned_state_count();
-        let remaining_temporary_state_roots = heap.state_arena.temporary_state_root_count();
+        let remaining_coroutine_states = heap.state_arena().live_owned_state_count();
+        let remaining_temporary_state_roots = heap.state_arena().temporary_state_root_count();
         let remaining_collector_queue_entries = heap.heap.collector().transient_queue_entry_count();
         let allocator = heap.heap.allocator_stats();
         let summary = self.shutdown_summary.unwrap_or_default();
@@ -2983,7 +3076,7 @@ impl Runtime {
             remaining_coroutine_states,
             remaining_temporary_state_roots,
             rejected_temporary_state_root_releases: heap
-                .state_arena
+                .state_arena()
                 .rejected_temporary_root_releases,
             remaining_collector_queue_entries,
             drained_coroutine_states: summary.drained_coroutine_states,
@@ -3023,7 +3116,8 @@ impl Runtime {
             // SAFETY: state_pointer names the still-owned main-state Box.
             unsafe { state_pointer.as_mut() }
                 .prepare_for_runtime_shutdown(heap.heap.collector_mut());
-        heap.state_arena.detach_external(handle, state_pointer)?;
+        // SAFETY: close has exclusive Runtime access and no state turn exists.
+        unsafe { &mut *heap.state_arena.get() }.detach_external(handle, state_pointer)?;
         self.main_state_handle = None;
         drop(self.main_state.take());
         Ok(state_report)
@@ -3835,7 +3929,7 @@ mod tests {
                 .heap
                 .as_ref()
                 .get_ref()
-                .state_arena
+                .state_arena()
                 .validate(inserted_handle),
             Err(StateResolveError::StaleGeneration { .. })
         ));
@@ -3914,7 +4008,7 @@ mod tests {
                 .heap
                 .as_ref()
                 .get_ref()
-                .state_arena
+                .state_arena()
                 .validate(bound_handle),
             Err(StateResolveError::StaleGeneration { .. })
         ));
@@ -4103,7 +4197,7 @@ mod tests {
         assert_eq!(completed, "finished");
         assert_eq!(turn_index, 3);
         assert_eq!(runtime.active_execution_count(), 0);
-        let arena = &runtime.heap.as_ref().get_ref().state_arena;
+        let arena = runtime.heap.as_ref().get_ref().state_arena();
         assert_eq!(arena.peak_turn_borrowed_slots, 1);
         assert_eq!(
             arena.turn_borrow_events,
@@ -4134,7 +4228,7 @@ mod tests {
         assert!(panic_result.is_err());
         assert_eq!(runtime.active_execution_count(), 0);
         {
-            let arena = &runtime.heap.as_ref().get_ref().state_arena;
+            let arena = runtime.heap.as_ref().get_ref().state_arena();
             assert_eq!(
                 arena.turn_borrow_events,
                 vec![
@@ -4185,7 +4279,7 @@ mod tests {
         };
         // SAFETY: RuntimeStorage is pinned and no execution guard is live.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
-        heap.state_arena
+        heap.state_arena_mut()
             .remove_owned(stale)
             .expect("test child can be removed");
         assert!(matches!(
@@ -4206,7 +4300,7 @@ mod tests {
         // SAFETY: RuntimeStorage is pinned and the test releases this synthetic
         // direct borrow before any teardown or further state access.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
-        heap.state_arena
+        heap.state_arena_mut()
             .begin_direct_borrow(main, main_ptr)
             .expect("test can mark the main slot borrowed");
         assert!(matches!(
@@ -4219,8 +4313,8 @@ mod tests {
         assert_eq!(runtime.active_execution_count(), 0);
         // SAFETY: the same pinned arena owns the synthetic borrow above.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
-        assert!(heap.state_arena.release(main));
-        assert!(heap.state_arena.slots.iter().all(|slot| !slot.borrowed));
+        assert!(heap.state_arena_mut().release(main));
+        assert!(heap.state_arena().slots.iter().all(|slot| !slot.borrowed));
     }
 
     #[test]
@@ -4353,10 +4447,10 @@ mod tests {
         };
         // SAFETY: RuntimeStorage is pinned and no execution guard is live.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
-        heap.state_arena
+        heap.state_arena_mut()
             .remove_owned(removed)
             .expect("child is removed");
-        heap.state_arena.free_slots.push(removed.slot());
+        heap.state_arena_mut().free_slots.push(removed.slot());
 
         assert!(matches!(
             runtime.close(),
@@ -4376,7 +4470,10 @@ mod tests {
         // SAFETY: RuntimeStorage remains pinned and the failed close did not
         // create an execution guard or mutate arena ownership.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
-        assert_eq!(heap.state_arena.free_slots.pop(), Some(removed.slot()));
+        assert_eq!(
+            heap.state_arena_mut().free_slots.pop(),
+            Some(removed.slot())
+        );
         runtime
             .close()
             .expect("close succeeds after test corruption is repaired");
@@ -4439,10 +4536,10 @@ mod tests {
 
         // SAFETY: RuntimeStorage is pinned and no execution guard is live.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
-        heap.state_arena
+        heap.state_arena_mut()
             .remove_owned(first_handle)
             .expect("owned child can be removed");
-        assert_eq!(heap.state_arena.live_owned_state_count(), 0);
+        assert_eq!(heap.state_arena().live_owned_state_count(), 0);
 
         let second_handle = {
             let mut parts = runtime.parts_mut().expect("parts are available");
@@ -4540,7 +4637,7 @@ mod tests {
         arena.slots[slot_index].generation = u64::MAX;
 
         let (handle, temporary_root_id) = arena
-            .insert_pending_owned(Box::new(LuaState::new()))
+            .insert_pending_owned(Box::new(LuaState::new()), None)
             .expect("final generation can host one pending state");
         assert_eq!(handle.slot(), slot_index);
         assert_eq!(handle.generation(), u64::MAX);
@@ -4668,7 +4765,7 @@ mod tests {
                 .heap
                 .as_ref()
                 .get_ref()
-                .state_arena
+                .state_arena()
                 .validate(child_handle),
             Err(StateResolveError::StaleGeneration { .. })
         ));
@@ -4720,11 +4817,11 @@ mod tests {
 
         // SAFETY: RuntimeStorage is pinned and no execution guard is live.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
-        let arena = &mut heap.state_arena;
+        let arena_cell = heap.state_arena_cell();
+        let arena = heap.state_arena_mut();
         let slot_index = child_handle.slot();
         arena.slots[slot_index].generation = u64::MAX;
         let final_handle = arena.issue_handle(slot_index);
-        let arena_ptr = NonNull::from(&mut *arena);
         let mut child_state = arena.slots[slot_index]
             .state
             .expect("child slot remains occupied");
@@ -4734,12 +4831,12 @@ mod tests {
         unsafe {
             child_state
                 .as_mut()
-                .attach_runtime_state(final_handle, arena_ptr);
+                .attach_runtime_state(final_handle, Some(arena_cell));
         }
 
         let first = runtime.close().expect("runtime closes at generation max");
         assert_eq!(first.drained_coroutine_states, 1);
-        let slot = &runtime.heap.as_ref().get_ref().state_arena.slots[slot_index];
+        let slot = &runtime.heap.as_ref().get_ref().state_arena().slots[slot_index];
         assert!(slot.retired);
         assert_eq!(slot.generation, u64::MAX);
         assert!(slot.state.is_none());
@@ -4748,7 +4845,7 @@ mod tests {
                 .heap
                 .as_ref()
                 .get_ref()
-                .state_arena
+                .state_arena()
                 .free_slots
                 .contains(&slot_index)
         );
@@ -4757,7 +4854,7 @@ mod tests {
                 .heap
                 .as_ref()
                 .get_ref()
-                .state_arena
+                .state_arena()
                 .validate(final_handle),
             Err(StateResolveError::RetiredSlot { .. })
         ));
@@ -4765,7 +4862,7 @@ mod tests {
         let second = runtime.close().expect("second close is idempotent");
         assert!(second.already_closed);
         assert_eq!(
-            runtime.heap.as_ref().get_ref().state_arena.slots[slot_index].generation,
+            runtime.heap.as_ref().get_ref().state_arena().slots[slot_index].generation,
             u64::MAX
         );
     }

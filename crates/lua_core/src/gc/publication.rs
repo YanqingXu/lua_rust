@@ -11,6 +11,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 
+use crate::allocator::{AllocationSite, ManagedAllocationError};
 use crate::function::{CFunction, Function, RuntimeNativeFunction};
 use crate::gc::collector::{GarbageCollector, GcRefValidationError};
 use crate::gc::gc_object::GcObject;
@@ -80,9 +81,19 @@ impl<'scope> PublicationTxn<'scope> {
     /// infallible identity insertion is the only step between registration
     /// and protection.
     pub fn alloc<T: GcObject>(&mut self, object: T) -> Rooted<'scope, T> {
-        self.prepare_registration();
+        self.try_alloc(object)
+            .unwrap_or_else(|error| panic!("managed publication allocation failed: {error}"))
+    }
+
+    /// Try to allocate and protect an object without leaving a registered
+    /// object or temporary root behind when a checked allocation fails.
+    pub fn try_alloc<T: GcObject>(
+        &mut self,
+        object: T,
+    ) -> Result<Rooted<'scope, T>, ManagedAllocationError> {
+        self.try_prepare_registration::<T>()?;
         let temporary_root_id = self.collector.allocate_temporary_root_id();
-        let reference = self.collector.create(object);
+        let reference = self.collector.try_create(object)?;
 
         // Capacity was reserved before object allocation. Record ownership in
         // the transaction first, so an unexpected panic during map insertion
@@ -97,11 +108,11 @@ impl<'scope> PublicationTxn<'scope> {
             "temporary publication root identity was unexpectedly reused"
         );
 
-        Rooted {
+        Ok(Rooted {
             reference,
             temporary_root_id,
             _scope: PhantomData,
-        }
+        })
     }
 
     /// Protect an already registered allocation for this transaction.
@@ -718,6 +729,32 @@ impl<'scope> PublicationTxn<'scope> {
     fn prepare_registration(&mut self) {
         self.temporary_root_ids.reserve(1);
         self.collector.temporary_roots.reserve(1);
+    }
+
+    fn try_prepare_registration<T: GcObject>(&mut self) -> Result<(), ManagedAllocationError> {
+        let requested_bytes =
+            std::mem::size_of::<u64>().saturating_add(std::mem::size_of::<GcRef<T>>());
+        self.collector
+            .allocation_account
+            .allocation_checkpoint(AllocationSite::PublicationRoot, requested_bytes)?;
+        self.temporary_root_ids.try_reserve(1).map_err(|source| {
+            ManagedAllocationError::capacity(
+                AllocationSite::PublicationRoot,
+                requested_bytes,
+                source,
+            )
+        })?;
+        self.collector
+            .temporary_roots
+            .try_reserve(1)
+            .map_err(|source| {
+                ManagedAllocationError::capacity(
+                    AllocationSite::PublicationRoot,
+                    requested_bytes,
+                    source,
+                )
+            })?;
+        Ok(())
     }
 
     fn validate_protection<T: GcObject>(

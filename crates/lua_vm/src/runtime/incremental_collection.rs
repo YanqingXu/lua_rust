@@ -141,7 +141,8 @@ mod tests {
         let fixed_strings = runtime.fixed_strings.clone();
         // SAFETY: the test holds the only Runtime borrow and no state turn is active.
         let storage = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
-        let arena = &mut storage.state_arena;
+        // SAFETY: no state turn or other arena borrow is active in this test.
+        let arena = unsafe { &mut *storage.state_arena.get() };
         let activations = &mut storage.native_activations;
         let incremental_trace = &mut storage.incremental_trace;
         let (gc, strings) = storage.heap.parts_mut();

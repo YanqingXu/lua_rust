@@ -1,8 +1,8 @@
 ---
 status: accepted-design
-implementation_status: implemented-managed-allocator-automatic-slice
+implementation_status: implemented-failure-injection-and-local-miri-slice
 schema_version: 1
-last_updated: 2026-07-29
+last_updated: 2026-07-30
 cpp_oracle: 87c15e69ceb94eb74e28226ccbefb7e196635711
 ---
 
@@ -33,9 +33,10 @@ complete cycle at that safe point.
 ## 2. Why this is a hard prerequisite
 
 The audited implementation now has one owner graph, a shared managed-payload
-ledger, and explicit/automatic safe-point collection contracts. Public
-allocator callbacks, host usable-size accounting, and allocation-failure
-injection remain outside this slice:
+ledger, explicit/automatic safe-point collection contracts, and deterministic
+one-shot allocation failure at GC object, StringPool key, publication-root,
+and StateArena-slot checkpoints. Public allocator callbacks and host
+usable-size accounting remain outside this slice:
 
 - `GarbageCollector` stores an intrusive raw-pointer list and raw-pointer work
   queues in `crates/lua_core/src/gc/collector.rs:22-59`.
@@ -1114,8 +1115,25 @@ Lua-visible completion result.
 - run targeted Miri and Linux ASan jobs over the unsafe lifecycle paths;
 - run Lua 5.1 and pinned C++ GC/lifecycle differential fixtures.
 
-The managed allocator and automatic-GC slice is implemented locally.
-Sanitizer, allocation-failure, and binary-dump lifecycle evidence remains.
+The managed allocator and automatic-GC slice now includes transactional
+failure tests for GC object registration, StringPool interning,
+publication-root installation, and StateArena insertion. Each one-shot fault
+fires before owner-graph mutation, automatically clears for rollback/retry,
+and is followed by a zero-live close assertion.
+
+Targeted local Miri passes both `allocator_failure` and
+`runtime_durability`, including the 1,000-cycle pending-state soak. The first
+Miri run exposed and this slice fixed two aliasing defects: GC intrusive-list
+pointers were derived before `Box::into_raw` performed its final unique retag,
+and LuaState retained a StateArena pointer that later `&mut StateArena`
+borrows invalidated. GC pointers are now derived only after the ownership
+transfer, while the pinned Runtime stores StateArena in `UnsafeCell` and
+LuaState retains the cell identity; scoped arena references still follow the
+existing dynamic borrow protocol.
+
+Pinned Linux Miri and ASan jobs are present in CI. Their first remote execution
+is still required before claiming cross-platform sanitizer completion.
+Binary-dump lifecycle evidence remains gated on the M3 serializer.
 
 ## 9. Unsafe invariants
 
@@ -1170,9 +1188,9 @@ requirements:
       ownership separate, and cover stop/restart, weak cleanup, and finalizers.
 
 The remaining risk is broader than this automatic entry: generic non-string
-scoped access, sanitizer runs, allocation-failure injection, public allocator
-callbacks, and explicit IO/module service drain still gate later production
-milestones.
+scoped access, the first remote Linux ASan/Miri run, public allocator
+callbacks, binary-dump lifecycle, and explicit IO/module service drain still
+gate later production milestones.
 
 ## 11. Acceptance commands
 
@@ -1214,11 +1232,12 @@ cargo test -p lua_app --test runtime_durability --release
 Targeted unsafe checks should run in a Linux CI lane:
 
 ```bash
-cargo +nightly miri test -p lua_core --lib gc::
-cargo +nightly miri test -p lua_vm --test runtime_ownership
+cargo +nightly-2026-07-29 miri test -p lua_core --test allocator_failure
+cargo +nightly-2026-07-29 miri test -p lua_vm --test runtime_durability
 RUSTFLAGS="-Zsanitizer=address" \
-  cargo +nightly test -Zbuild-std \
-  --target x86_64-unknown-linux-gnu --workspace --tests
+  cargo +nightly-2026-07-29 test -Zbuild-std \
+  --target x86_64-unknown-linux-gnu \
+  -p lua_vm --test runtime_durability
 ```
 
 `tools/m1_foundation_gate.ps1` now includes the allocator contract; a future

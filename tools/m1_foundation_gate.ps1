@@ -623,7 +623,7 @@ $openDebts = @(
     [ordered]@{
         id = "automatic-gc-and-allocator-accounting"
         blocks = "M1.12-M1.13"
-        detail = "Managed allocator live/peak/total accounting and Runtime instruction-boundary automatic collection are implemented and gated. System allocator metadata, failure injection, Miri/ASan evidence, and future public allocator callbacks remain open."
+        detail = "Managed allocator accounting, Runtime instruction-boundary automatic collection, four-site one-shot failure injection, transactional failure tests, and targeted local Miri evidence are implemented and gated. Linux ASan awaits the added remote CI lane; system allocator metadata and future public allocator callbacks remain open."
     },
     [ordered]@{
         id = "generational-gc-handles-and-publication-roots"

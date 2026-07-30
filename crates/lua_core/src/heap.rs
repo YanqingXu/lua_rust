@@ -8,7 +8,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::allocator::{AllocationLedger, AllocatorStats};
+use crate::allocator::{AllocationLedger, AllocationSite, AllocatorStats};
 use crate::gc::collector::{GarbageCollector, GcDestroyAllReport};
 use crate::string_pool::StringPool;
 
@@ -129,6 +129,26 @@ impl Heap {
     /// Managed allocator payload statistics for this Heap and attached Runtime.
     pub fn allocator_stats(&self) -> AllocatorStats {
         self.allocator.stats()
+    }
+
+    /// Install a one-shot managed-allocation failure plan for lifecycle tests.
+    ///
+    /// This deliberately does not model the future public Lua allocator
+    /// callback. The selected failure occurs before a logical owner mutation.
+    #[doc(hidden)]
+    pub fn inject_allocator_failure_after(
+        &self,
+        site: AllocationSite,
+        successful_matching_checkpoints: usize,
+    ) {
+        self.allocator
+            .inject_failure_after(site, successful_matching_checkpoints);
+    }
+
+    /// Remove a lifecycle-test allocation failure plan.
+    #[doc(hidden)]
+    pub fn clear_allocator_failure_injection(&self) {
+        self.allocator.clear_failure_injection();
     }
 
     /// Clone the ledger identity for a Runtime-owned StateArena component.

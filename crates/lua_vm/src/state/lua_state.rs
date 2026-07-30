@@ -113,8 +113,12 @@ pub struct LuaState {
     pub number_metatable: Option<GcRef<Table>>,
     /// This state's runtime-scoped generational identity.
     pub(crate) state_handle: Option<StateHandle>,
-    /// Stable transitional pointer to the Runtime-owned StateArena.
-    pub(crate) state_arena: Option<std::ptr::NonNull<StateArena>>,
+    /// Stable pointer to the Runtime-owned StateArena interior-mutation cell.
+    ///
+    /// The cell, rather than a long-lived pointer derived from `&mut
+    /// StateArena`, lets Runtime create non-overlapping scoped arena borrows
+    /// without invalidating the backpointer under Rust's aliasing model.
+    pub(crate) state_arena: Option<std::ptr::NonNull<std::cell::UnsafeCell<StateArena>>>,
     /// Whether Runtime opened publication for the current state turn.
     native_request_scope: bool,
     /// Next per-state request identifier. Zero is permanently reserved.

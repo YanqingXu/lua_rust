@@ -287,7 +287,9 @@ impl Runtime {
         // the active-execution check establishes U-03 for immutable state
         // snapshots alongside mutable collector mark state.
         let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
-        let state_arena = &mut heap.state_arena;
+        // SAFETY: the active-execution gate gives this operation exclusive
+        // access to the arena stored in its pinned UnsafeCell.
+        let state_arena = unsafe { &mut *heap.state_arena.get() };
         let native_activations = &mut heap.native_activations;
         let gc = heap.heap.collector_mut();
         Ok(trace_roots_mark_only_at_safe_point(
@@ -1181,9 +1183,10 @@ mod tests {
             let payload = heap.heap.collector_mut().create(Table::new());
             let mut pending = LuaState::new();
             pending.push_value(Value::Table(payload));
+            let arena_cell = heap.state_arena_cell();
             let (handle, root_id) = heap
-                .state_arena
-                .insert_pending_owned(Box::new(pending))
+                .state_arena_mut()
+                .insert_pending_owned(Box::new(pending), Some(arena_cell))
                 .expect("detached state enters the pending root set");
             (handle, root_id, payload)
         };
@@ -1207,11 +1210,11 @@ mod tests {
         // SAFETY: the exact pending root remains live in this pinned arena and
         // no state or execution borrow is active.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
-        heap.state_arena
+        heap.state_arena_mut()
             .rollback_pending(pending_handle, temporary_root_id)
             .expect("exact pending root rolls back");
-        assert_eq!(heap.state_arena.temporary_state_root_count(), 0);
-        assert_eq!(heap.state_arena.live_owned_state_count(), 0);
+        assert_eq!(heap.state_arena().temporary_state_root_count(), 0);
+        assert_eq!(heap.state_arena().live_owned_state_count(), 0);
     }
 
     #[test]
@@ -1368,7 +1371,7 @@ mod tests {
         };
         // SAFETY: RuntimeStorage is pinned and no execution guard is live.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
-        heap.state_arena
+        heap.state_arena_mut()
             .remove_owned(stale)
             .expect("stale candidate is removed");
 

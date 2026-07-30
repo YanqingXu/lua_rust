@@ -88,3 +88,60 @@ jobs:
             target/compatibility/*.json
             target/compatibility/**/*.json
           if-no-files-found: error
+
+  m1-miri:
+    name: M1 Unsafe Durability (Miri)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pinned nightly with Miri
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-29
+          components: miri, rust-src
+
+      - name: Run allocator failure matrix under Miri
+        run: >-
+          cargo +nightly-2026-07-29 miri test
+          -p lua_core --test allocator_failure
+
+      - name: Run Runtime lifecycle soak under Miri
+        run: >-
+          cargo +nightly-2026-07-29 miri test
+          -p lua_vm --test runtime_durability
+
+  m1-asan:
+    name: M1 Unsafe Durability (Linux ASan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pinned nightly with rust-src
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-29
+          components: rust-src
+
+      - name: Run allocator failure matrix under ASan
+        run: >-
+          cargo +nightly-2026-07-29 test
+          -Zbuild-std
+          --target x86_64-unknown-linux-gnu
+          -p lua_core --test allocator_failure
+
+      - name: Run Runtime lifecycle soak under ASan
+        run: >-
+          cargo +nightly-2026-07-29 test
+          -Zbuild-std
+          --target x86_64-unknown-linux-gnu
+          -p lua_vm --test runtime_durability

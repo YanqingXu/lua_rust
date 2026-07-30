@@ -20,7 +20,10 @@ $knownFamilies = @(
     "STRING_POOL_KEYS",
     "STATE_ARENA",
     "SHUTDOWN_ZERO",
-    "AUTOMATIC_SAFE_POINT"
+    "AUTOMATIC_SAFE_POINT",
+    "ALLOCATOR_FAILURE_MATRIX",
+    "STATE_ARENA_FAILURE_MATRIX",
+    "SANITIZER_CI"
 )
 $resolvedInventory = [System.IO.Path]::GetFullPath((Join-Path $Root $InventoryPath))
 $families = @()
@@ -77,6 +80,10 @@ try {
         "pub live_bytes: usize",
         "pub peak_bytes: usize",
         "pub total_allocated_bytes: usize",
+        "pub enum AllocationSite",
+        "pub enum ManagedAllocationError",
+        "inject_failure_after",
+        "allocation_checkpoint",
         "replace_component",
         "impl Drop for AllocationAccount"
     )) {

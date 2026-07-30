@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Fail-closed inventory for M1.13 managed allocator accounting and allocation-triggered collection.",
+  "description": "Fail-closed inventory for M1.13 managed allocator accounting, allocation-triggered collection, deterministic allocation failure, and unsafe durability evidence.",
   "contract": {
     "metric": "managed_payload_bytes",
     "excludes": "host allocator metadata and unrelated Rust service bookkeeping",
@@ -43,6 +43,24 @@
       "status": "implemented",
       "path": "crates/lua_vm/src/runtime.rs",
       "anchors": ["AutomaticGc", "begin_automatic_cycle", "collect_incremental_step_at_safe_point"]
+    },
+    {
+      "family": "ALLOCATOR_FAILURE_MATRIX",
+      "status": "implemented",
+      "path": "crates/lua_core/tests/allocator_failure.rs",
+      "anchors": ["AllocationSite::GcObject", "AllocationSite::StringPoolKey", "AllocationSite::PublicationRoot"]
+    },
+    {
+      "family": "STATE_ARENA_FAILURE_MATRIX",
+      "status": "implemented",
+      "path": "crates/lua_vm/tests/runtime_durability.rs",
+      "anchors": ["AllocationSite::StateArenaSlot", "one_thousand_pending_state_lifetimes_close_at_zero", "remaining_allocator_live_bytes"]
+    },
+    {
+      "family": "SANITIZER_CI",
+      "status": "implemented",
+      "path": ".github/workflows/ci.yml",
+      "anchors": ["m1-miri", "m1-asan", "nightly-2026-07-29", "-Zsanitizer=address"]
     }
   ]
 }

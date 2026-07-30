@@ -3,12 +3,12 @@ title: lua_rust 完整复刻 lua_cpp 开发计划
 status: in-progress
 current_milestone: M1
 m0_status: completed
-last_updated: 2026-07-29
+last_updated: 2026-07-30
 rust_baseline: 6284135
 cpp_oracle: 87c15e6
 lua_oracle: Lua 5.1.5
-implementation_checkpoint: working-tree@c7ea95bc7a7c450ef15fcd9bfa0dee933ec1ba6a+m1-managed-allocator-auto-gc
-next_primary_task: M1.13 sanitizer durability and allocator-failure evidence
+implementation_checkpoint: working-tree@7d0db5e+m1-allocator-failure-local-miri
+next_primary_task: M1.13 first remote Linux ASan/Miri run and remaining lifecycle matrix
 ---
 
 # lua_rust 完整复刻 lua_cpp 开发计划
@@ -54,7 +54,7 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
   基础、`TEMPORARY_STATE_ROOTS/PendingState`、Runtime coroutine activation
   trampoline、compiler/stdlib/VM/app publication、production string contract、
   唯一 Heap/service owner、全图 STW、weak/finalizer/resurrection 与
-  Lua-visible `collectgarbage("collect"/"step")` 完成后，815 个
+  Lua-visible `collectgarbage("collect"/"step")` 完成后，826 个
   workspace tests 已枚举；当前 fmt、定向 tests、24/24 root inventory、
   8/8 mutation inventory、17-path string contract 与 54-path heap contract
   已通过，完整质量门结果见
@@ -148,7 +148,7 @@ M4 必须建立在 M1 和 M3 的生命周期、allocator 和公开状态合同�
 | 里程碑 | 状态 | 当前证据或入口 |
 |---|---|---|
 | M0 | `completed` | 本地统一 M0 gate 通过，0 hard failure、3 项已登记债务；详见 [M0 收口报告](docs/rust_migration/m0_report.md)。 |
-| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline、checked open-Upvalue owner、compiler/library/package/IO/VM/app/result publication、production string contract、唯一 Heap/service owner、weak/finalizer/resurrection、Lua-visible full STW、write-barrier mutation inventory、explicit incremental phase/debt/step、managed allocator live/peak/total 与 allocation-triggered automatic gate 已完成；sanitizer/allocator-failure 耐久证据是下一条主线。 |
+| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、Runtime coroutine activation trampoline、checked open-Upvalue owner、compiler/library/package/IO/VM/app/result publication、production string contract、唯一 Heap/service owner、weak/finalizer/resurrection、Lua-visible full STW、write-barrier mutation inventory、explicit incremental phase/debt/step、managed allocator live/peak/total、allocation-triggered automatic gate、四点 allocator failure injection 与本地 Miri 已完成；远程 Linux ASan/Miri 首次运行和剩余生命周期矩阵是下一条主线。 |
 | M2 | `active-limited` | 原两例 bytecode 指令/常量/metadata 已对齐；C++ local-name 证据缺口、nested Proto 大量差异、88 个 non-official 差异和真实 VM trace 仍开放。 |
 | M3 | `pending` | 等待 M1 的字节表示和生命周期合同稳定。 |
 | M4 | `pending` | 等待 M1/M3 的 runtime、allocator 与公开状态合同。 |
@@ -591,7 +591,7 @@ bytecode parity 差异和真实 VM trace unsupported；它们不会把报告误�
 | M1.10 Incremental GC | `completed-local` | collector 持有 pause→propagate→atomic→sweep→finalize、debt/threshold、pause/stepmul 与有界 sweep cursor；Runtime 持久保存 StateHandle/object 双队列，`step` 推进真实预算，大步可完成整轮，周期完成才返回 true；explicit 与 automatic 周期所有权相互隔离。 |
 | M1.11 Write barrier | `completed-local` | 8-family mutation inventory 与 fail-closed gate 已落地；`GarbageCollector::with_mut` 统一验证 owner 并执行 post-write barrier，活动周期分配发布初始图，Sweep 期变更保守放弃游标，Proto 保持 construction-only。 |
 | M1.12 Weak/finalizer/resurrection | `completed-local` | atomic weak key/value/kv、pending-finalizer weak 语义、protected callback delivery、nested collect 非递归 drain、异常隔离/保留队列、exactly-once、resurrection→再次不可达和 close drain 已有回归。finalizer 内跨 state resume/open-Upvalue 与 close-time Runtime-native 重入当前明确 fail-closed。 |
-| M1.13 内存与耐久 | `completed-local-slice` | 共享 managed-payload ledger 覆盖 GC 对象/动态容器、StringPool key 和 StateArena，公开 live/peak/total 快照并在 close 后归零；allocation threshold 在 Runtime 指令边界触发安全 collection，stop/restart、weak 和 protected finalizer 已回归，6/6 allocator contract 门通过。Miri/ASan、allocator failure injection 和 binary dump 生命周期仍待后续环境/里程碑证据。 |
+| M1.13 内存与耐久 | `completed-local-slice` | 共享 managed-payload ledger 覆盖 GC 对象/动态容器、StringPool key 和 StateArena，公开 live/peak/total 快照并在 close 后归零；allocation threshold 在 Runtime 指令边界触发安全 collection。GC object、StringPool key、publication root、StateArena slot 四点 one-shot failure injection 与事务性重试已落地，9/9 allocator contract 通过；本地 pinned-nightly Miri 已通过 3 个 core fault cases 和 2 个 Runtime durability cases（含 1000 轮），并修复两处实际 alias UB。Linux ASan/Miri workflow 已建立但待远程首次运行；binary dump 生命周期等待 M3 serializer。 |
 
 本台账中的 `completed-local` 只表示对应子任务的本地实现与定向证据完成；
 远程 CI 首次通过和合入前不改为最终 `completed`。M1 整体仍为 `active`。
@@ -1215,8 +1215,9 @@ M0 已在本地完成，M1 基础层已经完成 coroutine activation trampoline
 Proto→Function、library/package、IO construction、VM/app/result publication
 切片、production string canonicalization/scoped Eq/Hash 合同、唯一
 Heap/service owner、weak/finalizer/resurrection、Lua-visible full STW、production
-mutation barrier、Runtime-owned incremental GC、managed allocator 计账与
-allocation-triggered automatic GC。下一步补 sanitizer/allocator-failure 耐久证据：
+mutation barrier、Runtime-owned incremental GC、managed allocator 计账、
+allocation-triggered automatic GC、四点 allocator failure injection 与本地
+Miri。下一步取得远程 Linux ASan/Miri 首次证据并补剩余生命周期矩阵：
 
 1. 已完成 LightUserdata 拆型、`ObjectId + collector live table` 与字符串
    identity/scoped access 合同；唯一 HeapId owner、fixed strings、
@@ -1386,14 +1387,15 @@ pwsh -NoProfile -File tools/run_lua51_differential.ps1 -ComparatorSelfTestOnly
 #### 16.2.1 当前实现快照
 
 - 当前工作树基于
-  `c7ea95bc7a7c450ef15fcd9bfa0dee933ec1ba6a`
-  (`Implement runtime-only stop-the-world full collection`)；
+  `7d0db5e` (`Implement managed allocator accounting and automatic collection
+  triggers`) 并包含 M1.13 allocator-failure/Miri 工作树切片；
   交接时必须先运行 `git status --short`，保留用户与未提交实现改动，不得用
   reset/checkout 清除。
-- 当前仍是 M1 `active`，不是 GC/allocator 完成状态。weak/finalizer/
-  resurrection、Lua-visible full STW、production write barrier 与 explicit
-  incremental phase/debt/step 已完成；allocation-triggered automatic
-  collection 与 allocator live/peak 仍未启用。
+- 当前仍是 M1 `active`。weak/finalizer/resurrection、Lua-visible full STW、
+  production write barrier、explicit incremental phase/debt/step、managed
+  allocator accounting、allocation-triggered automatic collection、四点
+  allocator failure injection 与本地 Miri 已完成；远程 Linux ASan/Miri
+  首次运行和剩余 lifecycle matrix 尚未闭合。
 - 已关闭与待办边界如下：
 
 | publication/owner 子项 | 状态 | 当前证据或下一入口 |
@@ -1407,10 +1409,11 @@ pwsh -NoProfile -File tools/run_lua51_differential.ps1 -ComparatorSelfTestOnly
 | 唯一 Heap/service owner | `completed-slice` | `RuntimeStorage` 唯一持有 Heap/StateArena/activation service；HeapId 绑定 collector/accounting 与 canonical StringPool；LuaState 无 service backpointer；fixed/pending-finalizer roots 与 54-path heap gate 已落地 |
 | Runtime full collection | `completed-local` | direct crate-private 与 Runtime-native safe-point STW 均强制消费 canonical tracer，在 generation 失效前预关闭不可达 state/open Upvalue，并真实 sweep 全图、更新 object/accounted-byte 计账；所有 gap/foreign edge fail-closed |
 | Weak/finalizer/resurrection + Lua-visible collection | `completed-local` | weak key/value/kv、pending/finalized userdata、protected `__gc`、nested collect、异常隔离/保留队列、exactly-once、resurrection/再次不可达与 close drain 回归已通过；full 与 incremental 完成阶段都使用同一 protected finalizer delivery |
-| Write barrier + incremental GC | `completed-local` | 8-family mutation inventory、checked post-write barrier、active-allocation initial graph、五阶段、debt/pause/stepmul、真实 work unit、Thread→StateHandle 双队列与 weak/finalizer 多周期回归已落地；allocation-triggered collection 继续禁用 |
-| Allocator accounting + automatic GC | `next` | 实现 allocator live/peak、对象动态大小对账、阈值 checkpoint 与自动推进门；完成前不得把 collector estimated bytes 称为 allocator 合同 |
+| Write barrier + incremental GC | `completed-local` | 8-family mutation inventory、checked post-write barrier、active-allocation initial graph、五阶段、debt/pause/stepmul、真实 work unit、Thread→StateHandle 双队列与 weak/finalizer 多周期回归已落地 |
+| Allocator accounting + automatic GC | `completed-local` | allocator live/peak/total、对象动态大小对账、阈值 checkpoint、自动推进门与 9/9 allocator contract 已落地 |
+| Allocator failure + sanitizer durability | `completed-local-slice` | GC object/StringPool key/publication root/StateArena slot one-shot failure 均在 owner mutation 前触发并可重试；3 个 core + 2 个 Runtime tests 和 1000 轮 soak 在本地 Miri 通过。Linux ASan/Miri workflow 待首次远程执行 |
 
-当前 Debug/Release 各 815 个 workspace tests、fmt、all-targets
+当前 Debug/Release 各 826 个 workspace tests、fmt、all-targets
 check/Clippy、warning-free rustdoc、24/24 root inventory、8/8 mutation
 inventory、17-path string contract 与 54-path heap contract 均通过。当前
 M1 smoke 为
@@ -1535,8 +1538,9 @@ git diff --check
 
 IO 收口后的固定顺序已经执行到 weak/finalizer/resurrection、真实
 `collectgarbage("collect")`、production mutation inventory/write barrier
-与 explicit incremental phase/debt/step。下一步推进 allocator live/peak
-accounting 和 allocation-triggered automatic gate。
+与 explicit incremental phase/debt/step、allocator accounting、automatic GC、
+fault injection 和本地 Miri。下一步取得远程 Linux sanitizer 首次证据并补
+剩余 lifecycle matrix。
 
 ### 16.3 已完成主任务：VM/app/result publication
 
@@ -1696,14 +1700,29 @@ accounting 和 allocation-triggered automatic gate。
 5. allocation-triggered collection 按计划继续禁用；当前 debt/threshold 只为
    explicit step 与诊断服务，不夸大为 allocator live/peak 合同。
 
-#### 16.3.8 下一主任务
+#### 16.3.8 已完成主任务：allocator accounting 与 automatic GC gate
 
-推进 M1.13 allocator accounting 与 automatic GC gate：
+1. allocator live/peak/total 已覆盖对象动态容器、StringPool key、StateArena
+   与 shutdown 归零；
+2. collector estimated bytes 与 managed allocator bytes 已分栏，automatic
+   collection 只在 Runtime instruction boundary 推进；
+3. stop/restart、weak/finalizer、explicit/automatic cycle ownership 与 9/9
+   allocator contract 已通过。
 
-1. 建立 allocator live/peak/total allocation 计账，覆盖对象动态容器增长、
-   StringPool、StateArena 与 shutdown 归零；
-2. 将 collector estimated bytes 与 allocator authoritative bytes 分栏，并为
-   `count`/`gcinfo` 的 oracle 语义建立差分；
-3. 只有 allocator、mutation、root、weak/finalizer 与耐久门全部通过后，才在
-   审计过的 allocation checkpoint 启用 automatic incremental progress；
-4. 增加 1000-cycle soak、Miri/ASan lifecycle job 与 fault-injection 矩阵。
+#### 16.3.9 当前主任务：allocator failure 与 sanitizer durability
+
+1. GC object、StringPool key、publication root、StateArena slot 四点 one-shot
+   failure injection 已在 owner graph mutation 前接线，失败自动解除以允许
+   rollback/shutdown/retry；
+2. 新增 3 个 core fault tests、2 个 Runtime durability tests 和 1000-cycle
+   pending-state soak，关闭后 object/root/string/state/allocator/queue 均为零；
+3. 本地 `nightly-2026-07-29` Miri 已全部通过；首次运行曾发现 GC pointer
+   retag 与 StateArena backpointer alias 两处 UB，现分别通过 raw ownership
+   transfer 后派生指针及 pinned `UnsafeCell<StateArena>` 修复；
+4. Linux Miri/ASan workflow 已加入 CI，但远程首次运行仍是下一硬门；Windows
+   ASan 目标可编译，本机因缺少 ASan runtime DLL 返回
+   `STATUS_DLL_NOT_FOUND`，不得记录为通过；
+5. Debug/Release 各 826 个 workspace tests、fmt、all-targets check/Clippy、
+   warning-free rustdoc、9/9 allocator、24/24 root、8/8 mutation、
+   17-path string 与 54-path heap contract 均通过；
+6. binary dump 生命周期等待 M3 serializer，不在本切片伪造证据。

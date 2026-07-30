@@ -114,7 +114,9 @@ impl Runtime {
                 registry_root: self.registry_root,
                 fixed_strings: &self.fixed_strings,
             },
-            &mut storage.state_arena,
+            // SAFETY: collect_full_stw checked owner thread, Running phase,
+            // and zero active executions before borrowing the pinned arena.
+            unsafe { &mut *storage.state_arena.get() },
             &mut storage.native_activations,
             gc,
             strings,

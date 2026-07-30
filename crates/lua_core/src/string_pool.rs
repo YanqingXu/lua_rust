@@ -8,7 +8,9 @@
 
 use std::collections::HashMap;
 
-use crate::allocator::{AllocationAccount, AllocationLedger};
+use crate::allocator::{
+    AllocationAccount, AllocationLedger, AllocationSite, ManagedAllocationError,
+};
 use crate::byte_string::ByteString;
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_ref::GcRef;
@@ -72,10 +74,21 @@ impl StringPool {
     /// 该接口不执行 UTF-8 验证或编码转换；相同字节内容总是返回同一
     /// `GcRef<GcString>`。
     pub fn intern_bytes(&mut self, gc: &mut GarbageCollector, bytes: &[u8]) -> GcRef<GcString> {
+        self.try_intern_bytes(gc, bytes)
+            .unwrap_or_else(|error| panic!("managed string allocation failed: {error}"))
+    }
+
+    /// Try to intern arbitrary Lua bytes without partially publishing a new
+    /// canonical entry on managed-allocation failure.
+    pub fn try_intern_bytes(
+        &mut self,
+        gc: &mut GarbageCollector,
+        bytes: &[u8],
+    ) -> Result<GcRef<GcString>, ManagedAllocationError> {
         self.bind_or_assert_owner(gc.heap_id());
         if let Some(&existing) = self.pool.get(bytes) {
             if gc.contains_registered(existing) {
-                return existing;
+                return Ok(existing);
             }
             // A StringPool/collector mismatch or a previously detached pool
             // can leave a copied handle here. Evict it by owned byte key
@@ -83,10 +96,26 @@ impl StringPool {
             self.pool.remove(bytes);
         }
 
-        let gc_ref = gc.create(GcString::from_bytes(bytes));
-        self.pool.insert(ByteString::from_bytes(bytes), gc_ref);
+        let key_bytes = bytes.len().saturating_add(1);
+        self.allocation_account
+            .allocation_checkpoint(AllocationSite::StringPoolKey, key_bytes)?;
+        self.pool.try_reserve(1).map_err(|source| {
+            ManagedAllocationError::capacity(AllocationSite::StringPoolKey, key_bytes, source)
+        })?;
+
+        // Construct both byte owners before publishing either one. A rejected
+        // GC-object checkpoint drops both local values and leaves the pool and
+        // collector unchanged.
+        let key = ByteString::from_bytes(bytes);
+        let object = GcString::from_bytes(bytes);
+        let gc_ref = gc.try_create(object)?;
+        let replaced = self.pool.insert(key, gc_ref);
+        assert!(
+            replaced.is_none(),
+            "reserved StringPool insertion unexpectedly replaced an entry"
+        );
         self.reconcile_key_storage();
-        gc_ref
+        Ok(gc_ref)
     }
 
     /// Return the heap identity this pool is bound to, if any.

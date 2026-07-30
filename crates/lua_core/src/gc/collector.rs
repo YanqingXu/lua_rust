@@ -10,7 +10,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 
-use crate::allocator::{AllocationAccount, AllocationLedger};
+use crate::allocator::{
+    AllocationAccount, AllocationLedger, AllocationSite, ManagedAllocationError,
+};
 use crate::gc::gc_object::GcObject;
 use crate::gc::gc_ref::{ErasedGcRef, GcRef};
 use crate::gc::header::GcObjectHeader;
@@ -315,6 +317,16 @@ impl GarbageCollector {
     /// collector's tag-based mark/sweep dispatcher. Layout and tag invariants
     /// are checked before the allocation is registered.
     pub fn create<T: GcObject>(&mut self, obj: T) -> GcRef<T> {
+        self.try_create(obj)
+            .unwrap_or_else(|error| panic!("managed GC allocation failed: {error}"))
+    }
+
+    /// Try to create and register one GC-managed object.
+    ///
+    /// Deterministic failure injection and side-table capacity failure are
+    /// reported before the intrusive list, live table, counters, or allocator
+    /// account changes. The input object is dropped normally on failure.
+    pub fn try_create<T: GcObject>(&mut self, obj: T) -> Result<GcRef<T>, ManagedAllocationError> {
         let object_ptr = std::ptr::from_ref(&obj).cast::<GcObjectHeader>();
         let header_ptr = std::ptr::from_ref(obj.gc_header());
         assert_eq!(
@@ -329,6 +341,11 @@ impl GarbageCollector {
 
         let object_size = obj.get_size();
         let allocator_size = obj.get_allocator_payload_size();
+        self.allocation_account
+            .allocation_checkpoint(AllocationSite::GcObject, allocator_size)?;
+        self.live_allocations.try_reserve(1).map_err(|source| {
+            ManagedAllocationError::capacity(AllocationSite::GcObject, allocator_size, source)
+        })?;
         let next_object_count = self
             .object_count
             .checked_add(1)
@@ -342,8 +359,8 @@ impl GarbageCollector {
             .checked_add(allocator_size)
             .expect("GC allocator payload accounting overflow");
         let object_id = ObjectId::allocate();
-        let mut boxed = Box::new(obj);
-        let raw = NonNull::from(&mut *boxed);
+        let raw = NonNull::new(Box::into_raw(Box::new(obj)))
+            .expect("Box::into_raw never returns a null pointer");
 
         // SAFETY: `GcObject` is sealed and create validated header offset 0.
         let header_ptr = raw.as_ptr().cast::<GcObjectHeader>();
@@ -358,6 +375,11 @@ impl GarbageCollector {
                 });
             }
             std::collections::hash_map::Entry::Occupied(_) => {
+                // SAFETY: `raw` still has unique ownership here and has not
+                // been linked or exposed through a GcRef.
+                unsafe {
+                    drop(Box::from_raw(raw.as_ptr()));
+                }
                 panic!("new GC allocation reused an address that is still registered");
             }
         }
@@ -368,8 +390,8 @@ impl GarbageCollector {
         } else {
             GcColor::Black
         };
-        // SAFETY: header_ptr points into `boxed`, which is converted to a raw
-        // allocation before this function returns and therefore does not move.
+        // SAFETY: header_ptr was derived after Box ownership moved into its
+        // stable raw allocation and the object has not been exposed elsewhere.
         unsafe {
             (*header_ptr).set_next(self.all_objects);
             (*header_ptr).set_color(allocation_color);
@@ -383,7 +405,6 @@ impl GarbageCollector {
             // cannot overwrite `all_objects`.
             self.incremental_sweep_previous = header_ptr;
         }
-        let raw = Box::into_raw(boxed);
 
         self.object_count = next_object_count;
         self.total_memory = next_total_memory;
@@ -394,16 +415,11 @@ impl GarbageCollector {
 
         // SAFETY: the side table and intrusive list now register this exact
         // allocation identity and concrete layout.
-        let reference = unsafe {
-            GcRef::from_registered(
-                NonNull::new(raw).expect("Box::into_raw never returns null"),
-                object_id,
-            )
-        };
+        let reference = unsafe { GcRef::from_registered(raw, object_id) };
         if self.incremental_phase != IncrementalPhase::Pause {
             self.publish_new_allocation(header_ptr, T::expected_gc_type());
         }
-        reference
+        Ok(reference)
     }
 
     /// 创建并添加到根集
