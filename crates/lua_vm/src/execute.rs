@@ -40,6 +40,9 @@ pub enum VmExit {
     NativeRequest(NativeRequestId),
     /// An opcode must access an open Upvalue owned by another state.
     UpvalueAccess(Box<UpvalueAccessRequest>),
+    /// Managed allocation crossed the automatic-GC threshold at an
+    /// instruction boundary.
+    AutomaticGc,
 }
 
 /// 最大嵌套调用深度
@@ -582,6 +585,9 @@ fn execute_proto_inner(
                                     Ok(VmExit::UpvalueAccess(request)) => {
                                         return Ok(VmExit::UpvalueAccess(request));
                                     }
+                                    Ok(VmExit::AutomaticGc) => {
+                                        return Ok(VmExit::AutomaticGc);
+                                    }
                                     Err(e) => {
                                         // Restore call frame and propagate error
                                         unwind_lua_frames_to(l, gc, saved_ci)?;
@@ -626,6 +632,9 @@ fn execute_proto_inner(
                                 }
                                 Ok(VmExit::UpvalueAccess(request)) => {
                                     return Ok(VmExit::UpvalueAccess(request));
+                                }
+                                Ok(VmExit::AutomaticGc) => {
+                                    return Ok(VmExit::AutomaticGc);
                                 }
                                 Err(err) if err.message.starts_with("bad argument") => {
                                     return Err(runtime_error_at(
@@ -794,6 +803,7 @@ fn execute_proto_inner(
                                 VmExit::UpvalueAccess(request) => {
                                     return Ok(VmExit::UpvalueAccess(request));
                                 }
+                                VmExit::AutomaticGc => return Ok(VmExit::AutomaticGc),
                                 VmExit::Complete(ExecResult::Returned) => {}
                             }
                             let available = l.top.saturating_sub(func_pos);
@@ -1013,6 +1023,7 @@ fn execute_proto_inner(
                                     VmExit::UpvalueAccess(request) => {
                                         return Ok(VmExit::UpvalueAccess(request));
                                     }
+                                    VmExit::AutomaticGc => return Ok(VmExit::AutomaticGc),
                                     VmExit::Complete(ExecResult::Returned) => {}
                                 }
                             } else if let Some(iter_proto_ref) = func_obj.proto() {
@@ -1064,6 +1075,9 @@ fn execute_proto_inner(
                                     }
                                     Ok(VmExit::UpvalueAccess(request)) => {
                                         return Ok(VmExit::UpvalueAccess(request));
+                                    }
+                                    Ok(VmExit::AutomaticGc) => {
+                                        return Ok(VmExit::AutomaticGc);
                                     }
                                     Err(e) => {
                                         unwind_lua_frames_to(l, gc, saved_ci)?;
@@ -1252,6 +1266,10 @@ fn execute_proto_inner(
         }
 
         pc += 1;
+        if gc.automatic_step_due() {
+            l.status = ThreadStatus::Yield;
+            return Ok(VmExit::AutomaticGc);
+        }
     }
 
     l.pop_call_info();
@@ -1692,6 +1710,7 @@ pub(crate) fn resume_finalizer_callback(
             }
             Ok(VmExit::NativeRequest(id)) => return Ok(VmExit::NativeRequest(id)),
             Ok(VmExit::UpvalueAccess(request)) => return Ok(VmExit::UpvalueAccess(request)),
+            Ok(VmExit::AutomaticGc) => return Ok(VmExit::AutomaticGc),
             Err(error) => {
                 unwind_lua_frames_to(l, gc, stop_ci)?;
                 return Err(error);
@@ -1746,6 +1765,7 @@ pub fn resume_lua_thread(
             }
             VmExit::NativeRequest(id) => return Ok(VmExit::NativeRequest(id)),
             VmExit::UpvalueAccess(request) => return Ok(VmExit::UpvalueAccess(request)),
+            VmExit::AutomaticGc => return Ok(VmExit::AutomaticGc),
         }
     }
 }
@@ -1789,6 +1809,11 @@ fn call_value_at_stack(
                     "open Upvalue access cannot cross a protected helper boundary yet",
                 ));
             }
+            VmExit::AutomaticGc => {
+                return Err(RuntimeError::new(
+                    "automatic GC checkpoint crossed a protected helper boundary",
+                ));
+            }
         }
         return Ok(());
     }
@@ -1817,7 +1842,11 @@ fn call_value_at_stack(
     ci.proto = Some(callee_proto_ref);
     ci.tailcalls = 0;
 
-    match execute_counted_proto(l, callee_proto_ref, gc, RuntimeError::new("stack overflow")) {
+    gc.suspend_automatic_checkpoints();
+    let protected_result =
+        execute_counted_proto(l, callee_proto_ref, gc, RuntimeError::new("stack overflow"));
+    gc.resume_automatic_checkpoints();
+    match protected_result {
         Ok(VmExit::Complete(ExecResult::Returned)) => {}
         Ok(VmExit::Complete(ExecResult::Yielded)) => {
             unwind_lua_frames_to(l, gc, saved_ci)?;
@@ -1831,6 +1860,11 @@ fn call_value_at_stack(
         Ok(VmExit::UpvalueAccess(_)) => {
             return Err(RuntimeError::new(
                 "open Upvalue access cannot cross a protected helper boundary yet",
+            ));
+        }
+        Ok(VmExit::AutomaticGc) => {
+            return Err(RuntimeError::new(
+                "automatic GC checkpoint crossed a protected helper boundary",
             ));
         }
         Err(e) => {
@@ -2610,7 +2644,8 @@ pub(crate) fn finish_deferred_native_call(
         }
         VmExit::Complete(ExecResult::Yielded)
         | VmExit::NativeRequest(_)
-        | VmExit::UpvalueAccess(_) => Err(RuntimeError::new(
+        | VmExit::UpvalueAccess(_)
+        | VmExit::AutomaticGc => Err(RuntimeError::new(
             "VM: deferred native completion produced a second suspension",
         )),
     }
@@ -2642,7 +2677,8 @@ pub(crate) fn finish_deferred_native_values(
         }
         VmExit::Complete(ExecResult::Yielded)
         | VmExit::NativeRequest(_)
-        | VmExit::UpvalueAccess(_) => Err(RuntimeError::new(
+        | VmExit::UpvalueAccess(_)
+        | VmExit::AutomaticGc => Err(RuntimeError::new(
             "VM: raw deferred completion produced a second suspension",
         )),
     }
@@ -2697,7 +2733,8 @@ pub(crate) fn finish_deferred_full_collection(
         }
         VmExit::Complete(ExecResult::Yielded)
         | VmExit::NativeRequest(_)
-        | VmExit::UpvalueAccess(_) => Err(RuntimeError::new(
+        | VmExit::UpvalueAccess(_)
+        | VmExit::AutomaticGc => Err(RuntimeError::new(
             "VM: full collection completion produced a second suspension",
         )),
     }

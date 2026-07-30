@@ -967,6 +967,62 @@ fn incremental_cycle_clears_weak_values_and_delivers_finalizers_on_completion() 
 }
 
 #[test]
+fn allocation_threshold_automatically_collects_and_delivers_finalizers() {
+    let (state, _) = compile_and_run(
+        r#"
+        collectgarbage("setpause", 200)
+        collectgarbage("setstepmul", 10000)
+        local weak = setmetatable({}, {__mode = "v"})
+        weak[1] = {}
+        local calls = 0
+        local u = newproxy(true)
+        getmetatable(u).__gc = function()
+            calls = calls + 1
+        end
+        u = nil
+
+        local i = 0
+        repeat
+            i = i + 1
+            local garbage = {i, tostring(i), {}}
+        until calls == 1 or i == 5000
+
+        assert(calls == 1, "automatic GC did not deliver the finalizer")
+        assert(weak[1] == nil, "automatic GC did not clear the weak value")
+        return calls
+        "#,
+    );
+    assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
+fn collectgarbage_stop_defers_allocation_triggered_progress_until_restart() {
+    let (state, _) = compile_and_run(
+        r#"
+        collectgarbage("setpause", 200)
+        collectgarbage("setstepmul", 10000)
+        collectgarbage("stop")
+        local weak = setmetatable({}, {__mode = "v"})
+        weak[1] = {}
+        for i = 1, 4000 do
+            local garbage = {i, tostring(i), {}}
+        end
+        assert(weak[1] ~= nil, "stopped automatic GC still reclaimed a weak value")
+
+        collectgarbage("restart")
+        local i = 0
+        repeat
+            i = i + 1
+            local garbage = {i, tostring(i), {}}
+        until weak[1] == nil or i == 5000
+        assert(weak[1] == nil, "restart did not resume automatic GC")
+        return 1
+        "#,
+    );
+    assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
 fn runtime_full_collection_runs_lua_finalizers_exactly_once() {
     let (state, _gc) = compile_and_run(
         r#"

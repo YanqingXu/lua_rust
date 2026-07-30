@@ -115,4 +115,13 @@ pub unsafe trait GcObject: Sized + sealed::Sealed {
 
     /// 获取对象占用的总内存大小（字节）
     fn get_size(&self) -> usize;
+
+    /// Exact managed payload requested by this object and its containers.
+    ///
+    /// The default is suitable for fixed layouts and Vec-backed objects whose
+    /// `get_size` already uses capacities. Containers with a deliberately
+    /// approximate collector size override this metric.
+    fn get_allocator_payload_size(&self) -> usize {
+        self.get_size()
+    }
 }

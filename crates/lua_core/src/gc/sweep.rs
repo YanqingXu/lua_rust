@@ -7,7 +7,6 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::gc::collector::GarbageCollector;
-use crate::gc::gc_object::GcObject;
 use crate::gc::gc_ref::GcRef;
 use crate::gc::header::GcObjectHeader;
 use crate::gc_string::GcString;
@@ -126,10 +125,6 @@ impl GarbageCollector {
         self.external_marked
             .retain(|reference| reference.ptr() != obj);
 
-        // SAFETY: `obj` came from the intrusive list and its concrete layout
-        // is recorded in the authoritative side table entry just removed.
-        let obj_size = unsafe { self.object_size_of(obj, live.object_type) };
-
         // 如果是字符串，从 StringPool 中移除
         if live.object_type == GcObjectType::String
             && let Some(string_pool) = string_pool
@@ -144,8 +139,17 @@ impl GarbageCollector {
         }
 
         // 更新统计信息
-        self.total_memory = self.total_memory.saturating_sub(obj_size);
-        self.subtract_gc_debt(obj_size);
+        self.total_memory = self
+            .total_memory
+            .checked_sub(live.accounted_size)
+            .expect("destroyed object exceeded collector accounted bytes");
+        self.allocator_object_bytes = self
+            .allocator_object_bytes
+            .checked_sub(live.allocator_size)
+            .expect("destroyed object exceeded allocator live payload");
+        self.allocation_account
+            .set_live_bytes(self.allocator_object_bytes);
+        self.subtract_gc_debt(live.allocator_size);
         if self.object_count > 0 {
             self.object_count -= 1;
         }
@@ -160,53 +164,6 @@ impl GarbageCollector {
         // SAFETY: obj 通过 Box::into_raw 分配，现在回收所有权
         unsafe {
             Self::free_gc_object(obj, live.object_type);
-        }
-    }
-
-    /// 获取 GC 对象的大小（用于统计更新）
-    ///
-    /// # Safety
-    /// `obj` 必须指向有效的 GC 对象。
-    unsafe fn object_size_of(&self, obj: *mut GcObjectHeader, object_type: GcObjectType) -> usize {
-        // SAFETY: caller guarantees obj is valid
-        unsafe {
-            match object_type {
-                GcObjectType::String => {
-                    use crate::gc_string::GcString;
-                    let ptr = obj as *const GcString;
-                    (*ptr).get_size()
-                }
-                GcObjectType::Table => {
-                    use crate::table::Table;
-                    let ptr = obj as *const Table;
-                    (*ptr).get_size()
-                }
-                GcObjectType::Function => {
-                    use crate::function::Function;
-                    let ptr = obj as *const Function;
-                    (*ptr).get_size()
-                }
-                GcObjectType::Proto => {
-                    use crate::proto::Proto;
-                    let ptr = obj as *const Proto;
-                    (*ptr).get_size()
-                }
-                GcObjectType::Upval => {
-                    use crate::upvalue::Upvalue;
-                    let ptr = obj as *const Upvalue;
-                    (*ptr).get_size()
-                }
-                GcObjectType::Userdata => {
-                    use crate::userdata::Userdata;
-                    let ptr = obj as *const Userdata;
-                    (*ptr).get_size()
-                }
-                GcObjectType::Thread => {
-                    use crate::thread::Thread;
-                    let ptr = obj as *const Thread;
-                    (*ptr).get_size()
-                }
-            }
         }
     }
 

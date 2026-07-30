@@ -59,26 +59,31 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   `collectgarbage("step")` 已使用 pause→propagate→atomic→sweep→finalize、
   Runtime 持久 object/StateHandle 双队列、debt/pause/stepmul 和有界 work
   unit；8-family production mutation barrier 与 active-allocation publication
-  已接线。allocator live/peak 和 allocation-triggered automatic checkpoint
-  尚未实现。
+  已接线。M1.13 又加入共享 managed-payload allocator ledger，覆盖 GC
+  object/container、StringPool key 与 StateArena，并报告 live/peak/total；
+  Runtime 指令边界会在阈值到达后完成一个安全 automatic cycle，支持
+  stop/restart、weak cleanup 与 protected finalizer，close 后 live 为 0。
 - **Oracle：** stock Lua 5.1 的可达性和 GC API；`lua_cpp@87c15e6` 的
   `tests/unit/gc/test_gc.cpp`、official suite GC probe 与 shutdown/lifecycle
   行为。
 - **测试与任务：** `tests/lua/differential/gc-weak-value.lua`；
   full STW 的两轮全图、weak/finalizer/resurrection、typed Drop、
   state/upvalue prepass、stale handle、cross-collector/root-gap/phase 回归；
-  M1.7–M1.13，当前重点为 M1.13。
+  M1.7–M1.13，当前剩余重点为 sanitizer 与 allocator-failure 耐久证据。
 - **当前最小证据：** M0 weak-value probe 在官方 Lua 与 C++ oracle 两条 lane
-  均通过；Rust 另有 13 项新增 workspace 回归覆盖公开 full collection 和上述
-  weak/finalizer 生命周期，另有 12 项增量/屏障/控制回归。它们不证明
-  automatic collection 或 allocator live/peak 合同。
-- **影响：** Lua 脚本已能显式触发真实 full/增量回收并观察 collector
-  accounted bytes；但自动回收和 allocator 指标仍不能视为兼容，长生命周期
-  未显式 step/collect 的运行路径仍可能积累对象。
+  均通过；Rust workspace 回归覆盖公开 full/incremental/automatic
+  collection、weak/finalizer 生命周期、stop/restart、allocator 增长/峰值与
+  close 归零，另有 6-family allocator 静态合同门。该口径是 managed payload，
+  不等同宿主 allocator usable size。
+- **影响：** Lua 脚本能显式或按分配阈值触发真实回收；Runtime 可观察
+  managed allocator live/peak/total，而 `gcinfo/count` 继续保持 collector
+  accounted-byte 语义。系统 allocator metadata、OOM/failure injection 与公开
+  allocator callback 仍未对齐。
 - **处置状态：** `open`。full STW、weak/finalizer/resurrection、public
   `collectgarbage("collect"/"step")`、mutation barrier、实际 `gcinfo/count`
-  和 close drain 子项已关闭；automatic integration、allocator 与完整
-  shutdown 验收全部通过前，Phase 1 与 GC 相关的 Phase 3/4 能力保持 partial。
+  、close drain、managed allocator 与 automatic integration 子项已关闭；
+  sanitizer/failure-injection、公开 allocator callback 与完整 service shutdown
+  验收前，Phase 1 与 GC 相关的 Phase 3/4 能力保持 partial。
 
 ### NOTE-003: `string.dump` 不是 Lua 5.1 binary chunk
 

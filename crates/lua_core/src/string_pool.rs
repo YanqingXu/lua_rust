@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use crate::allocator::{AllocationAccount, AllocationLedger};
 use crate::byte_string::ByteString;
 use crate::gc::collector::GarbageCollector;
 use crate::gc::gc_ref::GcRef;
@@ -31,29 +32,36 @@ pub struct StringPool {
     /// 字符串哈希表: key = 字符串内容, value = GC 引用
     /// 使用 owned ByteString 作为 key，支持任意字节并避免悬空引用。
     pool: HashMap<ByteString, GcRef<GcString>>,
+    /// Exact bytes owned by canonical key buffers, including NUL sentinels.
+    allocation_account: AllocationAccount,
 }
 
 impl StringPool {
     /// 创建空的字符串池
     pub fn new() -> Self {
+        let allocator = AllocationLedger::new();
         Self {
             heap_id: None,
             pool: HashMap::new(),
+            allocation_account: AllocationAccount::new(allocator),
         }
     }
 
-    pub(crate) fn new_for_heap(heap_id: HeapId) -> Self {
+    pub(crate) fn new_for_heap(heap_id: HeapId, allocator: AllocationLedger) -> Self {
         Self {
             heap_id: Some(heap_id),
             pool: HashMap::new(),
+            allocation_account: AllocationAccount::new(allocator),
         }
     }
 
     /// 创建预分配容量的字符串池
     pub fn with_capacity(capacity: usize) -> Self {
+        let allocator = AllocationLedger::new();
         Self {
             heap_id: None,
             pool: HashMap::with_capacity(capacity),
+            allocation_account: AllocationAccount::new(allocator),
         }
     }
 
@@ -77,6 +85,7 @@ impl StringPool {
 
         let gc_ref = gc.create(GcString::from_bytes(bytes));
         self.pool.insert(ByteString::from_bytes(bytes), gc_ref);
+        self.reconcile_key_storage();
         gc_ref
     }
 
@@ -115,6 +124,7 @@ impl StringPool {
         }
 
         self.pool.retain(|_, canonical| *canonical != gc_ref);
+        self.reconcile_key_storage();
     }
 
     // ── 容量管理 ──────────────────────────────────────────────
@@ -132,6 +142,7 @@ impl StringPool {
     /// 清空字符串池（不释放 GC 对象，由 GC 负责）
     pub fn clear(&mut self) {
         self.pool.clear();
+        self.reconcile_key_storage();
     }
 
     /// 预分配哈希表空间
@@ -144,6 +155,7 @@ impl StringPool {
         match self.pool.entry(ByteString::from_bytes(bytes)) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(value);
+                self.reconcile_key_storage();
             }
             std::collections::hash_map::Entry::Occupied(_) => {
                 panic!("reserved StringPool publication unexpectedly found an entry");
@@ -158,6 +170,15 @@ impl StringPool {
         for (key, &value) in &self.pool {
             f(key.as_bytes(), value);
         }
+    }
+
+    fn reconcile_key_storage(&mut self) {
+        let bytes = self
+            .pool
+            .keys()
+            .map(|key| key.len().saturating_add(1))
+            .sum();
+        self.allocation_account.set_live_bytes(bytes);
     }
 }
 

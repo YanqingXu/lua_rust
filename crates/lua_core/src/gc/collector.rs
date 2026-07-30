@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 
+use crate::allocator::{AllocationAccount, AllocationLedger};
 use crate::gc::gc_object::GcObject;
 use crate::gc::gc_ref::{ErasedGcRef, GcRef};
 use crate::gc::header::GcObjectHeader;
@@ -28,6 +29,8 @@ use thiserror::Error;
 pub(crate) struct LiveAllocation {
     pub(crate) object_id: ObjectId,
     pub(crate) object_type: GcObjectType,
+    pub(crate) accounted_size: usize,
+    pub(crate) allocator_size: usize,
 }
 
 /// Why a copied GC handle could not be validated by one collector.
@@ -188,14 +191,27 @@ pub struct GarbageCollector {
     /// 估算总内存使用量（字节）
     pub(crate) total_memory: usize,
 
+    /// Exact managed object payload charged to the owner Heap ledger.
+    pub(crate) allocation_account: AllocationAccount,
+
+    /// Sum of allocator payload stored in live side-table entries.
+    pub(crate) allocator_object_bytes: usize,
+
     /// Whether allocation-triggered automatic progress is administratively stopped.
-    ///
-    /// M1.11 exposes the control state but intentionally leaves allocation
-    /// checkpoints disabled until the mutation and incremental gates pass.
     pub(crate) automatic_stopped: bool,
 
-    /// Next automatic-cycle threshold. It is diagnostic-only while automatic
-    /// allocation checkpoints remain disabled.
+    /// Nesting depth of VM helper regions that cannot suspend to a Runtime safe point.
+    pub(crate) automatic_checkpoint_suspensions: usize,
+
+    /// Whether execution is owned by the Runtime scheduler that can service a
+    /// [`crate::gc::collector::GarbageCollector::automatic_step_due`] exit.
+    pub(crate) automatic_checkpoint_driver_active: bool,
+
+    /// Whether the active incremental cycle was started by an automatic
+    /// allocation checkpoint rather than explicit `collectgarbage("step")`.
+    pub(crate) automatic_cycle_active: bool,
+
+    /// Next allocation-triggered automatic-cycle threshold.
     pub(crate) automatic_threshold_bytes: usize,
 
     /// Saturating allocation/work debt in bytes.
@@ -239,6 +255,14 @@ impl GarbageCollector {
 
     /// Create the collector owned by `heap_id`.
     pub(crate) fn new_for_heap(heap_id: HeapId) -> Self {
+        Self::new_for_heap_with_allocator(heap_id, AllocationLedger::new())
+    }
+
+    /// Create a collector sharing one owner Heap allocation ledger.
+    pub(crate) fn new_for_heap_with_allocator(
+        heap_id: HeapId,
+        allocator: AllocationLedger,
+    ) -> Self {
         Self {
             heap_id,
             all_objects: std::ptr::null_mut(),
@@ -256,7 +280,12 @@ impl GarbageCollector {
             finalizers_running: false,
             object_count: 0,
             total_memory: 0,
+            allocation_account: AllocationAccount::new(allocator),
+            allocator_object_bytes: 0,
             automatic_stopped: false,
+            automatic_checkpoint_suspensions: 0,
+            automatic_checkpoint_driver_active: false,
+            automatic_cycle_active: false,
             automatic_threshold_bytes: 64 * 1024,
             gc_debt_bytes: -(64 * 1024),
             pause: 200,
@@ -299,6 +328,7 @@ impl GarbageCollector {
         );
 
         let object_size = obj.get_size();
+        let allocator_size = obj.get_allocator_payload_size();
         let next_object_count = self
             .object_count
             .checked_add(1)
@@ -307,6 +337,10 @@ impl GarbageCollector {
             .total_memory
             .checked_add(object_size)
             .expect("GC memory accounting overflow");
+        let next_allocator_object_bytes = self
+            .allocator_object_bytes
+            .checked_add(allocator_size)
+            .expect("GC allocator payload accounting overflow");
         let object_id = ObjectId::allocate();
         let mut boxed = Box::new(obj);
         let raw = NonNull::from(&mut *boxed);
@@ -319,6 +353,8 @@ impl GarbageCollector {
                 entry.insert(LiveAllocation {
                     object_id,
                     object_type: T::expected_gc_type(),
+                    accounted_size: object_size,
+                    allocator_size,
                 });
             }
             std::collections::hash_map::Entry::Occupied(_) => {
@@ -351,7 +387,10 @@ impl GarbageCollector {
 
         self.object_count = next_object_count;
         self.total_memory = next_total_memory;
-        self.add_gc_debt(object_size);
+        self.allocator_object_bytes = next_allocator_object_bytes;
+        self.allocation_account
+            .set_live_bytes(self.allocator_object_bytes);
+        self.add_gc_debt(allocator_size);
 
         // SAFETY: the side table and intrusive list now register this exact
         // allocation identity and concrete layout.
@@ -526,8 +565,12 @@ impl GarbageCollector {
         self.finalizers_running = false;
         self.object_count = 0;
         self.total_memory = 0;
+        self.allocator_object_bytes = 0;
+        self.allocation_account.set_live_bytes(0);
         self.gc_debt_bytes = 0;
         self.automatic_threshold_bytes = 64 * 1024;
+        self.automatic_checkpoint_driver_active = false;
+        self.automatic_cycle_active = false;
         string_pool.clear();
 
         report
@@ -648,6 +691,54 @@ impl GarbageCollector {
         self.total_memory
     }
 
+    fn reconcile_managed_object_size(
+        &mut self,
+        address: usize,
+        current_accounted: usize,
+        current_allocator: usize,
+    ) {
+        let previous = *self
+            .live_allocations
+            .get(&address)
+            .expect("validated mutation owner remains registered");
+        if current_accounted >= previous.accounted_size {
+            let growth = current_accounted - previous.accounted_size;
+            self.total_memory = self
+                .total_memory
+                .checked_add(growth)
+                .expect("GC memory accounting overflow after object growth");
+        } else {
+            let shrink = previous.accounted_size - current_accounted;
+            self.total_memory = self
+                .total_memory
+                .checked_sub(shrink)
+                .expect("GC object shrink exceeded accounted memory");
+        }
+        if current_allocator >= previous.allocator_size {
+            let growth = current_allocator - previous.allocator_size;
+            self.allocator_object_bytes = self
+                .allocator_object_bytes
+                .checked_add(growth)
+                .expect("GC allocator payload overflow after object growth");
+            self.add_gc_debt(growth);
+        } else {
+            let shrink = previous.allocator_size - current_allocator;
+            self.allocator_object_bytes = self
+                .allocator_object_bytes
+                .checked_sub(shrink)
+                .expect("GC object allocator shrink exceeded live payload");
+            self.subtract_gc_debt(shrink);
+        }
+        let live = self
+            .live_allocations
+            .get_mut(&address)
+            .expect("validated mutation owner remains registered");
+        live.accounted_size = current_accounted;
+        live.allocator_size = current_allocator;
+        self.allocation_account
+            .set_live_bytes(self.allocator_object_bytes);
+    }
+
     /// 遍历所有对象（用于测试和调试）
     pub fn for_each_object<F: FnMut(*mut GcObjectHeader)>(&self, mut f: F) {
         let mut current = self.all_objects;
@@ -728,6 +819,11 @@ impl GarbageCollector {
         // `&mut self` prevents collection and other collector-mediated
         // mutation while the callback is running.
         let result = write(unsafe { pointer.as_mut() });
+        // SAFETY: the callback cannot replace or destroy its managed owner.
+        let current_size = unsafe { pointer.as_ref() }.get_size();
+        // SAFETY: same concrete allocation; this metric only reads capacities.
+        let current_allocator_size = unsafe { pointer.as_ref() }.get_allocator_payload_size();
+        self.reconcile_managed_object_size(header as usize, current_size, current_allocator_size);
         let state_edge_changed =
             previous_state_edge != self.managed_state_edge(header, T::expected_gc_type());
         self.after_managed_mutation(header, T::expected_gc_type(), state_edge_changed);

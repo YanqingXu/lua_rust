@@ -4,8 +4,8 @@
 //! releases its current state turn. The atomic phase consumes the canonical
 //! Runtime root tracer, prepares finalizers, propagates resurrected graphs,
 //! reconciles weak tables, closes unreachable coroutine states before object
-//! destruction, and then sweeps. Explicit incremental collection shares these
-//! Runtime safe points; allocation-triggered automatic entry remains disabled.
+//! destruction, and then sweeps. Explicit incremental collection and
+//! allocation-triggered cycles share these Runtime safe points.
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::state_handle::{RuntimeId, StateHandle};

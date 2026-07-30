@@ -8,6 +8,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::allocator::{AllocationLedger, AllocatorStats};
 use crate::gc::collector::{GarbageCollector, GcDestroyAllReport};
 use crate::string_pool::StringPool;
 
@@ -51,6 +52,7 @@ impl fmt::Debug for HeapId {
 /// [`Heap::destroy_all`] themselves.
 pub struct Heap {
     id: HeapId,
+    allocator: AllocationLedger,
     collector: GarbageCollector,
     strings: StringPool,
 }
@@ -59,10 +61,12 @@ impl Heap {
     /// Create one empty heap with a process-unique identity.
     pub fn new() -> Self {
         let id = HeapId::allocate();
+        let allocator = AllocationLedger::new();
         Self {
             id,
-            collector: GarbageCollector::new_for_heap(id),
-            strings: StringPool::new_for_heap(id),
+            allocator: allocator.clone(),
+            collector: GarbageCollector::new_for_heap_with_allocator(id, allocator.clone()),
+            strings: StringPool::new_for_heap(id, allocator),
         }
     }
 
@@ -122,6 +126,17 @@ impl Heap {
         self.collector.total_memory()
     }
 
+    /// Managed allocator payload statistics for this Heap and attached Runtime.
+    pub fn allocator_stats(&self) -> AllocatorStats {
+        self.allocator.stats()
+    }
+
+    /// Clone the ledger identity for a Runtime-owned StateArena component.
+    #[doc(hidden)]
+    pub fn allocation_ledger(&self) -> AllocationLedger {
+        self.allocator.clone()
+    }
+
     /// Number of canonical interned strings.
     pub fn interned_string_count(&self) -> usize {
         self.strings.len()
@@ -146,6 +161,7 @@ impl fmt::Debug for Heap {
             .field("id", &self.id)
             .field("objects", &self.object_count())
             .field("accounted_bytes", &self.accounted_bytes())
+            .field("allocator", &self.allocator_stats())
             .field("interned_strings", &self.interned_string_count())
             .finish()
     }
@@ -163,6 +179,7 @@ impl Drop for Heap {
 mod tests {
     use crate::gc_string::GcString;
     use crate::table::Table;
+    use crate::value::Value;
 
     use super::*;
 
@@ -207,5 +224,41 @@ mod tests {
         let report = heap.destroy_all();
         assert_eq!(report.destroyed_objects(), 2);
         assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn allocator_stats_reconcile_object_growth_string_keys_and_teardown() {
+        let mut heap = Heap::new();
+        let table = heap.collector_mut().create_root(Table::new());
+        let accounted_before = heap.accounted_bytes();
+        let allocator_before = heap.allocator_stats();
+
+        heap.collector_mut()
+            .with_mut(table, |table| {
+                for index in 1..=256 {
+                    table.set(&Value::Number(index as f64), &Value::Number(index as f64));
+                }
+            })
+            .unwrap();
+        let accounted_after = heap.accounted_bytes();
+        let allocator_after_table = heap.allocator_stats();
+        assert!(accounted_after > accounted_before);
+        assert!(allocator_after_table.live_bytes > allocator_before.live_bytes);
+
+        heap.with_parts_mut(|collector, strings| {
+            strings.intern_bytes(collector, b"allocator-key");
+        });
+        let allocator_after_string = heap.allocator_stats();
+        assert!(allocator_after_string.live_bytes > allocator_after_table.live_bytes);
+        assert!(allocator_after_string.peak_bytes >= allocator_after_string.live_bytes);
+        assert!(allocator_after_string.total_allocated_bytes >= allocator_after_string.peak_bytes);
+
+        let report = heap.destroy_all();
+        assert_eq!(report.destroyed_objects(), 2);
+        assert_eq!(heap.accounted_bytes(), 0);
+        let final_stats = heap.allocator_stats();
+        assert_eq!(final_stats.live_bytes, 0);
+        assert!(final_stats.peak_bytes > 0);
+        assert!(final_stats.total_allocated_bytes >= final_stats.peak_bytes);
     }
 }

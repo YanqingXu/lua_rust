@@ -26,10 +26,11 @@
 //! `Drop` uses the same implementation.
 //!
 //! This remains a partial shutdown substrate: library-specific IO/resource
-//! hooks, native-module ordering, and allocator live-byte accounting are
-//! explicit report/RFC debt. Live execution can request a stop-the-world full
-//! collection at Runtime safe points; allocation-triggered and incremental
-//! collection remain disabled.
+//! hooks and native-module ordering are explicit report/RFC debt. The shared
+//! managed-payload allocator ledger reports live/peak/cumulative bytes and
+//! reaches zero after deterministic close. Live execution supports explicit
+//! full/incremental collection plus allocation-triggered collection at
+//! Runtime-owned instruction boundaries.
 
 use std::collections::HashSet;
 use std::marker::{PhantomData, PhantomPinned};
@@ -39,8 +40,9 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::thread::{self, ThreadId};
 
+use lua_core::allocator::{AllocationAccount, AllocationLedger, AllocatorStats};
 use lua_core::function::Function;
-use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
+use lua_core::gc::collector::{GarbageCollector, GcRefValidationError, IncrementalPhase};
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc::object_id::ObjectId;
 use lua_core::gc::publication::{PublicationTxn, Rooted};
@@ -208,7 +210,7 @@ impl NativeActivationStack {
             }
         }
         for frame in &self.gc_frames {
-            frame.request.seed_roots(gc);
+            frame.seed_roots(gc);
             if let Some((userdata, callback)) = &frame.current_finalizer {
                 gc.mark_value(&Value::Userdata(*userdata));
                 gc.mark_value(callback);
@@ -221,12 +223,53 @@ impl NativeActivationStack {
 }
 
 #[derive(Clone, Debug)]
+enum GcActivationOrigin {
+    Explicit(Box<FullCollectionRequest>),
+    Automatic { stop_ci: usize, saved_top: usize },
+}
+
+#[derive(Clone, Debug)]
 struct GcActivationFrame {
     requester: StateHandle,
-    request: FullCollectionRequest,
+    origin: GcActivationOrigin,
     draining_finalizers: bool,
     current_finalizer: Option<(GcRef<Userdata>, Value)>,
     response: Option<CollectionResponse>,
+}
+
+impl GcActivationFrame {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        if let GcActivationOrigin::Explicit(request) = &self.origin {
+            request.seed_roots(gc);
+        }
+    }
+
+    fn explicit_request(&self) -> Option<&FullCollectionRequest> {
+        match &self.origin {
+            GcActivationOrigin::Explicit(request) => Some(request),
+            GcActivationOrigin::Automatic { .. } => None,
+        }
+    }
+
+    fn stop_ci(&self) -> Option<usize> {
+        match &self.origin {
+            GcActivationOrigin::Explicit(request) => request
+                .deferred
+                .as_ref()
+                .map(|deferred| deferred.saved_ci + 1),
+            GcActivationOrigin::Automatic { stop_ci, .. } => Some(*stop_ci),
+        }
+    }
+
+    fn saved_top(&self) -> Option<usize> {
+        match &self.origin {
+            GcActivationOrigin::Explicit(request) => request
+                .deferred
+                .as_ref()
+                .map(|deferred| deferred.snapshot.top()),
+            GcActivationOrigin::Automatic { saved_top, .. } => Some(*saved_top),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -267,6 +310,7 @@ enum NativeDriverAction {
         response: CollectionResponse,
         resume: NativeDriverRole,
     },
+    ResumeAutomaticGc,
     StartFinalizer {
         callback: Value,
         userdata: GcRef<Userdata>,
@@ -324,6 +368,10 @@ enum NativeTurnEvent {
         caller_thread: Option<GcRef<Thread>>,
     },
     UpvalueAccess(Box<UpvalueAccessRequest>),
+    AutomaticGc {
+        stop_ci: usize,
+        saved_top: usize,
+    },
     Main(Result<ExecResult, RuntimeError>),
     Finalizer(Result<(), RuntimeError>),
     Coroutine {
@@ -353,6 +401,12 @@ pub struct RuntimeCloseReport {
     pub remaining_interned_strings: usize,
     /// Collector's current estimated live-byte counter.
     pub remaining_estimated_bytes: usize,
+    /// Managed allocator payload bytes still live after close.
+    pub remaining_allocator_live_bytes: usize,
+    /// Highest managed allocator payload observed in this Runtime.
+    pub allocator_peak_bytes: usize,
+    /// Cumulative positive managed payload charges over the Runtime lifetime.
+    pub allocator_total_allocated_bytes: usize,
     /// Coroutine states still retained after close.
     pub remaining_coroutine_states: usize,
     /// PendingState roots still retained after close.
@@ -523,6 +577,7 @@ pub enum PendingStateError {
 struct StateSlot {
     generation: u64,
     state: Option<NonNull<LuaState>>,
+    accounted_bytes: usize,
     owned: bool,
     borrowed: bool,
     retired: bool,
@@ -543,6 +598,7 @@ pub struct StateArena {
     next_temporary_root_id: u64,
     rejected_temporary_root_releases: usize,
     turn_borrow: Option<StateHandle>,
+    allocation_account: AllocationAccount,
     #[cfg(test)]
     turn_borrow_events: Vec<TurnBorrowEvent>,
     #[cfg(test)]
@@ -569,7 +625,7 @@ struct StateArenaCollectionReport {
 }
 
 impl StateArena {
-    fn new(handle_issuer: StateHandleIssuer) -> Self {
+    fn new(handle_issuer: StateHandleIssuer, allocator: AllocationLedger) -> Self {
         Self {
             handle_issuer,
             slots: Vec::new(),
@@ -578,6 +634,7 @@ impl StateArena {
             next_temporary_root_id: 1,
             rejected_temporary_root_releases: 0,
             turn_borrow: None,
+            allocation_account: AllocationAccount::new(allocator),
             #[cfg(test)]
             turn_borrow_events: Vec::new(),
             #[cfg(test)]
@@ -612,6 +669,7 @@ impl StateArena {
                     self.slots.push(StateSlot {
                         generation: 1,
                         state: None,
+                        accounted_bytes: 0,
                         owned: false,
                         borrowed: false,
                         retired: false,
@@ -632,9 +690,13 @@ impl StateArena {
 
     fn attach_external(&mut self, state: NonNull<LuaState>) -> StateHandle {
         let handle = self.reserve_slot();
+        // SAFETY: Runtime passes its live, uniquely owned main-state Box.
+        let accounted_bytes = unsafe { state.as_ref() }.allocator_payload_bytes();
         let slot = &mut self.slots[handle.slot()];
         slot.state = Some(state);
+        slot.accounted_bytes = accounted_bytes;
         slot.owned = false;
+        self.reconcile_allocation_account();
         handle
     }
 
@@ -678,14 +740,17 @@ impl StateArena {
         let handle = self.reserve_slot();
         let arena = NonNull::from(&mut *self);
         state.attach_runtime_state(handle, arena);
+        let accounted_bytes = state.allocator_payload_bytes();
         let state =
             NonNull::new(Box::into_raw(state)).expect("Box::into_raw never returns a null pointer");
 
         let slot = &mut self.slots[handle.slot()];
         slot.state = Some(state);
+        slot.accounted_bytes = accounted_bytes;
         slot.owned = true;
         slot.temporary_root_id = temporary_root_id;
         self.live_owned_states = next_live_owned_states;
+        self.reconcile_allocation_account();
         handle
     }
 
@@ -1318,6 +1383,30 @@ impl StateArena {
         Ok(())
     }
 
+    fn update_state_allocation(&mut self, handle: StateHandle, state: NonNull<LuaState>) -> bool {
+        let Ok((slot_index, registered)) = self.validate(handle) else {
+            return false;
+        };
+        if registered != state {
+            return false;
+        }
+        // SAFETY: the scoped StateBorrow has ended its mutable callback, and
+        // validation proved this exact occupied state allocation.
+        self.slots[slot_index].accounted_bytes =
+            unsafe { state.as_ref() }.allocator_payload_bytes();
+        self.reconcile_allocation_account();
+        true
+    }
+
+    fn reconcile_allocation_account(&mut self) {
+        let live_bytes = self
+            .slots
+            .iter()
+            .map(|slot| slot.accounted_bytes)
+            .fold(0usize, usize::saturating_add);
+        self.allocation_account.set_live_bytes(live_bytes);
+    }
+
     fn vacate_slot(&mut self, slot_index: usize) {
         debug_assert!(
             self.turn_borrow
@@ -1332,6 +1421,8 @@ impl StateArena {
             self.free_slots.reserve(1);
         }
 
+        self.slots[slot_index].accounted_bytes = 0;
+        self.reconcile_allocation_account();
         let slot = &mut self.slots[slot_index];
         debug_assert!(!slot.retired);
         slot.state = None;
@@ -1372,6 +1463,7 @@ impl Drop for StateArena {
             slot.temporary_root_id = None;
         }
         self.live_owned_states = 0;
+        self.allocation_account.set_live_bytes(0);
     }
 }
 
@@ -1544,6 +1636,11 @@ impl Drop for StateBorrow {
         let mut arena = self.arena;
         // SAFETY: StateBorrow never escapes the resolving LuaState call. The
         // pinned RuntimeStorage and its StateArena therefore still exist.
+        let updated =
+            // SAFETY: the HRTB callback has returned, so no state reference
+            // remains while the arena reads this exact allocation's sizes.
+            unsafe { arena.as_mut() }.update_state_allocation(self.handle, self.state);
+        debug_assert!(updated);
         let released = match self.kind {
             // SAFETY: StateBorrow never escapes the resolving LuaState call.
             StateBorrowKind::Nested => unsafe { arena.as_mut() }.release(self.handle),
@@ -1668,9 +1765,11 @@ const FIXED_RUNTIME_STRING_BYTES: [&[u8]; 3] =
 
 impl RuntimeStorage {
     fn new(handle_issuer: StateHandleIssuer) -> Self {
+        let heap = Heap::new();
+        let allocator = heap.allocation_ledger();
         Self {
-            state_arena: StateArena::new(handle_issuer),
-            heap: Heap::new(),
+            state_arena: StateArena::new(handle_issuer, allocator),
+            heap,
             native_activations: NativeActivationStack::default(),
             incremental_trace: None,
             _pin: PhantomPinned,
@@ -1864,6 +1963,11 @@ impl Runtime {
             .get_ref()
             .state_arena
             .live_owned_state_count()
+    }
+
+    /// Snapshot managed allocator live/peak/cumulative payload bytes.
+    pub fn allocator_stats(&self) -> AllocatorStats {
+        self.heap.as_ref().get_ref().heap.allocator_stats()
     }
 
     /// Return active lexical temporary state roots.
@@ -2102,6 +2206,7 @@ impl Runtime {
         let (gc, string_pool) = heap.heap.parts_mut();
         let activations = &mut heap.native_activations;
         let incremental_trace = &mut heap.incremental_trace;
+        gc.begin_automatic_checkpoint_driver();
         let _activation_cleanup = NativeActivationSessionGuard {
             activations: NonNull::from(&mut *activations),
             gc: NonNull::from(&mut *gc),
@@ -2201,6 +2306,61 @@ impl Runtime {
             }
 
             match event {
+                NativeTurnEvent::AutomaticGc { stop_ci, saved_top } => {
+                    if !matches!(driver_role, NativeDriverRole::Program) {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "automatic GC checkpoint escaped from a finalizer".to_string(),
+                        ));
+                    }
+                    let roots = RuntimeRootSet {
+                        runtime_id: self.id,
+                        main_handle: initial,
+                        global_root: self.global_root,
+                        registry_root: self.registry_root,
+                        fixed_strings: &self.fixed_strings,
+                    };
+                    if gc.incremental_phase() == IncrementalPhase::Pause {
+                        gc.begin_automatic_cycle();
+                    }
+                    let report = collect_incremental_step_at_safe_point(
+                        roots,
+                        // SAFETY: the VM returned at an audited instruction
+                        // boundary and released the arena turn borrow.
+                        unsafe { arena.as_mut() },
+                        activations,
+                        gc,
+                        string_pool,
+                        incremental_trace,
+                        10_000,
+                    )
+                    .map_err(|error| {
+                        *incremental_trace = None;
+                        gc.abort_incremental_cycle();
+                        RuntimeExecutionError::Protocol(format!(
+                            "automatic incremental collection failed: {error}"
+                        ))
+                    })?;
+
+                    if report.cycle_finished
+                        && gc.pending_finalizer_count() != 0
+                        && gc.begin_finalizer_drain()
+                    {
+                        activations.gc_frames.push(GcActivationFrame {
+                            requester: current,
+                            origin: GcActivationOrigin::Automatic { stop_ci, saved_top },
+                            draining_finalizers: true,
+                            current_finalizer: None,
+                            response: None,
+                        });
+                        if let Some(next) = next_finalizer_action(activations, gc)? {
+                            action = next;
+                            continue;
+                        }
+                        activations.gc_frames.pop();
+                    }
+                    action = NativeDriverAction::ResumeAutomaticGc;
+                    continue;
+                }
                 NativeTurnEvent::Request {
                     request,
                     caller_thread,
@@ -2217,7 +2377,7 @@ impl Runtime {
                                 .unwrap_or(NativeDriverRole::Program);
                             activations.gc_frames.push(GcActivationFrame {
                                 requester: current,
-                                request: request.clone(),
+                                origin: GcActivationOrigin::Explicit(Box::new(request.clone())),
                                 draining_finalizers: false,
                                 current_finalizer: None,
                                 response: None,
@@ -2474,23 +2634,26 @@ impl Runtime {
                             "finalizer completion lost its pending userdata".to_string(),
                         )
                     })?;
-                    let callback_top = frame
-                        .request
-                        .deferred
-                        .as_ref()
-                        .ok_or_else(|| {
-                            RuntimeExecutionError::Protocol(
-                                "finalizer activation lost its caller snapshot".to_string(),
-                            )
-                        })?
-                        .snapshot
-                        .top();
+                    let callback_top = frame.saved_top().ok_or_else(|| {
+                        RuntimeExecutionError::Protocol(
+                            "finalizer activation lost its caller snapshot".to_string(),
+                        )
+                    })?;
+                    let automatic_failure =
+                        matches!(&frame.origin, GcActivationOrigin::Automatic { .. })
+                            .then(|| result.as_ref().err().cloned())
+                            .flatten();
                     let callback_error = StateArena::with_turn_state_mut(arena, current, |state| {
                         with_vm_context_parts(state, gc, string_pool, |state, gc, _| {
-                            let error = result
-                                .as_ref()
-                                .err()
-                                .map(|error| runtime_error_value(state, gc, error));
+                            let error =
+                                (!matches!(&frame.origin, GcActivationOrigin::Automatic { .. }))
+                                    .then(|| {
+                                        result
+                                            .as_ref()
+                                            .err()
+                                            .map(|error| runtime_error_value(state, gc, error))
+                                    })
+                                    .flatten();
                             let scratch_start = state.current_call_info().top;
                             let initialized = state.stack.size();
                             for index in scratch_start..initialized {
@@ -2514,13 +2677,21 @@ impl Runtime {
                         .last_mut()
                         .expect("validated collection activation remains");
                     frame.current_finalizer = None;
-                    if let Some(error) = callback_error {
+                    if let Some(error) = automatic_failure {
+                        gc.end_finalizer_drain();
+                        activations.gc_frames.pop();
+                        return Err(RuntimeExecutionError::Vm(error));
+                    } else if let Some(error) = callback_error {
                         gc.end_finalizer_drain();
                         frame.draining_finalizers = false;
                         let response = CollectionResponse::ErrorValue(error);
                         frame.response = Some(response.clone());
+                        let request = frame
+                            .explicit_request()
+                            .expect("explicit finalizer error owns a collection request")
+                            .clone();
                         action = NativeDriverAction::DeliverCollection {
-                            request: frame.request.clone(),
+                            request,
                             response,
                             resume: NativeDriverRole::Program,
                         };
@@ -2531,14 +2702,18 @@ impl Runtime {
                             .gc_frames
                             .last_mut()
                             .expect("collection activation remains after drain");
-                        let response =
-                            CollectionResponse::Success(frame.request.result.values(true));
-                        frame.response = Some(response.clone());
-                        action = NativeDriverAction::DeliverCollection {
-                            request: frame.request.clone(),
-                            response,
-                            resume: NativeDriverRole::Program,
-                        };
+                        if let Some(request) = frame.explicit_request().cloned() {
+                            let response = CollectionResponse::Success(request.result.values(true));
+                            frame.response = Some(response.clone());
+                            action = NativeDriverAction::DeliverCollection {
+                                request,
+                                response,
+                                resume: NativeDriverRole::Program,
+                            };
+                        } else {
+                            activations.gc_frames.pop();
+                            action = NativeDriverAction::ResumeAutomaticGc;
+                        }
                     }
                 }
                 NativeTurnEvent::Main(result) => {
@@ -2786,6 +2961,7 @@ impl Runtime {
         let remaining_coroutine_states = heap.state_arena.live_owned_state_count();
         let remaining_temporary_state_roots = heap.state_arena.temporary_state_root_count();
         let remaining_collector_queue_entries = heap.heap.collector().transient_queue_entry_count();
+        let allocator = heap.heap.allocator_stats();
         let summary = self.shutdown_summary.unwrap_or_default();
         RuntimeCloseReport {
             runtime_id: self.id,
@@ -2795,11 +2971,15 @@ impl Runtime {
                 || !heap.heap.strings().is_empty()
                 || remaining_coroutine_states != 0
                 || remaining_temporary_state_roots != 0
-                || remaining_collector_queue_entries != 0,
+                || remaining_collector_queue_entries != 0
+                || allocator.live_bytes != 0,
             remaining_objects,
             remaining_roots: heap.heap.collector().root_count(),
             remaining_interned_strings: heap.heap.interned_string_count(),
             remaining_estimated_bytes: heap.heap.accounted_bytes(),
+            remaining_allocator_live_bytes: allocator.live_bytes,
+            allocator_peak_bytes: allocator.peak_bytes,
+            allocator_total_allocated_bytes: allocator.total_allocated_bytes,
             remaining_coroutine_states,
             remaining_temporary_state_roots,
             rejected_temporary_state_root_releases: heap
@@ -2897,12 +3077,8 @@ fn active_finalizer_role(
             return None;
         }
         frame
-            .request
-            .deferred
-            .as_ref()
-            .map(|deferred| NativeDriverRole::Finalizer {
-                stop_ci: deferred.saved_ci + 1,
-            })
+            .stop_ci()
+            .map(|stop_ci| NativeDriverRole::Finalizer { stop_ci })
     })
 }
 
@@ -2912,13 +3088,7 @@ fn active_finalizer_saved_top(
 ) -> Option<usize> {
     activations.gc_frames.iter().rev().find_map(|frame| {
         (frame.draining_finalizers && frame.requester == requester)
-            .then(|| {
-                frame
-                    .request
-                    .deferred
-                    .as_ref()
-                    .map(|deferred| deferred.snapshot.top())
-            })
+            .then(|| frame.saved_top())
             .flatten()
     })
 }
@@ -2952,12 +3122,11 @@ fn next_finalizer_action(
             }
             continue;
         };
-        let deferred = frame.request.deferred.as_ref().ok_or_else(|| {
+        let stop_ci = frame.stop_ci().ok_or_else(|| {
             RuntimeExecutionError::Protocol(
-                "finalizer scheduling lost its deferred collector call".to_string(),
+                "finalizer scheduling lost its caller frame".to_string(),
             )
         })?;
-        let stop_ci = deferred.saved_ci + 1;
         frame.current_finalizer = Some((userdata, callback.clone()));
         return Ok(Some(NativeDriverAction::StartFinalizer {
             callback,
@@ -3083,6 +3252,10 @@ fn execute_native_driver_action(
                 }
             }
         }
+        NativeDriverAction::ResumeAutomaticGc => {
+            state.status = ThreadStatus::Yield;
+            resume_after_upvalue_access(state, gc)
+        }
         NativeDriverAction::StartFinalizer {
             callback,
             userdata,
@@ -3184,6 +3357,10 @@ fn classify_native_turn(
             })
         }
         Ok(VmExit::UpvalueAccess(request)) => Ok(NativeTurnEvent::UpvalueAccess(request)),
+        Ok(VmExit::AutomaticGc) => Ok(NativeTurnEvent::AutomaticGc {
+            stop_ci: state.current_ci,
+            saved_top: state.top,
+        }),
         Ok(VmExit::Complete(ExecResult::Returned))
             if matches!(role, NativeDriverRole::Finalizer { .. }) =>
         {
@@ -3451,6 +3628,7 @@ impl Drop for NativeActivationSessionGuard {
             gc.end_finalizer_drain();
         }
         activations.gc_frames.clear();
+        gc.end_automatic_checkpoint_driver();
     }
 }
 
@@ -3502,7 +3680,11 @@ impl Drop for RuntimePartsMut<'_> {
         let mut arena = self.state_arena;
         // SAFETY: RuntimePartsMut is tied to the exclusive Runtime borrow, so
         // its pinned heap and StateArena outlive this guard.
-        let released = unsafe { arena.as_mut() }.release(self.state_handle);
+        let arena = unsafe { arena.as_mut() };
+        let updated =
+            arena.update_state_allocation(self.state_handle, NonNull::from(&mut *self.state));
+        debug_assert!(updated);
+        let released = arena.release(self.state_handle);
         debug_assert!(released);
         debug_assert!(*self.active_executions > 0);
         *self.active_executions = self.active_executions.saturating_sub(1);
@@ -4085,6 +4267,15 @@ mod tests {
         let mut runtime = Runtime::new();
         assert_eq!(runtime.phase(), RuntimePhase::Running);
         assert!(runtime.global_root().is_some());
+        let initial_allocator = runtime.allocator_stats();
+        {
+            let mut parts = runtime.parts_mut().expect("main state is borrowable");
+            let (state, _, _) = parts.split_mut();
+            state.stack.ensure_space(2_048);
+        }
+        let grown_allocator = runtime.allocator_stats();
+        assert!(grown_allocator.live_bytes > initial_allocator.live_bytes);
+        assert!(grown_allocator.peak_bytes >= grown_allocator.live_bytes);
 
         let first = runtime.close().expect("first close succeeds");
         assert!(!first.already_closed);
@@ -4093,6 +4284,9 @@ mod tests {
         assert_eq!(first.remaining_roots, 0);
         assert_eq!(first.remaining_interned_strings, 0);
         assert_eq!(first.remaining_estimated_bytes, 0);
+        assert_eq!(first.remaining_allocator_live_bytes, 0);
+        assert!(first.allocator_peak_bytes >= grown_allocator.live_bytes);
+        assert!(first.allocator_total_allocated_bytes >= first.allocator_peak_bytes);
         assert_eq!(first.remaining_coroutine_states, 0);
         assert_eq!(first.remaining_temporary_state_roots, 0);
         assert_eq!(first.rejected_temporary_state_root_releases, 0);
@@ -4117,6 +4311,8 @@ mod tests {
         );
         assert_eq!(second.remaining_objects, 0);
         assert_eq!(second.remaining_estimated_bytes, 0);
+        assert_eq!(second.remaining_allocator_live_bytes, 0);
+        assert_eq!(second.allocator_peak_bytes, first.allocator_peak_bytes);
         assert_eq!(second.remaining_temporary_state_roots, 0);
         assert_eq!(second.rejected_temporary_state_root_releases, 0);
         assert!(!second.heap_reclamation_deferred);
@@ -4270,7 +4466,7 @@ mod tests {
     fn generation_max_is_issued_once_then_the_slot_is_permanently_retired() {
         let issuer =
             StateHandleIssuer::try_new().expect("test runtime namespace should be available");
-        let mut arena = StateArena::new(issuer);
+        let mut arena = StateArena::new(issuer, AllocationLedger::new());
         let original = arena.insert_owned(Box::new(LuaState::new()));
         let slot_index = original.slot();
 
@@ -4335,7 +4531,7 @@ mod tests {
     fn pending_state_rollback_retires_generation_max_exactly_once() {
         let issuer =
             StateHandleIssuer::try_new().expect("test runtime namespace should be available");
-        let mut arena = StateArena::new(issuer);
+        let mut arena = StateArena::new(issuer, AllocationLedger::new());
         let reusable = arena.insert_owned(Box::new(LuaState::new()));
         arena
             .remove_owned(reusable)
@@ -4394,7 +4590,7 @@ mod tests {
     fn duplicate_or_occupied_free_list_entries_cannot_overwrite_a_live_slot() {
         let issuer =
             StateHandleIssuer::try_new().expect("test runtime namespace should be available");
-        let mut arena = StateArena::new(issuer);
+        let mut arena = StateArena::new(issuer, AllocationLedger::new());
         let first = arena.insert_owned(Box::new(LuaState::new()));
         arena
             .remove_owned(first)
@@ -4424,7 +4620,7 @@ mod tests {
     fn arena_releases_one_thousand_owned_states_back_to_baseline() {
         let issuer =
             StateHandleIssuer::try_new().expect("test runtime namespace should be available");
-        let mut arena = StateArena::new(issuer);
+        let mut arena = StateArena::new(issuer, AllocationLedger::new());
         let baseline = arena.live_owned_state_count();
         let mut first_handle = None;
         let mut previous_generation = 0;
@@ -4482,7 +4678,7 @@ mod tests {
     fn arena_drain_closes_open_upvalue_before_invalidating_owner_handle() {
         let issuer =
             StateHandleIssuer::try_new().expect("test runtime namespace should be available");
-        let mut arena = StateArena::new(issuer);
+        let mut arena = StateArena::new(issuer, AllocationLedger::new());
         let mut gc = GarbageCollector::new();
         let owner = arena.insert_owned(Box::new(LuaState::new()));
         let arena_ptr = NonNull::from(&mut arena);

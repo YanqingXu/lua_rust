@@ -587,6 +587,30 @@ unsafe impl GcObject for Table {
 
         size
     }
+
+    fn get_allocator_payload_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.array
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(
+                self.hash.capacity().saturating_mul(
+                    std::mem::size_of::<Value>() * 2 + std::mem::size_of::<usize>(),
+                ),
+            )
+            .saturating_add(
+                self.hash_order
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(
+                self.hash_positions
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>() + std::mem::size_of::<usize>()),
+            )
+    }
 }
 
 impl Table {

@@ -156,10 +156,12 @@ function Test-RequiredFiles {
         "docs/rust_migration/runtime_ownership_rfc.md",
         "tests/compatibility/gc_root_inventory.json",
         "tests/compatibility/gc_mutation_inventory.json",
+        "tests/compatibility/allocator_accounting_inventory.json",
         "tests/compatibility/string_access_inventory.json",
         "tests/compatibility/m1-byte-differential-cases.json",
         "tools/check_gc_root_inventory.ps1",
         "tools/check_gc_mutation_contract.ps1",
+        "tools/check_allocator_contract.ps1",
         "tools/check_heap_contract.ps1",
         "tools/check_string_contract.ps1",
         "tools/run_lua51_differential.ps1"
@@ -483,6 +485,14 @@ try {
         -Arguments @("-Root", $Root, "-ResultPath", $mutationArtifact) `
         -Artifact $mutationArtifact
 
+    $allocatorArtifact =
+        Resolve-RootedPath "target/compatibility/allocator-accounting-contract.json"
+    Invoke-PowerShellStep `
+        -Name "allocator-accounting-contract" `
+        -Script (Join-Path $Root "tools/check_allocator_contract.ps1") `
+        -Arguments @("-Root", $Root, "-ResultPath", $allocatorArtifact) `
+        -Artifact $allocatorArtifact
+
     Invoke-PowerShellStep `
         -Name "raw-byte-comparator-self-test" `
         -Script (Join-Path $Root "tools/run_lua51_differential.ps1") `
@@ -608,17 +618,17 @@ $openDebts = @(
     [ordered]@{
         id = "deterministic-runtime-shutdown"
         blocks = "M1.8"
-        detail = "Deterministic Lua __gc drain plus state -> Thread -> ordinary -> fixed teardown and zero object/root/string/queue/state accounting are implemented; explicit service drain and allocator live-byte proof remain open."
+        detail = "Deterministic Lua __gc drain plus state -> Thread -> ordinary -> fixed teardown and zero object/root/string/queue/state/managed-allocator accounting are implemented; explicit IO/module service drain remains open."
     },
     [ordered]@{
         id = "automatic-gc-and-allocator-accounting"
         blocks = "M1.12-M1.13"
-        detail = "Production mutation inventory/barriers and Runtime-owned incremental pause/propagate/atomic/sweep/finalize with debt, pause, stepmul, bounded step work, weak/finalizer semantics, and public control are implemented. Allocation-triggered checkpoints remain deliberately disabled pending allocator live/peak accounting and automatic-GC gates."
+        detail = "Managed allocator live/peak/total accounting and Runtime instruction-boundary automatic collection are implemented and gated. System allocator metadata, failure injection, Miri/ASan evidence, and future public allocator callbacks remain open."
     },
     [ordered]@{
         id = "generational-gc-handles-and-publication-roots"
-            blocks = "allocation-triggered automatic sweep"
-        detail = "GcRef carries non-reused ObjectId provenance, StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement, lexical publication roots and HeapId service pairing are implemented, production string Eq/Hash is identity-only with scoped byte access, and public full plus incremental collection are integrated. Broader non-string object contexts, allocator accounting, and allocation-triggered automatic checkpoints remain open."
+            blocks = "broader scoped object access"
+        detail = "GcRef carries non-reused ObjectId provenance, StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement, lexical publication roots and HeapId service pairing are implemented, production string Eq/Hash is identity-only with scoped byte access, and public full, incremental, and automatic collection are integrated. Broader non-string object contexts remain open."
     }
 )
 
@@ -630,7 +640,7 @@ $result = [ordered]@{
         "m1-foundation-gate"
     }
     mode = if ($Smoke) { "smoke" } else { "full" }
-    scope = "ByteString and canonical/scoped production string access, unique Heap/service ownership and HeapId pairing, fixed/pending-finalizer/runtime-service roots, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, production mutation inventory and checked post-write barriers, compiler, library/package, IO, VM/app, and synchronous result publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, Lua-visible full-graph STW plus bounded incremental pause/propagate/atomic/sweep/finalize with weak/finalizer/resurrection, and byte differential"
+    scope = "ByteString and canonical/scoped production string access, unique Heap/service ownership and HeapId pairing, fixed/pending-finalizer/runtime-service roots, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, production mutation inventory and checked post-write barriers, managed allocator live/peak/total accounting, allocation-triggered Runtime safe points, compiler, library/package, IO, VM/app, and synchronous result publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, Lua-visible full-graph STW plus bounded incremental pause/propagate/atomic/sweep/finalize with weak/finalizer/resurrection, and byte differential"
     checksPassed = $failures.Count -eq 0
     foundationPassed = (
         $failures.Count -eq 0 -and

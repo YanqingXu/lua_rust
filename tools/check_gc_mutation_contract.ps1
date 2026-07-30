@@ -41,8 +41,11 @@ try {
             "GarbageCollector::after_managed_mutation") {
         $failures.Add("inventory must name the checked mutation context and barrier")
     }
-    if ($inventory.mutation_context.automatic_trigger -ne "disabled") {
-        $failures.Add("allocation-triggered collection must remain disabled in M1.11")
+    if ($inventory.mutation_context.automatic_trigger -ne
+        "runtime_instruction_safe_point") {
+        $failures.Add(
+            "allocation-triggered collection must use the audited Runtime instruction safe point"
+        )
     }
 
     $families = @($inventory.families)
@@ -114,6 +117,10 @@ try {
         "crates/lua_vm/src/runtime/incremental_collection.rs" = @(
             "collect_incremental_step_at_safe_point",
             "incremental_sweep_step"
+        )
+        "crates/lua_vm/src/execute.rs" = @(
+            "automatic_step_due",
+            "VmExit::AutomaticGc"
         )
     }
     foreach ($relative in $requiredSources.Keys) {

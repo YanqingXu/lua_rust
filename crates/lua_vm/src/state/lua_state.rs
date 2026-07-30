@@ -202,6 +202,52 @@ impl LuaState {
         }
     }
 
+    /// Managed payload bytes owned by this state and its growable containers.
+    ///
+    /// Hash-table control bytes and host allocator metadata are deliberately
+    /// outside the managed payload contract.
+    pub(crate) fn allocator_payload_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>()
+            .saturating_add(
+                self.stack
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(
+                self.call_stack
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CallInfo>()),
+            )
+            .saturating_add(self.debug_hook_mask.capacity())
+            .saturating_add(
+                self.open_upvalues
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<GcRef<Upvalue>>()),
+            )
+            .saturating_add(
+                self.yielded_values
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            );
+        for call in &self.call_stack {
+            bytes = bytes.saturating_add(
+                call.varargs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            );
+        }
+        bytes = bytes.saturating_add(self.debug_name_cache.capacity().saturating_mul(
+            std::mem::size_of::<((usize, usize, usize), (Option<String>, String))>(),
+        ));
+        for (name, source) in self.debug_name_cache.values() {
+            bytes = bytes.saturating_add(source.capacity());
+            if let Some(name) = name {
+                bytes = bytes.saturating_add(name.capacity());
+            }
+        }
+        bytes
+    }
+
     /// Read one live Lua string only within the owner collector's validation
     /// scope. The callback cannot return a borrow tied to the managed object.
     pub fn with_string_bytes<R>(

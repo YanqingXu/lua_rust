@@ -138,6 +138,7 @@ impl GarbageCollector {
 
     fn reset_incremental_state(&mut self) {
         self.incremental_phase = IncrementalPhase::Pause;
+        self.automatic_cycle_active = false;
         self.incremental_sweep_current = std::ptr::null_mut();
         self.incremental_sweep_previous = std::ptr::null_mut();
         self.incremental_collected = 0;
@@ -159,6 +160,56 @@ impl GarbageCollector {
     /// Whether automatic progress is stopped.
     pub fn is_automatic_stopped(&self) -> bool {
         self.automatic_stopped
+    }
+
+    /// Temporarily defer automatic VM checkpoints across a synchronous helper
+    /// boundary that cannot yield to the Runtime scheduler.
+    #[doc(hidden)]
+    pub fn suspend_automatic_checkpoints(&mut self) {
+        self.automatic_checkpoint_suspensions = self
+            .automatic_checkpoint_suspensions
+            .checked_add(1)
+            .expect("automatic checkpoint suspension depth overflow");
+    }
+
+    /// Leave one synchronous helper boundary.
+    #[doc(hidden)]
+    pub fn resume_automatic_checkpoints(&mut self) {
+        self.automatic_checkpoint_suspensions = self
+            .automatic_checkpoint_suspensions
+            .checked_sub(1)
+            .expect("automatic checkpoint suspension depth underflow");
+    }
+
+    /// Enter a Runtime-owned VM session that can service automatic exits.
+    #[doc(hidden)]
+    pub fn begin_automatic_checkpoint_driver(&mut self) {
+        assert!(
+            !self.automatic_checkpoint_driver_active,
+            "automatic checkpoint driver is already active"
+        );
+        self.automatic_checkpoint_driver_active = true;
+    }
+
+    /// Leave the Runtime-owned VM session.
+    #[doc(hidden)]
+    pub fn end_automatic_checkpoint_driver(&mut self) {
+        assert!(
+            self.automatic_checkpoint_driver_active,
+            "automatic checkpoint driver is not active"
+        );
+        self.automatic_checkpoint_driver_active = false;
+    }
+
+    /// Tag a new Pause-phase cycle as allocation-triggered.
+    #[doc(hidden)]
+    pub fn begin_automatic_cycle(&mut self) {
+        assert_eq!(
+            self.incremental_phase,
+            IncrementalPhase::Pause,
+            "only a paused collector can begin an automatic cycle"
+        );
+        self.automatic_cycle_active = true;
     }
 
     /// Return the configured pause percentage.
@@ -193,6 +244,23 @@ impl GarbageCollector {
     /// Diagnostic threshold used once automatic checkpoints are enabled.
     pub fn automatic_threshold_bytes(&self) -> usize {
         self.automatic_threshold_bytes
+    }
+
+    /// Whether the Runtime should yield at the next audited allocation safe
+    /// point and advance automatic incremental work.
+    pub fn automatic_step_due(&mut self) -> bool {
+        let live = self.allocation_account.stats().live_bytes;
+        self.gc_debt_bytes = i64::try_from(live)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(self.automatic_threshold_bytes).unwrap_or(i64::MAX));
+        self.automatic_checkpoint_driver_active
+            && !self.automatic_stopped
+            && self.automatic_checkpoint_suspensions == 0
+            && !self.finalizers_running
+            && ((self.incremental_phase == IncrementalPhase::Pause
+                && live >= self.automatic_threshold_bytes)
+                || (self.incremental_phase != IncrementalPhase::Pause
+                    && self.automatic_cycle_active))
     }
 
     /// Convert Lua's step argument into a bounded object/state work budget.
@@ -231,9 +299,10 @@ impl GarbageCollector {
 
     fn update_automatic_threshold_after_cycle(&mut self) {
         let pause = self.pause.max(100) as usize;
-        let paused = self.total_memory.saturating_mul(pause) / 100;
+        let live = self.allocation_account.stats().live_bytes;
+        let paused = live.saturating_mul(pause) / 100;
         self.automatic_threshold_bytes = paused.max(MINIMUM_AUTOMATIC_THRESHOLD);
-        self.gc_debt_bytes = i64::try_from(self.total_memory)
+        self.gc_debt_bytes = i64::try_from(live)
             .unwrap_or(i64::MAX)
             .saturating_sub(i64::try_from(self.automatic_threshold_bytes).unwrap_or(i64::MAX));
     }
@@ -306,6 +375,33 @@ impl GarbageCollector {
                 _ => None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod automatic_tests {
+    use super::*;
+    use crate::table::Table;
+
+    #[test]
+    fn managed_allocation_threshold_honors_stop_and_helper_suspension() {
+        let mut gc = GarbageCollector::new();
+        gc.begin_automatic_checkpoint_driver();
+        assert!(!gc.automatic_step_due());
+
+        let _large = gc.create(Table::with_capacity(8_192, 0));
+        assert!(gc.automatic_step_due());
+
+        gc.stop_automatic();
+        assert!(!gc.automatic_step_due());
+        gc.restart_automatic();
+        assert!(gc.automatic_step_due());
+
+        gc.suspend_automatic_checkpoints();
+        assert!(!gc.automatic_step_due());
+        gc.resume_automatic_checkpoints();
+        assert!(gc.automatic_step_due());
+        gc.end_automatic_checkpoint_driver();
     }
 }
 

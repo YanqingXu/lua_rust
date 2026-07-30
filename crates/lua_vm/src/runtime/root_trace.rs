@@ -773,27 +773,6 @@ fn snapshot_state(state: &LuaState, handle: StateHandle, is_main: bool) -> State
         snapshot.push_value(RuntimeRootKind::LastError, error.clone());
     }
 
-    let stack_size = state.stack.size();
-    if state.top > stack_size {
-        snapshot.gaps.push(UnsafeTraceGap {
-            state: handle,
-            kind: UnsafeTraceGapKind::StackWindowOutOfBounds {
-                top: state.top,
-                available: stack_size,
-            },
-        });
-    }
-    let stack_kind = if is_main {
-        RuntimeRootKind::MainStack
-    } else {
-        RuntimeRootKind::CoroutineStack
-    };
-    for index in 0..state.top.min(stack_size) {
-        if let Some(value) = state.stack.at(index) {
-            snapshot.push_value(stack_kind, value.clone());
-        }
-    }
-
     let active_frames = match state.current_ci.checked_add(1) {
         Some(requested) if requested <= state.call_stack.len() => requested,
         _ => {
@@ -807,6 +786,35 @@ fn snapshot_state(state: &LuaState, handle: StateHandle, is_main: bool) -> State
             state.call_stack.len()
         }
     };
+    let active_stack_top = state
+        .call_stack
+        .iter()
+        .take(active_frames)
+        .map(|call_info| call_info.top)
+        .max()
+        .unwrap_or(state.top)
+        .max(state.top);
+    let stack_size = state.stack.size();
+    if active_stack_top > stack_size {
+        snapshot.gaps.push(UnsafeTraceGap {
+            state: handle,
+            kind: UnsafeTraceGapKind::StackWindowOutOfBounds {
+                top: active_stack_top,
+                available: stack_size,
+            },
+        });
+    }
+    let stack_kind = if is_main {
+        RuntimeRootKind::MainStack
+    } else {
+        RuntimeRootKind::CoroutineStack
+    };
+    for index in 0..active_stack_top.min(stack_size) {
+        if let Some(value) = state.stack.at(index) {
+            snapshot.push_value(stack_kind, value.clone());
+        }
+    }
+
     for (frame, call_info) in state.call_stack.iter().take(active_frames).enumerate() {
         let idle_placeholder = frame == 0
             && active_frames == 1

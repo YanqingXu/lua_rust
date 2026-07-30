@@ -6,7 +6,7 @@
     "barrier_symbol": "GarbageCollector::after_managed_mutation",
     "sweep_policy": "A checked managed-object write during Sweep abandons the remaining cursor. Propagate/Atomic writes re-trace black owners; a changed cross-StateArena edge abandons Propagate.",
     "allocation_policy": "Objects allocated during an active cycle are black and publish their complete initial object graph. Thread/Upvalue allocation conservatively restarts because lua_core cannot enqueue StateHandles.",
-    "automatic_trigger": "disabled"
+    "automatic_trigger": "runtime_instruction_safe_point"
   },
   "families": [
     {
@@ -81,7 +81,7 @@
         {"path": "crates/lua_vm/src/runtime/root_trace.rs", "symbol": "snapshot_state"},
         {"path": "crates/lua_vm/src/runtime/root_trace.rs", "symbol": "IncrementalRootTrace::atomic_rescan"}
       ],
-      "mechanism": "State writes occur only during scheduler turns. Every cycle snapshots reachable states initially and re-scans all known reachable states plus temporary roots at Atomic."
+      "mechanism": "State writes occur only during scheduler turns. Root snapshots cover logical top plus every active CallInfo register window and re-scan all known reachable states at Atomic. Allocation-triggered cycles run to completion at one safe point; explicit bounded cycles retain the audited Atomic rescan contract."
     },
     {
       "family": "RUNTIME_ROOTS",

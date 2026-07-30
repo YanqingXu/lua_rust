@@ -17,6 +17,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 // Phase 1.1: Types + Value system ✅
+pub mod allocator;
 pub mod byte_string;
 pub mod light_userdata;
 pub mod state_handle;
