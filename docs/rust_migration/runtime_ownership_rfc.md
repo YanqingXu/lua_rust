@@ -641,9 +641,10 @@ The StateHandle issuance/exhaustion slice is complete locally:
   corrupted free-list, real stale/foreign tracing, and MAX-generation close
   have focused regressions.
 
-Phase B remains incomplete because arena ownership of the main state and the
-deep-chain/broader coroutine fault matrix are still outstanding. The
-debug/protected-helper cross-state scheduling slice is described in B.5.
+Phase B remains incomplete because arena ownership of the main state and
+arbitrary-Lua protected-helper suspension are still outstanding. The
+debug/protected-helper cross-state scheduling slice is described in B.5; the
+deep-chain/broader fault matrix is now covered by B.3.
 
 #### B.2 Implemented Runtime turn-borrow substrate (partial)
 
@@ -702,7 +703,9 @@ This is a completed local trampoline slice, not completion of Phase B:
 
 - debug cross-state Upvalue operations now use the sealed request protocol
   described in B.5;
-- deep-chain and broader fault-injection matrices remain open;
+- 1,000-level resume/wrap plus mailbox/owner/response/unwind/shutdown fault
+  matrices now lock a peak of one borrowed state slot and zero retained
+  activation frames after success or failure;
 - main-state external ownership remains;
 - raw GC/StringPool backpointers are removed and the activation buffer is a
   canonical Runtime root provider. Lua-visible full STW now runs at released
@@ -1229,10 +1232,11 @@ requirements:
       ownership separate, and cover stop/restart, weak cleanup, and finalizers.
 
 The remaining risk is broader than this automatic entry: generic non-string
-scoped access, arbitrary-Lua protected-helper suspension, deep-chain/broader
-coroutine fault coverage, deferred cross-platform sanitizer execution, public
-allocator callbacks, binary-dump lifecycle, and explicit IO/module service
-drain still gate later production milestones.
+scoped access, arbitrary-Lua protected-helper suspension, deferred
+cross-platform sanitizer execution, public allocator callbacks, binary-dump
+lifecycle, and explicit IO/module service drain still gate later production
+milestones. Deep-chain and named scheduler fault boundaries now have local
+coverage.
 
 ## 11. Acceptance commands
 

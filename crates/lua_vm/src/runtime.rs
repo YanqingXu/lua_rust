@@ -100,6 +100,66 @@ pub enum RuntimePhase {
     Closed,
 }
 
+/// Runtime scheduler boundary used by one-shot durability fault injection.
+///
+/// This is a hidden test surface rather than a Lua-visible execution policy.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeFaultSite {
+    /// A Runtime-native request was published, sealed, and removed from the
+    /// requester mailbox, but has not yet been scheduled.
+    SealedMailboxTake,
+    /// An open-Upvalue transfer frame was rooted, but its owner state has not
+    /// yet been resolved.
+    UpvalueOwnerResolve,
+    /// An owner response was rooted, but has not yet been delivered to the
+    /// requester state.
+    UpvalueResponseDelivery,
+    /// A coroutine stopped while its activation links still need restoration.
+    ActivationUnwind,
+    /// Shutdown validation passed, but no finalizer or ownership mutation has
+    /// started.
+    ShutdownPreflight,
+}
+
+/// Observable scheduler invariants from the most recent execution session.
+///
+/// Current depths must return to zero after every success or failure. Peak
+/// values make deep-chain tests independent of host stack layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeActivationStats {
+    /// Runtime-owned state turns executed in the session.
+    pub executed_turns: usize,
+    /// Largest number of nested coroutine resume/wrap frames.
+    pub peak_resume_depth: usize,
+    /// Largest number of ordinary open-Upvalue transfer frames.
+    pub peak_upvalue_transfer_depth: usize,
+    /// Largest number of debug-library open-Upvalue transfer frames.
+    pub peak_debug_upvalue_transfer_depth: usize,
+    /// Largest combined activation/root-transfer buffer depth.
+    pub peak_rooted_activation_depth: usize,
+    /// Largest number of StateArena slots borrowed at the same instant.
+    pub peak_borrowed_state_slots: usize,
+    /// Coroutine frames still retained after the session.
+    pub current_resume_depth: usize,
+    /// Ordinary open-Upvalue transfers still retained after the session.
+    pub current_upvalue_transfer_depth: usize,
+    /// Debug open-Upvalue transfers still retained after the session.
+    pub current_debug_upvalue_transfer_depth: usize,
+    /// GC/finalizer frames still retained after the session.
+    pub current_gc_depth: usize,
+}
+
+impl RuntimeActivationStats {
+    /// Total Runtime-owned activation and transfer frames still retained.
+    pub fn current_rooted_activation_depth(self) -> usize {
+        self.current_resume_depth
+            .saturating_add(self.current_upvalue_transfer_depth)
+            .saturating_add(self.current_debug_upvalue_transfer_depth)
+            .saturating_add(self.current_gc_depth)
+    }
+}
+
 /// Failure to access or close a runtime.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum RuntimeAccessError {
@@ -142,6 +202,14 @@ pub enum RuntimeAccessError {
         runtime_id: RuntimeId,
         /// Arena validation failure.
         source: StateResolveError,
+    },
+    /// A durability-test fault stopped the operation at its named boundary.
+    #[error("runtime {runtime_id:?} injected a fault at {site:?}")]
+    InjectedFault {
+        /// Runtime whose operation was interrupted.
+        runtime_id: RuntimeId,
+        /// Boundary selected by the one-shot fault plan.
+        site: RuntimeFaultSite,
     },
 }
 
@@ -194,9 +262,50 @@ struct NativeActivationStack {
     upvalue_transfers: Vec<UpvalueTransferFrame>,
     debug_upvalue_transfers: Vec<DebugUpvalueTransferFrame>,
     gc_frames: Vec<GcActivationFrame>,
+    stats: NativeActivationCounters,
 }
 
 impl NativeActivationStack {
+    fn begin_session(&mut self) {
+        self.stats = NativeActivationCounters::default();
+    }
+
+    fn observe_turn(&mut self) {
+        self.stats.executed_turns = self.stats.executed_turns.saturating_add(1);
+        self.stats.peak_resume_depth = self.stats.peak_resume_depth.max(self.frames.len());
+        self.stats.peak_upvalue_transfer_depth = self
+            .stats
+            .peak_upvalue_transfer_depth
+            .max(self.upvalue_transfers.len());
+        self.stats.peak_debug_upvalue_transfer_depth = self
+            .stats
+            .peak_debug_upvalue_transfer_depth
+            .max(self.debug_upvalue_transfers.len());
+        let rooted_depth = self
+            .frames
+            .len()
+            .saturating_add(self.upvalue_transfers.len())
+            .saturating_add(self.debug_upvalue_transfers.len())
+            .saturating_add(self.gc_frames.len());
+        self.stats.peak_rooted_activation_depth =
+            self.stats.peak_rooted_activation_depth.max(rooted_depth);
+    }
+
+    fn snapshot(&self, peak_borrowed_state_slots: usize) -> RuntimeActivationStats {
+        RuntimeActivationStats {
+            executed_turns: self.stats.executed_turns,
+            peak_resume_depth: self.stats.peak_resume_depth,
+            peak_upvalue_transfer_depth: self.stats.peak_upvalue_transfer_depth,
+            peak_debug_upvalue_transfer_depth: self.stats.peak_debug_upvalue_transfer_depth,
+            peak_rooted_activation_depth: self.stats.peak_rooted_activation_depth,
+            peak_borrowed_state_slots,
+            current_resume_depth: self.frames.len(),
+            current_upvalue_transfer_depth: self.upvalue_transfers.len(),
+            current_debug_upvalue_transfer_depth: self.debug_upvalue_transfers.len(),
+            current_gc_depth: self.gc_frames.len(),
+        }
+    }
+
     fn seed_roots(&self, gc: &mut GarbageCollector) {
         for frame in &self.frames {
             frame.request.seed_roots(gc);
@@ -229,6 +338,38 @@ impl NativeActivationStack {
                 response.seed_roots(gc);
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NativeActivationCounters {
+    executed_turns: usize,
+    peak_resume_depth: usize,
+    peak_upvalue_transfer_depth: usize,
+    peak_debug_upvalue_transfer_depth: usize,
+    peak_rooted_activation_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimeFaultInjection {
+    site: RuntimeFaultSite,
+    successful_matching_checkpoints: usize,
+}
+
+impl RuntimeFaultInjection {
+    fn checkpoint(plan: &mut Option<Self>, site: RuntimeFaultSite) -> bool {
+        let Some(active) = plan.as_mut() else {
+            return false;
+        };
+        if active.site != site {
+            return false;
+        }
+        if active.successful_matching_checkpoints != 0 {
+            active.successful_matching_checkpoints -= 1;
+            return false;
+        }
+        *plan = None;
+        true
     }
 }
 
@@ -637,7 +778,6 @@ pub struct StateArena {
     allocation_account: AllocationAccount,
     #[cfg(test)]
     turn_borrow_events: Vec<TurnBorrowEvent>,
-    #[cfg(test)]
     peak_turn_borrowed_slots: usize,
 }
 
@@ -673,7 +813,6 @@ impl StateArena {
             allocation_account: AllocationAccount::new(allocator),
             #[cfg(test)]
             turn_borrow_events: Vec::new(),
-            #[cfg(test)]
             peak_turn_borrowed_slots: 0,
         }
     }
@@ -1073,10 +1212,11 @@ impl StateArena {
         self.slots[handle.slot()].borrowed = true;
         self.turn_borrow = Some(handle);
 
+        let borrowed_slots = self.slots.iter().filter(|slot| slot.borrowed).count();
+        self.peak_turn_borrowed_slots = self.peak_turn_borrowed_slots.max(borrowed_slots);
+
         #[cfg(test)]
         {
-            let borrowed_slots = self.slots.iter().filter(|slot| slot.borrowed).count();
-            self.peak_turn_borrowed_slots = self.peak_turn_borrowed_slots.max(borrowed_slots);
             self.turn_borrow_events
                 .push(TurnBorrowEvent::Acquired(handle));
         }
@@ -1880,6 +2020,7 @@ pub struct Runtime {
     registry_root: Option<GcRef<Table>>,
     fixed_strings: Vec<GcRef<GcString>>,
     shutdown_summary: Option<RuntimeShutdownSummary>,
+    runtime_fault_injection: Option<RuntimeFaultInjection>,
     heap: Pin<Box<RuntimeStorage>>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
@@ -1962,6 +2103,7 @@ impl Runtime {
             registry_root: Some(registry_root),
             fixed_strings,
             shutdown_summary: None,
+            runtime_fault_injection: None,
             heap,
             _not_send_or_sync: PhantomData,
         })
@@ -2055,6 +2197,32 @@ impl Runtime {
     /// Snapshot managed allocator live/peak/cumulative payload bytes.
     pub fn allocator_stats(&self) -> AllocatorStats {
         self.heap.as_ref().get_ref().heap.allocator_stats()
+    }
+
+    /// Return scheduler depth and cleanup invariants for the last execution.
+    pub fn activation_stats(&self) -> RuntimeActivationStats {
+        let heap = self.heap.as_ref().get_ref();
+        heap.native_activations
+            .snapshot(heap.state_arena().peak_turn_borrowed_slots)
+    }
+
+    /// Install a one-shot Runtime scheduler failure for durability tests.
+    #[doc(hidden)]
+    pub fn inject_runtime_fault_after(
+        &mut self,
+        site: RuntimeFaultSite,
+        successful_matching_checkpoints: usize,
+    ) {
+        self.runtime_fault_injection = Some(RuntimeFaultInjection {
+            site,
+            successful_matching_checkpoints,
+        });
+    }
+
+    /// Remove a pending Runtime scheduler durability-test failure.
+    #[doc(hidden)]
+    pub fn clear_runtime_fault_injection(&mut self) {
+        self.runtime_fault_injection = None;
     }
 
     /// Install a one-shot managed-allocation failure plan for durability tests.
@@ -2309,6 +2477,7 @@ impl Runtime {
             active_executions: &mut self.active_executions,
         };
         let runtime_id = self.id;
+        let runtime_fault_injection = &mut self.runtime_fault_injection;
 
         // SAFETY: RuntimeStorage was pinned at construction. The arena, collector,
         // and activation stack are disjoint fields and remain at stable
@@ -2328,6 +2497,10 @@ impl Runtime {
         let (gc, string_pool) = heap.heap.parts_mut();
         let activations = &mut heap.native_activations;
         let incremental_trace = &mut heap.incremental_trace;
+        // SAFETY: execute_proto owns the Runtime, no state turn has started,
+        // and the pinned arena is disjoint from the activation stack.
+        unsafe { arena.as_mut() }.peak_turn_borrowed_slots = 0;
+        activations.begin_session();
         gc.begin_automatic_checkpoint_driver();
         let _activation_cleanup = NativeActivationSessionGuard {
             activations: NonNull::from(&mut *activations),
@@ -2338,6 +2511,7 @@ impl Runtime {
         let mut action = NativeDriverAction::StartProto(proto);
         let mut pending_native_delivery = None;
         loop {
+            activations.observe_turn();
             activations.seed_roots(gc);
             let driver_role = action.role();
             let completed_activation = match &action {
@@ -2375,6 +2549,16 @@ impl Runtime {
                 })
             })
             .map_err(|source| RuntimeAccessError::StateArena { runtime_id, source })??;
+            if matches!(event, NativeTurnEvent::Request { .. })
+                && RuntimeFaultInjection::checkpoint(
+                    runtime_fault_injection,
+                    RuntimeFaultSite::SealedMailboxTake,
+                )
+            {
+                return Err(RuntimeExecutionError::Protocol(
+                    "injected Runtime fault at SealedMailboxTake".to_string(),
+                ));
+            }
             if completed_upvalue_transfer {
                 activations.upvalue_transfers.pop().ok_or_else(|| {
                     RuntimeExecutionError::Protocol(
@@ -2649,6 +2833,14 @@ impl Runtime {
                                     request: request.clone(),
                                     response: None,
                                 });
+                            if RuntimeFaultInjection::checkpoint(
+                                runtime_fault_injection,
+                                RuntimeFaultSite::UpvalueOwnerResolve,
+                            ) {
+                                return Err(RuntimeExecutionError::Protocol(
+                                    "injected Runtime fault at UpvalueOwnerResolve".to_string(),
+                                ));
+                            }
                             let response = resolve_debug_upvalue_request(
                                 arena,
                                 gc,
@@ -2666,6 +2858,14 @@ impl Runtime {
                                     )
                                 })?;
                             transfer.response = Some(response);
+                            if RuntimeFaultInjection::checkpoint(
+                                runtime_fault_injection,
+                                RuntimeFaultSite::UpvalueResponseDelivery,
+                            ) {
+                                return Err(RuntimeExecutionError::Protocol(
+                                    "injected Runtime fault at UpvalueResponseDelivery".to_string(),
+                                ));
+                            }
                             action = NativeDriverAction::DeliverDebugUpvalue(transfer.clone());
                             current = request.requester;
                             continue;
@@ -2745,6 +2945,14 @@ impl Runtime {
                         request: request.clone(),
                         response: None,
                     });
+                    if RuntimeFaultInjection::checkpoint(
+                        runtime_fault_injection,
+                        RuntimeFaultSite::UpvalueOwnerResolve,
+                    ) {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "injected Runtime fault at UpvalueOwnerResolve".to_string(),
+                        ));
+                    }
                     let response =
                         StateArena::with_turn_state_mut(arena, request.owner, |owner_state| {
                             with_vm_context_parts(
@@ -2765,6 +2973,14 @@ impl Runtime {
                         )
                     })?;
                     transfer.response = Some(response);
+                    if RuntimeFaultInjection::checkpoint(
+                        runtime_fault_injection,
+                        RuntimeFaultSite::UpvalueResponseDelivery,
+                    ) {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "injected Runtime fault at UpvalueResponseDelivery".to_string(),
+                        ));
+                    }
                     action = NativeDriverAction::DeliverUpvalue(transfer.clone());
                     current = request.requester;
                 }
@@ -2777,6 +2993,14 @@ impl Runtime {
                     if frame.request.thread != thread {
                         return Err(RuntimeExecutionError::Protocol(
                             "stopped coroutine does not match activation target".to_string(),
+                        ));
+                    }
+                    if RuntimeFaultInjection::checkpoint(
+                        runtime_fault_injection,
+                        RuntimeFaultSite::ActivationUnwind,
+                    ) {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "injected Runtime fault at ActivationUnwind".to_string(),
                         ));
                     }
                     restore_native_activation_links(gc, frame)?;
@@ -3016,6 +3240,15 @@ impl Runtime {
                         source,
                     }
                 })?;
+                if RuntimeFaultInjection::checkpoint(
+                    &mut self.runtime_fault_injection,
+                    RuntimeFaultSite::ShutdownPreflight,
+                ) {
+                    return Err(RuntimeAccessError::InjectedFault {
+                        runtime_id: self.id,
+                        site: RuntimeFaultSite::ShutdownPreflight,
+                    });
+                }
                 let close_finalizers = self.drain_finalizers_for_close();
                 self.validate_shutdown_state().map_err(|source| {
                     RuntimeAccessError::StateArena {

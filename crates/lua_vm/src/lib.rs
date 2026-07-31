@@ -21,9 +21,9 @@ pub use execute::{
 };
 pub use native::{NativeRequestId, UpvalueAccessOperation, UpvalueAccessRequest};
 pub use runtime::{
-    PendingState, PendingStateError, Runtime, RuntimeAccessError, RuntimeCloseReport,
-    RuntimeExecutionError, RuntimeId, RuntimeIdExhausted, RuntimePartsMut, RuntimePhase,
-    StateArena, StateHandle, StateResolveError,
+    PendingState, PendingStateError, Runtime, RuntimeAccessError, RuntimeActivationStats,
+    RuntimeCloseReport, RuntimeExecutionError, RuntimeFaultSite, RuntimeId, RuntimeIdExhausted,
+    RuntimePartsMut, RuntimePhase, StateArena, StateHandle, StateResolveError,
 };
 pub use state::{
     CallInfo, LUA_MULTRET, LuaState, Stack, ThreadStatus, with_vm_context, with_vm_context_parts,

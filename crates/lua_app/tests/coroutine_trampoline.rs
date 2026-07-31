@@ -104,3 +104,65 @@ fn closure_can_read_and_write_an_open_upvalue_owned_by_a_suspended_coroutine() {
         "true\t15\ntrue\t15\n"
     );
 }
+
+#[test]
+fn three_level_normal_ancestor_with_open_upvalue_matches_cpp_oracle() {
+    let output = run_lua(&[
+        "-e",
+        r#"
+        local log = ""
+        local replayed = false
+        local function noop() return nil end
+        local owner = coroutine.create(function()
+          local value = 0
+          local function touch(delta) value = value + delta; return value end
+          coroutine.yield(touch)
+          return value
+        end)
+        local owner_ok, touch = coroutine.resume(owner)
+        assert(owner_ok)
+        local a
+        local b
+        local c
+        a = coroutine.create(function(input)
+          log = log .. "Ae" .. touch(1) .. ";"
+          local ok, value = coroutine.resume(b, "from-A")
+          if replayed then
+            touch(10)
+            noop()
+            return "A-replay"
+          end
+          replayed = true
+          log = log .. "Aa" .. touch(10) .. ":" .. input .. ":" ..
+              ok .. ":" .. tostring(value) .. ";"
+          return "A-done"
+        end)
+        b = coroutine.create(function()
+          log = log .. "Be" .. touch(2) .. ";"
+          local ok, value = coroutine.resume(c, "from-B")
+          log = log .. "Ba" .. touch(20) .. ":" .. ok .. ":" .. value .. ";"
+          return "B-done"
+        end)
+        c = coroutine.create(function()
+          log = log .. "Ce" .. touch(3) .. ";"
+          local ok, value = coroutine.resume(a, "from-C")
+          log = log .. "Ca" .. touch(30) .. ":" .. ok .. ":" .. value .. ";"
+          return "C-done"
+        end)
+        local ok, value = coroutine.resume(a, "from-main")
+        if not ok then value = "<resume-error>" end
+        local owner_done, owner_value = coroutine.resume(owner)
+        print(ok, value, owner_done, owner_value, log)
+        "#,
+    ]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("oracle output is UTF-8"),
+        concat!(
+            "false\t<resume-error>\ttrue\t76\t",
+            "Ae1;Be3;Ce6;Aa16:from-main:from-C:nil;\n"
+        )
+    );
+}

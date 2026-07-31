@@ -1,13 +1,15 @@
 use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::parser::Parser;
 use lua_core::gc::gc_object::GcObject;
+use lua_core::gc::gc_ref::GcRef;
+use lua_core::proto::Proto;
 use lua_core::value::Value;
 use lua_stdlib::catalog::open_all;
-use lua_vm::Runtime;
 use lua_vm::runtime::RuntimeRootKind;
+use lua_vm::{Runtime, RuntimeFaultSite, RuntimePhase};
 use std::path::{Path, PathBuf};
 
-fn compile_and_run(source: &str) -> (Runtime, ()) {
+fn compile_runtime(source: &str) -> (Runtime, GcRef<Proto>) {
     let mut runtime = Runtime::new();
     let proto = {
         let mut parts = runtime.parts_mut().expect("runtime parts are available");
@@ -22,6 +24,11 @@ fn compile_and_run(source: &str) -> (Runtime, ()) {
             .expect("codegen should succeed");
         gc.create(proto)
     };
+    (runtime, proto)
+}
+
+fn compile_and_run(source: &str) -> (Runtime, ()) {
+    let (mut runtime, proto) = compile_runtime(source);
     runtime
         .execute_proto(proto)
         .expect("Runtime trampoline should execute");
@@ -1881,4 +1888,253 @@ fn alien_signals_init_entry_loads_and_updates_reactive_graph() {
 
     let (state, _gc) = compile_and_run(&source);
     assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
+fn thousand_level_resume_and_wrap_chains_bound_borrows_and_release_transfers() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local depth = 1000
+        local trace = ""
+        local owner = coroutine.create(function()
+            local value = 0
+            local function touch(delta)
+                value = value + delta
+                return value
+            end
+            coroutine.yield(touch)
+            return value
+        end)
+        local owner_ok, touch = coroutine.resume(owner)
+        assert(owner_ok and type(touch) == "function")
+
+        local chain = {}
+        for i = 1, depth do
+            local index = i
+            chain[index] = coroutine.create(function(value)
+                if index == depth then
+                    trace = trace .. "resume-leaf;"
+                    return touch(value + 1)
+                end
+                local ok, result = coroutine.resume(chain[index + 1], value + 1)
+                assert(ok, result)
+                if index == depth - 1 then trace = trace .. "resume-near;" end
+                if index == 1 then trace = trace .. "resume-root;" end
+                return result + 1
+            end)
+        end
+        local resume_ok, resume_result = coroutine.resume(chain[1], 0)
+        assert(resume_ok and resume_result == 1999, resume_result)
+
+        local wrapped = {}
+        wrapped[depth] = coroutine.wrap(function(value)
+            trace = trace .. "wrap-leaf;"
+            local name, current = debug.getupvalue(touch, 1)
+            assert(name == "value" and current == 1000)
+            assert(debug.setupvalue(touch, 1, 20) == "value")
+            return touch(value + 1)
+        end)
+        for i = depth - 1, 1, -1 do
+            local index = i
+            wrapped[index] = coroutine.wrap(function(value)
+                local result = wrapped[index + 1](value + 1)
+                if index == depth - 1 then trace = trace .. "wrap-near;" end
+                if index == 1 then trace = trace .. "wrap-root;" end
+                return result + 1
+            end)
+        end
+        local wrap_result = wrapped[1](0)
+        assert(wrap_result == 2019, wrap_result)
+
+        local owner_done, owner_value = coroutine.resume(owner)
+        assert(owner_done and owner_value == 1020, owner_value)
+        trace = trace .. "owner-done;"
+
+        chain, wrapped, owner, touch = nil, nil, nil, nil
+        collectgarbage("collect")
+        return trace
+        "#,
+    );
+
+    assert_eq!(
+        returned_string(&runtime),
+        concat!(
+            "resume-leaf;resume-near;resume-root;",
+            "wrap-leaf;wrap-near;wrap-root;owner-done;"
+        )
+    );
+    let stats = runtime.activation_stats();
+    assert_eq!(stats.peak_resume_depth, 1000);
+    assert_eq!(stats.peak_upvalue_transfer_depth, 1);
+    assert_eq!(stats.peak_debug_upvalue_transfer_depth, 1);
+    assert_eq!(stats.peak_rooted_activation_depth, 1001);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    assert_eq!(runtime.active_execution_count(), 0);
+    assert_eq!(runtime.temporary_state_root_count(), 0);
+    assert_eq!(runtime.live_coroutine_state_count(), 0);
+
+    let report = runtime.close().expect("deep-chain Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
+fn scheduler_fault_matrix_clears_activations_and_closes_open_upvalues() {
+    let cases = [
+        (
+            RuntimeFaultSite::SealedMailboxTake,
+            r#"
+            local thread = coroutine.create(function() return 1 end)
+            local ok, value = coroutine.resume(thread)
+            return ok, value
+            "#,
+            0,
+        ),
+        (
+            RuntimeFaultSite::UpvalueOwnerResolve,
+            r#"
+            local owner = coroutine.create(function()
+                local value = 10
+                local function read() return value end
+                coroutine.yield(read)
+                return value
+            end)
+            local ok, read = coroutine.resume(owner)
+            assert(ok)
+            local value = read()
+            return value
+            "#,
+            1,
+        ),
+        (
+            RuntimeFaultSite::UpvalueResponseDelivery,
+            r#"
+            local owner = coroutine.create(function()
+                local value = 20
+                local function read() return value end
+                coroutine.yield(read)
+                return value
+            end)
+            local ok, read = coroutine.resume(owner)
+            assert(ok)
+            local name, value = debug.getupvalue(read, 1)
+            return name, value
+            "#,
+            1,
+        ),
+        (
+            RuntimeFaultSite::ActivationUnwind,
+            r#"
+            local leaf = coroutine.create(function()
+                local value = 30
+                local function read() return value end
+                coroutine.yield(read)
+                return value
+            end)
+            local middle = coroutine.create(function()
+                local ok, read = coroutine.resume(leaf)
+                return ok, read
+            end)
+            local root = coroutine.create(function()
+                local ok, read = coroutine.resume(middle)
+                return ok, read
+            end)
+            local ok, read = coroutine.resume(root)
+            return ok, read
+            "#,
+            1,
+        ),
+    ];
+
+    for (site, source, minimum_closed_upvalues) in cases {
+        let (mut runtime, proto) = compile_runtime(source);
+        runtime.inject_runtime_fault_after(site, 0);
+        let error = runtime
+            .execute_proto(proto)
+            .expect_err("selected scheduler boundary must fail once");
+        assert!(
+            error.to_string().contains(&format!("{site:?}")),
+            "unexpected fault result for {site:?}: {error}"
+        );
+        let stats = runtime.activation_stats();
+        assert_eq!(
+            stats.current_rooted_activation_depth(),
+            0,
+            "{site:?} retained a Runtime-owned transfer"
+        );
+        assert_eq!(stats.peak_borrowed_state_slots, 1);
+        if site == RuntimeFaultSite::ActivationUnwind {
+            assert_eq!(stats.peak_resume_depth, 3);
+        }
+        assert_eq!(runtime.active_execution_count(), 0);
+        assert_eq!(runtime.temporary_state_root_count(), 0);
+        runtime.trace_roots_mark_only().unwrap_or_else(|error| {
+            panic!("{site:?} cleanup left an invalid State/Thread/Upvalue graph: {error}")
+        });
+
+        let report = runtime.close().unwrap_or_else(|error| {
+            panic!("{site:?} cleanup did not leave a closable Runtime: {error}")
+        });
+        assert_eq!(report.remaining_objects, 0);
+        assert_eq!(report.remaining_coroutine_states, 0);
+        assert_eq!(report.remaining_allocator_live_bytes, 0);
+        assert!(
+            report.closed_open_upvalues >= minimum_closed_upvalues,
+            "{site:?} did not close its owner-state Upvalue: {report:?}"
+        );
+        assert_eq!(report.rejected_open_upvalue_edges, 0);
+        assert_eq!(report.open_upvalue_owner_mismatches, 0);
+        assert_eq!(report.open_upvalue_stack_values_missing, 0);
+    }
+}
+
+#[test]
+fn shutdown_preflight_fault_is_retryable_before_any_owner_mutation() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local owner = coroutine.create(function()
+            local value = 40
+            local function read() return value end
+            coroutine.yield(read)
+            return value
+        end)
+        local ok, read = coroutine.resume(owner)
+        assert(ok and read() == 40)
+        return 40
+        "#,
+    );
+    let live_states = runtime.live_coroutine_state_count();
+    let live_bytes = runtime.allocator_stats().live_bytes;
+
+    runtime.inject_runtime_fault_after(RuntimeFaultSite::ShutdownPreflight, 0);
+    let error = runtime
+        .close()
+        .expect_err("shutdown preflight fault must stop before mutation");
+    assert!(matches!(
+        error,
+        lua_vm::RuntimeAccessError::InjectedFault {
+            site: RuntimeFaultSite::ShutdownPreflight,
+            ..
+        }
+    ));
+    assert_eq!(runtime.phase(), RuntimePhase::Running);
+    assert_eq!(runtime.live_coroutine_state_count(), live_states);
+    assert_eq!(runtime.allocator_stats().live_bytes, live_bytes);
+    assert_eq!(
+        runtime.activation_stats().current_rooted_activation_depth(),
+        0
+    );
+    runtime
+        .trace_roots_mark_only()
+        .expect("shutdown preflight fault preserves the checked owner graph");
+
+    let report = runtime
+        .close()
+        .expect("one-shot shutdown fault is retryable");
+    assert!(report.closed_open_upvalues >= 1);
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
 }

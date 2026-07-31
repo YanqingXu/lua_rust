@@ -825,6 +825,21 @@ impl Default for LuaState {
 mod tests {
     use super::*;
 
+    fn test_deferred_call(state: &LuaState, request_id: NativeRequestId) -> DeferredNativeCall {
+        DeferredNativeCall {
+            request_id,
+            func_pos: 0,
+            nargs: 0,
+            wanted_results: Some(0),
+            saved_ci: state.current_ci,
+            saved_top: state.top,
+            caller_proto: None,
+            caller_pc: None,
+            continuation: DeferredVmContinuation::Call,
+            snapshot: crate::native::StateContinuationSnapshot::capture(state),
+        }
+    }
+
     #[test]
     fn test_lua_state_new() {
         let ls = LuaState::new();
@@ -896,5 +911,66 @@ mod tests {
                 .iter()
                 .all(|ci| ci.proto.is_none() && ci.varargs.is_empty())
         );
+    }
+
+    #[test]
+    fn native_mailbox_publish_fault_clears_scope_and_owned_request() {
+        let mut state = LuaState::new();
+        let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state
+                .with_native_request_scope(|state| {
+                    state
+                        .publish_full_collection_request(FullCollectionResult::Collect)
+                        .expect("fault test publishes one request");
+                    panic!("injected failure after native mailbox publication");
+                })
+                .expect("mailbox scope opens");
+        }));
+        assert!(fault.is_err());
+        assert!(!state.native_request_scope);
+        assert!(state.pending_native_request.is_none());
+
+        let recovered = state
+            .with_native_request_scope(|state| {
+                let id = state
+                    .publish_full_collection_request(FullCollectionResult::Collect)
+                    .expect("mailbox is reusable after publication unwind");
+                let deferred = test_deferred_call(state, id);
+                assert!(state.seal_native_request(id, deferred));
+                state.take_native_request(id)
+            })
+            .expect("mailbox scope reopens");
+        assert!(matches!(recovered, Some(RuntimeRequest::FullCollection(_))));
+    }
+
+    #[test]
+    fn native_mailbox_seal_fault_clears_deferred_snapshot() {
+        let mut state = LuaState::new();
+        let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state
+                .with_native_request_scope(|state| {
+                    let id = state
+                        .publish_full_collection_request(FullCollectionResult::Collect)
+                        .expect("fault test publishes one request");
+                    let deferred = test_deferred_call(state, id);
+                    assert!(state.seal_native_request(id, deferred));
+                    panic!("injected failure after native mailbox seal");
+                })
+                .expect("mailbox scope opens");
+        }));
+        assert!(fault.is_err());
+        assert!(!state.native_request_scope);
+        assert!(state.pending_native_request.is_none());
+
+        state
+            .with_native_request_scope(|state| {
+                let id = state
+                    .publish_full_collection_request(FullCollectionResult::Step { size: 1 })
+                    .expect("mailbox is reusable after seal unwind");
+                let deferred = test_deferred_call(state, id);
+                assert!(state.seal_native_request(id, deferred));
+                assert!(state.take_native_request(id).is_some());
+            })
+            .expect("mailbox scope reopens");
     }
 }
