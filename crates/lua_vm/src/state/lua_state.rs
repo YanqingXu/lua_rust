@@ -22,7 +22,7 @@ use super::stack::Stack;
 use crate::native::{
     DebugUpvalueOperation, DebugUpvalueRequest, DeferredNativeCall, DeferredVmContinuation,
     FullCollectionRequest, FullCollectionResult, NativeRequestId, NativeRequestPublishError,
-    ResumeEnvelope, ResumeRequest, RuntimeRequest,
+    ProtectedCallKind, ProtectedCallRequest, ResumeEnvelope, ResumeRequest, RuntimeRequest,
 };
 use crate::runtime::StateArena;
 use thiserror::Error;
@@ -709,6 +709,37 @@ impl LuaState {
         Ok(id)
     }
 
+    pub(crate) fn publish_protected_call_request(
+        &mut self,
+        kind: ProtectedCallKind,
+        function: Value,
+        args: Vec<Value>,
+        handler: Option<Value>,
+    ) -> Result<NativeRequestId, NativeRequestPublishError> {
+        if !self.native_request_scope {
+            return Err(NativeRequestPublishError::ScopeUnavailable);
+        }
+        if self.pending_native_request.is_some() {
+            return Err(NativeRequestPublishError::MailboxOccupied);
+        }
+        let id = NativeRequestId::new(self.next_native_request_id);
+        self.next_native_request_id = self
+            .next_native_request_id
+            .checked_add(1)
+            .ok_or(NativeRequestPublishError::IdExhausted)?;
+        self.pending_native_request = Some(RuntimeRequest::ProtectedCall(Box::new(
+            ProtectedCallRequest {
+                id,
+                kind,
+                function,
+                args,
+                handler,
+                deferred: None,
+            },
+        )));
+        Ok(id)
+    }
+
     pub(crate) fn pending_native_request_id(&self) -> Option<NativeRequestId> {
         self.pending_native_request.as_ref().map(RuntimeRequest::id)
     }
@@ -794,6 +825,7 @@ impl LuaState {
                 request.protected = true;
                 request.deferred = None;
             }
+            RuntimeRequest::ProtectedCall(_) => return false,
         }
         true
     }

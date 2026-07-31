@@ -54,6 +54,10 @@ pub enum RuntimeNativeFunction {
     DebugGetUpvalue = 3,
     /// `debug.setupvalue`, including cross-state open-Upvalue writes.
     DebugSetUpvalue = 4,
+    /// Base-library `pcall`, driven by the Runtime so arbitrary Lua callees may suspend.
+    ProtectedCall = 5,
+    /// Base-library `xpcall`, including its Runtime-owned error-handler phase.
+    ProtectedXCall = 6,
 }
 
 // =====================================================================

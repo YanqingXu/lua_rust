@@ -51,7 +51,14 @@ pub fn open_base(l: &mut LuaState, gc: &mut GarbageCollector) {
         register(l, gc, global_table, "newproxy", lua_b_newproxy_raw);
         register(l, gc, global_table, "next", lua_b_next_raw);
         register(l, gc, global_table, "pairs", lua_b_pairs_raw);
-        register(l, gc, global_table, "pcall", lua_b_pcall_raw);
+        crate::registration::register_runtime_native(
+            l,
+            gc,
+            global_table,
+            b"pcall",
+            RuntimeNativeFunction::ProtectedCall,
+        )
+        .expect("pcall Runtime-native publication must remain collector-valid");
         register(l, gc, global_table, "print", lua_b_print_raw);
         register(l, gc, global_table, "rawequal", lua_b_rawequal_raw);
         register(l, gc, global_table, "rawget", lua_b_rawget_raw);
@@ -63,7 +70,14 @@ pub fn open_base(l: &mut LuaState, gc: &mut GarbageCollector) {
         register(l, gc, global_table, "type", lua_b_type_raw);
         register(l, gc, global_table, "tostring", lua_b_tostring_raw);
         register(l, gc, global_table, "unpack", lua_b_unpack_raw);
-        register(l, gc, global_table, "xpcall", lua_b_xpcall_raw);
+        crate::registration::register_runtime_native(
+            l,
+            gc,
+            global_table,
+            b"xpcall",
+            RuntimeNativeFunction::ProtectedXCall,
+        )
+        .expect("xpcall Runtime-native publication must remain collector-valid");
     }
 }
 
@@ -322,123 +336,6 @@ unsafe extern "C" fn lua_b_gcinfo_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
         .floor();
     l.push_value(Value::Number(kb));
     1
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// pcall
-// ═══════════════════════════════════════════════════════════════════
-
-unsafe extern "C" fn lua_b_pcall_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: _l_ptr is the LuaState pointer passed by the VM CALL handler.
-    let l: &mut LuaState = unsafe { &mut *(_l_ptr as *mut LuaState) };
-    let nargs = l.get_top();
-    if nargs < 1 {
-        l.push_value(Value::Boolean(false));
-        if !push_lua_string(l, "bad argument #1 to 'pcall' (function expected)") {
-            return -1;
-        }
-        return 2;
-    }
-
-    let func = l.at(1).cloned().unwrap_or(Value::Nil);
-    let args: Vec<Value> = (2..=nargs)
-        .map(|idx| l.at(idx).cloned().unwrap_or(Value::Nil))
-        .collect();
-
-    let Some(gc_ptr) = l.active_gc_ptr() else {
-        l.push_value(Value::Boolean(false));
-        if !push_lua_string(l, "pcall unavailable without an active GC") {
-            return -1;
-        }
-        return 2;
-    };
-    // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
-    let gc = unsafe { &mut *gc_ptr };
-
-    let mut result_count = 0;
-    match call_value_with_results(l, gc, func, &args, None, |l, _, results| {
-        l.push_value(Value::Boolean(true));
-        result_count = results.len();
-        for result in results {
-            l.push_value(result.clone());
-        }
-    }) {
-        Ok(()) => 1 + result_count as i32,
-        Err(err) => {
-            if err.is_native_request_suspend() {
-                return 0;
-            }
-            l.push_value(Value::Boolean(false));
-            push_runtime_error_value(l, &err);
-            2
-        }
-    }
-}
-
-unsafe extern "C" fn lua_b_xpcall_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
-    // SAFETY: _l_ptr is the LuaState pointer passed by the VM CALL handler.
-    let l: &mut LuaState = unsafe { &mut *(_l_ptr as *mut LuaState) };
-    if l.get_top() < 2 {
-        l.push_value(Value::Boolean(false));
-        if !push_lua_string(
-            l,
-            "bad argument to 'xpcall' (function and handler expected)",
-        ) {
-            return -1;
-        }
-        return 2;
-    }
-
-    let func = l.at(1).cloned().unwrap_or(Value::Nil);
-    let handler = l.at(2).cloned().unwrap_or(Value::Nil);
-    let Some(gc_ptr) = l.active_gc_ptr() else {
-        l.push_value(Value::Boolean(false));
-        if !push_lua_string(l, "xpcall unavailable without an active GC") {
-            return -1;
-        }
-        return 2;
-    };
-    // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
-    let gc = unsafe { &mut *gc_ptr };
-
-    let mut result_count = 0;
-    match call_value_with_results(l, gc, func, &[], None, |l, _, results| {
-        l.push_value(Value::Boolean(true));
-        result_count = results.len();
-        for result in results {
-            l.push_value(result.clone());
-        }
-    }) {
-        Ok(()) => 1 + result_count as i32,
-        Err(err) => {
-            push_runtime_error_value(l, &err);
-            let error_arg = l.stack.at(l.top - 1).cloned().unwrap_or(Value::Nil);
-            let mut handler_result_count = 0;
-            match call_value_with_results(l, gc, handler, &[error_arg], None, |l, _, results| {
-                let _ = l.pop();
-                l.push_value(Value::Boolean(false));
-                handler_result_count = results.len();
-                for result in results {
-                    l.push_value(result.clone());
-                }
-            }) {
-                Ok(()) => 1 + handler_result_count as i32,
-                Err(handler_err) => {
-                    let _ = l.pop();
-                    l.push_value(Value::Boolean(false));
-                    let published = push_runtime_error_value(l, &handler_err);
-                    let published_nil = l.stack.at(l.top - 1).is_none_or(|value| value.is_nil());
-                    if !published || published_nil {
-                        let _ = l.pop();
-                        if !push_lua_string(l, "error in error handling") {
-                            return -1;
-                        }
-                    }
-                    2
-                }
-            }
-        }
-    }
 }
 
 fn push_runtime_error_value(l: &mut LuaState, err: &lua_vm::RuntimeError) -> bool {

@@ -64,14 +64,17 @@ use lua_core::value::Value;
 use thiserror::Error;
 
 use crate::execute::{
-    ExecResult, RuntimeError, VmExit, abort_finalizer_callback, call_value_with_results,
-    execute_proto, finish_deferred_native_call, finish_deferred_native_values,
-    finish_deferred_runtime_result, resume_after_deferred_native_call, resume_finalizer_callback,
-    resume_lua_thread, start_finalizer_callback, start_lua_call_at_stack,
+    ExecResult, RuntimeError, VmExit, abort_finalizer_callback, abort_protected_call_turn,
+    call_value_with_results, execute_proto, finish_deferred_native_call,
+    finish_deferred_native_values, finish_deferred_runtime_result, finish_protected_call_turn,
+    resume_after_deferred_native_call, resume_finalizer_callback, resume_lua_thread,
+    resume_protected_call, start_finalizer_callback, start_lua_call_at_stack,
+    start_protected_call_target,
 };
 use crate::native::{
     DebugUpvalueOperation, DebugUpvalueRequest, DeferredNativeCall, FullCollectionRequest,
-    ResumeRequest, ResumeResponse, RuntimeRequest, UpvalueAccessOperation, UpvalueAccessRequest,
+    ProtectedCallKind, ProtectedCallRequest, ResumeRequest, ResumeResponse, RuntimeRequest,
+    UpvalueAccessOperation, UpvalueAccessRequest,
 };
 use crate::state::lua_state::LuaStateShutdownReport;
 use crate::state::{
@@ -136,6 +139,8 @@ pub struct RuntimeActivationStats {
     pub peak_upvalue_transfer_depth: usize,
     /// Largest number of debug-library open-Upvalue transfer frames.
     pub peak_debug_upvalue_transfer_depth: usize,
+    /// Largest number of nested Runtime-owned `pcall`/`xpcall` helpers.
+    pub peak_protected_call_depth: usize,
     /// Largest combined activation/root-transfer buffer depth.
     pub peak_rooted_activation_depth: usize,
     /// Largest number of StateArena slots borrowed at the same instant.
@@ -146,6 +151,8 @@ pub struct RuntimeActivationStats {
     pub current_upvalue_transfer_depth: usize,
     /// Debug open-Upvalue transfers still retained after the session.
     pub current_debug_upvalue_transfer_depth: usize,
+    /// Protected helper frames still retained after the session.
+    pub current_protected_call_depth: usize,
     /// GC/finalizer frames still retained after the session.
     pub current_gc_depth: usize,
 }
@@ -156,6 +163,7 @@ impl RuntimeActivationStats {
         self.current_resume_depth
             .saturating_add(self.current_upvalue_transfer_depth)
             .saturating_add(self.current_debug_upvalue_transfer_depth)
+            .saturating_add(self.current_protected_call_depth)
             .saturating_add(self.current_gc_depth)
     }
 }
@@ -261,6 +269,7 @@ struct NativeActivationStack {
     frames: Vec<NativeActivationFrame>,
     upvalue_transfers: Vec<UpvalueTransferFrame>,
     debug_upvalue_transfers: Vec<DebugUpvalueTransferFrame>,
+    protected_calls: Vec<ProtectedCallActivationFrame>,
     gc_frames: Vec<GcActivationFrame>,
     stats: NativeActivationCounters,
 }
@@ -281,11 +290,16 @@ impl NativeActivationStack {
             .stats
             .peak_debug_upvalue_transfer_depth
             .max(self.debug_upvalue_transfers.len());
+        self.stats.peak_protected_call_depth = self
+            .stats
+            .peak_protected_call_depth
+            .max(self.protected_calls.len());
         let rooted_depth = self
             .frames
             .len()
             .saturating_add(self.upvalue_transfers.len())
             .saturating_add(self.debug_upvalue_transfers.len())
+            .saturating_add(self.protected_calls.len())
             .saturating_add(self.gc_frames.len());
         self.stats.peak_rooted_activation_depth =
             self.stats.peak_rooted_activation_depth.max(rooted_depth);
@@ -297,11 +311,13 @@ impl NativeActivationStack {
             peak_resume_depth: self.stats.peak_resume_depth,
             peak_upvalue_transfer_depth: self.stats.peak_upvalue_transfer_depth,
             peak_debug_upvalue_transfer_depth: self.stats.peak_debug_upvalue_transfer_depth,
+            peak_protected_call_depth: self.stats.peak_protected_call_depth,
             peak_rooted_activation_depth: self.stats.peak_rooted_activation_depth,
             peak_borrowed_state_slots,
             current_resume_depth: self.frames.len(),
             current_upvalue_transfer_depth: self.upvalue_transfers.len(),
             current_debug_upvalue_transfer_depth: self.debug_upvalue_transfers.len(),
+            current_protected_call_depth: self.protected_calls.len(),
             current_gc_depth: self.gc_frames.len(),
         }
     }
@@ -328,6 +344,9 @@ impl NativeActivationStack {
                 response.seed_roots(gc);
             }
         }
+        for frame in &self.protected_calls {
+            frame.seed_roots(gc);
+        }
         for frame in &self.gc_frames {
             frame.seed_roots(gc);
             if let Some((userdata, callback)) = &frame.current_finalizer {
@@ -347,6 +366,7 @@ struct NativeActivationCounters {
     peak_resume_depth: usize,
     peak_upvalue_transfer_depth: usize,
     peak_debug_upvalue_transfer_depth: usize,
+    peak_protected_call_depth: usize,
     peak_rooted_activation_depth: usize,
 }
 
@@ -383,6 +403,7 @@ enum GcActivationOrigin {
 struct GcActivationFrame {
     requester: StateHandle,
     origin: GcActivationOrigin,
+    resume: NativeDriverRole,
     draining_finalizers: bool,
     current_finalizer: Option<(GcRef<Userdata>, Value)>,
     response: Option<CollectionResponse>,
@@ -419,6 +440,38 @@ impl GcActivationFrame {
                 .as_ref()
                 .map(|deferred| deferred.snapshot.top()),
             GcActivationOrigin::Automatic { saved_top, .. } => Some(*saved_top),
+        }
+    }
+
+    fn automatic_resume(&self) -> Option<NativeDriverRole> {
+        match self.origin {
+            GcActivationOrigin::Explicit(_) => None,
+            GcActivationOrigin::Automatic { .. } => Some(self.resume),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProtectedCallPhase {
+    Target,
+    Handler,
+}
+
+#[derive(Clone, Debug)]
+struct ProtectedCallActivationFrame {
+    requester: StateHandle,
+    request: ProtectedCallRequest,
+    phase: ProtectedCallPhase,
+    role: NativeDriverRole,
+    parent_role: NativeDriverRole,
+    pending_response: Option<ResumeResponse>,
+}
+
+impl ProtectedCallActivationFrame {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        self.request.seed_roots(gc);
+        if let Some(response) = &self.pending_response {
+            response.seed_roots(gc);
         }
     }
 }
@@ -476,15 +529,33 @@ enum NativeDriverAction {
         frame: NativeActivationFrame,
         response: ResumeResponse,
         replay_dead_ancestor: bool,
+        resume: NativeDriverRole,
     },
-    DeliverUpvalue(UpvalueTransferFrame),
-    DeliverDebugUpvalue(DebugUpvalueTransferFrame),
+    StartProtectedCall {
+        function: Value,
+        args: Vec<Value>,
+        role: NativeDriverRole,
+    },
+    FinishProtectedCall {
+        frame: ProtectedCallActivationFrame,
+        response: ResumeResponse,
+    },
+    DeliverUpvalue {
+        frame: UpvalueTransferFrame,
+        resume: NativeDriverRole,
+    },
+    DeliverDebugUpvalue {
+        frame: DebugUpvalueTransferFrame,
+        resume: NativeDriverRole,
+    },
     DeliverCollection {
         request: FullCollectionRequest,
         response: CollectionResponse,
         resume: NativeDriverRole,
     },
-    ResumeAutomaticGc,
+    ResumeAutomaticGc {
+        resume: NativeDriverRole,
+    },
     StartFinalizer {
         callback: Value,
         userdata: GcRef<Userdata>,
@@ -521,7 +592,14 @@ impl CollectionResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeDriverRole {
     Program,
-    Finalizer { stop_ci: usize },
+    Finalizer {
+        stop_ci: usize,
+    },
+    ProtectedCall {
+        stop_ci: usize,
+        call_pos: usize,
+        saved_top: usize,
+    },
 }
 
 impl NativeDriverAction {
@@ -530,6 +608,12 @@ impl NativeDriverAction {
             Self::StartFinalizer { stop_ci, .. } | Self::FailFinalizer { stop_ci, .. } => {
                 NativeDriverRole::Finalizer { stop_ci: *stop_ci }
             }
+            Self::StartProtectedCall { role, .. } => *role,
+            Self::FinishProtectedCall { frame, .. } => frame.parent_role,
+            Self::Deliver { resume, .. }
+            | Self::DeliverUpvalue { resume, .. }
+            | Self::DeliverDebugUpvalue { resume, .. }
+            | Self::ResumeAutomaticGc { resume } => *resume,
             Self::DeliverCollection { resume, .. } => *resume,
             _ => NativeDriverRole::Program,
         }
@@ -548,6 +632,7 @@ enum NativeTurnEvent {
     },
     Main(Result<ExecResult, RuntimeError>),
     Finalizer(Result<(), RuntimeError>),
+    ProtectedCall(ResumeResponse),
     Coroutine {
         thread: GcRef<Thread>,
         response: ResumeResponse,
@@ -2486,6 +2571,7 @@ impl Runtime {
         if !heap.native_activations.frames.is_empty()
             || !heap.native_activations.upvalue_transfers.is_empty()
             || !heap.native_activations.debug_upvalue_transfers.is_empty()
+            || !heap.native_activations.protected_calls.is_empty()
             || !heap.native_activations.gc_frames.is_empty()
         {
             return Err(RuntimeExecutionError::Protocol(
@@ -2528,9 +2614,11 @@ impl Runtime {
                 _ => pending_native_delivery.take(),
             };
             let completed_upvalue_transfer =
-                matches!(&action, NativeDriverAction::DeliverUpvalue(_));
+                matches!(&action, NativeDriverAction::DeliverUpvalue { .. });
             let completed_debug_upvalue_transfer =
-                matches!(&action, NativeDriverAction::DeliverDebugUpvalue(_));
+                matches!(&action, NativeDriverAction::DeliverDebugUpvalue { .. });
+            let completed_protected_call =
+                matches!(&action, NativeDriverAction::FinishProtectedCall { .. });
             let completed_collection =
                 matches!(&action, NativeDriverAction::DeliverCollection { .. });
             let mut event = StateArena::with_turn_state_mut(arena, current, |state| {
@@ -2570,6 +2658,13 @@ impl Runtime {
                 activations.debug_upvalue_transfers.pop().ok_or_else(|| {
                     RuntimeExecutionError::Protocol(
                         "debug Upvalue delivery lost its rooted transfer frame".to_string(),
+                    )
+                })?;
+            }
+            if completed_protected_call {
+                activations.protected_calls.pop().ok_or_else(|| {
+                    RuntimeExecutionError::Protocol(
+                        "protected helper delivery lost its rooted activation frame".to_string(),
                     )
                 })?;
             }
@@ -2622,7 +2717,7 @@ impl Runtime {
 
             match event {
                 NativeTurnEvent::AutomaticGc { stop_ci, saved_top } => {
-                    if !matches!(driver_role, NativeDriverRole::Program) {
+                    if active_finalizer_role(activations, current).is_some() {
                         return Err(RuntimeExecutionError::Protocol(
                             "automatic GC checkpoint escaped from a finalizer".to_string(),
                         ));
@@ -2663,6 +2758,7 @@ impl Runtime {
                         activations.gc_frames.push(GcActivationFrame {
                             requester: current,
                             origin: GcActivationOrigin::Automatic { stop_ci, saved_top },
+                            resume: driver_role,
                             draining_finalizers: true,
                             current_finalizer: None,
                             response: None,
@@ -2673,7 +2769,9 @@ impl Runtime {
                         }
                         activations.gc_frames.pop();
                     }
-                    action = NativeDriverAction::ResumeAutomaticGc;
+                    action = NativeDriverAction::ResumeAutomaticGc {
+                        resume: driver_role,
+                    };
                     continue;
                 }
                 NativeTurnEvent::Request {
@@ -2681,6 +2779,35 @@ impl Runtime {
                     caller_thread,
                 } => {
                     let request = match *request {
+                        RuntimeRequest::ProtectedCall(request) => {
+                            let request = *request;
+                            let deferred = request.deferred.as_ref().ok_or_else(|| {
+                                RuntimeExecutionError::Protocol(
+                                    "protected call reached Runtime without deferred metadata"
+                                        .to_string(),
+                                )
+                            })?;
+                            let role = NativeDriverRole::ProtectedCall {
+                                stop_ci: deferred.saved_ci + 1,
+                                call_pos: deferred.snapshot.top(),
+                                saved_top: deferred.snapshot.top(),
+                            };
+                            let frame = ProtectedCallActivationFrame {
+                                requester: current,
+                                request: request.clone(),
+                                phase: ProtectedCallPhase::Target,
+                                role,
+                                parent_role: active_driver_role(activations, current),
+                                pending_response: None,
+                            };
+                            activations.protected_calls.push(frame);
+                            action = NativeDriverAction::StartProtectedCall {
+                                function: request.function,
+                                args: request.args,
+                                role,
+                            };
+                            continue;
+                        }
                         RuntimeRequest::FullCollection(request) => {
                             if request.deferred.is_none() {
                                 return Err(RuntimeExecutionError::Protocol(
@@ -2688,11 +2815,11 @@ impl Runtime {
                                         .to_string(),
                                 ));
                             }
-                            let resume = active_finalizer_role(activations, current)
-                                .unwrap_or(NativeDriverRole::Program);
+                            let resume = active_driver_role(activations, current);
                             activations.gc_frames.push(GcActivationFrame {
                                 requester: current,
                                 origin: GcActivationOrigin::Explicit(Box::new(request.clone())),
+                                resume,
                                 draining_finalizers: false,
                                 current_finalizer: None,
                                 response: None,
@@ -2767,7 +2894,7 @@ impl Runtime {
                             };
                             if matches!(response, CollectionResponse::Success(_))
                                 && cycle_completed
-                                && matches!(resume, NativeDriverRole::Program)
+                                && !matches!(resume, NativeDriverRole::Finalizer { .. })
                                 && gc.pending_finalizer_count() != 0
                                 && gc.begin_finalizer_drain()
                             {
@@ -2866,7 +2993,10 @@ impl Runtime {
                                     "injected Runtime fault at UpvalueResponseDelivery".to_string(),
                                 ));
                             }
-                            action = NativeDriverAction::DeliverDebugUpvalue(transfer.clone());
+                            action = NativeDriverAction::DeliverDebugUpvalue {
+                                frame: transfer.clone(),
+                                resume: active_driver_role(activations, current),
+                            };
                             current = request.requester;
                             continue;
                         }
@@ -2981,7 +3111,10 @@ impl Runtime {
                             "injected Runtime fault at UpvalueResponseDelivery".to_string(),
                         ));
                     }
-                    action = NativeDriverAction::DeliverUpvalue(transfer.clone());
+                    action = NativeDriverAction::DeliverUpvalue {
+                        frame: transfer.clone(),
+                        resume: active_driver_role(activations, current),
+                    };
                     current = request.requester;
                 }
                 NativeTurnEvent::Coroutine { thread, response } => {
@@ -3026,12 +3159,69 @@ impl Runtime {
                     }
                     frame.pending_response = Some(response.clone());
                     frame.replay_dead_ancestor = replay_dead_ancestor;
+                    let delivery_frame = frame.clone();
                     current = frame.caller;
+                    let resume = active_driver_role(activations, current);
                     action = NativeDriverAction::Deliver {
-                        frame: frame.clone(),
+                        frame: delivery_frame,
                         response,
                         replay_dead_ancestor,
+                        resume,
                     };
+                }
+                NativeTurnEvent::ProtectedCall(response) => {
+                    let frame = activations.protected_calls.last_mut().ok_or_else(|| {
+                        RuntimeExecutionError::Protocol(
+                            "protected helper stopped without an activation frame".to_string(),
+                        )
+                    })?;
+                    if frame.requester != current {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "protected helper stopped on a different requester state".to_string(),
+                        ));
+                    }
+                    match (frame.request.kind, frame.phase, &response) {
+                        (
+                            ProtectedCallKind::XPCall,
+                            ProtectedCallPhase::Target,
+                            ResumeResponse::Error(error),
+                        ) => {
+                            frame.phase = ProtectedCallPhase::Handler;
+                            frame.pending_response = Some(response.clone());
+                            let handler = frame.request.handler.clone().ok_or_else(|| {
+                                RuntimeExecutionError::Protocol(
+                                    "xpcall activation lost its error handler".to_string(),
+                                )
+                            })?;
+                            action = NativeDriverAction::StartProtectedCall {
+                                function: handler,
+                                args: vec![error.clone()],
+                                role: frame.role,
+                            };
+                        }
+                        _ => {
+                            let response = match (frame.phase, response) {
+                                (ProtectedCallPhase::Target, ResumeResponse::Success(values)) => {
+                                    let mut protected = Vec::with_capacity(values.len() + 1);
+                                    protected.push(Value::Boolean(true));
+                                    protected.extend(values);
+                                    ResumeResponse::Success(protected)
+                                }
+                                (ProtectedCallPhase::Target, ResumeResponse::Error(error))
+                                | (ProtectedCallPhase::Handler, ResumeResponse::Error(error)) => {
+                                    ResumeResponse::Error(error)
+                                }
+                                (ProtectedCallPhase::Handler, ResumeResponse::Success(values)) => {
+                                    ResumeResponse::Success(values)
+                                }
+                            };
+                            frame.pending_response = Some(response.clone());
+                            action = NativeDriverAction::FinishProtectedCall {
+                                frame: frame.clone(),
+                                response,
+                            };
+                        }
+                    }
                 }
                 NativeTurnEvent::Finalizer(result) => {
                     let frame = activations.gc_frames.last().ok_or_else(|| {
@@ -3106,10 +3296,11 @@ impl Runtime {
                             .explicit_request()
                             .expect("explicit finalizer error owns a collection request")
                             .clone();
+                        let resume = frame.resume;
                         action = NativeDriverAction::DeliverCollection {
                             request,
                             response,
-                            resume: NativeDriverRole::Program,
+                            resume,
                         };
                     } else if let Some(next) = next_finalizer_action(activations, gc)? {
                         action = next;
@@ -3121,14 +3312,20 @@ impl Runtime {
                         if let Some(request) = frame.explicit_request().cloned() {
                             let response = CollectionResponse::Success(request.result.values(true));
                             frame.response = Some(response.clone());
+                            let resume = frame.resume;
                             action = NativeDriverAction::DeliverCollection {
                                 request,
                                 response,
-                                resume: NativeDriverRole::Program,
+                                resume,
                             };
                         } else {
+                            let resume = frame.automatic_resume().ok_or_else(|| {
+                                RuntimeExecutionError::Protocol(
+                                    "automatic GC activation lost its resume role".to_string(),
+                                )
+                            })?;
                             activations.gc_frames.pop();
-                            action = NativeDriverAction::ResumeAutomaticGc;
+                            action = NativeDriverAction::ResumeAutomaticGc { resume };
                         }
                     }
                 }
@@ -3136,6 +3333,7 @@ impl Runtime {
                     if !activations.frames.is_empty()
                         || !activations.upvalue_transfers.is_empty()
                         || !activations.debug_upvalue_transfers.is_empty()
+                        || !activations.protected_calls.is_empty()
                         || !activations.gc_frames.is_empty()
                     {
                         return Err(RuntimeExecutionError::Protocol(
@@ -3330,6 +3528,7 @@ impl Runtime {
         if !heap.native_activations.frames.is_empty()
             || !heap.native_activations.upvalue_transfers.is_empty()
             || !heap.native_activations.debug_upvalue_transfers.is_empty()
+            || !heap.native_activations.protected_calls.is_empty()
             || !heap.native_activations.gc_frames.is_empty()
         {
             return Err(StateResolveError::ArenaInvariant {
@@ -3512,6 +3711,19 @@ fn active_finalizer_role(
     })
 }
 
+fn active_driver_role(
+    activations: &NativeActivationStack,
+    requester: StateHandle,
+) -> NativeDriverRole {
+    activations
+        .protected_calls
+        .iter()
+        .rev()
+        .find_map(|frame| (frame.requester == requester).then_some(frame.role))
+        .or_else(|| active_finalizer_role(activations, requester))
+        .unwrap_or(NativeDriverRole::Program)
+}
+
 fn active_finalizer_saved_top(
     activations: &NativeActivationStack,
     requester: StateHandle,
@@ -3617,6 +3829,7 @@ fn execute_native_driver_action(
             frame,
             response,
             replay_dead_ancestor,
+            resume,
         } => {
             let deferred = frame.request.deferred.as_ref().ok_or_else(|| {
                 RuntimeError::new("Runtime-native activation lost its deferred call")
@@ -3627,9 +3840,51 @@ fn execute_native_driver_action(
             } else {
                 finish_deferred_native_call(state, gc, deferred, frame.request.envelope, response)?;
             }
-            resume_after_deferred_native_call(state, gc, deferred)
+            resume_after_deferred_for_role(state, gc, deferred, resume)
         }
-        NativeDriverAction::DeliverUpvalue(frame) => {
+        NativeDriverAction::StartProtectedCall {
+            function,
+            args,
+            role:
+                NativeDriverRole::ProtectedCall {
+                    stop_ci, call_pos, ..
+                },
+        } => start_protected_call_target(state, gc, function, &args, stop_ci, call_pos),
+        NativeDriverAction::StartProtectedCall { .. } => Err(RuntimeError::new(
+            "VM: protected helper action lost its protected role",
+        )),
+        NativeDriverAction::FinishProtectedCall { frame, response } => {
+            let deferred = frame.request.deferred.as_ref().ok_or_else(|| {
+                RuntimeError::new("protected helper activation lost its deferred call")
+            })?;
+            let values = match (frame.phase, response) {
+                (ProtectedCallPhase::Target, ResumeResponse::Success(values)) => values,
+                (ProtectedCallPhase::Target, ResumeResponse::Error(error)) => {
+                    vec![Value::Boolean(false), error]
+                }
+                (ProtectedCallPhase::Handler, ResumeResponse::Success(values)) => {
+                    let mut protected = Vec::with_capacity(values.len() + 1);
+                    protected.push(Value::Boolean(false));
+                    protected.extend(values);
+                    protected
+                }
+                (ProtectedCallPhase::Handler, ResumeResponse::Error(error)) => {
+                    let error = if error.is_nil() {
+                        runtime_error_value(
+                            state,
+                            gc,
+                            &RuntimeError::new("error in error handling"),
+                        )
+                    } else {
+                        error
+                    };
+                    vec![Value::Boolean(false), error]
+                }
+            };
+            finish_deferred_native_values(state, gc, deferred, values)?;
+            resume_after_deferred_for_role(state, gc, deferred, frame.parent_role)
+        }
+        NativeDriverAction::DeliverUpvalue { frame, resume } => {
             if state.state_handle() != Some(frame.request.requester) {
                 return Err(RuntimeError::new(
                     "open Upvalue response reached a different requester state",
@@ -3657,9 +3912,9 @@ fn execute_native_driver_action(
                     ));
                 }
             }
-            resume_after_upvalue_access(state, gc)
+            resume_after_suspension_for_role(state, gc, resume)
         }
-        NativeDriverAction::DeliverDebugUpvalue(frame) => {
+        NativeDriverAction::DeliverDebugUpvalue { frame, resume } => {
             if state.state_handle() != Some(frame.request.requester) {
                 return Err(RuntimeError::new(
                     "debug Upvalue response reached a different requester state",
@@ -3680,7 +3935,7 @@ fn execute_native_driver_action(
                 }
             };
             finish_deferred_runtime_result(state, gc, deferred, frame.request.protected, response)?;
-            resume_after_deferred_native_call(state, gc, deferred)
+            resume_after_deferred_for_role(state, gc, deferred, resume)
         }
         NativeDriverAction::DeliverCollection {
             request,
@@ -3698,16 +3953,11 @@ fn execute_native_driver_action(
                 CollectionResponse::ErrorValue(error) => Err(error),
             };
             finish_deferred_runtime_result(state, gc, deferred, request.protected, response)?;
-            match resume {
-                NativeDriverRole::Program => resume_after_deferred_native_call(state, gc, deferred),
-                NativeDriverRole::Finalizer { stop_ci } => {
-                    resume_finalizer_callback(state, gc, stop_ci)
-                }
-            }
+            resume_after_deferred_for_role(state, gc, deferred, resume)
         }
-        NativeDriverAction::ResumeAutomaticGc => {
+        NativeDriverAction::ResumeAutomaticGc { resume } => {
             state.status = ThreadStatus::Yield;
-            resume_after_upvalue_access(state, gc)
+            resume_after_suspension_for_role(state, gc, resume)
         }
         NativeDriverAction::StartFinalizer {
             callback,
@@ -3815,6 +4065,35 @@ fn execute_debug_upvalue_owner_access(
     }
 }
 
+fn resume_after_deferred_for_role(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+    role: NativeDriverRole,
+) -> Result<VmExit, RuntimeError> {
+    match role {
+        NativeDriverRole::Program => resume_after_deferred_native_call(state, gc, deferred),
+        NativeDriverRole::Finalizer { stop_ci } => resume_finalizer_callback(state, gc, stop_ci),
+        NativeDriverRole::ProtectedCall { stop_ci, .. } => {
+            resume_protected_call(state, gc, stop_ci)
+        }
+    }
+}
+
+fn resume_after_suspension_for_role(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    role: NativeDriverRole,
+) -> Result<VmExit, RuntimeError> {
+    match role {
+        NativeDriverRole::Program => resume_after_upvalue_access(state, gc),
+        NativeDriverRole::Finalizer { stop_ci } => resume_finalizer_callback(state, gc, stop_ci),
+        NativeDriverRole::ProtectedCall { stop_ci, .. } => {
+            resume_protected_call(state, gc, stop_ci)
+        }
+    }
+}
+
 fn resolve_debug_upvalue_request(
     arena: NonNull<StateArena>,
     gc: &mut GarbageCollector,
@@ -3880,6 +4159,36 @@ fn classify_native_turn(
             saved_top: state.top,
         }),
         Ok(VmExit::Complete(ExecResult::Returned))
+            if matches!(role, NativeDriverRole::ProtectedCall { .. }) =>
+        {
+            let NativeDriverRole::ProtectedCall {
+                stop_ci,
+                call_pos,
+                saved_top,
+            } = role
+            else {
+                unreachable!("guarded protected helper role")
+            };
+            let values = finish_protected_call_turn(state, stop_ci, call_pos, saved_top)?;
+            Ok(NativeTurnEvent::ProtectedCall(ResumeResponse::Success(
+                values,
+            )))
+        }
+        Ok(VmExit::Complete(ExecResult::Yielded))
+            if matches!(role, NativeDriverRole::ProtectedCall { .. }) =>
+        {
+            let NativeDriverRole::ProtectedCall {
+                stop_ci, saved_top, ..
+            } = role
+            else {
+                unreachable!("guarded protected helper role")
+            };
+            abort_protected_call_turn(state, gc, stop_ci, saved_top)?;
+            let error =
+                runtime_error_value(state, gc, &RuntimeError::new("cannot yield across pcall"));
+            Ok(NativeTurnEvent::ProtectedCall(ResumeResponse::Error(error)))
+        }
+        Ok(VmExit::Complete(ExecResult::Returned))
             if matches!(role, NativeDriverRole::Finalizer { .. }) =>
         {
             Ok(NativeTurnEvent::Finalizer(Ok(())))
@@ -3922,6 +4231,14 @@ fn classify_native_turn(
             Ok(NativeTurnEvent::Coroutine { thread, response })
         }
         Err(error) => {
+            if let NativeDriverRole::ProtectedCall {
+                stop_ci, saved_top, ..
+            } = role
+            {
+                let error = runtime_error_value(state, gc, &error);
+                abort_protected_call_turn(state, gc, stop_ci, saved_top)?;
+                return Ok(NativeTurnEvent::ProtectedCall(ResumeResponse::Error(error)));
+            }
             if matches!(role, NativeDriverRole::Finalizer { .. }) {
                 return Ok(NativeTurnEvent::Finalizer(Err(error)));
             }
@@ -4139,6 +4456,7 @@ impl Drop for NativeActivationSessionGuard {
         }
         activations.upvalue_transfers.clear();
         activations.debug_upvalue_transfers.clear();
+        activations.protected_calls.clear();
         if activations
             .gc_frames
             .iter()

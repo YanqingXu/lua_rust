@@ -243,12 +243,49 @@ pub(crate) enum DebugUpvalueOperation {
     Write { value: Value },
 }
 
+/// Result policy for one Runtime-owned protected helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProtectedCallKind {
+    PCall,
+    XPCall,
+}
+
+/// Owned `pcall`/`xpcall` invocation transferred to the Runtime scheduler.
+#[derive(Clone, Debug)]
+pub(crate) struct ProtectedCallRequest {
+    pub id: NativeRequestId,
+    pub kind: ProtectedCallKind,
+    pub function: Value,
+    pub args: Vec<Value>,
+    pub handler: Option<Value>,
+    pub deferred: Option<DeferredNativeCall>,
+}
+
+impl ProtectedCallRequest {
+    pub(crate) fn seed_roots(&self, gc: &mut GarbageCollector) {
+        gc.mark_value(&self.function);
+        for value in &self.args {
+            gc.mark_value(value);
+        }
+        if let Some(handler) = &self.handler {
+            gc.mark_value(handler);
+        }
+        if let Some(deferred) = &self.deferred {
+            if let Some(proto) = deferred.caller_proto {
+                gc.mark_registered(proto);
+            }
+            deferred.snapshot.seed_roots(gc);
+        }
+    }
+}
+
 /// One sealed Runtime-native mailbox payload.
 #[derive(Clone, Debug)]
 pub(crate) enum RuntimeRequest {
     Resume(ResumeRequest),
     FullCollection(FullCollectionRequest),
     DebugUpvalue(Box<DebugUpvalueRequest>),
+    ProtectedCall(Box<ProtectedCallRequest>),
 }
 
 impl RuntimeRequest {
@@ -257,6 +294,7 @@ impl RuntimeRequest {
             Self::Resume(request) => request.id,
             Self::FullCollection(request) => request.id,
             Self::DebugUpvalue(request) => request.id,
+            Self::ProtectedCall(request) => request.id,
         }
     }
 
@@ -265,6 +303,7 @@ impl RuntimeRequest {
             Self::Resume(request) => request.deferred.as_ref(),
             Self::FullCollection(request) => request.deferred.as_ref(),
             Self::DebugUpvalue(request) => request.deferred.as_ref(),
+            Self::ProtectedCall(request) => request.deferred.as_ref(),
         }
     }
 
@@ -273,6 +312,7 @@ impl RuntimeRequest {
             Self::Resume(request) => &mut request.deferred,
             Self::FullCollection(request) => &mut request.deferred,
             Self::DebugUpvalue(request) => &mut request.deferred,
+            Self::ProtectedCall(request) => &mut request.deferred,
         }
     }
 }

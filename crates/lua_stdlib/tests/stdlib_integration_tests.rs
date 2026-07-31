@@ -923,6 +923,131 @@ fn base_pcall_wraps_success_results_and_runtime_errors() {
 }
 
 #[test]
+fn protected_helpers_resume_arbitrary_lua_runtime_native_requests() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local thread = coroutine.create(function(value)
+            coroutine.yield(value + 1)
+            return value + 2
+        end)
+        local function resume_through_lua(...)
+            return coroutine.resume(thread, ...)
+        end
+
+        local protected, resumed, yielded = pcall(resume_through_lua, 40)
+        assert(protected and resumed and yielded == 41)
+        local protected_again, resumed_again, returned =
+            pcall(function() return resume_through_lua() end)
+        assert(protected_again and resumed_again and returned == 42)
+
+        local broken = coroutine.wrap(function() error("wrapped-boom") end)
+        local handler_thread = coroutine.create(function(error_value)
+            return "handled:" .. type(error_value)
+        end)
+        local ok, handled = xpcall(
+            function() return broken() end,
+            function(error_value)
+                local handler_ok, value = coroutine.resume(handler_thread, error_value)
+                assert(handler_ok)
+                return value
+            end
+        )
+        assert(not ok and handled == "handled:string")
+        return 1
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(1.0));
+    let stats = runtime.activation_stats();
+    assert!(stats.peak_protected_call_depth >= 1);
+    assert!(stats.peak_resume_depth >= 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    let report = runtime
+        .close()
+        .expect("Runtime-native protected helper Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+}
+
+#[test]
+fn protected_helpers_resume_ordinary_cross_state_upvalue_access() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local owner = coroutine.create(function()
+            local value = 10
+            local function touch(delta)
+                value = value + delta
+                return value
+            end
+            coroutine.yield(touch)
+            return value
+        end)
+        local owner_ok, touch = coroutine.resume(owner)
+        assert(owner_ok and type(touch) == "function")
+
+        local protected, first = pcall(function() return touch(5) end)
+        assert(protected and first == 15)
+        local target_ok, second = xpcall(
+            function() return touch(2) end,
+            function(error_value) return error_value end
+        )
+        assert(target_ok and second == 17)
+        local handler_ok, handled, error_kind = xpcall(
+            function() error("boom") end,
+            function(error_value) return touch(3), type(error_value) end
+        )
+        assert(not handler_ok and handled == 20 and error_kind == "string")
+
+        local owner_done, owner_value = coroutine.resume(owner)
+        assert(owner_done and owner_value == 20)
+        return owner_value
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(20.0));
+    let stats = runtime.activation_stats();
+    assert_eq!(stats.peak_upvalue_transfer_depth, 1);
+    assert!(stats.peak_protected_call_depth >= 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    let report = runtime
+        .close()
+        .expect("ordinary-Upvalue protected helper Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+}
+
+#[test]
+fn nested_protected_helpers_use_runtime_owned_activation_frames() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local depth = 128
+        local nested = function(value) return value end
+        for _ = 1, depth do
+            local next_call = nested
+            nested = function(value)
+                local ok, result = pcall(next_call, value + 1)
+                assert(ok)
+                return result + 1
+            end
+        end
+        local ok, result = pcall(nested, 0)
+        assert(ok and result == depth * 2)
+        return result
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(256.0));
+    let stats = runtime.activation_stats();
+    assert_eq!(stats.peak_protected_call_depth, 129);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    let report = runtime
+        .close()
+        .expect("nested protected helper Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+}
+
+#[test]
 fn official_error_surface_regressions_are_preserved() {
     let (state, _gc) = compile_and_run(
         r#"
@@ -1991,6 +2116,19 @@ fn scheduler_fault_matrix_clears_activations_and_closes_open_upvalues() {
             return ok, value
             "#,
             0,
+            0,
+        ),
+        (
+            RuntimeFaultSite::SealedMailboxTake,
+            r#"
+            local thread = coroutine.create(function() return 2 end)
+            local ok, resumed, value = pcall(function()
+                return coroutine.resume(thread)
+            end)
+            return ok, resumed, value
+            "#,
+            1,
+            1,
         ),
         (
             RuntimeFaultSite::UpvalueOwnerResolve,
@@ -2007,6 +2145,7 @@ fn scheduler_fault_matrix_clears_activations_and_closes_open_upvalues() {
             return value
             "#,
             1,
+            0,
         ),
         (
             RuntimeFaultSite::UpvalueResponseDelivery,
@@ -2023,6 +2162,7 @@ fn scheduler_fault_matrix_clears_activations_and_closes_open_upvalues() {
             return name, value
             "#,
             1,
+            0,
         ),
         (
             RuntimeFaultSite::ActivationUnwind,
@@ -2045,12 +2185,13 @@ fn scheduler_fault_matrix_clears_activations_and_closes_open_upvalues() {
             return ok, read
             "#,
             1,
+            0,
         ),
     ];
 
-    for (site, source, minimum_closed_upvalues) in cases {
+    for (site, source, minimum_closed_upvalues, successful_matching_checkpoints) in cases {
         let (mut runtime, proto) = compile_runtime(source);
-        runtime.inject_runtime_fault_after(site, 0);
+        runtime.inject_runtime_fault_after(site, successful_matching_checkpoints);
         let error = runtime
             .execute_proto(proto)
             .expect_err("selected scheduler boundary must fail once");
@@ -2065,6 +2206,9 @@ fn scheduler_fault_matrix_clears_activations_and_closes_open_upvalues() {
             "{site:?} retained a Runtime-owned transfer"
         );
         assert_eq!(stats.peak_borrowed_state_slots, 1);
+        if successful_matching_checkpoints == 1 {
+            assert_eq!(stats.peak_protected_call_depth, 1);
+        }
         if site == RuntimeFaultSite::ActivationUnwind {
             assert_eq!(stats.peak_resume_depth, 3);
         }

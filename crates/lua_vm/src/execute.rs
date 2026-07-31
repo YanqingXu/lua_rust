@@ -19,7 +19,7 @@ use std::cmp::Ordering;
 
 use crate::native::{
     DebugUpvalueOperation, DeferredNativeCall, DeferredVmContinuation, FullCollectionResult,
-    NativeRequestId, NativeRequestPublishError, ResumeEnvelope, ResumeResponse,
+    NativeRequestId, NativeRequestPublishError, ProtectedCallKind, ResumeEnvelope, ResumeResponse,
     UpvalueAccessOperation, UpvalueAccessRequest,
 };
 use crate::state::{LUA_MULTRET, LuaState, ThreadStatus};
@@ -1730,6 +1730,116 @@ pub(crate) fn abort_finalizer_callback(
     Ok(())
 }
 
+pub(crate) fn start_protected_call_target(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    function: Value,
+    args: &[Value],
+    stop_ci: usize,
+    call_pos: usize,
+) -> Result<VmExit, RuntimeError> {
+    if l.current_ci != stop_ci {
+        return Err(RuntimeError::new(
+            "VM: protected helper started at an unexpected frame depth",
+        ));
+    }
+    l.status = ThreadStatus::Ok;
+    l.top = call_pos;
+    ensure_stack_slot(l, call_pos + args.len());
+    if let Some(slot) = l.stack.at_mut(call_pos) {
+        *slot = function.clone();
+    }
+    for (index, argument) in args.iter().enumerate() {
+        if let Some(slot) = l.stack.at_mut(call_pos + 1 + index) {
+            *slot = argument.clone();
+        }
+    }
+    l.top = call_pos + 1 + args.len();
+
+    let Value::Function(function_ref) = function else {
+        return Err(RuntimeError::new(format!(
+            "attempt to call a {} value",
+            value_type_name(&function)
+        )));
+    };
+    // SAFETY: the function is rooted by the protected activation and has been
+    // copied into the active stack before it is inspected.
+    let Some(function) = (unsafe { function_ref.as_ref() }) else {
+        return Err(RuntimeError::new("attempt to call an invalid function"));
+    };
+    if let Some(callable) = native_callable(function) {
+        return call_native_function(l, gc, call_pos, args.len(), None, callable);
+    }
+
+    start_lua_call_at_stack(l, gc, call_pos, args.len(), None)?;
+    resume_protected_call(l, gc, stop_ci)
+}
+
+pub(crate) fn resume_protected_call(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    stop_ci: usize,
+) -> Result<VmExit, RuntimeError> {
+    loop {
+        if l.current_ci == stop_ci {
+            return Ok(VmExit::Complete(ExecResult::Returned));
+        }
+        if l.current_ci < stop_ci {
+            return Err(RuntimeError::new(
+                "VM: protected helper resumed below its caller boundary",
+            ));
+        }
+        let proto = l
+            .current_call_info()
+            .proto
+            .or_else(|| current_lua_function(l).and_then(Function::proto))
+            .ok_or_else(|| RuntimeError::new("protected helper frame has no Lua proto"))?;
+        l.status = ThreadStatus::Yield;
+        match execute_proto(l, proto, gc)? {
+            VmExit::Complete(ExecResult::Returned) => {}
+            VmExit::Complete(ExecResult::Yielded) => {
+                return Ok(VmExit::Complete(ExecResult::Yielded));
+            }
+            VmExit::NativeRequest(id) => return Ok(VmExit::NativeRequest(id)),
+            VmExit::UpvalueAccess(request) => return Ok(VmExit::UpvalueAccess(request)),
+            VmExit::AutomaticGc => return Ok(VmExit::AutomaticGc),
+        }
+    }
+}
+
+pub(crate) fn finish_protected_call_turn(
+    l: &mut LuaState,
+    stop_ci: usize,
+    call_pos: usize,
+    saved_top: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if l.current_ci != stop_ci {
+        return Err(RuntimeError::new(
+            "VM: protected helper completed above its caller boundary",
+        ));
+    }
+    if l.top < call_pos {
+        return Err(RuntimeError::new(
+            "VM: protected helper result window moved below its call slot",
+        ));
+    }
+    let results = collect_call_results(l, call_pos);
+    l.top = saved_top;
+    Ok(results)
+}
+
+pub(crate) fn abort_protected_call_turn(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    stop_ci: usize,
+    saved_top: usize,
+) -> Result<(), RuntimeError> {
+    unwind_lua_frames_to(l, gc, stop_ci)?;
+    l.top = saved_top;
+    l.status = ThreadStatus::Ok;
+    Ok(())
+}
+
 pub fn resume_lua_thread(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
@@ -2828,6 +2938,12 @@ fn invoke_runtime_native(
         RuntimeNativeFunction::DebugSetUpvalue => {
             return invoke_debug_upvalue_runtime_native(l, gc, true);
         }
+        RuntimeNativeFunction::ProtectedCall => {
+            return invoke_protected_call_runtime_native(l, gc, ProtectedCallKind::PCall);
+        }
+        RuntimeNativeFunction::ProtectedXCall => {
+            return invoke_protected_call_runtime_native(l, gc, ProtectedCallKind::XPCall);
+        }
         RuntimeNativeFunction::CoroutineResume | RuntimeNativeFunction::CoroutineWrapRunner => {}
     }
 
@@ -2856,7 +2972,9 @@ fn invoke_runtime_native(
         }
         RuntimeNativeFunction::CollectGarbage
         | RuntimeNativeFunction::DebugGetUpvalue
-        | RuntimeNativeFunction::DebugSetUpvalue => unreachable!("handled above"),
+        | RuntimeNativeFunction::DebugSetUpvalue
+        | RuntimeNativeFunction::ProtectedCall
+        | RuntimeNativeFunction::ProtectedXCall => unreachable!("handled above"),
     };
 
     let (status, target) = match gc.with_ref(thread_ref, |thread: &Thread| {
@@ -2891,6 +3009,51 @@ fn invoke_runtime_native(
                 }
             };
             publish_runtime_native_error(l, gc, envelope, message)
+        }
+    }
+}
+
+fn invoke_protected_call_runtime_native(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    kind: ProtectedCallKind,
+) -> i32 {
+    let minimum = match kind {
+        ProtectedCallKind::PCall => 1,
+        ProtectedCallKind::XPCall => 2,
+    };
+    if l.get_top() < minimum {
+        let message = match kind {
+            ProtectedCallKind::PCall => {
+                b"bad argument #1 to 'pcall' (function expected)".as_slice()
+            }
+            ProtectedCallKind::XPCall => {
+                b"bad argument to 'xpcall' (function and handler expected)".as_slice()
+            }
+        };
+        return publish_runtime_native_error(l, gc, ResumeEnvelope::ProtectedWrap, message);
+    }
+
+    let function = l.at(1).cloned().unwrap_or(Value::Nil);
+    let (args, handler) = match kind {
+        ProtectedCallKind::PCall => (native_args_from(l, 2), None),
+        ProtectedCallKind::XPCall => (Vec::new(), Some(l.at(2).cloned().unwrap_or(Value::Nil))),
+    };
+    match l.publish_protected_call_request(kind, function, args, handler) {
+        Ok(_) => 0,
+        Err(error) => {
+            let message = match error {
+                NativeRequestPublishError::ScopeUnavailable => {
+                    b"runtime-native dispatcher unavailable".as_slice()
+                }
+                NativeRequestPublishError::MailboxOccupied => {
+                    b"runtime-native mailbox already occupied".as_slice()
+                }
+                NativeRequestPublishError::IdExhausted => {
+                    b"runtime-native request id exhausted".as_slice()
+                }
+            };
+            publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message)
         }
     }
 }

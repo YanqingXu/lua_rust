@@ -642,9 +642,10 @@ The StateHandle issuance/exhaustion slice is complete locally:
   have focused regressions.
 
 Phase B remains incomplete because arena ownership of the main state and
-arbitrary-Lua protected-helper suspension are still outstanding. The
-debug/protected-helper cross-state scheduling slice is described in B.5; the
-deep-chain/broader fault matrix is now covered by B.3.
+Runtime continuation support for synchronous callback helpers other than
+`pcall/xpcall` are still outstanding. The debug/protected-helper cross-state
+scheduling slice is described in B.5, arbitrary-Lua `pcall/xpcall` in B.6, and
+the deep-chain/broader fault matrix in B.3.
 
 #### B.2 Implemented Runtime turn-borrow substrate (partial)
 
@@ -689,8 +690,8 @@ It drops the caller guard before validating and borrowing the target, moves
 arguments/results/errors through owned activation buffers, and seeds those
 buffers from the canonical root tracer. It restores status, caller links,
 yield permission and saved execution counters on unwind. Generic-for
-continuations and protected `pcall` boundaries around resume/wrap are also
-resumed through the same protocol.
+continuations and arbitrary-Lua `pcall/xpcall` target/error-handler boundaries
+are also resumed through the same protocol.
 
 The CLI and stdlib integration harness now enter execution through Runtime
 scheduling. Focused process tests cover ordinary yield/resume, protected
@@ -763,11 +764,36 @@ The debug request, name, write value, continuation snapshot, and response are
 seeded through `COROUTINE_ACTIVATION_BUFFER`. Focused regressions cover direct
 and protected cross-state read/write, mutation observed by ordinary bytecode,
 owner completion and close-before-invalidate, closed-Upvalue access,
-foreign/stale owner errors, zero-state/root shutdown, and Windows ASan. The
-remaining protected-helper boundary is arbitrary Lua code executed inside
-`pcall`: an ordinary bytecode `VmExit::UpvalueAccess` still cannot suspend
-through that synchronous helper and belongs to the broader helper/continuation
-redesign, not this sealed debug operation.
+foreign/stale owner errors, zero-state/root shutdown, and Windows ASan.
+Arbitrary Lua under `pcall/xpcall` now shares the Runtime-owned scheduling
+described in B.6; this sealed debug operation retains its typed result envelope.
+
+#### B.6 Implemented arbitrary-Lua `pcall/xpcall` activation
+
+`pcall` and `xpcall` are sealed `RuntimeNativeFunction` operations. Their
+`ProtectedCallRequest` owns the function, arguments, optional error handler,
+and the outer deferred-native snapshot. Runtime starts the target only after
+the publishing state turn ends. A `ProtectedCallActivationFrame` records the
+target-versus-handler phase, exact call/result window, parent driver role, and
+rooted pending response.
+
+Coroutine resume/wrap, ordinary and debug open-Upvalue transfer, explicit or
+automatic collection, and a nested protected call preserve that role when
+their response is delivered. Completion stops at the protected boundary
+instead of trying to resume through the dormant native `pcall` frame. Runtime
+then constructs `(true, ...)` or `(false, error/handler-results)`, finishes the
+outer deferred call, and resumes its parent role. No `LuaState` borrow or Rust
+callback closure is retained between turns.
+
+Focused regressions cover an arbitrary Lua wrapper around Runtime-native
+resume/wrap, Runtime-native execution during the `xpcall` handler, ordinary
+cross-state Upvalue access in both target and handler phases, error identity,
+`error in error handling`, and 128 nested protected calls. The nested case
+observes 129 rooted protected activations, one borrowed StateArena slot, and
+zero retained activation depth after completion. Other synchronous
+`call_value_with_results` users—metamethod helpers, load readers, comparators,
+and debug hooks—still fail closed on suspension and require typed continuation
+variants rather than storing their Rust `FnOnce` publishers.
 
 ### C. Registry and dump lifetime — M1.6
 
@@ -1232,11 +1258,11 @@ requirements:
       ownership separate, and cover stop/restart, weak cleanup, and finalizers.
 
 The remaining risk is broader than this automatic entry: generic non-string
-scoped access, arbitrary-Lua protected-helper suspension, deferred
-cross-platform sanitizer execution, public allocator callbacks, binary-dump
-lifecycle, and explicit IO/module service drain still gate later production
-milestones. Deep-chain and named scheduler fault boundaries now have local
-coverage.
+scoped access, suspension in synchronous callback helpers other than
+`pcall/xpcall`, deferred cross-platform sanitizer execution, public allocator
+callbacks, binary-dump lifecycle, and explicit IO/module service drain still
+gate later production milestones. Deep-chain and named scheduler fault
+boundaries now have local coverage.
 
 ## 11. Acceptance commands
 
