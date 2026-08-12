@@ -524,6 +524,10 @@ try {
                 $env:LUA_CPP_ORACLE_ROOT
             )) {
                 $env:LUA_CPP_ORACLE_ROOT
+            } elseif (Test-Path -LiteralPath (
+                Join-Path $Root "target/oracles/lua_cpp-source"
+            )) {
+                Join-Path $Root "target/oracles/lua_cpp-source"
             } else {
                 Join-Path (Split-Path -Parent $Root) "lua_cpp"
             }
@@ -616,19 +620,9 @@ try {
 
 $openDebts = @(
     [ordered]@{
-        id = "deterministic-runtime-shutdown"
-        blocks = "M1.8"
-        detail = "Deterministic Lua __gc drain plus state -> Thread -> ordinary -> fixed teardown and zero object/root/string/queue/state/managed-allocator accounting are implemented; explicit IO/module service drain remains open."
-    },
-    [ordered]@{
         id = "automatic-gc-and-allocator-accounting"
-        blocks = "M1.12-M1.13"
-        detail = "Managed allocator accounting, Runtime instruction-boundary automatic collection, four-site one-shot failure injection, transactional failure tests, targeted local Miri, Windows ASan, and the 1,000-cycle combined lifecycle matrix are implemented and gated. Cross-platform sanitizer execution is deferred under the current Windows validation policy; system allocator metadata and future public allocator callbacks remain open."
-    },
-    [ordered]@{
-        id = "generational-gc-handles-and-publication-roots"
-            blocks = "broader scoped object access"
-        detail = "GcRef carries non-reused ObjectId provenance, StateHandle uses an opaque checked RuntimeId namespace plus MAX-generation slot retirement, lexical publication roots and HeapId service pairing are implemented, production string Eq/Hash is identity-only with scoped byte access, and public full, incremental, and automatic collection are integrated. Broader non-string object contexts remain open."
+        blocks = "M1.13"
+        detail = "Managed allocator accounting, Runtime instruction-boundary automatic collection, five-site one-shot failure injection including the resource registry, transactional failure tests, targeted local Miri, Windows ASan, and the 1,000-cycle combined lifecycle plus 1,000-resource drain matrices are implemented and gated. Cross-platform sanitizer execution is deferred under the current Windows validation policy; system allocator metadata and future public allocator callbacks remain open."
     }
 )
 
@@ -640,7 +634,7 @@ $result = [ordered]@{
         "m1-foundation-gate"
     }
     mode = if ($Smoke) { "smoke" } else { "full" }
-    scope = "ByteString and canonical/scoped production string access, unique Heap/service ownership and HeapId pairing, fixed/pending-finalizer/runtime-service roots, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, production mutation inventory and checked post-write barriers, managed allocator live/peak/total accounting, allocation-triggered Runtime safe points, compiler, library/package, IO, VM/app, and synchronous result publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown, Lua-visible full-graph STW plus bounded incremental pause/propagate/atomic/sweep/finalize with weak/finalizer/resurrection, and byte differential"
+    scope = "ByteString and canonical/scoped production string access, scoped non-string managed-object access, unique Heap/service ownership and HeapId pairing, fixed/pending-finalizer/runtime-service roots, GcRef provenance, managed Proto, checked open-Upvalue and coroutine activation roots, temporary object/PendingState roots, production mutation inventory and checked post-write barriers, managed allocator live/peak/total accounting, allocation-triggered Runtime safe points, compiler, library/package, IO, VM/app, and synchronous result publication, fail-closed StateHandle identity/generation, Runtime/StateArena shutdown with explicit IO resource drain, Lua-visible full-graph STW plus bounded incremental pause/propagate/atomic/sweep/finalize with weak/finalizer/resurrection, and byte differential"
     checksPassed = $failures.Count -eq 0
     foundationPassed = (
         $failures.Count -eq 0 -and

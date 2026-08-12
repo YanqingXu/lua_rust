@@ -4,6 +4,8 @@
 //! 循环、return、函数定义等全部 13 种 Stmt 节点。
 //!
 
+use std::collections::HashSet;
+
 use crate::ast::expr::Expr;
 use crate::ast::stmt::{
     AssignStmt, CallStmt, DoStmt, ForInStmt, ForNumStmt, FunctionStmt, IfStmt, LocalStmt,
@@ -12,6 +14,154 @@ use crate::ast::stmt::{
 use crate::codegen::types::{AccessKind, LValueKind, NO_JUMP, SymbolKind, ValueResult};
 use crate::codegen::{CodeGenerator, CodegenObjectAllocator};
 use crate::opcode::{MAXINDEXRK, OpCode, is_k, rk_ask};
+
+fn expression_has_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nil(_)
+        | Expr::Boolean(_)
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Vararg(_)
+        | Expr::Name(_)
+        | Expr::Function(_) => false,
+        Expr::Binary(binary) => {
+            expression_has_call(&binary.left) || expression_has_call(&binary.right)
+        }
+        Expr::Unary(unary) => expression_has_call(&unary.operand),
+        Expr::Call(_) => true,
+        Expr::Table(table) => table.fields.iter().any(|field| {
+            field.key.as_deref().is_some_and(expression_has_call)
+                || expression_has_call(&field.value)
+        }),
+        Expr::Index(index) => {
+            expression_has_call(&index.table) || expression_has_call(&index.index)
+        }
+        Expr::Member(member) => expression_has_call(&member.table),
+        Expr::Paren(paren) => expression_has_call(&paren.expression),
+    }
+}
+
+fn collect_expr_reads(expr: &Expr, reads: &mut HashSet<String>) {
+    match expr {
+        Expr::Name(name) => {
+            reads.insert(name.name.clone());
+        }
+        Expr::Binary(binary) => {
+            collect_expr_reads(&binary.left, reads);
+            collect_expr_reads(&binary.right, reads);
+        }
+        Expr::Unary(unary) => collect_expr_reads(&unary.operand, reads),
+        Expr::Table(table) => {
+            for field in &table.fields {
+                if let Some(key) = &field.key {
+                    collect_expr_reads(key, reads);
+                }
+                collect_expr_reads(&field.value, reads);
+            }
+        }
+        Expr::Call(call) => {
+            collect_expr_reads(&call.func, reads);
+            for arg in &call.args {
+                collect_expr_reads(arg, reads);
+            }
+        }
+        Expr::Index(index) => {
+            collect_expr_reads(&index.table, reads);
+            collect_expr_reads(&index.index, reads);
+        }
+        Expr::Member(member) => collect_expr_reads(&member.table, reads),
+        Expr::Function(function) => collect_stmt_list_reads(&function.body, reads),
+        Expr::Paren(paren) => collect_expr_reads(&paren.expression, reads),
+        Expr::Nil(_) | Expr::Boolean(_) | Expr::Number(_) | Expr::String(_) | Expr::Vararg(_) => {}
+    }
+}
+
+fn collect_assign_target_reads(target: &Expr, reads: &mut HashSet<String>) {
+    if !matches!(target, Expr::Name(_)) {
+        collect_expr_reads(target, reads);
+    }
+}
+
+fn collect_stmt_reads(stmt: &Stmt, reads: &mut HashSet<String>) {
+    match stmt {
+        Stmt::Assign(assign) => {
+            for target in &assign.targets {
+                collect_assign_target_reads(target, reads);
+            }
+            for value in &assign.values {
+                collect_expr_reads(value, reads);
+            }
+        }
+        Stmt::Local(local) => {
+            for value in &local.values {
+                collect_expr_reads(value, reads);
+            }
+        }
+        Stmt::Call(call) => collect_expr_reads(&call.call, reads),
+        Stmt::If(if_stmt) => {
+            for branch in &if_stmt.branches {
+                collect_expr_reads(&branch.condition, reads);
+                collect_stmt_list_reads(&branch.body, reads);
+            }
+            collect_stmt_list_reads(&if_stmt.else_branch, reads);
+        }
+        Stmt::While(while_stmt) => {
+            collect_expr_reads(&while_stmt.condition, reads);
+            collect_stmt_list_reads(&while_stmt.body, reads);
+        }
+        Stmt::Repeat(repeat_stmt) => {
+            collect_stmt_list_reads(&repeat_stmt.body, reads);
+            collect_expr_reads(&repeat_stmt.condition, reads);
+        }
+        Stmt::ForNum(for_stmt) => {
+            collect_expr_reads(&for_stmt.init, reads);
+            collect_expr_reads(&for_stmt.limit, reads);
+            if let Some(step) = &for_stmt.step {
+                collect_expr_reads(step, reads);
+            }
+            collect_stmt_list_reads(&for_stmt.body, reads);
+        }
+        Stmt::ForIn(for_stmt) => {
+            for iterator in &for_stmt.iterators {
+                collect_expr_reads(iterator, reads);
+            }
+            collect_stmt_list_reads(&for_stmt.body, reads);
+        }
+        Stmt::Function(function) => {
+            if !function.is_local {
+                reads.insert(function.name.clone());
+            }
+            collect_stmt_list_reads(&function.body, reads);
+        }
+        Stmt::Return(return_stmt) => {
+            for value in &return_stmt.values {
+                collect_expr_reads(value, reads);
+            }
+        }
+        Stmt::Do(do_stmt) => collect_stmt_list_reads(&do_stmt.body, reads),
+        Stmt::Empty(_) | Stmt::Break(_) => {}
+    }
+}
+
+fn collect_stmt_list_reads(stmts: &[Box<Stmt>], reads: &mut HashSet<String>) {
+    for stmt in stmts {
+        collect_stmt_reads(stmt, reads);
+    }
+}
+
+fn receiver_table_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Index(index) => match index.table.as_ref() {
+            Expr::Name(name) => Some(name.name.as_str()),
+            _ => None,
+        },
+        Expr::Member(member) => match member.table.as_ref() {
+            Expr::Name(name) => Some(name.name.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // ═══════════════════════════════════════════════════════════════
@@ -44,9 +194,27 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
     /// 发射语句块
     pub fn emit_block(&mut self, stmts: &[Box<Stmt>]) -> Result<(), String> {
-        for stmt in stmts {
-            self.emit_statement(stmt)?;
+        let block_level = self.active_var_count;
+        let block_line = self.current_line;
+        let mut reads_after = vec![HashSet::new(); stmts.len() + 1];
+        for index in (0..stmts.len()).rev() {
+            let mut reads = reads_after[index + 1].clone();
+            collect_stmt_reads(&stmts[index], &mut reads);
+            reads_after[index] = reads;
         }
+
+        let previous_future_reads = self.future_reads.take();
+        for (index, stmt) in stmts.iter().enumerate() {
+            self.future_reads = Some(reads_after[index + 1].clone());
+            if let Err(error) = self.emit_statement(stmt) {
+                self.future_reads = previous_future_reads;
+                self.current_line = block_line;
+                return Err(error);
+            }
+            self.current_line = block_line;
+        }
+        self.future_reads = previous_future_reads;
+        self.remove_local_vars(block_level);
         Ok(())
     }
 
@@ -63,15 +231,130 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
             return Ok(());
         }
 
-        for target in &a.targets {
-            if let Expr::Name(name) = target.as_ref() {
-                let _ = self.resolve_name(&name.name);
+        if nvars == 1
+            && nexps == 1
+            && let (Expr::Name(target), Expr::Name(value)) =
+                (a.targets[0].as_ref(), a.values[0].as_ref())
+            && target.name == value.name
+            && self.find_local_var(&target.name) >= 0
+        {
+            return Ok(());
+        }
+
+        if nvars == nexps {
+            let local_assignment = a
+                .targets
+                .iter()
+                .zip(&a.values)
+                .map(|(target, value)| match (target.as_ref(), value.as_ref()) {
+                    (Expr::Name(target), Expr::Name(value)) => {
+                        let target_reg = self.find_local_var(&target.name);
+                        let source_reg = self.find_local_var(&value.name);
+                        (target_reg >= 0 && source_reg >= 0).then_some((target_reg, source_reg))
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+
+            if let Some(registers) = local_assignment {
+                let changed = registers.iter().any(|(target, source)| target != source);
+                if !changed {
+                    return Ok(());
+                }
+
+                if registers.len() == 2
+                    && registers[0].0 == registers[1].1
+                    && registers[1].0 == registers[0].1
+                {
+                    let temp_reg = self.reg_alloc.alloc();
+                    self.code_abc(OpCode::MOVE, temp_reg, registers[0].1, 0, self.current_line);
+                    self.code_abc(
+                        OpCode::MOVE,
+                        registers[0].0,
+                        registers[1].1,
+                        0,
+                        self.current_line,
+                    );
+                    self.code_abc(OpCode::MOVE, registers[1].0, temp_reg, 0, self.current_line);
+                    self.reg_alloc.set_freereg(temp_reg);
+                    return Ok(());
+                }
+
+                let has_forward_dependency = (0..registers.len())
+                    .any(|i| ((i + 1)..registers.len()).any(|j| registers[i].0 == registers[j].1));
+                if !has_forward_dependency {
+                    for (target, source) in registers {
+                        if target != source {
+                            self.code_abc(OpCode::MOVE, target, source, 0, self.current_line);
+                        }
+                    }
+                    return Ok(());
+                }
             }
+        }
+
+        let rhs_has_call = a.values.iter().any(|value| expression_has_call(value));
+        let assigned_local_names = a
+            .targets
+            .iter()
+            .filter_map(|target| match target.as_ref() {
+                Expr::Name(name) if self.find_local_var(&name.name) >= 0 => {
+                    Some(name.name.as_str())
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+
+        let mut targets = Vec::with_capacity(a.targets.len());
+        for target_expr in &a.targets {
+            let mut target = self.emit_lvalue(target_expr)?;
+            if target.kind == LValueKind::Indexed {
+                let stable_receiver = receiver_table_name(target_expr).is_some_and(|name| {
+                    self.find_local_var(name) >= 0 && !assigned_local_names.contains(name)
+                });
+                if rhs_has_call || !stable_receiver {
+                    let stable_reg = self.reg_alloc.alloc();
+                    if stable_reg != target.table_reg {
+                        self.code_abc(
+                            OpCode::MOVE,
+                            stable_reg,
+                            target.table_reg,
+                            0,
+                            self.current_line,
+                        );
+                    }
+                    target.table_reg = stable_reg;
+                }
+
+                let key_expr = match target_expr.as_ref() {
+                    Expr::Index(index) => Some(index.index.as_ref()),
+                    _ => None,
+                };
+                let stable_key = is_k(target.key)
+                    || (!rhs_has_call
+                        && key_expr.is_some_and(|expr| match expr {
+                            Expr::Name(name) => {
+                                self.find_local_var(&name.name) >= 0
+                                    && !assigned_local_names.contains(name.name.as_str())
+                            }
+                            _ => false,
+                        }));
+                if !stable_key {
+                    let stable_reg = self.reg_alloc.alloc();
+                    if stable_reg != target.key {
+                        self.code_abc(OpCode::MOVE, stable_reg, target.key, 0, self.current_line);
+                    }
+                    target.key = stable_reg;
+                }
+            }
+            targets.push(target);
         }
 
         let value_base = self.reg_alloc.current();
         let mut assigned_values = 0;
         let direct_values = nvars.min(nexps);
+        let assignment_needs_frozen_values = nvars > 1 || nexps > 1;
+        let mut values_for_store = Vec::with_capacity(a.targets.len());
 
         for i in 0..direct_values {
             let expr = &a.values[i as usize];
@@ -97,10 +380,22 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
                 }
             }
 
+            self.reg_alloc.set_freereg(target_reg);
             let val = self.emit_value(expr);
             let val = self.force_single_value(val);
-            self.materialize_value(val, target_reg);
-            self.reg_alloc.ensure_at_least(target_reg + 1);
+            let borrows_stable_local = i == direct_values - 1
+                && matches!(expr.as_ref(), Expr::Name(name) if self.find_local_var(&name.name) >= 0);
+            if assignment_needs_frozen_values && !borrows_stable_local {
+                self.materialize_value(val, target_reg);
+                values_for_store.push(ValueResult::make_register(
+                    target_reg,
+                    false,
+                    AccessKind::None,
+                ));
+            } else {
+                values_for_store.push(val);
+            }
+            self.reg_alloc.set_freereg(target_reg + 1);
             assigned_values = i + 1;
         }
 
@@ -120,33 +415,18 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
                 let val = self.force_single_value(val);
                 self.materialize_value(val, scratch_reg);
             }
+            self.reg_alloc.set_freereg(scratch_reg);
         }
 
-        self.reg_alloc.set_freereg(value_base + nvars);
-        let mut targets = Vec::with_capacity(a.targets.len());
-        for target_expr in &a.targets {
-            let mut lv = self.emit_lvalue(target_expr)?;
-            if lv.kind == LValueKind::Indexed {
-                let table_tmp = self.reg_alloc.alloc();
-                self.code_abc(OpCode::MOVE, table_tmp, lv.table_reg, 0, self.current_line);
-                lv.table_reg = table_tmp;
-
-                if !is_k(lv.key) {
-                    let key_tmp = self.reg_alloc.alloc();
-                    self.code_abc(OpCode::MOVE, key_tmp, lv.key, 0, self.current_line);
-                    lv.key = key_tmp;
-                }
-            }
-            targets.push(lv);
-        }
-
-        for (i, lv) in targets.iter().enumerate() {
+        for (i, target) in targets.iter().enumerate().rev() {
             let val = if (i as i32) < assigned_values {
-                ValueResult::make_register(value_base + i as i32, false, AccessKind::None)
+                values_for_store.get(i).cloned().unwrap_or_else(|| {
+                    ValueResult::make_register(value_base + i as i32, false, AccessKind::None)
+                })
             } else {
                 ValueResult::make_nil()
             };
-            self.emit_store(lv, val);
+            self.emit_store(target, val);
         }
         Ok(())
     }
@@ -163,47 +443,81 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
         self.reg_alloc.set_freereg(base);
 
-        let mut initialized = 0;
-        let prefix_count = if nexps <= nvars {
-            nexps.saturating_sub(1)
-        } else {
-            nvars
-        };
+        let all_nil_initializers = !l.values.is_empty()
+            && l.values
+                .iter()
+                .all(|value| matches!(value.as_ref(), Expr::Nil(_)));
+        let mut all_vars_initialized = nexps == 0
+            && nvars > 0
+            && !self.force_nil_local_initialization
+            && self.builder.instruction_count() == 0;
 
-        for (i, value_expr) in l.values.iter().take(prefix_count as usize).enumerate() {
-            let target_reg = base + i as i32;
-            let val = self.emit_value(value_expr);
-            let val = self.force_single_value(val);
-            self.materialize_value(val, target_reg);
-            self.reg_alloc.ensure_at_least(target_reg + 1);
-            initialized += 1;
+        if !all_vars_initialized
+            && nexps == 0
+            && nvars > 0
+            && !self.force_nil_local_initialization
+            && let Some(future_reads) = &self.future_reads
+        {
+            all_vars_initialized = l.names.iter().all(|name| !future_reads.contains(name));
         }
 
-        if nexps > 0 && nexps <= nvars {
-            let last_index = (nexps - 1) as usize;
-            let target_reg = base + nexps - 1;
-            let wanted = nvars - (nexps - 1);
-            if let Expr::Call(call) = l.values[last_index].as_ref() {
-                let mut info = self.emit_call_expr(call, target_reg);
-                self.set_wanted_results(&mut info, wanted);
+        let mut initialized = 0;
+        if all_nil_initializers {
+            if nvars > 0 {
+                self.code_abc(
+                    OpCode::LOADNIL,
+                    base,
+                    base + nvars - 1,
+                    0,
+                    self.current_line,
+                );
                 self.reg_alloc.ensure_at_least(base + nvars);
                 initialized = nvars;
-            } else if matches!(l.values[last_index].as_ref(), Expr::Vararg(_)) {
-                let mut info = self.emit_vararg_expr();
-                self.set_multi_ret_base(&mut info, target_reg);
-                self.set_wanted_results(&mut info, wanted);
-                self.reg_alloc.ensure_at_least(base + nvars);
-                initialized = nvars;
+                all_vars_initialized = true;
+            }
+        } else {
+            let prefix_count = if nexps <= nvars {
+                nexps.saturating_sub(1)
             } else {
-                let val = self.emit_value(&l.values[last_index]);
+                nvars
+            };
+
+            for (i, value_expr) in l.values.iter().take(prefix_count as usize).enumerate() {
+                let target_reg = base + i as i32;
+                let val = self.emit_value(value_expr);
                 let val = self.force_single_value(val);
                 self.materialize_value(val, target_reg);
                 self.reg_alloc.ensure_at_least(target_reg + 1);
                 initialized += 1;
             }
+
+            if nexps > 0 && nexps <= nvars {
+                let last_index = (nexps - 1) as usize;
+                let target_reg = base + nexps - 1;
+                let wanted = nvars - (nexps - 1);
+                if let Expr::Call(call) = l.values[last_index].as_ref() {
+                    let mut info = self.emit_call_expr(call, -1);
+                    self.set_wanted_results(&mut info, wanted);
+                    self.move_reg_range(target_reg, info.base_reg, wanted);
+                    self.reg_alloc.ensure_at_least(base + nvars);
+                    initialized = nvars;
+                } else if matches!(l.values[last_index].as_ref(), Expr::Vararg(_)) {
+                    let mut info = self.emit_vararg_expr();
+                    self.set_multi_ret_base(&mut info, target_reg);
+                    self.set_wanted_results(&mut info, wanted);
+                    self.reg_alloc.ensure_at_least(base + nvars);
+                    initialized = nvars;
+                } else {
+                    let val = self.emit_value(&l.values[last_index]);
+                    let val = self.force_single_value(val);
+                    self.materialize_value(val, target_reg);
+                    self.reg_alloc.ensure_at_least(target_reg + 1);
+                    initialized += 1;
+                }
+            }
         }
 
-        if initialized < nvars {
+        if initialized < nvars && !all_vars_initialized {
             let loadnil_line = if nexps == 0 { 0 } else { self.current_line };
             self.code_abc(
                 OpCode::LOADNIL,
@@ -250,10 +564,14 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
             self.enter_block(false);
             let _ = self.emit_block(&branch.body);
+            self.current_line = i.location.line;
             self.leave_block();
 
             if idx < i.branches.len() - 1 || !i.else_branch.is_empty() {
+                let saved_line = self.current_line;
+                self.current_line = i.end_line;
                 exit_list.push(self.emit_jump());
+                self.current_line = saved_line;
             }
             self.patch_list_to_here(&cond.false_list);
         }
@@ -261,6 +579,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         if !i.else_branch.is_empty() {
             self.enter_block(false);
             let _ = self.emit_block(&i.else_branch);
+            self.current_line = i.location.line;
             self.leave_block();
         }
 
@@ -282,12 +601,14 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         let cond = self.emit_cond_result(&w.condition);
         self.patch_list_to_here(&cond.true_list);
 
+        let body_level = self.active_var_count;
         let _ = self.emit_block(&w.body);
+        self.current_line = w.location.line;
+        self.remove_local_vars(body_level);
 
         // 跳回循环头
         let offset = loop_start - (self.get_label() + 1);
-        self.builder
-            .emit_as_bx(self.current_line, OpCode::JMP, 0, offset);
+        self.builder.emit_as_bx(0, OpCode::JMP, 0, offset);
 
         self.patch_list_to_here(&cond.false_list);
         self.leave_block();
@@ -303,19 +624,38 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         self.enter_block(true);
 
         let loop_start = self.get_label();
-        let _ = self.emit_block(&r.body);
+        let saved_force_nil_local_initialization = self.force_nil_local_initialization;
+        self.force_nil_local_initialization = true;
+        for stmt in &r.body {
+            let _ = self.emit_statement(stmt);
+            self.current_line = r.location.line;
+        }
+        self.force_nil_local_initialization = saved_force_nil_local_initialization;
 
+        if matches!(r.condition.as_ref(), Expr::Boolean(boolean) if boolean.value) {
+            self.remove_local_vars(block_level);
+            self.leave_block();
+            return;
+        }
+
+        // The pinned C++ compiler deliberately lowers repeat conditions through
+        // the value pipeline, then emits one TEST/back-edge pair. This preserves
+        // boolean materialization for comparison/and/or expressions instead of
+        // reusing the generic condition jump-list pipeline.
+        self.current_line = r.location.line;
+        let cond = if matches!(r.condition.as_ref(), Expr::Nil(_)) {
+            ValueResult::make_boolean(false)
+        } else {
+            self.emit_value(&r.condition)
+        };
+        let cond = self.force_single_value(cond);
+        let cond_reg = self.value_to_any_reg(cond);
+
+        self.remove_local_vars(block_level);
         self.current_line = r.condition.line();
-        let cond = self.emit_cond_result(&r.condition);
-        let exit_jump = self.emit_jump();
-        let repeat_false_target = self.get_label();
-        let _ = self.close_scope_upvalues(block_level);
-        let offset = loop_start - (self.get_label() + 1);
-        self.builder
-            .emit_as_bx(self.current_line, OpCode::JMP, 0, offset);
-        self.patch_list_vec(&cond.false_list, repeat_false_target); // false → 重复
-        self.fix_jump(exit_jump, self.get_label());
-        self.patch_list_to_here(&cond.true_list); // true → 退出
+        self.code_abc(OpCode::TEST, cond_reg, 0, 0, self.current_line);
+        let repeat_jump = self.emit_jump();
+        self.fix_jump(repeat_jump, loop_start);
 
         self.leave_block();
     }
@@ -368,7 +708,12 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         let loop_start = self.get_label();
 
         let _ = self.emit_block(&f.body);
-        let _ = self.close_scope_upvalues(base + 3);
+        // The pinned C++ compiler emits an iteration-scope CLOSE for every
+        // non-empty numeric-for body, independently of captured-local analysis.
+        if !f.body.is_empty() {
+            self.current_line = loop_line;
+            self.emit_close(base + 3);
+        }
 
         // FORLOOP
         let offset = loop_start - (self.get_label() + 1);
@@ -454,8 +799,14 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         let jump_to_tfor = self.emit_jump();
         let loop_start = self.get_label();
         let _ = self.emit_block(&f.body);
-        let _ = self.close_scope_upvalues(base + 3);
 
+        // The pinned C++ compiler closes the visible loop-variable scope on
+        // every generic-for iteration, even when the body itself is empty. The
+        // initial jump skips that CLOSE and lands directly on TFORLOOP.
+        if nvars > 0 {
+            self.current_line = iterator_line;
+            self.emit_close(base + 3);
+        }
         self.fix_jump(jump_to_tfor, self.get_label());
         self.builder
             .emit_abc(iterator_line, OpCode::TFORLOOP, base, 0, nvars);
@@ -483,7 +834,9 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
             let sym = self.resolve_name(&f.name);
             match sym.kind {
                 SymbolKind::Local => {
-                    self.emit_closure_to_reg(f, sym.index)?;
+                    let reg = self.reg_alloc.alloc();
+                    self.emit_closure_to_reg(f, reg)?;
+                    self.code_abc(OpCode::MOVE, sym.index, reg, 0, def_line);
                 }
                 SymbolKind::Upvalue => {
                     let reg = self.reg_alloc.alloc();
@@ -606,7 +959,13 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
             return;
         }
 
-        let first_reg = self.reg_alloc.current();
+        // Return expressions use a fresh temporary range immediately above the
+        // active locals. Condition lowering can leave higher scratch registers
+        // live in the allocator, but the pinned C++ emitter discards that state
+        // with RegisterGuard + setFreeReg(activeVarCount) before evaluating the
+        // return list.
+        let first_reg = self.active_var_count;
+        self.reg_alloc.set_freereg(first_reg);
 
         if r.values.len() == 1
             && let Expr::Call(call) = r.values[0].as_ref()
@@ -676,6 +1035,12 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // ═══════════════════════════════════════════════════════════════
 
     fn emit_break(&mut self) {
+        if let Some(level) = self
+            .find_breakable_block()
+            .map(|block| block.active_var_count)
+        {
+            self.close_scope_upvalues(level);
+        }
         let jump_pc = self.emit_jump();
         self.append_break_jump(jump_pc);
     }
@@ -688,6 +1053,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         self.current_line = d.location.line;
         self.enter_block(false);
         let _ = self.emit_block(&d.body);
+        self.current_line = d.location.line;
         self.leave_block();
     }
 }

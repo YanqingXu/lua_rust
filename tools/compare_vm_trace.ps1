@@ -2,10 +2,13 @@
 .SYNOPSIS
     Compare lua_cpp and lua_rust VM JSONL traces with fail-closed evidence handling.
 .DESCRIPTION
-    Executes every selected Lua source with --trace-diff, captures each process with a
+    Executes every selected Lua source with the selected snapshot or diff trace mode,
+    captures each process with a
     timeout, validates both JSONL traces, canonicalizes runtime identity addresses, and
     writes structured event differences. Missing binaries, missing/empty traces, invalid
-    JSON, timeouts, unsupported trace options, and non-zero exits are failures.
+    JSON, timeouts, and unsupported trace options are infrastructure failures.
+    Completed non-zero executions remain comparable so matched unhandled-error
+    traces can be audited; differing exit codes are semantic failures.
 
     Representative mode is intended for pull-request checks. Full mode recursively
     executes every Lua source and is intended for nightly checks.
@@ -37,6 +40,7 @@ param(
 
     [string]$RepresentativeManifest = "",
     [string]$CppAppExe = "",
+    [string]$CppTraceExe = "",
     [string]$RustAppExe = "",
     [string]$OutputDir = "",
     [string]$ResultPath = "",
@@ -46,6 +50,12 @@ param(
 
     [ValidateSet("Synthetic", "Cpp", "Rust")]
     [string]$SelfTestTool = "Synthetic",
+
+    [ValidateSet("Snapshot", "Diff")]
+    [string]$TraceMode = "Diff",
+
+    [ValidateSet("Basic", "Complete")]
+    [string]$EvidenceProfile = "Complete",
 
     [switch]$InfrastructureSelfTest,
     [switch]$JsonOutput
@@ -154,6 +164,18 @@ function Get-TraceCoverage {
     $controlEvents = @($Events | Where-Object {
         (Get-TraceProperty -Object $_ -Name "kind") -in @("call", "return", "yield", "resume")
     })
+    $upvalueKindsComplete = @(@("upvalue-open", "upvalue-close") | Where-Object {
+        $kind = $_
+        @($upvalues | Where-Object {
+            (Get-TraceProperty -Object $_ -Name "kind") -eq $kind
+        }).Count -gt 0
+    })
+    $controlKindsComplete = @(@("call", "return", "yield", "resume") | Where-Object {
+        $kind = $_
+        @($controlEvents | Where-Object {
+            (Get-TraceProperty -Object $_ -Name "kind") -eq $kind
+        }).Count -gt 0
+    })
     $sequenceValid = $true
     for ($index = 0; $index -lt $Events.Count; $index++) {
         if (-not (Test-TraceProperty -Object $Events[$index] -Name "seq") -or
@@ -179,14 +201,17 @@ function Get-TraceCoverage {
         changedRegisters    = $instructions.Count -gt 0 -and @($instructions | Where-Object {
             -not (Test-TraceProperty -Object $_ -Name "changedRegisters")
         }).Count -eq 0
-        upvalueLifecycle    = @($upvalues | Where-Object {
+        registerSnapshots   = $instructions.Count -gt 0 -and @($instructions | Where-Object {
+            -not (Test-TraceProperty -Object $_ -Name "registers")
+        }).Count -eq 0
+        upvalueLifecycle    = $upvalueKindsComplete.Count -eq 2 -and @($upvalues | Where-Object {
             -not (Test-TraceProperty -Object $_ -Name "slot") -or
             -not (Test-TraceProperty -Object $_ -Name "name")
         }).Count -eq 0
-        callReturnYieldResume = @($controlEvents | Where-Object {
+        callReturnYieldResume = $controlKindsComplete.Count -eq 4 -and @($controlEvents | Where-Object {
             -not (Test-TraceProperty -Object $_ -Name "callDepth")
         }).Count -eq 0
-        errorValueCategory  = @($errors | Where-Object {
+        errorValueCategory  = $errors.Count -gt 0 -and @($errors | Where-Object {
             (-not (Test-TraceProperty -Object $_ -Name "errorValue") -and
                 -not (Test-TraceProperty -Object $_ -Name "value")) -or
             (-not (Test-TraceProperty -Object $_ -Name "errorCategory") -and
@@ -207,7 +232,7 @@ function Convert-TraceFile {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return [pscustomobject][ordered]@{
             success = $false
-            error = "trace file was not created; --trace-diff may be unsupported"
+            error = "trace file was not created; the selected trace mode may be unsupported"
             events = @()
             coverage = $null
         }
@@ -270,7 +295,8 @@ function Normalize-TraceHostOutput {
 
     $kept = @()
     foreach ($line in ($Text -split "\r?\n")) {
-        if ($line -match '^\[TRACE\]\s+(Trace(?: diff)? enabled|Trace complete):') {
+        if ($line -match '^\[TRACE\]\s+Trace(?: diff)? enabled\b' -or
+            $line -match '^\[TRACE\]\s+Trace complete:') {
             continue
         }
         if ($line -ne "" -or $kept.Count -gt 0) {
@@ -316,7 +342,10 @@ function Get-TraceInvocation {
         [Parameter(Mandatory = $true)]
         [string]$LuaInput,
         [Parameter(Mandatory = $true)]
-        [string]$FixtureScript
+        [string]$FixtureScript,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Snapshot", "Diff")]
+        [string]$Mode
     )
 
     if ($Adapter -eq "Synthetic") {
@@ -330,7 +359,11 @@ function Get-TraceInvocation {
     }
     return [pscustomobject][ordered]@{
         executable = $Executable
-        arguments = @("--trace-diff", $TracePath, $LuaInput)
+        arguments = @(
+            $(if ($Mode -eq "Snapshot") { "--trace" } else { "--trace-diff" }),
+            $TracePath,
+            $LuaInput
+        )
     }
 }
 
@@ -349,12 +382,76 @@ if (-not $RustAppExe) {
         $hostTarget
     }
 }
+
+function Normalize-TraceHostError {
+    param(
+        [AllowEmptyString()]
+        [string]$Text,
+        [Parameter(Mandatory = $true)]
+        [string]$Executable
+    )
+
+    $leaf = [System.IO.Path]::GetFileName($Executable)
+    if (-not $leaf) {
+        return $Text
+    }
+    $prefix = [Regex]::Escape($leaf) + ': '
+    return [Regex]::Replace($Text, "(?m)^$prefix", "")
+}
+
+function Get-TraceComparisonEvents {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Events,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Basic", "Complete")]
+        [string]$Profile
+    )
+
+    if ($Profile -eq "Complete") {
+        return ,$Events
+    }
+
+    # Basic is the instruction-evidence profile. Lifecycle events remain in
+    # the parsed trace and its coverage report, but do not alter the established
+    # instruction-only parity gate. Re-sequence the projection so a producer's
+    # additional lifecycle evidence cannot create artificial sequence gaps.
+    $projected = New-Object System.Collections.ArrayList
+    foreach ($event in @($Events | Where-Object {
+        (Get-TraceProperty -Object $_ -Name "kind") -eq "instruction"
+    })) {
+        $copy = [ordered]@{}
+        if ($event -is [System.Collections.IDictionary]) {
+            foreach ($key in $event.Keys) {
+                $copy[[string]$key] = $event[$key]
+            }
+        }
+        else {
+            foreach ($property in $event.PSObject.Properties) {
+                $copy[$property.Name] = $property.Value
+            }
+        }
+        $copy["seq"] = [int64]$projected.Count
+        [void]$projected.Add($copy)
+    }
+    return ,@($projected)
+}
+if (-not $CppTraceExe) {
+    $cppTraceName = if ($env:OS -eq "Windows_NT") {
+        "lua_vm_trace_evidence.exe"
+    }
+    else {
+        "lua_vm_trace_evidence"
+    }
+    $CppTraceExe = Join-Path (Split-Path -Parent $CppAppExe) $cppTraceName
+}
 if (-not $OutputDir) {
     $OutputDir = Join-Path $projectRoot "target\parity\vm-trace"
 }
 
 $InputPath = Resolve-ParityPath -Path $InputPath -BasePath $projectRoot
 $CppAppExe = Resolve-ParityPath -Path $CppAppExe -BasePath $projectRoot
+$CppTraceExe = Resolve-ParityPath -Path $CppTraceExe -BasePath $projectRoot
 $RustAppExe = Resolve-ParityPath -Path $RustAppExe -BasePath $projectRoot
 $OutputDir = Resolve-ParityPath -Path $OutputDir -BasePath $projectRoot
 if ($RepresentativeManifest) {
@@ -368,11 +465,20 @@ else {
 }
 $runDirectory = Join-Path (Join-Path $OutputDir "runs") $runId
 
-$requiredEvidence = @(
-    "eventSequence", "pcOpcode", "activeCallFrames", "stackTop",
-    "changedRegisters", "upvalueLifecycle", "callReturnYieldResume",
-    "errorValueCategory"
-)
+$requiredEvidence = if ($EvidenceProfile -eq "Basic") {
+    @(
+        "eventSequence", "pcOpcode", "activeCallFrames",
+        $(if ($TraceMode -eq "Snapshot") { "registerSnapshots" } else { "changedRegisters" })
+    )
+}
+else {
+    @(
+        "eventSequence", "pcOpcode", "activeCallFrames", "stackTop",
+        $(if ($TraceMode -eq "Snapshot") { "registerSnapshots" } else { "changedRegisters" }),
+        "upvalueLifecycle", "callReturnYieldResume",
+        "errorValueCategory"
+    )
+}
 $caseResults = New-Object System.Collections.ArrayList
 $preflightIssues = New-Object System.Collections.ArrayList
 $report = [ordered]@{
@@ -393,8 +499,11 @@ $report = [ordered]@{
     }
     tools = [ordered]@{
         cpp = $CppAppExe
+        cppTrace = $CppTraceExe
         rust = $RustAppExe
     }
+    traceMode = $TraceMode
+    evidenceProfile = $EvidenceProfile
     requiredEvidence = $requiredEvidence
     preflightIssues = $preflightIssues
     summary = [ordered]@{
@@ -416,7 +525,7 @@ catch {
     exit 2
 }
 
-$leftExecutable = $CppAppExe
+$leftExecutable = $CppTraceExe
 $rightExecutable = $RustAppExe
 $leftAdapter = "Cpp"
 $rightAdapter = "Rust"
@@ -430,8 +539,8 @@ if ($InfrastructureSelfTest) {
             $rightAdapter = "Synthetic"
         }
         "Cpp" {
-            $leftExecutable = $CppAppExe
-            $rightExecutable = $CppAppExe
+            $leftExecutable = $CppTraceExe
+            $rightExecutable = $leftExecutable
             $leftAdapter = "Cpp"
             $rightAdapter = "Cpp"
         }
@@ -507,9 +616,9 @@ foreach ($file in $files) {
     $toolInput = $file.FullName.Replace('\', '/')
 
     $leftInvocation = Get-TraceInvocation -Adapter $leftAdapter -Executable $leftExecutable `
-        -TracePath $leftTracePath -LuaInput $toolInput -FixtureScript $fixtureScript
+        -TracePath $leftTracePath -LuaInput $toolInput -FixtureScript $fixtureScript -Mode $TraceMode
     $rightInvocation = Get-TraceInvocation -Adapter $rightAdapter -Executable $rightExecutable `
-        -TracePath $rightTracePath -LuaInput $toolInput -FixtureScript $fixtureScript
+        -TracePath $rightTracePath -LuaInput $toolInput -FixtureScript $fixtureScript -Mode $TraceMode
     $leftRaw = Invoke-ParityProcess -Executable $leftInvocation.executable -Arguments $leftInvocation.arguments `
         -WorkingDirectory $projectRoot -TimeoutSeconds $TimeoutSeconds
     $rightRaw = Invoke-ParityProcess -Executable $rightInvocation.executable -Arguments $rightInvocation.arguments `
@@ -533,11 +642,12 @@ foreach ($file in $files) {
             Add-TraceDifference -List $differences -Path "$($side.name).process" -Kind "timeout" `
                 -Left $TimeoutSeconds -Right $null -Message "VM tool exceeded timeout"
         }
-        if ($null -ne $side.execution.exitCode -and $side.execution.exitCode -ne 0) {
-            $infrastructureFailure = $true
-            Add-TraceDifference -List $differences -Path "$($side.name).exitCode" -Kind "process-exit" `
-                -Left $side.execution.exitCode -Right 0 -Message "VM tool exited unsuccessfully"
-        }
+    }
+    if ($null -ne $leftExecution.exitCode -and $null -ne $rightExecution.exitCode -and
+        $leftExecution.exitCode -ne $rightExecution.exitCode) {
+        Add-TraceDifference -List $differences -Path '$.process.exitCode' -Kind "value" `
+            -Left $leftExecution.exitCode -Right $rightExecution.exitCode `
+            -Message "observable process exit codes differ"
     }
 
     $leftParsed = if (-not $leftExecution.startError -and -not $leftExecution.timedOut) {
@@ -581,7 +691,9 @@ foreach ($file in $files) {
             }
         }
 
-        $eventComparison = Compare-ParityValue -Left $leftParsed.events -Right $rightParsed.events `
+        $leftComparisonEvents = Get-TraceComparisonEvents -Events $leftParsed.events -Profile $EvidenceProfile
+        $rightComparisonEvents = Get-TraceComparisonEvents -Events $rightParsed.events -Profile $EvidenceProfile
+        $eventComparison = Compare-ParityValue -Left $leftComparisonEvents -Right $rightComparisonEvents `
             -Path '$.events' -MaximumDifferences 500
         foreach ($difference in $eventComparison.items) {
             [void]$differences.Add($difference)
@@ -597,9 +709,11 @@ foreach ($file in $files) {
             Add-TraceDifference -List $differences -Path '$.process.stdout' -Kind "value" `
                 -Left $leftStdout -Right $rightStdout -Message "observable stdout differs after trace diagnostics are removed"
         }
-        if ($leftExecution.stderr -cne $rightExecution.stderr) {
+        $leftStderr = Normalize-TraceHostError -Text $leftExecution.stderr -Executable $leftExecutable
+        $rightStderr = Normalize-TraceHostError -Text $rightExecution.stderr -Executable $rightExecutable
+        if ($leftStderr -cne $rightStderr) {
             Add-TraceDifference -List $differences -Path '$.process.stderr' -Kind "value" `
-                -Left $leftExecution.stderr -Right $rightExecution.stderr -Message "observable stderr differs"
+                -Left $leftStderr -Right $rightStderr -Message "observable stderr differs after executable names are removed"
         }
     }
 

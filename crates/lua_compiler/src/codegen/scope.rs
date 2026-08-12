@@ -105,7 +105,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     }
 
     /// 发射 CLOSE 指令
-    fn emit_close(&mut self, level: i32) -> i32 {
+    pub(crate) fn emit_close(&mut self, level: i32) -> i32 {
         self.flush_pending_jumps();
         self.builder
             .emit_abc(self.current_line, OpCode::CLOSE, level, 0, 0)
@@ -188,9 +188,9 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     ///
     pub fn leave_block(&mut self) {
         let block = self.blocks.pop().expect("No block to leave");
-        let close_pc = self.remove_local_vars(block.active_var_count);
+        self.remove_local_vars(block.active_var_count);
         let label = self.get_label();
-        self.patch_list_vec(&block.breaklist, close_pc.unwrap_or(label));
+        self.patch_list_vec(&block.breaklist, label);
     }
 
     /// 当前代码块

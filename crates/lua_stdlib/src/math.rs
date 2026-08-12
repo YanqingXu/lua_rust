@@ -20,7 +20,7 @@ unsafe fn to_lua<'state>(l_ptr: *mut std::ffi::c_void) -> &'state mut LuaState {
 
 pub fn open_math(l: &mut LuaState, gc: &mut GarbageCollector) {
     // Find the "math" table in the global table
-    let math_table = find_lib_table(l, "math");
+    let math_table = find_lib_table(l, gc, "math");
     // math_table found — register all functions
     if math_table.is_null() {
         return;
@@ -84,8 +84,12 @@ fn set_number(
 }
 
 /// Find a library table in the global namespace
-fn find_lib_table(l: &LuaState, name: &str) -> lua_core::gc::gc_ref::GcRef<Table> {
-    crate::registration::find_library_table(l, name.as_bytes())
+fn find_lib_table(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    name: &str,
+) -> lua_core::gc::gc_ref::GcRef<Table> {
+    crate::registration::find_library_table_with_gc(l, gc, name.as_bytes())
         .ok()
         .flatten()
         .unwrap_or_else(lua_core::gc::gc_ref::GcRef::null)

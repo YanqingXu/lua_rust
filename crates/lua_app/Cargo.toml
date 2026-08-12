@@ -19,5 +19,8 @@ lua_compiler = { path = "../lua_compiler" }
 lua_vm       = { path = "../lua_vm" }
 lua_stdlib   = { path = "../lua_stdlib" }
 
+[dev-dependencies]
+serde_json = "1"
+
 [lints]
 workspace = true

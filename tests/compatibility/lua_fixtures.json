@@ -3,8 +3,8 @@
   "fixture_root": "tests/lua",
   "inventory": {
     "m0_baseline": 125,
-    "added_differential": 6,
-    "current_total": 131
+    "added_differential": 7,
+    "current_total": 132
   },
   "cases": [
     {"id":"alien-signals.bit","path":"tests/lua/alien_signals/bit.lua","kind":"helper","working_directory":"temporary","args":[],"environment":{},"expected_exit":0,"timeout_ms":30000,"compare_stdout":true,"compare_stderr":true,"compare_side_effects":true,"side_effects":[],"normalizations":[],"oracles":["lua_rust","lua_cpp"]},
@@ -49,6 +49,7 @@
     {"id":"differential.gc-weak-value","path":"tests/lua/differential/gc-weak-value.lua","kind":"entry","working_directory":"temporary","args":[],"environment":{},"expected_exit":0,"timeout_ms":10000,"compare_stdout":true,"compare_stderr":true,"compare_side_effects":true,"side_effects":[],"normalizations":[],"oracles":["lua_rust","lua_cpp","lua51"]},
     {"id":"differential.m1-byte-chunk-source","path":"tests/lua/differential/m1-byte-chunk-source.lua","kind":"entry","working_directory":"temporary","args":[],"environment":{},"expected_exit":0,"timeout_ms":30000,"compare_stdout":true,"compare_stderr":true,"compare_side_effects":true,"side_effects":[],"normalizations":[],"oracles":["lua_rust","lua_cpp","lua51"]},
     {"id":"differential.m1-byte-string","path":"tests/lua/differential/m1-byte-string.lua","kind":"entry","working_directory":"temporary","args":[],"environment":{},"expected_exit":0,"timeout_ms":30000,"compare_stdout":true,"compare_stderr":true,"compare_side_effects":true,"side_effects":[],"normalizations":[],"oracles":["lua_rust","lua_cpp","lua51"]},
+    {"id":"differential.m2-unary-frontend-coverage","path":"tests/lua/differential/m2-unary-frontend-coverage.lua","kind":"entry","working_directory":"temporary","args":[],"environment":{},"expected_exit":0,"timeout_ms":10000,"compare_stdout":true,"compare_stderr":true,"compare_side_effects":true,"side_effects":[],"normalizations":[],"oracles":["lua_rust","lua_cpp","lua51"]},
     {"id":"differential.stderr","path":"tests/lua/differential/stderr.lua","kind":"entry","working_directory":"temporary","args":[],"environment":{},"expected_exit":0,"timeout_ms":10000,"compare_stdout":true,"compare_stderr":true,"compare_side_effects":true,"side_effects":[],"normalizations":[],"oracles":["lua_rust","lua_cpp","lua51"]},
     {"id":"differential.value-types","path":"tests/lua/differential/value-types.lua","kind":"entry","working_directory":"temporary","args":[],"environment":{},"expected_exit":0,"timeout_ms":10000,"compare_stdout":true,"compare_stderr":true,"compare_side_effects":true,"side_effects":[],"normalizations":[],"oracles":["lua_rust","lua_cpp","lua51"]},
 

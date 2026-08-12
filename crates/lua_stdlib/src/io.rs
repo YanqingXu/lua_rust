@@ -6,14 +6,20 @@
 use lua_core::function::{CFunction, Function};
 use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::gc::object_id::ObjectId;
 use lua_core::gc::publication::{PublicationTxn, Rooted};
 use lua_core::gc_string::GcString;
 use lua_core::table::Table;
 use lua_core::userdata::Userdata;
 use lua_core::value::Value;
+use lua_vm::runtime::{RuntimeResourceDrainOutcome, StateResolveError};
 use lua_vm::state::LuaState;
 
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 const DIRECT_WRITE_THRESHOLD: usize = 256 * 1024;
 
@@ -27,6 +33,25 @@ enum StandardStream {
 struct IoFileData {
     direct_handle: Option<std::fs::File>,
     standard_stream: Option<StandardStream>,
+    pipe: Option<PipeData>,
+}
+
+struct PipeData {
+    child: Child,
+    input: Option<ChildStdin>,
+    output: Option<ChildStdout>,
+    waited: bool,
+}
+
+impl Drop for PipeData {
+    fn drop(&mut self) {
+        self.input.take();
+        self.output.take();
+        if !self.waited {
+            let _ = self.child.wait();
+            self.waited = true;
+        }
+    }
 }
 
 struct FileConstruction {
@@ -34,6 +59,7 @@ struct FileConstruction {
     mode: Vec<u8>,
     writable: bool,
     standard_stream: Option<StandardStream>,
+    pipe: Option<PipeData>,
     initial: Vec<u8>,
 }
 
@@ -49,40 +75,60 @@ enum IoPublicationStage {
     IteratorFunctionEnvironmentReady,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum IoPublishError {
+    #[error(transparent)]
+    Object(#[from] GcRefValidationError),
+    #[error(transparent)]
+    Runtime(#[from] StateResolveError),
+}
+
 pub fn open_io(l: &mut LuaState, gc: &mut GarbageCollector) {
-    let io_table = find_lib_table(l, "io");
+    let io_table = find_lib_table(l, gc, "io");
     if io_table.is_null() {
         return;
     }
 
-    gc.with_publication(|transaction| {
-        let io_table = transaction.protect(io_table)?;
-        let mut checkpoint = |_| Ok(());
-        let stdout = build_file(
-            l,
-            transaction,
-            memory_file_construction(None, b"w", true, Some(StandardStream::Stdout)),
-            &mut checkpoint,
-        )?;
-        let stdin = build_file(
-            l,
-            transaction,
-            memory_file_construction(None, b"r", false, Some(StandardStream::Stdin)),
-            &mut checkpoint,
-        )?;
-        let stderr = build_file(
-            l,
-            transaction,
-            memory_file_construction(None, b"w", true, Some(StandardStream::Stderr)),
-            &mut checkpoint,
-        )?;
-        set_rooted_userdata_field(l, transaction, &io_table, b"stdout", &stdout)?;
-        set_rooted_userdata_field(l, transaction, &io_table, b"stdin", &stdin)?;
-        set_rooted_userdata_field(l, transaction, &io_table, b"stderr", &stderr)?;
-        set_rooted_userdata_field(l, transaction, &io_table, b"__output", &stdout)?;
-        set_rooted_userdata_field(l, transaction, &io_table, b"__input", &stdin)
-    })
-    .expect("IO standard file graph publication must remain collector-valid");
+    l.reserve_runtime_resource_registrations(3)
+        .expect("IO standard resource registry reservation must succeed");
+    let standard_resource_ids = gc
+        .with_publication(|transaction| {
+            let io_table = transaction.protect(io_table)?;
+            let mut checkpoint = |_| Ok(());
+            let stdout = build_file(
+                l,
+                transaction,
+                memory_file_construction(None, b"w", true, Some(StandardStream::Stdout)),
+                &mut checkpoint,
+            )?;
+            let stdin = build_file(
+                l,
+                transaction,
+                memory_file_construction(None, b"r", false, Some(StandardStream::Stdin)),
+                &mut checkpoint,
+            )?;
+            let stderr = build_file(
+                l,
+                transaction,
+                memory_file_construction(None, b"w", true, Some(StandardStream::Stderr)),
+                &mut checkpoint,
+            )?;
+            set_rooted_userdata_field(l, transaction, &io_table, b"stdout", &stdout)?;
+            set_rooted_userdata_field(l, transaction, &io_table, b"stdin", &stdin)?;
+            set_rooted_userdata_field(l, transaction, &io_table, b"stderr", &stderr)?;
+            set_rooted_userdata_field(l, transaction, &io_table, b"__output", &stdout)?;
+            set_rooted_userdata_field(l, transaction, &io_table, b"__input", &stdin)?;
+            Ok::<_, GcRefValidationError>([
+                stdout.object_id(),
+                stdin.object_id(),
+                stderr.object_id(),
+            ])
+        })
+        .expect("IO standard file graph publication must remain collector-valid");
+    for object_id in standard_resource_ids {
+        l.register_runtime_resource(object_id, drain_io_file_resource)
+            .expect("reserved IO standard resource registration must succeed");
+    }
 
     reg(l, gc, io_table, "close", lua_io_close);
     reg(l, gc, io_table, "flush", lua_io_flush);
@@ -90,6 +136,7 @@ pub fn open_io(l: &mut LuaState, gc: &mut GarbageCollector) {
     reg(l, gc, io_table, "lines", lua_io_lines);
     reg(l, gc, io_table, "open", lua_io_open);
     reg(l, gc, io_table, "output", lua_io_output);
+    reg(l, gc, io_table, "popen", lua_io_popen);
     reg(l, gc, io_table, "read", lua_io_read);
     reg(l, gc, io_table, "tmpfile", lua_io_tmpfile);
     reg(l, gc, io_table, "type", lua_io_type);
@@ -107,8 +154,8 @@ fn reg(
         .expect("IO Function publication must remain collector-valid");
 }
 
-fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
-    crate::registration::find_library_table(l, name.as_bytes())
+fn find_lib_table(l: &LuaState, gc: &GarbageCollector, name: &str) -> GcRef<Table> {
+    crate::registration::find_library_table_with_gc(l, gc, name.as_bytes())
         .ok()
         .flatten()
         .unwrap_or_else(GcRef::null)
@@ -120,10 +167,17 @@ fn memory_file_construction(
     writable: bool,
     standard_stream: Option<StandardStream>,
 ) -> FileConstruction {
+    let text_mode = !mode.contains(&b'b');
     let initial = if mode.contains(&b'a') || (mode.starts_with(b"r") && !mode.starts_with(b"w")) {
-        path.as_deref()
+        let bytes = path
+            .as_deref()
             .and_then(|path| std::fs::read(path).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if text_mode {
+            crate::host_io::decode_text(&bytes)
+        } else {
+            bytes
+        }
     } else {
         Vec::new()
     };
@@ -132,6 +186,7 @@ fn memory_file_construction(
         mode: mode.to_vec(),
         writable,
         standard_stream,
+        pipe: None,
         initial,
     }
 }
@@ -222,6 +277,7 @@ fn build_file<'scope>(
         userdata.write_typed(IoFileData {
             direct_handle: None,
             standard_stream: construction.standard_stream,
+            pipe: construction.pipe,
         });
     }
     let userdata = transaction.alloc(userdata);
@@ -287,25 +343,43 @@ fn set_table_ref_value(
 }
 
 fn table_get_string(l: &LuaState, table_ref: GcRef<Table>, key: &str) -> Value {
-    // SAFETY: table_ref is reachable from globals while IO functions execute.
-    let Some(table) = (unsafe { table_ref.as_ref() }) else {
-        return Value::Nil;
-    };
-    get_field(l, table, key)
+    l.with_gc_ref(table_ref, |table| get_field(l, table, key))
+        .unwrap_or(Value::Nil)
 }
 
-fn current_output(l: &LuaState) -> Option<GcRef<Userdata>> {
-    let io_table = find_lib_table(l, "io");
-    match table_get_string(l, io_table, "__output") {
+fn table_get_string_with_gc(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    table_ref: GcRef<Table>,
+    key: &str,
+) -> Value {
+    let Some(pool) = l.active_string_pool_ptr() else {
+        return Value::Nil;
+    };
+    // SAFETY: StringPool is disjoint from the explicitly borrowed collector
+    // and remains active for this state turn.
+    let Some(key_ref) = (unsafe { &*pool }).find_bytes(key.as_bytes()) else {
+        return Value::Nil;
+    };
+    if gc.with_ref(key_ref, |_| ()).is_err() {
+        return Value::Nil;
+    }
+    gc.with_ref(table_ref, |table| table.get(&Value::String(key_ref)))
+        .unwrap_or(Value::Nil)
+}
+
+fn current_output(l: &LuaState, gc: &GarbageCollector) -> Option<GcRef<Userdata>> {
+    let io_table = find_lib_table(l, gc, "io");
+    match table_get_string_with_gc(l, gc, io_table, "__output") {
         Value::Userdata(file_ref) => Some(file_ref),
         Value::Table(file_ref) => table_to_file_userdata(file_ref),
         _ => None,
     }
 }
 
-fn current_input(l: &LuaState) -> Option<GcRef<Userdata>> {
-    let io_table = find_lib_table(l, "io");
-    match table_get_string(l, io_table, "__input") {
+fn current_input(l: &LuaState, gc: &GarbageCollector) -> Option<GcRef<Userdata>> {
+    let io_table = find_lib_table(l, gc, "io");
+    match table_get_string_with_gc(l, gc, io_table, "__input") {
         Value::Userdata(file_ref) => Some(file_ref),
         Value::Table(file_ref) => table_to_file_userdata(file_ref),
         _ => None,
@@ -318,10 +392,10 @@ fn set_current_output(
     io_table: GcRef<Table>,
     file_ref: GcRef<Userdata>,
 ) {
-    if let Value::Userdata(previous) = table_get_string(state, io_table, "__output")
+    if let Value::Userdata(previous) = table_get_string_with_gc(state, gc, io_table, "__output")
         && previous != file_ref
     {
-        let _ = flush_file_to_disk(state, previous);
+        let _ = flush_file_to_disk(state, gc, previous);
     }
     set_table_ref_value(state, gc, io_table, b"__output", &Value::Userdata(file_ref))
         .expect("current output publication must remain collector-valid");
@@ -339,16 +413,15 @@ fn file_state_ref(
 }
 
 fn with_file_state<R>(
+    state: &LuaState,
     file_ref: GcRef<Userdata>,
     access: impl for<'state> FnOnce(&'state Table) -> R,
 ) -> Option<R> {
-    // SAFETY: file_ref is rooted by the active stack/table/function environment for
-    // this call. The HRTB callback keeps the metatable borrow inside this function.
-    let userdata = unsafe { file_ref.as_ref() }?;
-    let metatable = userdata.metatable()?;
-    // SAFETY: the userdata keeps its metatable alive for the callback's duration.
-    let state = unsafe { metatable.as_ptr().as_ref() }?;
-    Some(access(state))
+    let metatable = state
+        .with_gc_ref(file_ref, Userdata::metatable)
+        .ok()
+        .flatten()?;
+    state.with_gc_ref(metatable, access).ok()
 }
 
 fn prepare_open_file(path: &str, mode: &[u8]) -> std::io::Result<FileConstruction> {
@@ -395,7 +468,7 @@ fn prepare_open_file(path: &str, mode: &[u8]) -> std::io::Result<FileConstructio
 
     Ok(memory_file_construction(
         Some(path.to_string()),
-        &normalized_mode,
+        mode,
         write_mode,
         None,
     ))
@@ -405,18 +478,23 @@ fn publish_file_to_stack(
     state: &mut LuaState,
     gc: &mut GarbageCollector,
     construction: FileConstruction,
-) -> Result<(), GcRefValidationError> {
-    gc.with_publication(|transaction| {
+) -> Result<(), IoPublishError> {
+    state.reserve_runtime_resource_registrations(1)?;
+    let object_id = gc.with_publication(|transaction| {
         let mut checkpoint = |_| Ok(());
         let file = build_file(state, transaction, construction, &mut checkpoint)?;
+        let object_id = file.object_id();
         // SAFETY: the callback installs the Userdata on the active Lua stack
         // before its temporary root is released.
         unsafe {
             transaction.publish_userdata_value(file, |value| {
                 state.push_value(value);
-            })
+            })?;
         }
-    })
+        Ok::<_, GcRefValidationError>(object_id)
+    })?;
+    state.register_runtime_resource(object_id, drain_io_file_resource)?;
+    Ok(())
 }
 
 fn publish_file_to_table_and_stack(
@@ -425,20 +503,25 @@ fn publish_file_to_table_and_stack(
     table: GcRef<Table>,
     key: &[u8],
     construction: FileConstruction,
-) -> Result<(), GcRefValidationError> {
-    gc.with_publication(|transaction| {
+) -> Result<(), IoPublishError> {
+    state.reserve_runtime_resource_registrations(1)?;
+    let object_id = gc.with_publication(|transaction| {
         let table = transaction.protect(table)?;
         let mut checkpoint = |_| Ok(());
         let file = build_file(state, transaction, construction, &mut checkpoint)?;
+        let object_id = file.object_id();
         set_rooted_userdata_field(state, transaction, &table, key, &file)?;
         // SAFETY: the callback adds a second durable edge from the active
         // stack before the file's temporary root is released.
         unsafe {
             transaction.publish_userdata_value(file, |value| {
                 state.push_value(value);
-            })
+            })?;
         }
-    })
+        Ok::<_, GcRefValidationError>(object_id)
+    })?;
+    state.register_runtime_resource(object_id, drain_io_file_resource)?;
+    Ok(())
 }
 
 unsafe extern "C" fn lua_io_tmpfile(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -460,6 +543,80 @@ unsafe extern "C" fn lua_io_tmpfile(l_ptr: *mut std::ffi::c_void) -> i32 {
     }
 }
 
+unsafe extern "C" fn lua_io_popen(l_ptr: *mut std::ffi::c_void) -> i32 {
+    // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
+    let l = unsafe { &mut *(l_ptr as *mut LuaState) };
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        l.push_nil();
+        return 1;
+    };
+    // SAFETY: LuaState::gc is installed by the VM before calling C functions.
+    let gc = unsafe { &mut *gc_ptr };
+
+    let Some(command) = bytes_arg(l, 1) else {
+        return push_error(l, gc, "io.popen: command expected");
+    };
+    let Ok(command) = String::from_utf8(command) else {
+        return push_error(l, gc, "io.popen: command must be valid UTF-8");
+    };
+    let mode = bytes_arg(l, 2).unwrap_or_else(|| b"r".to_vec());
+    if mode.as_slice() != b"r" && mode.as_slice() != b"w" {
+        return push_error(l, gc, "io.popen: invalid mode (must be 'r' or 'w')");
+    }
+
+    match prepare_pipe(&command, &mode) {
+        Ok(construction) => match publish_file_to_stack(l, gc, construction) {
+            Ok(()) => 1,
+            Err(_) => {
+                l.push_nil();
+                1
+            }
+        },
+        Err(error) => {
+            push_io_error_tuple(l, gc, &error.to_string(), error.raw_os_error().unwrap_or(0))
+        }
+    }
+}
+
+fn prepare_pipe(command: &str, mode: &[u8]) -> std::io::Result<FileConstruction> {
+    #[cfg(windows)]
+    let mut process = {
+        let mut process = Command::new("cmd");
+        let raw_command = if command.trim_start().starts_with('"') {
+            format!(" \"{command}\"")
+        } else {
+            format!(" {command}")
+        };
+        process.arg("/C").raw_arg(&raw_command);
+        process
+    };
+
+    #[cfg(not(windows))]
+    let mut process = {
+        let mut process = Command::new("sh");
+        process.args(["-c", command]);
+        process
+    };
+
+    let readable = mode == b"r";
+    if readable {
+        process.stdout(Stdio::piped());
+    } else {
+        process.stdin(Stdio::piped());
+    }
+    let mut child = process.spawn()?;
+    let input = child.stdin.take();
+    let output = child.stdout.take();
+    let mut construction = memory_file_construction(None, mode, !readable, None);
+    construction.pipe = Some(PipeData {
+        child,
+        input,
+        output,
+        waited: false,
+    });
+    Ok(construction)
+}
+
 unsafe extern "C" fn lua_io_input(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
@@ -469,7 +626,7 @@ unsafe extern "C" fn lua_io_input(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let io_table = find_lib_table(l, "io");
+    let io_table = find_lib_table(l, gc, "io");
     if io_table.is_null() {
         l.push_nil();
         return 1;
@@ -559,7 +716,14 @@ unsafe extern "C" fn lua_io_open(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_read(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(file_ref) = current_input(l) else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        l.push_nil();
+        return 1;
+    };
+    // SAFETY: this shared lookup borrow ends before read_from_file obtains its
+    // own callback-scoped collector access.
+    let file_ref = current_input(l, unsafe { &*gc_ptr });
+    let Some(file_ref) = file_ref else {
         l.push_nil();
         return 1;
     };
@@ -578,7 +742,7 @@ unsafe extern "C" fn lua_io_type(l_ptr: *mut std::ffi::c_void) -> i32 {
     match l.at(1).cloned().unwrap_or(Value::Nil) {
         Value::Userdata(file_ref) => {
             let Some(closed) =
-                with_file_state(file_ref, |state| get_bool_field(l, state, "__closed"))
+                with_file_state(l, file_ref, |state| get_bool_field(l, state, "__closed"))
             else {
                 l.push_nil();
                 return 1;
@@ -600,11 +764,19 @@ unsafe extern "C" fn lua_io_type(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_flush(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(file_ref) = current_output(l) else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_value(Value::Boolean(false));
         return 1;
     };
-    l.push_value(Value::Boolean(flush_file_to_disk(l, file_ref).is_ok()));
+    // SAFETY: this shared lookup borrow ends before the mutable flush borrow.
+    let file_ref = current_output(l, unsafe { &*gc_ptr });
+    let Some(file_ref) = file_ref else {
+        l.push_value(Value::Boolean(false));
+        return 1;
+    };
+    // SAFETY: the VM installs the owning collector for this callback.
+    let gc = unsafe { &mut *gc_ptr };
+    l.push_value(Value::Boolean(flush_file_to_disk(l, gc, file_ref).is_ok()));
     1
 }
 
@@ -620,7 +792,7 @@ unsafe extern "C" fn lua_io_lines(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     match l.at(1).cloned().unwrap_or(Value::Nil) {
         Value::Nil => {
-            let Some(file_ref) = current_input(l) else {
+            let Some(file_ref) = current_input(l, gc) else {
                 l.push_nil();
                 return 1;
             };
@@ -659,7 +831,7 @@ unsafe extern "C" fn lua_io_output(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let io_table = find_lib_table(l, "io");
+    let io_table = find_lib_table(l, gc, "io");
     if io_table.is_null() {
         l.push_nil();
         return 1;
@@ -679,7 +851,7 @@ unsafe extern "C" fn lua_io_output(l_ptr: *mut std::ffi::c_void) -> i32 {
             match prepare_open_file(&path, b"w") {
                 Ok(construction) => {
                     if let Value::Userdata(previous) = table_get_string(l, io_table, "__output") {
-                        let _ = flush_file_to_disk(l, previous);
+                        let _ = flush_file_to_disk(l, gc, previous);
                     }
                     match publish_file_to_table_and_stack(
                         l,
@@ -718,7 +890,14 @@ unsafe extern "C" fn lua_io_output(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_write(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
-    let Some(file_ref) = current_output(l) else {
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        l.push_nil();
+        return 1;
+    };
+    // SAFETY: this shared lookup borrow ends before write_to_file obtains its
+    // own callback-scoped collector access.
+    let file_ref = current_output(l, unsafe { &*gc_ptr });
+    let Some(file_ref) = file_ref else {
         l.push_nil();
         return 1;
     };
@@ -728,8 +907,13 @@ unsafe extern "C" fn lua_io_write(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_io_close(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        l.push_value(Value::Boolean(false));
+        return 1;
+    };
     let file_ref = match l.at(1).cloned().unwrap_or(Value::Nil) {
-        Value::Nil => current_output(l),
+        // SAFETY: this shared lookup borrow ends before close_file_handle.
+        Value::Nil => current_output(l, unsafe { &*gc_ptr }),
         Value::Userdata(file_ref) => Some(file_ref),
         _ => None,
     };
@@ -770,7 +954,7 @@ fn write_to_file(
     }
 
     let Some((closed, writable, pos, content, direct_write, buffer_mode)) =
-        with_file_state(file_ref, |file| {
+        with_file_state(l, file_ref, |file| {
             let already_direct = get_bool_field(l, file, "__direct");
             let pos = get_number_field(l, file, "__pos").max(0.0) as usize;
             let content = if already_direct {
@@ -811,7 +995,44 @@ fn write_to_file(
         return 3;
     }
 
-    if let Some(stream) = file_standard_stream(file_ref) {
+    if file_is_pipe(l, file_ref) {
+        let written = with_file_data_mut(gc, file_ref, |data| {
+            let Some(pipe) = data.pipe.as_mut() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pipe is closed",
+                ));
+            };
+            let Some(input) = pipe.input.as_mut() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pipe is not open for writing",
+                ));
+            };
+            crate::host_io::write_text(input, &appended)?;
+            Ok::<usize, std::io::Error>(appended.len())
+        })
+        .unwrap_or_else(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pipe is closed",
+            ))
+        });
+        return match written {
+            Ok(count) => {
+                if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+                    let _ = set_number_field(l, file, gc, "__pos", (pos + count) as f64);
+                }
+                l.push_value(Value::Userdata(file_ref));
+                1
+            }
+            Err(error) => {
+                push_io_error_tuple(l, gc, &error.to_string(), error.raw_os_error().unwrap_or(0))
+            }
+        };
+    }
+
+    if let Some(stream) = file_standard_stream(l, file_ref) {
         match write_standard_stream(stream, &appended) {
             Ok(()) => {
                 if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
@@ -858,7 +1079,7 @@ fn write_to_file(
     }
 
     if buffer_mode == b"no" || (buffer_mode == b"line" && appended.contains(&b'\n')) {
-        let _ = flush_file_to_disk(l, file_ref);
+        let _ = flush_file_to_disk(l, gc, file_ref);
     }
 
     l.push_value(Value::Userdata(file_ref));
@@ -869,12 +1090,12 @@ fn write_standard_stream(stream: StandardStream, bytes: &[u8]) -> std::io::Resul
     match stream {
         StandardStream::Stdout => {
             let mut stdout = std::io::stdout().lock();
-            stdout.write_all(bytes)?;
+            crate::host_io::write_text(&mut stdout, bytes)?;
             stdout.flush()
         }
         StandardStream::Stderr => {
             let mut stderr = std::io::stderr().lock();
-            stderr.write_all(bytes)?;
+            crate::host_io::write_text(&mut stderr, bytes)?;
             stderr.flush()
         }
         StandardStream::Stdin => Err(std::io::Error::new(
@@ -910,32 +1131,50 @@ unsafe extern "C" fn lua_io_file_seek(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     let whence = bytes_arg(l, 2).unwrap_or_else(|| b"cur".to_vec());
     let offset = number_arg(l, 3).unwrap_or(0.0) as isize;
-    let Some((direct, buffered_len, current)) = with_file_state(file_ref, |file| {
-        (
-            get_bool_field(l, file, "__direct"),
-            get_bytes_field(l, file, "__content").len(),
-            get_number_field(l, file, "__pos") as isize,
-        )
-    }) else {
+    let Some((direct, content, current, text_mode, has_path)) =
+        with_file_state(l, file_ref, |file| {
+            let path = get_bytes_field(l, file, "__path");
+            (
+                get_bool_field(l, file, "__direct"),
+                get_bytes_field(l, file, "__content"),
+                get_number_field(l, file, "__pos").max(0.0) as usize,
+                !get_bytes_field(l, file, "__mode").contains(&b'b'),
+                !path.is_empty(),
+            )
+        })
+    else {
         l.push_nil();
         return 1;
     };
-
-    let content_len = if direct {
-        direct_file_len(l, file_ref).unwrap_or(buffered_len) as isize
+    let mapped_text_file = text_mode && has_path && !direct;
+    let logical_len = content.len();
+    let current_position = if mapped_text_file {
+        crate::host_io::logical_to_physical_text_offset(&content, current)
     } else {
-        buffered_len as isize
+        current
+    };
+    let end_position = if direct {
+        direct_file_len(l, gc, file_ref).unwrap_or(logical_len)
+    } else if mapped_text_file {
+        crate::host_io::logical_to_physical_text_offset(&content, logical_len)
+    } else {
+        logical_len
     };
     let base = match whence.as_slice() {
         b"set" => 0,
-        b"end" => content_len,
-        _ => current,
+        b"end" => end_position as isize,
+        _ => current_position as isize,
     };
-    let new_pos = (base + offset).clamp(0, content_len) as usize;
+    let physical_position = (base + offset).clamp(0, end_position as isize) as usize;
+    let logical_position = if mapped_text_file {
+        crate::host_io::physical_to_logical_text_offset(&content, physical_position)
+    } else {
+        physical_position
+    };
     if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
-        let _ = set_number_field(l, file, gc, "__pos", new_pos as f64);
+        let _ = set_number_field(l, file, gc, "__pos", logical_position as f64);
     }
-    l.push_value(Value::Number(new_pos as f64));
+    l.push_value(Value::Number(physical_position as f64));
     1
 }
 
@@ -972,7 +1211,13 @@ unsafe extern "C" fn lua_io_file_flush(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_value(Value::Boolean(false));
         return 1;
     };
-    l.push_value(Value::Boolean(flush_file_to_disk(l, file_ref).is_ok()));
+    let Some(gc_ptr) = l.active_gc_ptr() else {
+        l.push_value(Value::Boolean(false));
+        return 1;
+    };
+    // SAFETY: the VM installs the owning collector for this callback.
+    let gc = unsafe { &mut *gc_ptr };
+    l.push_value(Value::Boolean(flush_file_to_disk(l, gc, file_ref).is_ok()));
     1
 }
 
@@ -1017,9 +1262,9 @@ unsafe extern "C" fn lua_io_file_tostring(l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let text = match file_arg(l)
-        .and_then(|file_ref| with_file_state(file_ref, |file| get_bool_field(l, file, "__closed")))
-    {
+    let text = match file_arg(l).and_then(|file_ref| {
+        with_file_state(l, file_ref, |file| get_bool_field(l, file, "__closed"))
+    }) {
         Some(true) => "file (closed)".to_string(),
         Some(false) => "file".to_string(),
         None => "file (closed)".to_string(),
@@ -1058,22 +1303,27 @@ unsafe extern "C" fn lua_io_lines_iter(l_ptr: *mut std::ffi::c_void) -> i32 {
         return 1;
     };
     // SAFETY: the iterator function owns env_ref through its function environment.
-    let Some(env) = (unsafe { env_ref.as_ref() }) else {
+    let env = l.with_gc_ref(env_ref, |env| {
+        (
+            get_bool_field(l, env, "__dead"),
+            get_field(l, env, "__file"),
+            get_bool_field(l, env, "__auto_close"),
+        )
+    });
+    let Ok((dead, file_value, auto_close)) = env else {
         l.push_nil();
         return 1;
     };
-    if get_bool_field(l, env, "__dead") {
+    if dead {
         return push_error(l, gc, "file iterator is closed");
     }
-    let file_ref = match get_field(l, env, "__file") {
+    let file_ref = match file_value {
         Value::Userdata(file_ref) => file_ref,
         _ => {
             l.push_nil();
             return 1;
         }
     };
-    let auto_close = get_bool_field(l, env, "__auto_close");
-
     match read_line_from_file(l, gc, file_ref) {
         Ok(Some(line)) => {
             push_lua_bytes(l, gc, &line);
@@ -1097,7 +1347,8 @@ fn close_file_handle(l: &mut LuaState, file_ref: GcRef<Userdata>) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(l, file, "__closed")) else {
+    let Some(closed) = with_file_state(l, file_ref, |file| get_bool_field(l, file, "__closed"))
+    else {
         l.push_value(Value::Boolean(false));
         return 1;
     };
@@ -1106,12 +1357,30 @@ fn close_file_handle(l: &mut LuaState, file_ref: GcRef<Userdata>) -> i32 {
         return push_error(l, gc, "attempt to close a closed file");
     }
 
-    if flush_file_to_disk(l, file_ref).is_err() {
+    if flush_file_to_disk(l, gc, file_ref).is_err() {
         l.push_value(Value::Boolean(false));
         return 1;
     }
 
-    close_direct_handle(file_ref);
+    if let Some(result) = close_pipe(gc, file_ref) {
+        return match result {
+            Ok(success) => {
+                if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+                    let _ = set_bool_field(l, file, gc, "__closed", true);
+                }
+                if success {
+                    l.push_value(Value::Boolean(true));
+                    1
+                } else {
+                    push_io_error_tuple(l, gc, host_no_error_message(), 0)
+                }
+            }
+            Err(error) => {
+                push_io_error_tuple(l, gc, &error.to_string(), error.raw_os_error().unwrap_or(0))
+            }
+        };
+    }
+    close_direct_handle(gc, file_ref);
     if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
         let _ = set_bool_field(l, file, gc, "__closed", true);
     }
@@ -1124,14 +1393,18 @@ fn close_file_silent(
     gc: &mut GarbageCollector,
     file_ref: GcRef<Userdata>,
 ) -> Result<(), String> {
-    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(l, file, "__closed")) else {
+    let Some(closed) = with_file_state(l, file_ref, |file| get_bool_field(l, file, "__closed"))
+    else {
         return Err("invalid file".to_string());
     };
     if closed {
         return Err("attempt to close a closed file".to_string());
     }
-    flush_file_to_disk(l, file_ref).map_err(|err| err.to_string())?;
-    close_direct_handle(file_ref);
+    flush_file_to_disk(l, gc, file_ref).map_err(|err| err.to_string())?;
+    if let Some(result) = close_pipe(gc, file_ref) {
+        let _ = result.map_err(|error| error.to_string())?;
+    }
+    close_direct_handle(gc, file_ref);
     let Some(file) =
         file_state_ref(gc, file_ref).map_err(|error| format!("invalid file: {error}"))?
     else {
@@ -1140,6 +1413,28 @@ fn close_file_silent(
     set_bool_field(l, file, gc, "__closed", true)
         .map_err(|error| format!("invalid file: {error}"))?;
     Ok(())
+}
+
+fn drain_io_file_resource(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    object_id: ObjectId,
+) -> RuntimeResourceDrainOutcome {
+    let Some(file_ref) = gc.registered_ref_by_id::<Userdata>(object_id) else {
+        return RuntimeResourceDrainOutcome::Stale;
+    };
+    let Some(closed) = with_file_state(state, file_ref, |file| {
+        get_bool_field(state, file, "__closed")
+    }) else {
+        return RuntimeResourceDrainOutcome::Failed;
+    };
+    if closed {
+        return RuntimeResourceDrainOutcome::AlreadyClosed;
+    }
+    match close_file_silent(state, gc, file_ref) {
+        Ok(()) => RuntimeResourceDrainOutcome::Drained,
+        Err(_) => RuntimeResourceDrainOutcome::Failed,
+    }
 }
 
 #[derive(Debug)]
@@ -1173,7 +1468,7 @@ fn read_from_file(l: &mut LuaState, file_ref: GcRef<Userdata>, first_arg: i32) -
         Err(message) => return push_error(l, gc, &message),
     };
 
-    let Some((readable, mut pos)) = with_file_state(file_ref, |file| {
+    let Some((readable, mut pos)) = with_file_state(l, file_ref, |file| {
         (
             get_bool_field(l, file, "__readable"),
             get_number_field(l, file, "__pos").max(0.0) as usize,
@@ -1192,7 +1487,7 @@ fn read_from_file(l: &mut LuaState, file_ref: GcRef<Userdata>, first_arg: i32) -
         if let Err(message) = prepare_standard_input(l, gc, file_ref, pos, &format) {
             return push_error(l, gc, &message);
         }
-        let content = with_file_state(file_ref, |file| get_bytes_field(l, file, "__content"))
+        let content = with_file_state(l, file_ref, |file| get_bytes_field(l, file, "__content"))
             .unwrap_or_default();
         let value = read_one(&content, pos, &format);
         pos = value.1;
@@ -1225,7 +1520,7 @@ fn read_line_from_file(
     file_ref: GcRef<Userdata>,
 ) -> Result<Option<Vec<u8>>, String> {
     ensure_file_readable(l, gc, file_ref)?;
-    let Some((readable, pos)) = with_file_state(file_ref, |file| {
+    let Some((readable, pos)) = with_file_state(l, file_ref, |file| {
         (
             get_bool_field(l, file, "__readable"),
             get_number_field(l, file, "__pos").max(0.0) as usize,
@@ -1237,7 +1532,7 @@ fn read_line_from_file(
         return Ok(None);
     }
     prepare_standard_input(l, gc, file_ref, pos, &ReadFormat::Line)?;
-    let Some(content) = with_file_state(file_ref, |file| get_bytes_field(l, file, "__content"))
+    let Some(content) = with_file_state(l, file_ref, |file| get_bytes_field(l, file, "__content"))
     else {
         return Err("invalid file".to_string());
     };
@@ -1258,11 +1553,16 @@ fn ensure_file_readable(
     gc: &mut GarbageCollector,
     file_ref: GcRef<Userdata>,
 ) -> Result<(), String> {
-    let Some(closed) = with_file_state(file_ref, |file| get_bool_field(l, file, "__closed")) else {
+    let Some(closed) = with_file_state(l, file_ref, |file| get_bool_field(l, file, "__closed"))
+    else {
         return Err("invalid file".to_string());
     };
     if closed {
         return Err("attempt to use a closed file".to_string());
+    }
+    if file_is_pipe(l, file_ref) {
+        fill_pipe_output(l, gc, file_ref)?;
+        return Ok(());
     }
     refresh_file_from_disk(l, gc, file_ref);
     Ok(())
@@ -1275,11 +1575,11 @@ fn prepare_standard_input(
     pos: usize,
     format: &ReadFormat,
 ) -> Result<(), String> {
-    if file_standard_stream(file_ref) != Some(StandardStream::Stdin) {
+    if file_standard_stream(l, file_ref) != Some(StandardStream::Stdin) {
         return Ok(());
     }
 
-    let Some((stdin_eof, content)) = with_file_state(file_ref, |file| {
+    let Some((stdin_eof, content)) = with_file_state(l, file_ref, |file| {
         (
             get_bool_field(l, file, "__stdin_eof"),
             get_bytes_field(l, file, "__content"),
@@ -1477,10 +1777,11 @@ fn read_number_bytes(content: &[u8], pos: usize) -> (ReadValue, usize) {
 }
 
 fn refresh_file_from_disk(l: &LuaState, gc: &mut GarbageCollector, file_ref: GcRef<Userdata>) {
-    let Some((writable, path, old_pos)) = with_file_state(file_ref, |file| {
+    let Some((writable, path, mode, old_pos)) = with_file_state(l, file_ref, |file| {
         (
             get_bool_field(l, file, "__writable"),
             get_utf8_field(l, file, "__path"),
+            get_bytes_field(l, file, "__mode"),
             get_number_field(l, file, "__pos").max(0.0) as usize,
         )
     }) else {
@@ -1492,7 +1793,10 @@ fn refresh_file_from_disk(l: &LuaState, gc: &mut GarbageCollector, file_ref: GcR
     let Ok(Some(path)) = path else {
         return;
     };
-    if let Ok(bytes) = std::fs::read(&path) {
+    if let Ok(mut bytes) = std::fs::read(&path) {
+        if !mode.contains(&b'b') {
+            bytes = crate::host_io::decode_text(&bytes);
+        }
         let len = bytes.len();
         if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
             let _ = set_bytes_field(l, file, gc, "__content", &bytes);
@@ -1501,26 +1805,42 @@ fn refresh_file_from_disk(l: &LuaState, gc: &mut GarbageCollector, file_ref: GcR
     }
 }
 
-fn flush_file_to_disk(l: &LuaState, file_ref: GcRef<Userdata>) -> std::io::Result<()> {
-    let Some((closed, writable, direct, path, content)) = with_file_state(file_ref, |file| {
-        (
-            get_bool_field(l, file, "__closed"),
-            get_bool_field(l, file, "__writable"),
-            get_bool_field(l, file, "__direct"),
-            get_utf8_field(l, file, "__path"),
-            get_bytes_field(l, file, "__content"),
-        )
-    }) else {
+fn flush_file_to_disk(
+    l: &LuaState,
+    gc: &mut GarbageCollector,
+    file_ref: GcRef<Userdata>,
+) -> std::io::Result<()> {
+    let Some((closed, writable, direct, path, mode, content)) =
+        with_file_state(l, file_ref, |file| {
+            (
+                get_bool_field(l, file, "__closed"),
+                get_bool_field(l, file, "__writable"),
+                get_bool_field(l, file, "__direct"),
+                get_utf8_field(l, file, "__path"),
+                get_bytes_field(l, file, "__mode"),
+                get_bytes_field(l, file, "__content"),
+            )
+        })
+    else {
         return Ok(());
     };
     if closed || !writable {
         return Ok(());
     }
-    if let Some(stream) = file_standard_stream(file_ref) {
+    if file_is_pipe(l, file_ref) {
+        return with_file_data_mut(gc, file_ref, |data| {
+            if let Some(input) = data.pipe.as_mut().and_then(|pipe| pipe.input.as_mut()) {
+                input.flush()?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap_or(Ok(()));
+    }
+    if let Some(stream) = file_standard_stream(l, file_ref) {
         return flush_standard_stream(stream);
     }
     if direct {
-        return with_file_data_mut(file_ref, |data| {
+        return with_file_data_mut(gc, file_ref, |data| {
             if let Some(handle) = data.direct_handle.as_mut() {
                 handle.flush()?;
             }
@@ -1531,7 +1851,12 @@ fn flush_file_to_disk(l: &LuaState, file_ref: GcRef<Userdata>) -> std::io::Resul
     let Some(path) = path? else {
         return Ok(());
     };
-    std::fs::write(path, content)
+    let mut file = std::fs::File::create(path)?;
+    if mode.contains(&b'b') {
+        file.write_all(&content)
+    } else {
+        crate::host_io::write_text(&mut file, &content)
+    }
 }
 
 fn flush_standard_stream(stream: StandardStream) -> std::io::Result<()> {
@@ -1556,6 +1881,14 @@ fn should_write_direct(
     if !get_bool_field(l, file, "__writable") {
         return false;
     }
+    if crate::host_io::text_output_translates_lf()
+        && !get_bytes_field(l, file, "__mode").contains(&b'b')
+    {
+        // The buffered representation uses logical text positions. Keeping a
+        // Windows text file buffered avoids mixing those positions with the
+        // larger physical offsets created by CRLF expansion.
+        return false;
+    }
     let path = get_bytes_field(l, file, "__path");
     if path.is_empty() {
         return false;
@@ -1576,7 +1909,7 @@ fn write_direct(
     pos: usize,
     appended: &[u8],
 ) -> std::io::Result<usize> {
-    let Some((path, direct)) = with_file_state(file_ref, |file| {
+    let Some((path, direct)) = with_file_state(l, file_ref, |file| {
         (
             get_utf8_field(l, file, "__path"),
             get_bool_field(l, file, "__direct"),
@@ -1615,7 +1948,7 @@ fn write_direct(
         })?;
     }
 
-    if let Some(result) = with_file_data_mut(file_ref, |data| -> std::io::Result<()> {
+    if let Some(result) = with_file_data_mut(gc, file_ref, |data| -> std::io::Result<()> {
         if data.direct_handle.is_none() {
             data.direct_handle = Some(
                 std::fs::OpenOptions::new()
@@ -1646,41 +1979,105 @@ fn write_direct(
 }
 
 fn with_file_data<R>(
+    state: &LuaState,
     file_ref: GcRef<Userdata>,
     access: impl for<'data> FnOnce(&'data IoFileData) -> R,
 ) -> Option<R> {
-    // SAFETY: file_ref is rooted for this call. The HRTB callback prevents a
-    // reference into the userdata payload from escaping.
-    let userdata = unsafe { file_ref.as_ref() }?;
-    // SAFETY: create_file constructs every IO userdata with IoFileData.
-    let data = unsafe { userdata.data_as::<IoFileData>() }?;
-    Some(access(data))
+    state
+        .with_gc_ref(file_ref, |userdata| {
+            // SAFETY: build_file constructs every IO userdata with IoFileData.
+            unsafe { userdata.data_as::<IoFileData>() }.map(access)
+        })
+        .ok()
+        .flatten()
 }
 
 fn with_file_data_mut<R>(
+    gc: &mut GarbageCollector,
     file_ref: GcRef<Userdata>,
     access: impl for<'data> FnOnce(&'data mut IoFileData) -> R,
 ) -> Option<R> {
-    // SAFETY: file_ref is rooted for this call and IO operations are serialized on
-    // the VM thread. The HRTB callback prevents mutable payload access from escaping.
-    let userdata = unsafe { (file_ref.as_ptr() as *mut Userdata).as_mut() }?;
-    // SAFETY: create_file constructs every IO userdata with IoFileData.
-    let data = unsafe { userdata.data_as_mut::<IoFileData>() }?;
-    Some(access(data))
+    gc.with_mut(file_ref, |userdata| {
+        // SAFETY: build_file constructs every IO userdata with IoFileData.
+        unsafe { userdata.data_as_mut::<IoFileData>() }.map(access)
+    })
+    .ok()
+    .flatten()
 }
 
-fn file_standard_stream(file_ref: GcRef<Userdata>) -> Option<StandardStream> {
-    with_file_data(file_ref, |data| data.standard_stream).flatten()
+fn file_standard_stream(state: &LuaState, file_ref: GcRef<Userdata>) -> Option<StandardStream> {
+    with_file_data(state, file_ref, |data| data.standard_stream).flatten()
 }
 
-fn close_direct_handle(file_ref: GcRef<Userdata>) {
-    let _ = with_file_data_mut(file_ref, |data| {
+fn file_is_pipe(state: &LuaState, file_ref: GcRef<Userdata>) -> bool {
+    with_file_data(state, file_ref, |data| data.pipe.is_some()).unwrap_or(false)
+}
+
+fn fill_pipe_output(
+    l: &LuaState,
+    gc: &mut GarbageCollector,
+    file_ref: GcRef<Userdata>,
+) -> Result<(), String> {
+    let bytes = with_file_data_mut(gc, file_ref, |data| {
+        let Some(pipe) = data.pipe.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let Some(mut output) = pipe.output.take() else {
+            return Ok(Vec::new());
+        };
+        let mut bytes = Vec::new();
+        output
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        Ok::<Vec<u8>, String>(bytes)
+    })
+    .ok_or_else(|| "invalid pipe".to_string())??;
+    if let Ok(Some(file)) = file_state_ref(gc, file_ref) {
+        let content = crate::host_io::decode_text(&bytes);
+        set_bytes_field(l, file, gc, "__content", &content)
+            .map_err(|error| format!("invalid pipe: {error}"))?;
+    }
+    Ok(())
+}
+
+fn close_pipe(
+    gc: &mut GarbageCollector,
+    file_ref: GcRef<Userdata>,
+) -> Option<std::io::Result<bool>> {
+    with_file_data_mut(gc, file_ref, |data| {
+        let mut pipe = data.pipe.take()?;
+        pipe.input.take();
+        pipe.output.take();
+        let result = pipe.child.wait().map(|status| status.success());
+        pipe.waited = true;
+        Some(result)
+    })
+    .flatten()
+}
+
+fn host_no_error_message() -> &'static str {
+    #[cfg(windows)]
+    {
+        "No error"
+    }
+    #[cfg(not(windows))]
+    {
+        "Success"
+    }
+}
+
+fn close_direct_handle(gc: &mut GarbageCollector, file_ref: GcRef<Userdata>) {
+    let _ = with_file_data_mut(gc, file_ref, |data| {
         data.direct_handle.take();
     });
 }
 
-fn direct_file_len(l: &LuaState, file_ref: GcRef<Userdata>) -> Option<usize> {
-    if let Some(length) = with_file_data_mut(file_ref, |data| {
+fn direct_file_len(
+    l: &LuaState,
+    gc: &mut GarbageCollector,
+    file_ref: GcRef<Userdata>,
+) -> Option<usize> {
+    if let Some(length) = with_file_data_mut(gc, file_ref, |data| {
         let handle = data.direct_handle.as_mut()?;
         let current = handle.stream_position().ok()?;
         let end = handle.seek(SeekFrom::End(0)).ok()?;
@@ -1692,7 +2089,7 @@ fn direct_file_len(l: &LuaState, file_ref: GcRef<Userdata>) -> Option<usize> {
         return Some(length);
     }
 
-    let path = with_file_state(file_ref, |file| get_utf8_field(l, file, "__path"))?;
+    let path = with_file_state(l, file_ref, |file| get_utf8_field(l, file, "__path"))?;
     let Ok(Some(path)) = path else {
         return None;
     };
@@ -1733,9 +2130,14 @@ fn push_new_file_lines_iterator(
     construction: FileConstruction,
     auto_close: bool,
 ) -> i32 {
+    if l.reserve_runtime_resource_registrations(1).is_err() {
+        l.push_nil();
+        return 1;
+    }
     let published = gc.with_publication(|transaction| {
         let mut checkpoint = |_| Ok(());
         let file = build_file(l, transaction, construction, &mut checkpoint)?;
+        let object_id = file.object_id();
         let iterator = build_lines_iterator(l, transaction, &file, auto_close, &mut checkpoint)?;
         // SAFETY: the callback installs the complete
         // Function -> environment -> Userdata graph on the active stack before
@@ -1743,14 +2145,21 @@ fn push_new_file_lines_iterator(
         unsafe {
             transaction.publish_function_value(iterator, |value| {
                 l.push_value(value);
-            })
+            })?;
         }
+        Ok::<_, GcRefValidationError>(object_id)
     });
-    if published.is_ok() {
-        1
-    } else {
-        l.push_nil();
-        1
+    match published {
+        Ok(object_id)
+            if l.register_runtime_resource(object_id, drain_io_file_resource)
+                .is_ok() =>
+        {
+            1
+        }
+        _ => {
+            l.push_nil();
+            1
+        }
     }
 }
 
@@ -1784,10 +2193,7 @@ fn build_lines_iterator<'scope>(
 fn current_c_function_env(l: &LuaState) -> Option<GcRef<Table>> {
     let ci = l.current_call_info();
     match l.stack.at(ci.func) {
-        Some(Value::Function(func_ref)) => {
-            // SAFETY: the current call frame keeps its function live.
-            unsafe { func_ref.as_ref() }.and_then(|func| func.env())
-        }
+        Some(Value::Function(func_ref)) => l.with_gc_ref(*func_ref, Function::env).ok().flatten(),
         _ => None,
     }
 }
@@ -2011,7 +2417,7 @@ mod tests {
         let global = gc.create_root(Table::new());
         let mut state = state_with_services();
         state.global_table = Some(global);
-        let io = lua_vm::with_vm_context_parts(&mut state, gc, pool, |state, gc, _| {
+        let io = lua_vm::with_vm_context_gc(&mut state, gc, pool, |state, gc| {
             crate::registration::publish_new_table(state, gc, global, b"io")
                 .expect("IO table should publish")
         });
@@ -2032,6 +2438,7 @@ mod tests {
             userdata.write_typed(IoFileData {
                 direct_handle: None,
                 standard_stream: None,
+                pipe: None,
             });
         }
         // SAFETY: the preceding call constructed IoFileData in this payload.
@@ -2044,39 +2451,42 @@ mod tests {
         let mut pool = StringPool::new();
         let (mut state, global, io) = state_with_io_table(&mut gc, &mut pool);
 
-        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
-            open_io(state, gc);
+        let object_count =
+            lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
+                open_io(state, gc);
 
-            assert_eq!(gc.temporary_root_count(), 0);
-            for name in [b"stdin".as_slice(), b"stdout", b"stderr"] {
-                let file =
-                    table_get_string(state, io, std::str::from_utf8(name).unwrap()).as_userdata();
-                let metatable = file_state_ref(gc, file)
-                    .expect("file Userdata should validate")
-                    .expect("file metatable should publish");
-                assert!(matches!(
-                    table_get_string(state, metatable, "__index"),
-                    Value::Table(index) if index == metatable
-                ));
-                assert!(matches!(
-                    table_get_string(state, metatable, "write"),
-                    Value::Function(_)
-                ));
-            }
+                assert_eq!(gc.temporary_root_count(), 0);
+                for name in [b"stdin".as_slice(), b"stdout", b"stderr"] {
+                    let file =
+                        table_get_string_with_gc(state, gc, io, std::str::from_utf8(name).unwrap())
+                            .as_userdata();
+                    let metatable = file_state_ref(gc, file)
+                        .expect("file Userdata should validate")
+                        .expect("file metatable should publish");
+                    assert!(matches!(
+                        table_get_string_with_gc(state, gc, metatable, "__index"),
+                        Value::Table(index) if index == metatable
+                    ));
+                    assert!(matches!(
+                        table_get_string_with_gc(state, gc, metatable, "write"),
+                        Value::Function(_)
+                    ));
+                }
 
-            let seed = gc.begin_mark_only();
-            assert_eq!(seed.rejected, 0);
-            gc.propagate_marks();
-            assert_eq!(gc.rejected_mark_edge_count(), 0);
-            assert_eq!(gc.marked_object_count(), gc.object_count());
+                let seed = gc.begin_mark_only();
+                assert_eq!(seed.rejected, 0);
+                gc.propagate_marks();
+                assert_eq!(gc.rejected_mark_edge_count(), 0);
+                assert_eq!(gc.marked_object_count(), gc.object_count());
 
-            let object_count = gc.object_count();
-            gc.remove_root(global);
-            gc.mark();
-            assert_eq!(gc.sweep(pool), object_count);
-            assert_eq!(gc.object_count(), 0);
-            assert!(pool.is_empty());
-        });
+                let object_count = gc.object_count();
+                gc.remove_root(global);
+                gc.mark();
+                object_count
+            });
+        assert_eq!(gc.sweep(&mut pool), object_count);
+        assert_eq!(gc.object_count(), 0);
+        assert!(pool.is_empty());
     }
 
     #[test]
@@ -2093,41 +2503,43 @@ mod tests {
             let mut gc = GarbageCollector::new();
             let mut pool = StringPool::new();
             let mut state = state_with_services();
-            lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
-                let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    gc.with_publication(|transaction| {
-                        let mut checkpoint = |stage| {
-                            if stage == target {
-                                panic!("injected file graph publication failure");
-                            }
-                            Ok(())
-                        };
-                        let _file = build_file(
-                            state,
-                            transaction,
-                            memory_file_construction(None, b"w+", true, None),
-                            &mut checkpoint,
-                        )
-                        .expect("pre-injection construction should validate");
-                    });
-                }));
+            let object_count =
+                lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
+                    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        gc.with_publication(|transaction| {
+                            let mut checkpoint = |stage| {
+                                if stage == target {
+                                    panic!("injected file graph publication failure");
+                                }
+                                Ok(())
+                            };
+                            let _file = build_file(
+                                state,
+                                transaction,
+                                memory_file_construction(None, b"w+", true, None),
+                                &mut checkpoint,
+                            )
+                            .expect("pre-injection construction should validate");
+                        });
+                    }));
 
-                assert!(unwind.is_err(), "stage {target:?} should inject a panic");
-                assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
-                assert_eq!(
-                    gc.rejected_temporary_root_release_count(),
-                    0,
-                    "stage {target:?}"
-                );
-                let object_count = gc.object_count();
-                let seed = gc.begin_mark_only();
-                assert_eq!(seed.seeded, 0, "stage {target:?}");
-                gc.propagate_marks();
-                assert_eq!(gc.marked_object_count(), 0, "stage {target:?}");
-                assert_eq!(gc.sweep(pool), object_count, "stage {target:?}");
-                assert_eq!(gc.object_count(), 0, "stage {target:?}");
-                assert!(pool.is_empty(), "stage {target:?}");
-            });
+                    assert!(unwind.is_err(), "stage {target:?} should inject a panic");
+                    assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
+                    assert_eq!(
+                        gc.rejected_temporary_root_release_count(),
+                        0,
+                        "stage {target:?}"
+                    );
+                    let object_count = gc.object_count();
+                    let seed = gc.begin_mark_only();
+                    assert_eq!(seed.seeded, 0, "stage {target:?}");
+                    gc.propagate_marks();
+                    assert_eq!(gc.marked_object_count(), 0, "stage {target:?}");
+                    object_count
+                });
+            assert_eq!(gc.sweep(&mut pool), object_count, "stage {target:?}");
+            assert_eq!(gc.object_count(), 0, "stage {target:?}");
+            assert!(pool.is_empty(), "stage {target:?}");
         }
     }
 
@@ -2137,27 +2549,29 @@ mod tests {
         let mut pool = StringPool::new();
         let mut state = state_with_services();
 
-        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
-            let result: Result<(), GcRefValidationError> = gc.with_publication(|transaction| {
-                let mut checkpoint = |_| Ok(());
-                let _file = build_file(
-                    state,
-                    transaction,
-                    memory_file_construction(None, b"w+", true, None),
-                    &mut checkpoint,
-                )?;
-                Err(GcRefValidationError::Null)
-            });
+        let object_count =
+            lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
+                let result: Result<(), GcRefValidationError> = gc.with_publication(|transaction| {
+                    let mut checkpoint = |_| Ok(());
+                    let _file = build_file(
+                        state,
+                        transaction,
+                        memory_file_construction(None, b"w+", true, None),
+                        &mut checkpoint,
+                    )?;
+                    Err(GcRefValidationError::Null)
+                });
 
-            assert!(result.is_err());
-            assert_eq!(gc.temporary_root_count(), 0);
-            assert_eq!(gc.rejected_temporary_root_release_count(), 0);
-            let object_count = gc.object_count();
-            gc.mark();
-            assert_eq!(gc.sweep(pool), object_count);
-            assert_eq!(gc.object_count(), 0);
-            assert!(pool.is_empty());
-        });
+                assert!(result.is_err());
+                assert_eq!(gc.temporary_root_count(), 0);
+                assert_eq!(gc.rejected_temporary_root_release_count(), 0);
+                let object_count = gc.object_count();
+                gc.mark();
+                object_count
+            });
+        assert_eq!(gc.sweep(&mut pool), object_count);
+        assert_eq!(gc.object_count(), 0);
+        assert!(pool.is_empty());
     }
 
     #[test]
@@ -2170,39 +2584,47 @@ mod tests {
             let mut pool = StringPool::new();
             let mut state = state_with_services();
 
-            lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
-                let result: Result<(), GcRefValidationError> = gc.with_publication(|transaction| {
-                    let mut checkpoint = |stage| {
-                        if stage == target {
-                            Err(GcRefValidationError::Null)
-                        } else {
+            let object_count =
+                lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
+                    let result: Result<(), GcRefValidationError> =
+                        gc.with_publication(|transaction| {
+                            let mut checkpoint = |stage| {
+                                if stage == target {
+                                    Err(GcRefValidationError::Null)
+                                } else {
+                                    Ok(())
+                                }
+                            };
+                            let file = build_file(
+                                state,
+                                transaction,
+                                memory_file_construction(None, b"r", false, None),
+                                &mut checkpoint,
+                            )?;
+                            let _iterator = build_lines_iterator(
+                                state,
+                                transaction,
+                                &file,
+                                true,
+                                &mut checkpoint,
+                            )?;
                             Ok(())
-                        }
-                    };
-                    let file = build_file(
-                        state,
-                        transaction,
-                        memory_file_construction(None, b"r", false, None),
-                        &mut checkpoint,
-                    )?;
-                    let _iterator =
-                        build_lines_iterator(state, transaction, &file, true, &mut checkpoint)?;
-                    Ok(())
-                });
+                        });
 
-                assert!(result.is_err(), "stage {target:?} should return an error");
-                assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
-                assert_eq!(
-                    gc.rejected_temporary_root_release_count(),
-                    0,
-                    "stage {target:?}"
-                );
-                let object_count = gc.object_count();
-                gc.mark();
-                assert_eq!(gc.sweep(pool), object_count, "stage {target:?}");
-                assert_eq!(gc.object_count(), 0, "stage {target:?}");
-                assert!(pool.is_empty(), "stage {target:?}");
-            });
+                    assert!(result.is_err(), "stage {target:?} should return an error");
+                    assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
+                    assert_eq!(
+                        gc.rejected_temporary_root_release_count(),
+                        0,
+                        "stage {target:?}"
+                    );
+                    let object_count = gc.object_count();
+                    gc.mark();
+                    object_count
+                });
+            assert_eq!(gc.sweep(&mut pool), object_count, "stage {target:?}");
+            assert_eq!(gc.object_count(), 0, "stage {target:?}");
+            assert!(pool.is_empty(), "stage {target:?}");
         }
     }
 
@@ -2212,51 +2634,53 @@ mod tests {
         let mut pool = StringPool::new();
         let mut state = state_with_services();
 
-        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
-            assert_eq!(
-                push_new_file_lines_iterator(
-                    state,
-                    gc,
-                    memory_file_construction(None, b"r", false, None),
-                    true,
-                ),
-                1
-            );
-            assert_eq!(gc.temporary_root_count(), 0);
-            let iterator = match state.at(-1) {
-                Some(Value::Function(iterator)) => *iterator,
-                value => panic!("expected iterator Function, got {value:?}"),
-            };
-            let environment = gc
-                .with_ref(iterator, |iterator| iterator.env())
-                .expect("iterator should remain live")
-                .expect("iterator environment should publish");
-            let file = match table_get_string(state, environment, "__file") {
-                Value::Userdata(file) => file,
-                value => panic!("expected iterator file Userdata, got {value:?}"),
-            };
-            assert!(
-                file_state_ref(gc, file)
-                    .expect("file Userdata should validate")
-                    .is_some()
-            );
+        let object_count =
+            lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
+                assert_eq!(
+                    push_new_file_lines_iterator(
+                        state,
+                        gc,
+                        memory_file_construction(None, b"r", false, None),
+                        true,
+                    ),
+                    1
+                );
+                assert_eq!(gc.temporary_root_count(), 0);
+                let iterator = match state.at(-1) {
+                    Some(Value::Function(iterator)) => *iterator,
+                    value => panic!("expected iterator Function, got {value:?}"),
+                };
+                let environment = gc
+                    .with_ref(iterator, |iterator| iterator.env())
+                    .expect("iterator should remain live")
+                    .expect("iterator environment should publish");
+                let file = match table_get_string_with_gc(state, gc, environment, "__file") {
+                    Value::Userdata(file) => file,
+                    value => panic!("expected iterator file Userdata, got {value:?}"),
+                };
+                assert!(
+                    file_state_ref(gc, file)
+                        .expect("file Userdata should validate")
+                        .is_some()
+                );
 
-            gc.add_root(iterator);
-            let seed = gc.begin_mark_only();
-            assert_eq!(seed.seeded, 1);
-            assert_eq!(seed.rejected, 0);
-            gc.propagate_marks();
-            assert_eq!(gc.rejected_mark_edge_count(), 0);
-            assert_eq!(gc.marked_object_count(), gc.object_count());
+                gc.add_root(iterator);
+                let seed = gc.begin_mark_only();
+                assert_eq!(seed.seeded, 1);
+                assert_eq!(seed.rejected, 0);
+                gc.propagate_marks();
+                assert_eq!(gc.rejected_mark_edge_count(), 0);
+                assert_eq!(gc.marked_object_count(), gc.object_count());
 
-            let object_count = gc.object_count();
-            state.pop();
-            gc.remove_root(iterator);
-            gc.mark();
-            assert_eq!(gc.sweep(pool), object_count);
-            assert_eq!(gc.object_count(), 0);
-            assert!(pool.is_empty());
-        });
+                let object_count = gc.object_count();
+                state.pop();
+                gc.remove_root(iterator);
+                gc.mark();
+                object_count
+            });
+        assert_eq!(gc.sweep(&mut pool), object_count);
+        assert_eq!(gc.object_count(), 0);
+        assert!(pool.is_empty());
     }
 
     #[test]
@@ -2271,41 +2695,48 @@ mod tests {
             let mut gc = GarbageCollector::new();
             let mut pool = StringPool::new();
             let mut state = state_with_services();
-            lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
-                let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    gc.with_publication(|transaction| {
-                        let mut checkpoint = |stage| {
-                            if stage == target {
-                                panic!("injected iterator graph publication failure");
-                            }
-                            Ok(())
-                        };
-                        let file = build_file(
-                            state,
-                            transaction,
-                            memory_file_construction(None, b"r", false, None),
-                            &mut checkpoint,
-                        )
-                        .expect("file should build before iterator injection");
-                        let _iterator =
-                            build_lines_iterator(state, transaction, &file, true, &mut checkpoint)
-                                .expect("pre-injection iterator construction should validate");
-                    });
-                }));
+            let object_count =
+                lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
+                    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        gc.with_publication(|transaction| {
+                            let mut checkpoint = |stage| {
+                                if stage == target {
+                                    panic!("injected iterator graph publication failure");
+                                }
+                                Ok(())
+                            };
+                            let file = build_file(
+                                state,
+                                transaction,
+                                memory_file_construction(None, b"r", false, None),
+                                &mut checkpoint,
+                            )
+                            .expect("file should build before iterator injection");
+                            let _iterator = build_lines_iterator(
+                                state,
+                                transaction,
+                                &file,
+                                true,
+                                &mut checkpoint,
+                            )
+                            .expect("pre-injection iterator construction should validate");
+                        });
+                    }));
 
-                assert!(unwind.is_err(), "stage {target:?} should inject a panic");
-                assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
-                assert_eq!(
-                    gc.rejected_temporary_root_release_count(),
-                    0,
-                    "stage {target:?}"
-                );
-                let object_count = gc.object_count();
-                gc.mark();
-                assert_eq!(gc.sweep(pool), object_count, "stage {target:?}");
-                assert_eq!(gc.object_count(), 0, "stage {target:?}");
-                assert!(pool.is_empty(), "stage {target:?}");
-            });
+                    assert!(unwind.is_err(), "stage {target:?} should inject a panic");
+                    assert_eq!(gc.temporary_root_count(), 0, "stage {target:?}");
+                    assert_eq!(
+                        gc.rejected_temporary_root_release_count(),
+                        0,
+                        "stage {target:?}"
+                    );
+                    let object_count = gc.object_count();
+                    gc.mark();
+                    object_count
+                });
+            assert_eq!(gc.sweep(&mut pool), object_count, "stage {target:?}");
+            assert_eq!(gc.object_count(), 0, "stage {target:?}");
+            assert!(pool.is_empty(), "stage {target:?}");
         }
     }
 
@@ -2317,31 +2748,40 @@ mod tests {
         let mut foreign_gc = GarbageCollector::new();
         let foreign = foreign_gc.create_root(Userdata::new(0));
 
-        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+        let stale = lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
             let foreign_result =
                 set_table_ref_value(state, gc, io, b"foreign", &Value::Userdata(foreign));
             assert!(foreign_result.is_err());
             assert!(file_state_ref(gc, foreign).is_err());
-            assert!(matches!(table_get_string(state, io, "foreign"), Value::Nil));
+            assert!(matches!(
+                table_get_string_with_gc(state, gc, io, "foreign"),
+                Value::Nil
+            ));
             assert_eq!(gc.temporary_root_count(), 0);
 
             let stale = gc.create_root(Userdata::new(0));
             gc.remove_root(stale);
             gc.mark();
-            assert!(gc.sweep(pool) >= 1);
+            stale
+        });
+        assert!(gc.sweep(&mut pool) >= 1);
+        lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
             let stale_result =
                 set_table_ref_value(state, gc, io, b"stale", &Value::Userdata(stale));
             assert!(stale_result.is_err());
             assert!(file_state_ref(gc, stale).is_err());
-            assert!(matches!(table_get_string(state, io, "stale"), Value::Nil));
+            assert!(matches!(
+                table_get_string_with_gc(state, gc, io, "stale"),
+                Value::Nil
+            ));
             assert_eq!(gc.temporary_root_count(), 0);
 
             gc.remove_root(global);
             gc.mark();
-            let remaining = gc.object_count();
-            assert_eq!(gc.sweep(pool), remaining);
-            assert_eq!(gc.object_count(), 0);
-            assert!(pool.is_empty());
         });
+        let remaining = gc.object_count();
+        assert_eq!(gc.sweep(&mut pool), remaining);
+        assert_eq!(gc.object_count(), 0);
+        assert!(pool.is_empty());
     }
 }

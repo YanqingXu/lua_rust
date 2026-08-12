@@ -3,12 +3,11 @@ use lua_compiler::parser::Parser;
 use lua_core::value::Value;
 use lua_stdlib::catalog::open_all;
 use lua_vm::Runtime;
-use lua_vm::execute::execute_proto;
 
 #[test]
 fn load_and_loadstring_keep_lua_provided_chunk_name_bytes() {
     let mut runtime = Runtime::new();
-    {
+    let proto = {
         let mut parts = runtime.parts_mut().expect("runtime parts are available");
         let (state, gc, string_pool) = parts.split_mut();
         open_all(state, gc);
@@ -31,9 +30,11 @@ fn load_and_loadstring_keep_lua_provided_chunk_name_bytes() {
         let proto = CodeGenerator::new_with_pool(gc, string_pool)
             .generate(&chunk, "<chunk-name-byte-test>")
             .expect("test source should compile");
-        let proto = gc.create(proto);
-        execute_proto(state, proto, gc).expect("test source should execute");
-    }
+        gc.create(proto)
+    };
+    runtime
+        .execute_proto(proto)
+        .expect("test source should execute through the Runtime dispatcher");
 
     let mut parts = runtime.parts_mut().expect("runtime parts remain available");
     let (state, _, _) = parts.split_mut();

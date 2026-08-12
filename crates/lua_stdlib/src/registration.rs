@@ -22,6 +22,39 @@ pub(crate) fn rooted_bytes<'scope>(
     }
 }
 
+pub(crate) fn find_table_field_with_gc(
+    state: &LuaState,
+    gc: &GarbageCollector,
+    table: GcRef<Table>,
+    name: &[u8],
+) -> Result<Option<Value>, GcRefValidationError> {
+    let pool = state
+        .active_string_pool_ptr()
+        .ok_or(GcRefValidationError::StringPoolUnavailable)?;
+    // SAFETY: the active StringPool is disjoint from the explicitly supplied
+    // collector and remains live for this dynamic state turn.
+    let Some(name) = (unsafe { &*pool }).find_bytes(name) else {
+        return Ok(None);
+    };
+    gc.with_ref(name, |_| ())?;
+    let value = gc.with_ref(table, |table| table.get(&Value::String(name)))?;
+    Ok((!value.is_nil()).then_some(value))
+}
+
+pub(crate) fn find_library_table_with_gc(
+    state: &LuaState,
+    gc: &GarbageCollector,
+    name: &[u8],
+) -> Result<Option<GcRef<Table>>, GcRefValidationError> {
+    let Some(global) = state.global_table else {
+        return Ok(None);
+    };
+    Ok(match find_table_field_with_gc(state, gc, global, name)? {
+        Some(Value::Table(table)) => Some(table),
+        _ => None,
+    })
+}
+
 pub(crate) fn find_table_field(
     state: &LuaState,
     table: GcRef<Table>,
@@ -30,26 +63,8 @@ pub(crate) fn find_table_field(
     let Some(name) = state.find_interned_string(name)? else {
         return Ok(None);
     };
-    let gc = state
-        .active_gc_ptr()
-        .ok_or(GcRefValidationError::CollectorUnavailable)?;
-    // SAFETY: the dynamic Runtime turn owns this collector; `with_ref`
-    // validates identity before accessing table memory.
-    let value = unsafe { &*gc }.with_ref(table, |table| table.get(&Value::String(name)))?;
+    let value = state.with_gc_ref(table, |table| table.get(&Value::String(name)))?;
     Ok((!value.is_nil()).then_some(value))
-}
-
-pub(crate) fn find_library_table(
-    state: &LuaState,
-    name: &[u8],
-) -> Result<Option<GcRef<Table>>, GcRefValidationError> {
-    let Some(global) = state.global_table else {
-        return Ok(None);
-    };
-    Ok(match find_table_field(state, global, name)? {
-        Some(Value::Table(table)) => Some(table),
-        _ => None,
-    })
 }
 
 pub(crate) fn register_c_function(
@@ -247,7 +262,7 @@ mod tests {
         let mut gc = GarbageCollector::new();
         let mut pool = StringPool::new();
         let (mut state, global) = state_with_global(&mut gc);
-        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+        lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
             let library = publish_new_table(state, gc, global, b"fixture")
                 .expect("library table should publish");
 
@@ -267,20 +282,19 @@ mod tests {
                 table_value_by_bytes(gc, library, b"alias").expect("alias lookup should validate");
             assert_eq!(primary, alias);
             assert!(matches!(primary, Value::Function(_)));
-            assert!(pool.find_bytes(b"primary").is_some());
-            assert!(pool.find_bytes(b"alias").is_some());
-            assert!(pool.find_bytes(b"fixture").is_some());
             assert_eq!(gc.temporary_root_count(), 0);
-
-            gc.mark();
-            assert_eq!(gc.marked_object_count(), gc.object_count());
-            let object_count = gc.object_count();
-            gc.remove_root(global);
-            gc.mark();
-            assert_eq!(gc.sweep(pool), object_count);
-            assert_eq!(gc.object_count(), 0);
-            assert!(pool.is_empty());
         });
+        assert!(pool.find_bytes(b"primary").is_some());
+        assert!(pool.find_bytes(b"alias").is_some());
+        assert!(pool.find_bytes(b"fixture").is_some());
+        gc.mark();
+        assert_eq!(gc.marked_object_count(), gc.object_count());
+        let object_count = gc.object_count();
+        gc.remove_root(global);
+        gc.mark();
+        assert_eq!(gc.sweep(&mut pool), object_count);
+        assert_eq!(gc.object_count(), 0);
+        assert!(pool.is_empty());
     }
 
     #[test]
@@ -289,7 +303,7 @@ mod tests {
         let mut pool = StringPool::new();
         let (mut state, global) = state_with_global(&mut gc);
 
-        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, _| {
+        lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
             crate::catalog::open_all(state, gc);
 
             for name in [
@@ -340,7 +354,7 @@ mod tests {
         let mut foreign_gc = GarbageCollector::new();
         let foreign = foreign_gc.create(Table::new());
 
-        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+        lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
             let result = set_value(state, gc, global, b"foreign", &Value::Table(foreign));
 
             assert!(result.is_err());
@@ -352,9 +366,9 @@ mod tests {
             ));
             gc.mark();
             assert_eq!(gc.marked_object_count(), 1);
-            assert_eq!(gc.sweep(pool), 1);
-            assert!(pool.is_empty());
         });
+        assert_eq!(gc.sweep(&mut pool), 1);
+        assert!(pool.is_empty());
     }
 
     #[test]
@@ -363,7 +377,7 @@ mod tests {
         let mut pool = StringPool::new();
         let (mut state, global) = state_with_global(&mut gc);
 
-        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
+        lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
             let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 gc.with_publication(|transaction| {
                     let global = transaction.protect(global).expect("global should protect");
@@ -395,13 +409,12 @@ mod tests {
                     .expect("published prefix should remain valid"),
                 Value::Table(_)
             ));
-
-            let object_count = gc.object_count();
-            gc.remove_root(global);
-            gc.mark();
-            assert_eq!(gc.sweep(pool), object_count);
-            assert_eq!(gc.object_count(), 0);
-            assert!(pool.is_empty());
         });
+        let object_count = gc.object_count();
+        gc.remove_root(global);
+        gc.mark();
+        assert_eq!(gc.sweep(&mut pool), object_count);
+        assert_eq!(gc.object_count(), 0);
+        assert!(pool.is_empty());
     }
 }

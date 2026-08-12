@@ -2,11 +2,12 @@
 .SYNOPSIS
     Compare lua_cpp and lua_rust compiler bytecode without treating missing evidence as success.
 .DESCRIPTION
-    Runs each selected Lua source through the C++ full-text dumper and the Rust JSON
-    dumper. Every case receives an evidence directory containing the exact commands,
-    stdout, stderr, exit status, timeout state, normalized bytecode, and structured
-    differences. The default parity mode is fail-closed when a tool or required schema
-    field is unavailable.
+    Runs each selected Lua source through the pristine C++ full-text dumper, a
+    separately audited read-only C++ local-variable evidence adapter, and the Rust
+    JSON dumper. Every case receives an evidence directory containing the exact
+    commands, stdout, stderr, exit status, timeout state, normalized bytecode, and
+    structured differences. The default parity mode is fail-closed when a tool or
+    required schema field is unavailable.
 
     Representative mode is intended for pull-request checks. Full mode recursively
     executes every Lua source and is intended for nightly checks.
@@ -43,6 +44,7 @@ param(
 
     [string]$RepresentativeManifest = "",
     [string]$CppBytecodeExe = "",
+    [string]$CppEvidenceExe = "",
     [string]$RustBytecodeExe = "",
     [string]$OutputDir = "",
     [string]$ResultPath = "",
@@ -353,12 +355,14 @@ function Convert-CppConstant {
     }
 }
 
-function Convert-RustConstant {
+function Convert-JsonConstant {
     param(
         [Parameter(Mandatory = $true)]
         [int]$Index,
         [Parameter(Mandatory = $true)]
-        [object]$Constant
+        [object]$Constant,
+        [Parameter(Mandatory = $true)]
+        [string]$Context
     )
 
     $type = [string](Get-RequiredPropertyValue -Object $Constant -Name "type")
@@ -375,7 +379,7 @@ function Convert-RustConstant {
         "number" {
             $bits = [string](Get-RequiredPropertyValue -Object $Constant -Name "bits")
             if ($bits -notmatch '^[0-9A-Fa-f]{16}$') {
-                throw "Rust number constant $Index has malformed IEEE-754 bits"
+                throw "$Context number constant $Index has malformed IEEE-754 bits"
             }
             $value = $bits.ToLowerInvariant()
             $known = $true
@@ -383,10 +387,10 @@ function Convert-RustConstant {
         "string" {
             $envelope = Get-RequiredPropertyValue -Object $Constant -Name "value"
             if ($null -eq $envelope) {
-                throw "Rust string constant $Index has null byte evidence"
+                throw "$Context string constant $Index has null byte evidence"
             }
             $value = Convert-RustByteEnvelopeToHex -Envelope $envelope `
-                -Context "Rust string constant $Index"
+                -Context "$Context string constant $Index"
             $known = $true
         }
     }
@@ -625,6 +629,162 @@ function Convert-CppBytecode {
     }
 }
 
+function Add-CppByteSafeEvidence {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Bytecode,
+        [Parameter(Mandatory = $true)]
+        [string]$Text
+    )
+
+    $document = $Text | ConvertFrom-Json
+    $schemaVersion = [int](
+        Get-RequiredPropertyValue -Object $document -Name "schema_version"
+    )
+    if ($schemaVersion -ne 2) {
+        throw "unsupported C++ bytecode evidence schema version $schemaVersion"
+    }
+    $oracleCommit = [string](
+        Get-RequiredPropertyValue -Object $document -Name "oracle_commit"
+    )
+    $expectedCommit = "87c15e69ceb94eb74e28226ccbefb7e196635711"
+    if ($oracleCommit -ne $expectedCommit) {
+        throw "C++ bytecode evidence commit mismatch: expected $expectedCommit, got $oracleCommit"
+    }
+
+    $evidenceByPath = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    foreach ($proto in @(
+        Get-RequiredPropertyValue -Object $document -Name "protos"
+    )) {
+        $path = [string](Get-RequiredPropertyValue -Object $proto -Name "path")
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            throw "C++ bytecode evidence contains an empty Proto path"
+        }
+        if ($evidenceByPath.ContainsKey($path)) {
+            throw "C++ bytecode evidence contains duplicate Proto path '$path'"
+        }
+
+        $constantValues = @(Get-RequiredPropertyValue -Object $proto -Name "constants")
+        $constants = New-Object System.Collections.ArrayList
+        for ($index = 0; $index -lt $constantValues.Count; $index++) {
+            [void]$constants.Add((Convert-JsonConstant -Index $index `
+                -Constant $constantValues[$index] -Context "C++"))
+        }
+
+        $nameValues = @(Get-RequiredPropertyValue -Object $proto -Name "local_names")
+        $localValues = @(Get-RequiredPropertyValue -Object $proto -Name "locals")
+        if ($nameValues.Count -ne $localValues.Count) {
+            throw "C++ bytecode evidence local name/metadata count differs at Proto $path"
+        }
+        $names = [object[]]@($nameValues | ForEach-Object {
+            if ($null -eq $_) {
+                $null
+            }
+            else {
+                Convert-RustByteEnvelopeToHex -Envelope $_ `
+                    -Context "C++ local name at Proto $path"
+            }
+        })
+        for ($index = 0; $index -lt $localValues.Count; $index++) {
+            $local = $localValues[$index]
+            $localNameEnvelope = Get-RequiredPropertyValue -Object $local -Name "name"
+            $localName = if ($null -eq $localNameEnvelope) {
+                $null
+            }
+            else {
+                Convert-RustByteEnvelopeToHex -Envelope $localNameEnvelope `
+                    -Context "C++ local metadata name at Proto $path index $index"
+            }
+            if ($localName -cne $names[$index]) {
+                throw "C++ bytecode evidence local name disagrees with metadata at Proto $path index $index"
+            }
+            $startPc = [int](Get-RequiredPropertyValue -Object $local -Name "start_pc")
+            $endPc = [int](Get-RequiredPropertyValue -Object $local -Name "end_pc")
+            $register = [int](Get-RequiredPropertyValue -Object $local -Name "register")
+            if ($startPc -lt 0 -or $endPc -lt $startPc -or $register -lt 0) {
+                throw "C++ bytecode evidence has invalid local metadata at Proto $path index $index"
+            }
+        }
+        $evidenceByPath.Add($path, [pscustomobject]@{
+            constants = @($constants)
+            names = $names
+        })
+    }
+
+    foreach ($proto in @($Bytecode.protos)) {
+        $evidence = $null
+        if (-not $evidenceByPath.TryGetValue(
+            [string]$proto.path,
+            [ref]$evidence
+        )) {
+            throw "C++ bytecode evidence is missing Proto path '$($proto.path)'"
+        }
+        if (@($proto.constants).Count -ne @($evidence.constants).Count) {
+            throw "C++ bytecode evidence constant count differs at Proto '$($proto.path)'"
+        }
+        $proto.constants = [object[]]@($evidence.constants)
+        $proto.localNames = [object[]]@($evidence.names)
+    }
+    if ($evidenceByPath.Count -ne @($Bytecode.protos).Count) {
+        throw "C++ bytecode evidence contains Proto paths absent from full-text output"
+    }
+    $Bytecode.coverage = Get-BytecodeCoverage `
+        -Protos @($Bytecode.protos) -Adapter "CppFullText+ByteSafeEvidence"
+    return $Bytecode
+}
+
+function Merge-CppEvidenceIfRequired {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Bytecode,
+        [Parameter(Mandatory = $true)]
+        [string]$Adapter,
+        [AllowNull()]
+        [object]$EvidenceExecution
+    )
+
+    if ($Adapter -ne "CppFullText" -or -not $Bytecode.success) {
+        return $Bytecode
+    }
+    if ($null -eq $EvidenceExecution -or
+        $EvidenceExecution.startError -or
+        $EvidenceExecution.timedOut -or
+        $null -eq $EvidenceExecution.exitCode -or
+        $EvidenceExecution.exitCode -ne 0) {
+        return [pscustomobject][ordered]@{
+            success  = $false
+            error    = "C++ byte-safe evidence process did not complete successfully"
+            protos   = @()
+            coverage = $null
+        }
+    }
+
+    try {
+        return Add-CppByteSafeEvidence -Bytecode $Bytecode -Text $EvidenceExecution.stdout
+    }
+    catch {
+        return [pscustomobject][ordered]@{
+            success  = $false
+            error    = "C++ byte-safe evidence is invalid: $($_.Exception.Message)"
+            protos   = @()
+            coverage = $null
+        }
+    }
+}
+
+function Convert-RustConstant {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Index,
+        [Parameter(Mandatory = $true)]
+        [object]$Constant
+    )
+
+    return Convert-JsonConstant -Index $Index -Constant $Constant -Context "Rust"
+}
+
 function Add-RustProto {
     param(
         [Parameter(Mandatory = $true)]
@@ -646,11 +806,9 @@ function Add-RustProto {
     if ($null -eq $lineInfoProperty) {
         throw "missing property 'line_info'"
     }
-    $lineInfo = if ($null -eq $lineInfoProperty.Value) {
-        $null
-    }
-    else {
-        @($lineInfoProperty.Value)
+    $lineInfo = $null
+    if ($null -ne $lineInfoProperty.Value) {
+        $lineInfo = [object[]]@($lineInfoProperty.Value)
     }
 
     $instructionValues = @(Get-RequiredPropertyValue -Object $Proto -Name "instructions")
@@ -789,6 +947,7 @@ function Convert-BytecodeOutput {
         [ValidateSet("CppFullText", "RustJson")]
         [string]$Adapter,
         [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
         [string]$Text
     )
 
@@ -836,6 +995,18 @@ $runId = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
 if (-not $CppBytecodeExe) {
     $CppBytecodeExe = Join-Path $projectRoot "..\lua_cpp\bin\lua_bytecode.exe"
 }
+if (-not $CppEvidenceExe) {
+    $cppExecutableDirectory = Split-Path -Parent $CppBytecodeExe
+    $cppEvidenceName = if (
+        [System.IO.Path]::GetExtension($CppBytecodeExe) -ieq ".exe"
+    ) {
+        "lua_bytecode_evidence.exe"
+    }
+    else {
+        "lua_bytecode_evidence"
+    }
+    $CppEvidenceExe = Join-Path $cppExecutableDirectory $cppEvidenceName
+}
 if (-not $RustBytecodeExe) {
     $configuredTarget = Join-Path $projectRoot "target\x86_64-pc-windows-msvc\debug\lua_bytecode.exe"
     $hostTarget = Join-Path $projectRoot "target\debug\lua_bytecode.exe"
@@ -852,6 +1023,7 @@ if (-not $OutputDir) {
 
 $InputPath = Resolve-ParityPath -Path $InputPath -BasePath $projectRoot
 $CppBytecodeExe = Resolve-ParityPath -Path $CppBytecodeExe -BasePath $projectRoot
+$CppEvidenceExe = Resolve-ParityPath -Path $CppEvidenceExe -BasePath $projectRoot
 $RustBytecodeExe = Resolve-ParityPath -Path $RustBytecodeExe -BasePath $projectRoot
 $OutputDir = Resolve-ParityPath -Path $OutputDir -BasePath $projectRoot
 if ($RepresentativeManifest) {
@@ -889,8 +1061,9 @@ $report = [ordered]@{
         selected               = @()
     }
     tools         = [ordered]@{
-        cpp  = $CppBytecodeExe
-        rust = $RustBytecodeExe
+        cpp         = $CppBytecodeExe
+        cppEvidence = $CppEvidenceExe
+        rust        = $RustBytecodeExe
     }
     lua51OpcodeCount = $opcodeSpecification.Count
     requiredEvidence = $requiredEvidence
@@ -943,6 +1116,12 @@ if (-not (Test-Path -LiteralPath $leftExecutable -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $rightExecutable -PathType Leaf)) {
     [void]$preflightIssues.Add("right bytecode tool not found: $rightExecutable")
+}
+if (($leftAdapter -eq "CppFullText" -or $rightAdapter -eq "CppFullText") -and
+    -not (Test-Path -LiteralPath $CppEvidenceExe -PathType Leaf)) {
+    [void]$preflightIssues.Add(
+        "C++ bytecode evidence adapter not found: $CppEvidenceExe"
+    )
 }
 
 if ($preflightIssues.Count -gt 0) {
@@ -1009,13 +1188,37 @@ foreach ($file in $files) {
         -WorkingDirectory $projectRoot -TimeoutSeconds $TimeoutSeconds
     $leftExecution = Save-ParityExecution -Execution $leftRaw -CaseDirectory $caseDirectory -Side "left"
     $rightExecution = Save-ParityExecution -Execution $rightRaw -CaseDirectory $caseDirectory -Side "right"
+    $leftEvidenceExecution = $null
+    if ($leftAdapter -eq "CppFullText") {
+        $leftEvidenceRaw = Invoke-ParityProcess -Executable $CppEvidenceExe -Arguments @($toolInput) `
+            -WorkingDirectory $projectRoot -TimeoutSeconds $TimeoutSeconds
+        $leftEvidenceExecution = Save-ParityExecution -Execution $leftEvidenceRaw `
+            -CaseDirectory $caseDirectory -Side "left-evidence"
+    }
+    $rightEvidenceExecution = $null
+    if ($rightAdapter -eq "CppFullText") {
+        $rightEvidenceRaw = Invoke-ParityProcess -Executable $CppEvidenceExe -Arguments @($toolInput) `
+            -WorkingDirectory $projectRoot -TimeoutSeconds $TimeoutSeconds
+        $rightEvidenceExecution = Save-ParityExecution -Execution $rightEvidenceRaw `
+            -CaseDirectory $caseDirectory -Side "right-evidence"
+    }
 
     $differences = New-Object System.Collections.ArrayList
     $infrastructureFailure = $false
-    foreach ($side in @(
-        [pscustomobject]@{ name = "left"; execution = $leftExecution },
-        [pscustomobject]@{ name = "right"; execution = $rightExecution }
-    )) {
+    $processSides = New-Object System.Collections.ArrayList
+    [void]$processSides.Add([pscustomobject]@{ name = "left"; execution = $leftExecution })
+    [void]$processSides.Add([pscustomobject]@{ name = "right"; execution = $rightExecution })
+    if ($null -ne $leftEvidenceExecution) {
+        [void]$processSides.Add(
+            [pscustomobject]@{ name = "left-evidence"; execution = $leftEvidenceExecution }
+        )
+    }
+    if ($null -ne $rightEvidenceExecution) {
+        [void]$processSides.Add(
+            [pscustomobject]@{ name = "right-evidence"; execution = $rightEvidenceExecution }
+        )
+    }
+    foreach ($side in $processSides) {
         if ($side.execution.startError) {
             $infrastructureFailure = $true
             Add-BytecodeDifference -List $differences -Path "$($side.name).process" -Kind "start-error" `
@@ -1045,6 +1248,10 @@ foreach ($file in $files) {
     else {
         [pscustomobject]@{ success = $false; error = "process did not complete"; protos = @(); coverage = $null }
     }
+    $leftParsed = Merge-CppEvidenceIfRequired -Bytecode $leftParsed -Adapter $leftAdapter `
+        -EvidenceExecution $leftEvidenceExecution
+    $rightParsed = Merge-CppEvidenceIfRequired -Bytecode $rightParsed -Adapter $rightAdapter `
+        -EvidenceExecution $rightEvidenceExecution
     if (-not $leftParsed.success) {
         $infrastructureFailure = $true
         Add-BytecodeDifference -List $differences -Path "left.output" -Kind "parse-error" `
@@ -1102,8 +1309,10 @@ foreach ($file in $files) {
             right = $rightParsed.coverage
         }
         executions            = [ordered]@{
-            left  = $leftExecution
-            right = $rightExecution
+            left          = $leftExecution
+            leftEvidence  = $leftEvidenceExecution
+            right         = $rightExecution
+            rightEvidence = $rightEvidenceExecution
         }
         differences           = @($differences)
         differenceCount       = $differences.Count

@@ -38,12 +38,12 @@ infrastructure failures.
 
 The manifest contains the original 125 fixtures plus any subsequently added
 compatibility fixtures. Its default `non-official` lane intentionally remains
-the original 101-record corpus; the four focused probes live in the separate
-`differential` lane.
+the original 101-record corpus; the four M0 focused probes and subsequent
+compatibility probes live in the separate `differential` lane.
 
 The audited inventory is:
 
-- 20 `entry` records (16 from the M0 baseline and four differential probes);
+- 23 `entry` records (16 from the M0 baseline and seven differential probes);
 - 32 `helper` records (eight Alien Signals modules, one integration chunk, and
   23 files driven by official `all.lua`);
 - 76 `manual-output` records that still require byte-for-byte differential

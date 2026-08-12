@@ -7,11 +7,15 @@
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::gc_string::GcString;
 use lua_core::proto::Proto;
 use lua_core::state_handle::StateHandle;
+use lua_core::table::Table;
 use lua_core::thread::Thread;
 use lua_core::upvalue::Upvalue;
 use lua_core::value::Value;
+
+use crate::trace::TraceCallbackBarrier;
 
 use crate::state::{CallInfo, LuaState, Stack, ThreadStatus};
 
@@ -43,6 +47,9 @@ pub(crate) enum DeferredVmContinuation {
     Call,
     /// TFORLOOP must update its control register or skip the loop body.
     GenericFor { base: usize, register: usize },
+    /// A Runtime-native TAILCALL must return its completed result window from
+    /// the suspended Lua caller instead of executing the opcode again.
+    TailCall,
 }
 
 /// Metadata needed to finish a native call after its target state stops.
@@ -111,6 +118,10 @@ impl StateContinuationSnapshot {
 
     pub(crate) fn top(&self) -> usize {
         self.top
+    }
+
+    pub(crate) fn allow_yield(&self) -> u16 {
+        self.allow_yield
     }
 
     pub(crate) fn seed_roots(&self, gc: &mut GarbageCollector) {
@@ -279,6 +290,387 @@ impl ProtectedCallRequest {
     }
 }
 
+/// Result/publication policy for one ordinary stdlib callback helper.
+///
+/// Each variant owns a distinct Lua-visible contract. This deliberately stays
+/// separate from [`ProtectedCallKind`], whose envelope belongs only to
+/// `pcall`/`xpcall`.
+#[derive(Clone, Debug)]
+pub(crate) enum CallbackHelperKind {
+    /// `tostring(value)` invoking `value`'s `__tostring` metamethod.
+    ToString,
+    /// `load(reader, chunk_name)` accumulating bytes over repeated reader calls.
+    LoadReader {
+        chunk_name: Vec<u8>,
+        source: Vec<u8>,
+        terminal_error: Option<String>,
+    },
+    /// `table.sort(table, comparator?)` retaining its transactional working copy
+    /// and exact merge cursor between comparator turns.
+    TableSort {
+        state: Box<TableSortState>,
+        terminal_error: Option<String>,
+    },
+    /// `dofile` executing its compiled chunk and forwarding all results.
+    DoFile,
+    /// `table.foreach[i]` retaining its exact traversal cursor between calls.
+    TableForeach { state: Box<TableForeachState> },
+    /// `require` retaining its `package.loaded` publication target and module key.
+    PackageRequire {
+        loaded: GcRef<Table>,
+        module_key: Value,
+    },
+    /// `module` retaining the ordered option callbacks still to execute.
+    PackageModuleOptions {
+        state: Box<PackageModuleOptionsState>,
+        terminal_error: Option<String>,
+    },
+    /// `string.gsub` retaining immutable matches and incremental output across
+    /// function replacements or table `__index` callbacks.
+    Gsub {
+        state: Box<GsubState>,
+        terminal_error: Option<String>,
+    },
+    /// One Lua debug-hook event plus the exact VM boundary resumed afterwards.
+    DebugHook {
+        stop_ci: usize,
+        call_pos: usize,
+        saved_top: usize,
+        trace_barrier: Option<TraceCallbackBarrier>,
+        continuation: Box<DebugHookContinuation>,
+    },
+    /// One opcode-local metamethod call plus its exact VM result publication.
+    VmMetamethod {
+        stop_ci: usize,
+        call_pos: usize,
+        saved_top: usize,
+        trace_barrier: Option<TraceCallbackBarrier>,
+        continuation: VmMetamethodContinuation,
+    },
+}
+
+/// VM action performed after an opcode metamethod returns its first result.
+#[derive(Clone, Debug)]
+pub(crate) enum VmMetamethodContinuation {
+    /// Store the first callback result and advance beyond the suspended opcode.
+    StoreResult {
+        proto: GcRef<Proto>,
+        pc: usize,
+        destination: usize,
+    },
+    /// Restore SELF's receiver register after callback scratch-stack cleanup,
+    /// then store the resolved method in the adjacent destination register.
+    StoreSelfResult {
+        proto: GcRef<Proto>,
+        pc: usize,
+        destination: usize,
+        self_destination: usize,
+        object: Value,
+    },
+    /// Ignore callback results and advance beyond the suspended opcode.
+    CompleteSet { proto: GcRef<Proto>, pc: usize },
+    /// Apply a comparison result and optionally skip the following instruction.
+    Compare {
+        proto: GcRef<Proto>,
+        pc: usize,
+        expected: bool,
+        invert_result: bool,
+    },
+    /// Store one concat result, then fold the remaining absolute stack slots.
+    Concat {
+        proto: GcRef<Proto>,
+        pc: usize,
+        destination: usize,
+        next_slot: usize,
+        end_slot: usize,
+        stack_limit: usize,
+    },
+}
+
+impl VmMetamethodContinuation {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        let proto = match self {
+            Self::StoreResult { proto, .. }
+            | Self::StoreSelfResult { proto, .. }
+            | Self::CompleteSet { proto, .. }
+            | Self::Compare { proto, .. }
+            | Self::Concat { proto, .. } => *proto,
+        };
+        gc.mark_registered(proto);
+        if let Self::StoreSelfResult { object, .. } = self {
+            gc.mark_value(object);
+        }
+    }
+}
+
+/// Runtime-owned traversal state for `table.foreach` and `table.foreachi`.
+#[derive(Clone, Debug)]
+pub(crate) struct TableForeachState {
+    pub table: GcRef<Table>,
+    pub callback: Value,
+    pub cursor: TableForeachCursor,
+}
+
+impl TableForeachState {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        gc.mark_value(&Value::Table(self.table));
+        gc.mark_value(&self.callback);
+        if let TableForeachCursor::Pairs { key } = &self.cursor {
+            gc.mark_value(key);
+        }
+    }
+}
+
+/// Exact next element selected by one table traversal helper.
+#[derive(Clone, Debug)]
+pub(crate) enum TableForeachCursor {
+    Pairs { key: Value },
+    Indices { next: usize, limit: usize },
+}
+
+/// Runtime-owned ordered callback state for Lua 5.1 `module` options.
+#[derive(Clone, Debug)]
+pub(crate) struct PackageModuleOptionsState {
+    pub module: GcRef<Table>,
+    pub options: Vec<Value>,
+    pub next: usize,
+}
+
+impl PackageModuleOptionsState {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        gc.mark_value(&Value::Table(self.module));
+        for option in &self.options {
+            gc.mark_value(option);
+        }
+    }
+}
+
+/// Runtime-owned continuation for callback-capable `string.gsub` replacements.
+#[derive(Clone, Debug)]
+pub(crate) struct GsubState {
+    pub replacement: GsubReplacement,
+    pub steps: Vec<GsubStep>,
+    pub next: usize,
+    pub output: Vec<u8>,
+    pub suffix: Vec<u8>,
+    pub completed: bool,
+}
+
+impl GsubState {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        match &self.replacement {
+            GsubReplacement::Function(function) => gc.mark_value(function),
+            GsubReplacement::Table { table, index_key } => {
+                gc.mark_value(&Value::Table(*table));
+                gc.mark_value(index_key);
+            }
+        }
+        for step in &self.steps {
+            for argument in &step.arguments {
+                gc.mark_value(argument);
+            }
+            gc.mark_value(&step.table_key);
+        }
+    }
+}
+
+/// Callback-capable replacement source for one `string.gsub` activation.
+#[derive(Clone, Debug)]
+pub(crate) enum GsubReplacement {
+    Function(Value),
+    Table {
+        table: GcRef<Table>,
+        index_key: Value,
+    },
+}
+
+/// One immutable match selected by the stdlib pattern engine.
+#[derive(Clone, Debug)]
+pub(crate) struct GsubStep {
+    pub prefix: Vec<u8>,
+    pub matched: Vec<u8>,
+    pub arguments: Vec<Value>,
+    pub table_key: Value,
+}
+
+/// Native call frame retained while its `call` or `return` hook executes.
+#[derive(Clone, Debug)]
+pub(crate) struct DebugHookNativeCall {
+    pub func_pos: usize,
+    pub nargs: usize,
+    pub wanted_results: Option<usize>,
+    pub saved_ci: usize,
+    pub saved_top: usize,
+    pub caller_proto: Option<GcRef<Proto>>,
+    pub caller_pc: Option<usize>,
+    pub continuation: DeferredVmContinuation,
+}
+
+/// VM operation paused at a debug-hook event boundary.
+#[derive(Clone, Debug)]
+pub(crate) enum DebugHookContinuation {
+    /// Enter a freshly pushed Lua frame and still run its first instruction hooks.
+    LuaCall { proto: GcRef<Proto> },
+    /// Resume this exact instruction without dispatching its hooks a second time.
+    ResumeAt { proto: GcRef<Proto>, pc: usize },
+    /// A count hook completed; line-hook selection for the same instruction is next.
+    InstructionAfterCount { proto: GcRef<Proto>, pc: usize },
+    /// Finish a Lua RETURN after its return/tail-return hook sequence.
+    LuaReturn {
+        call_info: CallInfo,
+        results: Vec<Value>,
+        remaining_tail_returns: i32,
+    },
+    /// Invoke a native function after its call hook.
+    NativeCall { frame: DebugHookNativeCall },
+    /// Publish native results after its return hook.
+    NativeReturn {
+        frame: DebugHookNativeCall,
+        result_count: i32,
+    },
+}
+
+impl DebugHookContinuation {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        match self {
+            Self::LuaCall { proto }
+            | Self::ResumeAt { proto, .. }
+            | Self::InstructionAfterCount { proto, .. } => {
+                gc.mark_registered(*proto);
+            }
+            Self::LuaReturn {
+                call_info, results, ..
+            } => {
+                if let Some(proto) = call_info.proto {
+                    gc.mark_registered(proto);
+                }
+                for value in call_info.varargs.iter().chain(results) {
+                    gc.mark_value(value);
+                }
+            }
+            Self::NativeCall { frame } | Self::NativeReturn { frame, .. } => {
+                if let Some(proto) = frame.caller_proto {
+                    gc.mark_registered(proto);
+                }
+            }
+        }
+    }
+}
+
+/// Owned continuation for the oracle-aligned bottom-up merge sort.
+#[derive(Clone, Debug)]
+pub(crate) struct TableSortState {
+    pub table: GcRef<Table>,
+    pub comparator: Option<Value>,
+    pub less_key: Option<GcRef<GcString>>,
+    pub nil_metatable: Option<GcRef<Table>>,
+    pub boolean_metatable: Option<GcRef<Table>>,
+    pub number_metatable: Option<GcRef<Table>>,
+    pub values: Vec<Value>,
+    pub scratch: Vec<Value>,
+    pub stage: TableSortStage,
+    pub pending: Option<TableSortPending>,
+}
+
+impl TableSortState {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        gc.mark_value(&Value::Table(self.table));
+        if let Some(comparator) = &self.comparator {
+            gc.mark_value(comparator);
+        }
+        if let Some(less_key) = self.less_key {
+            gc.mark_value(&Value::String(less_key));
+        }
+        for metatable in [
+            self.nil_metatable,
+            self.boolean_metatable,
+            self.number_metatable,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            gc.mark_value(&Value::Table(metatable));
+        }
+        for value in self.values.iter().chain(&self.scratch) {
+            gc.mark_value(value);
+        }
+    }
+}
+
+/// Exact phase of the transactional table-sort working copy.
+#[derive(Clone, Debug)]
+pub(crate) enum TableSortStage {
+    ValidateComparator {
+        index: usize,
+    },
+    Merge {
+        width: usize,
+        left: usize,
+        middle: usize,
+        right: usize,
+        first: usize,
+        second: usize,
+        output: usize,
+    },
+    Complete,
+}
+
+/// Comparator result expected by the next table-sort continuation turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TableSortPending {
+    ValidatePrimary,
+    ValidateReverse,
+    MergePrimary { custom: bool },
+    MergeReverse,
+}
+
+/// Owned stdlib callback transferred to the Runtime scheduler.
+#[derive(Clone, Debug)]
+pub(crate) struct CallbackHelperRequest {
+    pub id: NativeRequestId,
+    pub kind: CallbackHelperKind,
+    pub function: Value,
+    pub args: Vec<Value>,
+    pub deferred: Option<DeferredNativeCall>,
+}
+
+impl CallbackHelperRequest {
+    pub(crate) fn seed_roots(&self, gc: &mut GarbageCollector) {
+        gc.mark_value(&self.function);
+        for value in &self.args {
+            gc.mark_value(value);
+        }
+        if let Some(deferred) = &self.deferred {
+            if let Some(proto) = deferred.caller_proto {
+                gc.mark_registered(proto);
+            }
+            deferred.snapshot.seed_roots(gc);
+        }
+        if let CallbackHelperKind::TableSort { state, .. } = &self.kind {
+            state.seed_roots(gc);
+        }
+        if let CallbackHelperKind::TableForeach { state } = &self.kind {
+            state.seed_roots(gc);
+        }
+        if let CallbackHelperKind::PackageRequire { loaded, module_key } = &self.kind {
+            gc.mark_value(&Value::Table(*loaded));
+            gc.mark_value(module_key);
+        }
+        if let CallbackHelperKind::PackageModuleOptions { state, .. } = &self.kind {
+            state.seed_roots(gc);
+        }
+        if let CallbackHelperKind::Gsub { state, .. } = &self.kind {
+            state.seed_roots(gc);
+        }
+        if let CallbackHelperKind::DebugHook { continuation, .. } = &self.kind {
+            continuation.seed_roots(gc);
+        }
+        if let CallbackHelperKind::VmMetamethod { continuation, .. } = &self.kind {
+            continuation.seed_roots(gc);
+        }
+    }
+}
+
 /// One sealed Runtime-native mailbox payload.
 #[derive(Clone, Debug)]
 pub(crate) enum RuntimeRequest {
@@ -286,6 +678,7 @@ pub(crate) enum RuntimeRequest {
     FullCollection(FullCollectionRequest),
     DebugUpvalue(Box<DebugUpvalueRequest>),
     ProtectedCall(Box<ProtectedCallRequest>),
+    CallbackHelper(Box<CallbackHelperRequest>),
 }
 
 impl RuntimeRequest {
@@ -295,6 +688,7 @@ impl RuntimeRequest {
             Self::FullCollection(request) => request.id,
             Self::DebugUpvalue(request) => request.id,
             Self::ProtectedCall(request) => request.id,
+            Self::CallbackHelper(request) => request.id,
         }
     }
 
@@ -304,6 +698,7 @@ impl RuntimeRequest {
             Self::FullCollection(request) => request.deferred.as_ref(),
             Self::DebugUpvalue(request) => request.deferred.as_ref(),
             Self::ProtectedCall(request) => request.deferred.as_ref(),
+            Self::CallbackHelper(request) => request.deferred.as_ref(),
         }
     }
 
@@ -313,7 +708,21 @@ impl RuntimeRequest {
             Self::FullCollection(request) => &mut request.deferred,
             Self::DebugUpvalue(request) => &mut request.deferred,
             Self::ProtectedCall(request) => &mut request.deferred,
+            Self::CallbackHelper(request) => &mut request.deferred,
         }
+    }
+
+    pub(crate) fn is_ready_for_runtime(&self) -> bool {
+        self.deferred().is_some()
+            || matches!(
+                self,
+                Self::CallbackHelper(request)
+                    if matches!(
+                        &request.kind,
+                        CallbackHelperKind::DebugHook { .. }
+                            | CallbackHelperKind::VmMetamethod { .. }
+                    )
+            )
     }
 }
 

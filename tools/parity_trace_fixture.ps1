@@ -34,6 +34,9 @@ $events = @(
         seq = 2; kind = "instruction"; funcName = $sourceName; source = $sourceName
         pc = 0; op = "LOADK"; a = 0; b = 0; c = 0; bx = 0; sbx = -131071
         line = 1; callDepth = 1; stackTop = 1
+        registers = @(
+            [ordered]@{ slot = 0; name = "fixture"; value = 1; type = "number" }
+        )
         changedRegisters = @(
             [ordered]@{
                 slot = 0; name = "fixture"; old = $null; new = 1

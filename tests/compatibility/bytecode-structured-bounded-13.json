@@ -1,0 +1,17 @@
+{
+  "files": [
+    "alien_signals/bit.lua",
+    "alien_signals/constants.lua",
+    "basic/test_arithmetic.lua",
+    "bytecode/test_bytecode_debug.lua",
+    "control_flow/test_break_counter.lua",
+    "differential/m1-byte-string.lua",
+    "differential/m2-unary-frontend-coverage.lua",
+    "functions/test_call_success.lua",
+    "functions/test_closure_simple.lua",
+    "functions/test_syntax_sugar.lua",
+    "functions/test_table_constructor_multret.lua",
+    "integration/test_coroutine_scheduler.lua",
+    "regressions/test_logical_return_combo.lua"
+  ]
+}

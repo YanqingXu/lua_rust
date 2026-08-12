@@ -1561,14 +1561,14 @@ mod tests {
         let manifest_path = repo_root.join("tests/compatibility/lua_fixtures.json");
         let manifest =
             load_and_validate_manifest(&manifest_path, &repo_root).expect("valid manifest");
-        assert_eq!(manifest.cases.len(), 131);
+        assert_eq!(manifest.cases.len(), manifest.inventory.current_total);
         assert_eq!(
             manifest
                 .cases
                 .iter()
                 .filter(|case| is_differential_path(&case.path))
                 .count(),
-            6
+            manifest.inventory.added_differential
         );
         assert_eq!(
             manifest
@@ -1605,12 +1605,15 @@ mod tests {
         let manifest_path = repo_root.join("tests/compatibility/lua_fixtures.json");
         let mut manifest =
             load_and_validate_manifest(&manifest_path, &repo_root).expect("valid manifest");
+        let classified_differential = manifest.inventory.added_differential;
         manifest.inventory.added_differential -= 1;
 
         let error =
             validate_manifest(&manifest, &repo_root).expect_err("stale inventory must fail");
         assert!(
-            error.contains("but 6 differential fixtures are classified"),
+            error.contains(&format!(
+                "but {classified_differential} differential fixtures are classified"
+            )),
             "{error}"
         );
     }

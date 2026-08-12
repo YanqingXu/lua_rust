@@ -122,6 +122,9 @@ function Invoke-ParityProcess {
 
         [string[]]$Arguments = @(),
 
+        [AllowNull()]
+        [byte[]]$StandardInputBytes = $null,
+
         [Parameter(Mandatory = $true)]
         [string]$WorkingDirectory,
 
@@ -150,6 +153,14 @@ function Invoke-ParityProcess {
         $startInfo.CreateNoWindow = $true
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
+        $startInfo.RedirectStandardInput = $null -ne $StandardInputBytes
+        if ($startInfo.RedirectStandardInput -and
+            $startInfo.PSObject.Properties.Name -contains "StandardInputEncoding") {
+            # Constructing the redirected writer with an explicit no-preamble
+            # encoding prevents a lazy UTF-8 BOM from being emitted when it is
+            # closed after the raw BaseStream payload.
+            $startInfo.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
+        }
 
         if ($startInfo.PSObject.Properties.Name -contains "ArgumentList") {
             foreach ($argument in $Arguments) {
@@ -170,6 +181,16 @@ function Invoke-ParityProcess {
 
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
+        if ($null -ne $StandardInputBytes) {
+            if ($StandardInputBytes.Count -gt 0) {
+                $process.StandardInput.BaseStream.Write(
+                    $StandardInputBytes,
+                    0,
+                    $StandardInputBytes.Count
+                )
+            }
+            $process.StandardInput.Close()
+        }
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             $timedOut = $true
             try {

@@ -3,8 +3,8 @@
 //! `Runtime` keeps one [`Heap`], the generational state arena, and runtime
 //! services in a pinned storage allocation. The Heap couples collector
 //! accounting and the canonical string pool under one non-reused identity. A
-//! boxed main `LuaState` remains Runtime-owned; the arena owns every coroutine
-//! state. LuaState stores no collector or string-pool backpointer: each state
+//! generational arena owns the main `LuaState` and every coroutine state.
+//! LuaState stores no collector or string-pool backpointer: each state
 //! turn installs a dynamically scoped service context. Callers can borrow the
 //! three execution parts together through `Runtime::parts_mut`; the returned
 //! guard records the service scope, Runtime execution, and main-state arena
@@ -18,22 +18,24 @@
 //!
 //! M1.8 adds explicit deterministic reclamation for shutdown. `Runtime::close`
 //! drains remaining Lua `__gc` callbacks with error isolation, drains
-//! coroutine states, closes collector-validated open Upvalues while their
-//! stacks are alive, detaches the main state, clears Runtime roots, and calls
+//! coroutine states and the main state, closes collector-validated open
+//! Upvalues while their stacks are alive, clears Runtime roots, and calls
 //! the collector's non-collecting `destroy_all` path. That path destroys
 //! non-fixed Threads first, other non-fixed objects second, and fixed objects
 //! last while a live StringPool removes every String index. Owner-thread
 //! `Drop` uses the same implementation.
 //!
-//! This remains a partial shutdown substrate: library-specific IO/resource
-//! hooks and native-module ordering are explicit report/RFC debt. The shared
+//! Runtime services may register weak object identities with static drain
+//! hooks. Close runs those hooks after Lua finalizers and before states or the
+//! heap are destroyed, isolating individual errors and panics. The shared
 //! managed-payload allocator ledger reports live/peak/cumulative bytes and
 //! reaches zero after deterministic close. Live execution supports explicit
 //! full/incremental collection plus allocation-triggered collection at
 //! Runtime-owned instruction boundaries.
 
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
+use std::io::Write;
 use std::marker::{PhantomData, PhantomPinned};
 use std::num::NonZeroU64;
 use std::pin::Pin;
@@ -64,21 +66,36 @@ use lua_core::value::Value;
 use thiserror::Error;
 
 use crate::execute::{
-    ExecResult, RuntimeError, VmExit, abort_finalizer_callback, abort_protected_call_turn,
-    call_value_with_results, execute_proto, finish_deferred_native_call,
-    finish_deferred_native_values, finish_deferred_runtime_result, finish_protected_call_turn,
-    resume_after_deferred_native_call, resume_finalizer_callback, resume_lua_thread,
-    resume_protected_call, start_finalizer_callback, start_lua_call_at_stack,
-    start_protected_call_target,
+    ExecResult, GsubAdvance, RuntimeError, TableForeachAdvance, TableSortAdvance, VmExit,
+    abort_finalizer_callback, abort_runtime_callback_turn, advance_gsub_state,
+    advance_table_foreach_state, advance_table_sort_state, call_value_with_results,
+    commit_table_sort, definite_load_syntax_error, dispatch_debug_line_hook,
+    dispatch_started_lua_call_hook, execute_proto, finish_deferred_gsub_result,
+    finish_deferred_load_error_message, finish_deferred_load_source, finish_deferred_native_call,
+    finish_deferred_native_values, finish_deferred_protected_values,
+    finish_deferred_runtime_result, finish_lua_return_after_debug_hook,
+    finish_native_call_after_debug_hook, finish_package_require_callback,
+    finish_protected_callback_turn, finish_runtime_callback_turn, finish_vm_metamethod_callback,
+    publish_debug_hook_event, resume_after_deferred_native_call, resume_finalizer_callback,
+    resume_lua_call_after_debug_hook, resume_lua_instruction_after_debug_hook, resume_lua_thread,
+    resume_native_call_after_debug_hook, resume_runtime_callback, start_finalizer_callback,
+    start_lua_call_at_stack, start_runtime_callback_target, unwind_top_level_lua_error,
 };
 use crate::native::{
-    DebugUpvalueOperation, DebugUpvalueRequest, DeferredNativeCall, FullCollectionRequest,
-    ProtectedCallKind, ProtectedCallRequest, ResumeRequest, ResumeResponse, RuntimeRequest,
-    UpvalueAccessOperation, UpvalueAccessRequest,
+    CallbackHelperKind, CallbackHelperRequest, DebugHookContinuation, DebugUpvalueOperation,
+    DebugUpvalueRequest, DeferredNativeCall, FullCollectionRequest, ProtectedCallKind,
+    ProtectedCallRequest, ResumeRequest, ResumeResponse, RuntimeRequest, UpvalueAccessOperation,
+    UpvalueAccessRequest,
 };
 use crate::state::lua_state::LuaStateShutdownReport;
 use crate::state::{
-    ActiveVmContext, LuaState, ThreadStatus, enter_vm_context, with_vm_context_parts,
+    ActiveVmContext, LuaState, ThreadStatus, enter_vm_context, with_vm_context, with_vm_context_gc,
+};
+use crate::trace::{
+    InstructionTrace, InstructionTraceError, InstructionTraceMode, InstructionTraceSummary,
+    SharedInstructionTrace, discard_all_instruction_diffs, emit_coroutine_resume_trace,
+    emit_runtime_error_trace, end_trace_callback_barrier, record_trace_nil_range,
+    retire_trace_state,
 };
 
 mod full_collection;
@@ -141,6 +158,8 @@ pub struct RuntimeActivationStats {
     pub peak_debug_upvalue_transfer_depth: usize,
     /// Largest number of nested Runtime-owned `pcall`/`xpcall` helpers.
     pub peak_protected_call_depth: usize,
+    /// Largest number of nested ordinary stdlib callback helpers.
+    pub peak_callback_helper_depth: usize,
     /// Largest combined activation/root-transfer buffer depth.
     pub peak_rooted_activation_depth: usize,
     /// Largest number of StateArena slots borrowed at the same instant.
@@ -153,6 +172,8 @@ pub struct RuntimeActivationStats {
     pub current_debug_upvalue_transfer_depth: usize,
     /// Protected helper frames still retained after the session.
     pub current_protected_call_depth: usize,
+    /// Ordinary stdlib callback frames still retained after the session.
+    pub current_callback_helper_depth: usize,
     /// GC/finalizer frames still retained after the session.
     pub current_gc_depth: usize,
 }
@@ -164,6 +185,7 @@ impl RuntimeActivationStats {
             .saturating_add(self.current_upvalue_transfer_depth)
             .saturating_add(self.current_debug_upvalue_transfer_depth)
             .saturating_add(self.current_protected_call_depth)
+            .saturating_add(self.current_callback_helper_depth)
             .saturating_add(self.current_gc_depth)
     }
 }
@@ -270,13 +292,27 @@ struct NativeActivationStack {
     upvalue_transfers: Vec<UpvalueTransferFrame>,
     debug_upvalue_transfers: Vec<DebugUpvalueTransferFrame>,
     protected_calls: Vec<ProtectedCallActivationFrame>,
+    callback_helpers: Vec<CallbackHelperActivationFrame>,
     gc_frames: Vec<GcActivationFrame>,
+    next_callback_sequence: u64,
     stats: NativeActivationCounters,
 }
 
 impl NativeActivationStack {
     fn begin_session(&mut self) {
         self.stats = NativeActivationCounters::default();
+        self.next_callback_sequence = 1;
+    }
+
+    fn allocate_callback_sequence(&mut self) -> Result<u64, RuntimeExecutionError> {
+        let sequence = self.next_callback_sequence;
+        self.next_callback_sequence =
+            self.next_callback_sequence.checked_add(1).ok_or_else(|| {
+                RuntimeExecutionError::Protocol(
+                    "Runtime callback activation sequence exhausted".to_string(),
+                )
+            })?;
+        Ok(sequence)
     }
 
     fn observe_turn(&mut self) {
@@ -294,12 +330,17 @@ impl NativeActivationStack {
             .stats
             .peak_protected_call_depth
             .max(self.protected_calls.len());
+        self.stats.peak_callback_helper_depth = self
+            .stats
+            .peak_callback_helper_depth
+            .max(self.callback_helpers.len());
         let rooted_depth = self
             .frames
             .len()
             .saturating_add(self.upvalue_transfers.len())
             .saturating_add(self.debug_upvalue_transfers.len())
             .saturating_add(self.protected_calls.len())
+            .saturating_add(self.callback_helpers.len())
             .saturating_add(self.gc_frames.len());
         self.stats.peak_rooted_activation_depth =
             self.stats.peak_rooted_activation_depth.max(rooted_depth);
@@ -312,12 +353,14 @@ impl NativeActivationStack {
             peak_upvalue_transfer_depth: self.stats.peak_upvalue_transfer_depth,
             peak_debug_upvalue_transfer_depth: self.stats.peak_debug_upvalue_transfer_depth,
             peak_protected_call_depth: self.stats.peak_protected_call_depth,
+            peak_callback_helper_depth: self.stats.peak_callback_helper_depth,
             peak_rooted_activation_depth: self.stats.peak_rooted_activation_depth,
             peak_borrowed_state_slots,
             current_resume_depth: self.frames.len(),
             current_upvalue_transfer_depth: self.upvalue_transfers.len(),
             current_debug_upvalue_transfer_depth: self.debug_upvalue_transfers.len(),
             current_protected_call_depth: self.protected_calls.len(),
+            current_callback_helper_depth: self.callback_helpers.len(),
             current_gc_depth: self.gc_frames.len(),
         }
     }
@@ -347,6 +390,9 @@ impl NativeActivationStack {
         for frame in &self.protected_calls {
             frame.seed_roots(gc);
         }
+        for frame in &self.callback_helpers {
+            frame.seed_roots(gc);
+        }
         for frame in &self.gc_frames {
             frame.seed_roots(gc);
             if let Some((userdata, callback)) = &frame.current_finalizer {
@@ -367,6 +413,7 @@ struct NativeActivationCounters {
     peak_upvalue_transfer_depth: usize,
     peak_debug_upvalue_transfer_depth: usize,
     peak_protected_call_depth: usize,
+    peak_callback_helper_depth: usize,
     peak_rooted_activation_depth: usize,
 }
 
@@ -464,10 +511,31 @@ struct ProtectedCallActivationFrame {
     phase: ProtectedCallPhase,
     role: NativeDriverRole,
     parent_role: NativeDriverRole,
+    previous_allow_yield: u16,
     pending_response: Option<ResumeResponse>,
+    sequence: u64,
 }
 
 impl ProtectedCallActivationFrame {
+    fn seed_roots(&self, gc: &mut GarbageCollector) {
+        self.request.seed_roots(gc);
+        if let Some(response) = &self.pending_response {
+            response.seed_roots(gc);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CallbackHelperActivationFrame {
+    requester: StateHandle,
+    request: CallbackHelperRequest,
+    role: NativeDriverRole,
+    parent_role: NativeDriverRole,
+    pending_response: Option<ResumeResponse>,
+    sequence: u64,
+}
+
+impl CallbackHelperActivationFrame {
     fn seed_roots(&self, gc: &mut GarbageCollector) {
         self.request.seed_roots(gc);
         if let Some(response) = &self.pending_response {
@@ -540,6 +608,16 @@ enum NativeDriverAction {
         frame: ProtectedCallActivationFrame,
         response: ResumeResponse,
     },
+    StartCallbackHelper {
+        function: Value,
+        args: Vec<Value>,
+        wanted_results: Option<usize>,
+        role: NativeDriverRole,
+    },
+    FinishCallbackHelper {
+        frame: CallbackHelperActivationFrame,
+        response: ResumeResponse,
+    },
     DeliverUpvalue {
         frame: UpvalueTransferFrame,
         resume: NativeDriverRole,
@@ -566,6 +644,21 @@ enum NativeDriverAction {
         stop_ci: usize,
         saved_top: usize,
     },
+}
+
+fn callback_helper_wanted_results(kind: &CallbackHelperKind) -> Option<usize> {
+    match kind {
+        CallbackHelperKind::DoFile => None,
+        CallbackHelperKind::PackageModuleOptions { .. } => Some(0),
+        CallbackHelperKind::ToString
+        | CallbackHelperKind::LoadReader { .. }
+        | CallbackHelperKind::TableSort { .. }
+        | CallbackHelperKind::TableForeach { .. }
+        | CallbackHelperKind::PackageRequire { .. }
+        | CallbackHelperKind::Gsub { .. }
+        | CallbackHelperKind::DebugHook { .. }
+        | CallbackHelperKind::VmMetamethod { .. } => Some(1),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -600,6 +693,11 @@ enum NativeDriverRole {
         call_pos: usize,
         saved_top: usize,
     },
+    CallbackHelper {
+        stop_ci: usize,
+        call_pos: usize,
+        saved_top: usize,
+    },
 }
 
 impl NativeDriverAction {
@@ -610,6 +708,8 @@ impl NativeDriverAction {
             }
             Self::StartProtectedCall { role, .. } => *role,
             Self::FinishProtectedCall { frame, .. } => frame.parent_role,
+            Self::StartCallbackHelper { role, .. } => *role,
+            Self::FinishCallbackHelper { frame, .. } => frame.parent_role,
             Self::Deliver { resume, .. }
             | Self::DeliverUpvalue { resume, .. }
             | Self::DeliverDebugUpvalue { resume, .. }
@@ -633,6 +733,7 @@ enum NativeTurnEvent {
     Main(Result<ExecResult, RuntimeError>),
     Finalizer(Result<(), RuntimeError>),
     ProtectedCall(ResumeResponse),
+    CallbackHelper(ResumeResponse),
     Coroutine {
         thread: GcRef<Thread>,
         response: ResumeResponse,
@@ -643,7 +744,8 @@ enum NativeTurnEvent {
 ///
 /// M1.8 reclaims Rust-owned states and collector allocations. Close drains
 /// Lua-visible `__gc` callbacks with error isolation before destroying the
-/// heap; library-specific close callbacks remain an explicit capability debt.
+/// heap; Runtime service hooks drain external resources between finalizers and
+/// state destruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeCloseReport {
     /// Runtime that produced the report.
@@ -696,10 +798,52 @@ pub struct RuntimeCloseReport {
     pub lua_finalizers_attempted: usize,
     /// Close-time Lua `__gc` errors isolated while continuing the drain.
     pub lua_finalizer_errors_ignored: usize,
+    /// Runtime resource drain hooks attempted during the first close.
+    pub runtime_resources_attempted: usize,
+    /// Runtime resources explicitly closed by their service hook.
+    pub runtime_resources_drained: usize,
+    /// Registered resources already closed before their service hook ran.
+    pub runtime_resources_already_closed: usize,
+    /// Weak resource identities no longer present in the collector.
+    pub runtime_resources_stale: usize,
+    /// Resource hook failures or panics isolated while continuing shutdown.
+    pub runtime_resource_drain_errors: usize,
     /// Whether close-time Lua `__gc` callback delivery remains unavailable.
     pub lua_gc_callback_debt: bool,
-    /// Capability debt: library-specific IO/resource drain hooks are not run.
+    /// Capability debt: Runtime resource drain hooks are unavailable.
     pub io_resource_drain_debt: bool,
+}
+
+/// Result returned by one Runtime-owned external-resource drain hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeResourceDrainOutcome {
+    /// The hook closed and released the external resource.
+    Drained,
+    /// Lua code or a finalizer had already closed the resource.
+    AlreadyClosed,
+    /// The weak object identity was already reclaimed by the collector.
+    Stale,
+    /// The resource remained open because its close operation failed.
+    Failed,
+}
+
+/// Static hook used to drain one weakly registered Runtime resource.
+pub type RuntimeResourceDrainHook =
+    fn(&mut LuaState, &mut GarbageCollector, ObjectId) -> RuntimeResourceDrainOutcome;
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimeResourceEntry {
+    object_id: ObjectId,
+    drain: RuntimeResourceDrainHook,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RuntimeResourceDrainReport {
+    attempted: usize,
+    drained: usize,
+    already_closed: usize,
+    stale: usize,
+    errors: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -712,6 +856,7 @@ struct RuntimeShutdownSummary {
     pending_lua_finalizers_discarded: usize,
     lua_finalizers_attempted: usize,
     lua_finalizer_errors_ignored: usize,
+    resource_drain: RuntimeResourceDrainReport,
 }
 
 /// Failure to resolve a generational Lua state handle.
@@ -768,7 +913,9 @@ pub enum StateResolveError {
         /// Borrowed slot generation.
         generation: u64,
     },
-    /// Nested arena resolution was attempted during a Runtime-owned turn.
+    /// Nested arena resolution was attempted during a Runtime-owned turn for a
+    /// target that is not another Runtime-owned coroutine. Coroutine debug and
+    /// library inspection uses a separately tracked scoped borrow.
     #[error(
         "runtime turn already owns state slot {slot} generation {generation}; publish a switch instead"
     )]
@@ -781,19 +928,10 @@ pub enum StateResolveError {
     /// Resolution attempted to recreate the caller's current mutable state.
     #[error("cannot resolve the currently mutably borrowed LuaState")]
     CurrentState,
-    /// A direct owner borrow did not match the registered state allocation.
-    #[error("registered state pointer did not match the Runtime owner")]
-    PointerMismatch,
-    /// A non-owning slot was passed to an owned-state removal operation.
-    #[error("state slot {slot} is not owned by the StateArena")]
-    NotOwned {
-        /// Non-owning slot index.
-        slot: usize,
-    },
-    /// An owned slot was passed to the external-state detach operation.
-    #[error("state slot {slot} is owned by the StateArena, not externally boxed")]
-    NotExternal {
-        /// Owned slot index.
+    /// A handle expected to name the main state named another arena state.
+    #[error("state slot {slot} is not the Runtime main state")]
+    NotMainState {
+        /// Non-main slot index.
         slot: usize,
     },
     /// Internal StateArena bookkeeping disagreed before a destructive action.
@@ -840,13 +978,13 @@ struct StateSlot {
     generation: u64,
     state: Option<NonNull<LuaState>>,
     accounted_bytes: usize,
-    owned: bool,
+    is_main: bool,
     borrowed: bool,
     retired: bool,
     temporary_root_id: Option<u64>,
 }
 
-/// Runtime-owned generational arena for Lua coroutine states.
+/// Runtime-owned generational arena for the main and coroutine Lua states.
 ///
 /// Slots contain stable `NonNull<LuaState>` addresses rather than references.
 /// All resolution validates runtime, slot, generation, occupancy, current-state
@@ -856,10 +994,12 @@ pub struct StateArena {
     handle_issuer: StateHandleIssuer,
     slots: Vec<StateSlot>,
     free_slots: Vec<usize>,
-    live_owned_states: usize,
+    live_coroutine_states: usize,
     next_temporary_root_id: u64,
     rejected_temporary_root_releases: usize,
     turn_borrow: Option<StateHandle>,
+    runtime_resources: Vec<RuntimeResourceEntry>,
+    runtime_resource_drain_cursor: usize,
     allocation_account: AllocationAccount,
     #[cfg(test)]
     turn_borrow_events: Vec<TurnBorrowEvent>,
@@ -873,10 +1013,13 @@ enum TurnBorrowEvent {
     Released(StateHandle),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct StateArenaDrainReport {
-    drained_owned_states: usize,
+    drained_coroutine_states: usize,
+    drained_main_states: usize,
     state_shutdown: LuaStateShutdownReport,
+    #[cfg(test)]
+    drained_state_handles: Vec<StateHandle>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -891,10 +1034,12 @@ impl StateArena {
             handle_issuer,
             slots: Vec::new(),
             free_slots: Vec::new(),
-            live_owned_states: 0,
+            live_coroutine_states: 0,
             next_temporary_root_id: 1,
             rejected_temporary_root_releases: 0,
             turn_borrow: None,
+            runtime_resources: Vec::new(),
+            runtime_resource_drain_cursor: 0,
             allocation_account: AllocationAccount::new(allocator),
             #[cfg(test)]
             turn_borrow_events: Vec::new(),
@@ -913,7 +1058,7 @@ impl StateArena {
                     if self.slots.get(slot_index).is_some_and(|slot| {
                         !slot.retired
                             && slot.state.is_none()
-                            && !slot.owned
+                            && !slot.is_main
                             && !slot.borrowed
                             && slot.temporary_root_id.is_none()
                     }) =>
@@ -940,7 +1085,7 @@ impl StateArena {
                         generation: 1,
                         state: None,
                         accounted_bytes: 0,
-                        owned: false,
+                        is_main: false,
                         borrowed: false,
                         retired: false,
                         temporary_root_id: None,
@@ -958,24 +1103,18 @@ impl StateArena {
         self.handle_issuer.issue(slot, generation)
     }
 
-    fn attach_external(&mut self, state: NonNull<LuaState>) -> StateHandle {
-        let handle = self
-            .reserve_slot()
-            .expect("fresh Runtime main-state slot allocation cannot be fault-injected");
-        // SAFETY: Runtime passes its live, uniquely owned main-state Box.
-        let accounted_bytes = unsafe { state.as_ref() }.allocator_payload_bytes();
-        let slot = &mut self.slots[handle.slot()];
-        slot.state = Some(state);
-        slot.accounted_bytes = accounted_bytes;
-        slot.owned = false;
-        self.reconcile_allocation_account();
-        handle
-    }
-
     #[cfg(test)]
     fn insert_owned(&mut self, state: Box<LuaState>) -> StateHandle {
-        self.insert_owned_with_temporary_root(state, None, None)
+        self.insert_owned_with_temporary_root(state, None, None, false)
             .expect("test-owned StateArena insertion succeeds")
+    }
+
+    fn insert_main_owned(
+        &mut self,
+        state: Box<LuaState>,
+        owner_cell: NonNull<UnsafeCell<StateArena>>,
+    ) -> Result<StateHandle, ManagedAllocationError> {
+        self.insert_owned_with_temporary_root(state, None, Some(owner_cell), true)
     }
 
     fn insert_pending_owned(
@@ -998,8 +1137,12 @@ impl StateArena {
                 .ok_or(StateResolveError::ArenaInvariant {
                     reason: "temporary state-root identity space exhausted",
                 })?;
-        let handle =
-            self.insert_owned_with_temporary_root(state, Some(temporary_root_id), owner_cell)?;
+        let handle = self.insert_owned_with_temporary_root(
+            state,
+            Some(temporary_root_id),
+            owner_cell,
+            false,
+        )?;
         self.next_temporary_root_id = next_temporary_root_id;
         Ok((handle, temporary_root_id))
     }
@@ -1009,11 +1152,16 @@ impl StateArena {
         mut state: Box<LuaState>,
         temporary_root_id: Option<u64>,
         owner_cell: Option<NonNull<UnsafeCell<StateArena>>>,
+        is_main: bool,
     ) -> Result<StateHandle, ManagedAllocationError> {
-        let next_live_owned_states = self
-            .live_owned_states
-            .checked_add(1)
-            .expect("StateArena live owned-state count overflow");
+        debug_assert!(!is_main || temporary_root_id.is_none());
+        let next_live_coroutine_states = if is_main {
+            self.live_coroutine_states
+        } else {
+            self.live_coroutine_states
+                .checked_add(1)
+                .expect("StateArena live coroutine-state count overflow")
+        };
         let handle = self.reserve_slot()?;
         state.attach_runtime_state(handle, owner_cell);
         let accounted_bytes = state.allocator_payload_bytes();
@@ -1023,9 +1171,9 @@ impl StateArena {
         let slot = &mut self.slots[handle.slot()];
         slot.state = Some(state);
         slot.accounted_bytes = accounted_bytes;
-        slot.owned = true;
+        slot.is_main = is_main;
         slot.temporary_root_id = temporary_root_id;
-        self.live_owned_states = next_live_owned_states;
+        self.live_coroutine_states = next_live_coroutine_states;
         self.reconcile_allocation_account();
         Ok(handle)
     }
@@ -1037,7 +1185,7 @@ impl StateArena {
     ) -> Result<(usize, NonNull<LuaState>), PendingStateError> {
         let (slot_index, state) = self.validate(handle)?;
         let slot = &self.slots[slot_index];
-        if !slot.owned || slot.temporary_root_id != Some(temporary_root_id) {
+        if slot.is_main || slot.temporary_root_id != Some(temporary_root_id) {
             return Err(PendingStateError::RootMismatch);
         }
         Ok((slot_index, state))
@@ -1106,12 +1254,12 @@ impl StateArena {
             }
             .into());
         }
-        let next_live_owned_states = self
-            .live_owned_states
+        let next_live_coroutine_states = self
+            .live_coroutine_states
             .checked_sub(1)
-            .expect("pending owned slot requires a positive live count");
+            .expect("pending coroutine slot requires a positive live count");
         self.vacate_slot(slot_index);
-        self.live_owned_states = next_live_owned_states;
+        self.live_coroutine_states = next_live_coroutine_states;
         // SAFETY: pending slots originate from one Box::into_raw and have just
         // been made vacant without ever transferring ownership elsewhere.
         unsafe {
@@ -1134,6 +1282,96 @@ impl StateArena {
             .iter()
             .filter(|slot| slot.temporary_root_id.is_some())
             .count()
+    }
+
+    fn reserve_runtime_resources(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), ManagedAllocationError> {
+        let available = self
+            .runtime_resources
+            .capacity()
+            .saturating_sub(self.runtime_resources.len());
+        let additional = additional.saturating_sub(available);
+        if additional == 0 {
+            return Ok(());
+        }
+        let requested_bytes =
+            additional.saturating_mul(std::mem::size_of::<RuntimeResourceEntry>());
+        self.allocation_account
+            .allocation_checkpoint(AllocationSite::RuntimeResourceRegistry, requested_bytes)?;
+        self.runtime_resources
+            .try_reserve(additional)
+            .map_err(|source| {
+                ManagedAllocationError::capacity(
+                    AllocationSite::RuntimeResourceRegistry,
+                    requested_bytes,
+                    source,
+                )
+            })?;
+        self.reconcile_allocation_account();
+        Ok(())
+    }
+
+    fn register_runtime_resource(
+        &mut self,
+        object_id: ObjectId,
+        drain: RuntimeResourceDrainHook,
+    ) -> Result<bool, StateResolveError> {
+        if object_id.is_null() {
+            return Err(StateResolveError::ArenaInvariant {
+                reason: "runtime resource registration has a null object identity",
+            });
+        }
+        if self
+            .runtime_resources
+            .iter()
+            .any(|entry| entry.object_id == object_id)
+        {
+            return Ok(false);
+        }
+        if self.runtime_resources.len() == self.runtime_resources.capacity() {
+            return Err(StateResolveError::ArenaInvariant {
+                reason: "runtime resource registration capacity was not reserved",
+            });
+        }
+        self.runtime_resources
+            .push(RuntimeResourceEntry { object_id, drain });
+        Ok(true)
+    }
+
+    fn next_runtime_resource(&mut self) -> Option<RuntimeResourceEntry> {
+        let entry = self
+            .runtime_resources
+            .get(self.runtime_resource_drain_cursor)
+            .copied()?;
+        self.runtime_resource_drain_cursor = self
+            .runtime_resource_drain_cursor
+            .checked_add(1)
+            .expect("runtime resource drain cursor overflow");
+        Some(entry)
+    }
+
+    fn pending_runtime_resource_count(&self) -> usize {
+        self.runtime_resources
+            .len()
+            .saturating_sub(self.runtime_resource_drain_cursor)
+    }
+
+    fn finish_runtime_resource_drain(&mut self) {
+        let resources = std::mem::take(&mut self.runtime_resources);
+        drop(resources);
+        self.runtime_resource_drain_cursor = 0;
+        self.reconcile_allocation_account();
+    }
+
+    fn validate_runtime_resource_drain_complete(&self) -> Result<(), StateResolveError> {
+        if !self.runtime_resources.is_empty() || self.runtime_resource_drain_cursor != 0 {
+            return Err(StateResolveError::ArenaInvariant {
+                reason: "runtime resources remain registered after the close drain",
+            });
+        }
+        Ok(())
     }
 
     fn validate(
@@ -1212,6 +1450,39 @@ impl StateArena {
         Ok(state)
     }
 
+    fn main_state_ref(&self, handle: StateHandle) -> Result<&LuaState, StateResolveError> {
+        let (slot_index, state) = self.validate(handle)?;
+        let slot = &self.slots[slot_index];
+        if !slot.is_main {
+            return Err(StateResolveError::NotMainState { slot: slot_index });
+        }
+        if slot.borrowed {
+            return Err(StateResolveError::AlreadyBorrowed {
+                slot: slot_index,
+                generation: slot.generation,
+            });
+        }
+        // SAFETY: every occupied slot is owned by this arena. The returned
+        // reference is tied to `&self`, which prevents safe Runtime mutation or
+        // arena teardown for its lifetime, and the slot is not mutably borrowed.
+        Ok(unsafe { state.as_ref() })
+    }
+
+    fn validate_main(&self, handle: StateHandle) -> Result<NonNull<LuaState>, StateResolveError> {
+        let (slot_index, state) = self.validate(handle)?;
+        let slot = &self.slots[slot_index];
+        if !slot.is_main {
+            return Err(StateResolveError::NotMainState { slot: slot_index });
+        }
+        if slot.borrowed {
+            return Err(StateResolveError::AlreadyBorrowed {
+                slot: slot_index,
+                generation: slot.generation,
+            });
+        }
+        Ok(state)
+    }
+
     fn with_state_mut<R>(
         mut arena: NonNull<Self>,
         handle: StateHandle,
@@ -1223,11 +1494,48 @@ impl StateArena {
             // mutable borrow ends before the target-state closure starts, so
             // nested state resolution cannot overlap an arena `&mut` borrow.
             let arena_ref = unsafe { arena.as_mut() };
-            arena_ref.reject_active_turn()?;
             let state = arena_ref.resolve(handle, current_state)?;
+            if let Some(active_handle) = arena_ref.turn_borrow {
+                let (_, active_state) = arena_ref.validate(active_handle)?;
+                // Execution switches still have to leave the current turn.
+                // The one safe in-turn exception is a scoped debug/library
+                // inspection of another Runtime-owned coroutine: the current
+                // turn state remains borrowed and the target borrow cannot
+                // escape this HRTB callback.
+                if active_state != current_state
+                    // SAFETY: `resolve` validated this unborrowed, stable arena
+                    // pointer and no reference has yet been created for it.
+                    || unsafe { state.as_ref() }.current_thread.is_none()
+                {
+                    return Err(StateResolveError::TurnBorrowActive {
+                        slot: active_handle.slot(),
+                        generation: active_handle.generation(),
+                    });
+                }
+            }
             arena_ref.slots[handle.slot()].borrowed = true;
+            let borrowed_slots = arena_ref.slots.iter().filter(|slot| slot.borrowed).count();
+            arena_ref.peak_turn_borrowed_slots =
+                arena_ref.peak_turn_borrowed_slots.max(borrowed_slots);
             state
         };
+        let mut borrow = StateBorrow {
+            arena,
+            handle,
+            state,
+            kind: StateBorrowKind::Nested,
+        };
+        Ok(borrow.with_mut(f))
+    }
+
+    fn with_direct_state_mut<R>(
+        mut arena: NonNull<Self>,
+        handle: StateHandle,
+        f: impl for<'state> FnOnce(&'state mut LuaState) -> R,
+    ) -> Result<R, StateResolveError> {
+        // SAFETY: Runtime passes its pinned arena while holding exclusive
+        // access. The StateBorrow releases the slot even if `f` unwinds.
+        let state = unsafe { arena.as_mut() }.begin_direct_borrow(handle)?;
         let mut borrow = StateBorrow {
             arena,
             handle,
@@ -1312,13 +1620,9 @@ impl StateArena {
     fn begin_direct_borrow(
         &mut self,
         handle: StateHandle,
-        expected_state: NonNull<LuaState>,
-    ) -> Result<(), StateResolveError> {
+    ) -> Result<NonNull<LuaState>, StateResolveError> {
         self.reject_active_turn()?;
         let (slot_index, state) = self.validate(handle)?;
-        if state != expected_state {
-            return Err(StateResolveError::PointerMismatch);
-        }
         let slot = &mut self.slots[slot_index];
         if slot.borrowed {
             return Err(StateResolveError::AlreadyBorrowed {
@@ -1327,7 +1631,7 @@ impl StateArena {
             });
         }
         slot.borrowed = true;
-        Ok(())
+        Ok(state)
     }
 
     fn release(&mut self, handle: StateHandle) -> bool {
@@ -1359,38 +1663,6 @@ impl StateArena {
         released
     }
 
-    fn detach_external(
-        &mut self,
-        handle: StateHandle,
-        expected_state: NonNull<LuaState>,
-    ) -> Result<(), StateResolveError> {
-        let slot_index = self.validate_external_detach(handle, expected_state)?;
-        self.vacate_slot(slot_index);
-        Ok(())
-    }
-
-    fn validate_external_detach(
-        &self,
-        handle: StateHandle,
-        expected_state: NonNull<LuaState>,
-    ) -> Result<usize, StateResolveError> {
-        let (slot_index, state) = self.validate(handle)?;
-        if state != expected_state {
-            return Err(StateResolveError::PointerMismatch);
-        }
-        let slot = &self.slots[slot_index];
-        if slot.borrowed {
-            return Err(StateResolveError::AlreadyBorrowed {
-                slot: slot_index,
-                generation: slot.generation,
-            });
-        }
-        if slot.owned {
-            return Err(StateResolveError::NotExternal { slot: slot_index });
-        }
-        Ok(slot_index)
-    }
-
     #[cfg(test)]
     fn remove_owned(&mut self, handle: StateHandle) -> Result<(), StateResolveError> {
         let (slot_index, state) = self.validate(handle)?;
@@ -1401,16 +1673,18 @@ impl StateArena {
                 generation: slot.generation,
             });
         }
-        if !slot.owned {
-            return Err(StateResolveError::NotOwned { slot: slot_index });
+        if slot.is_main {
+            return Err(StateResolveError::ArenaInvariant {
+                reason: "the main state cannot be removed as a coroutine",
+            });
         }
 
-        let next_live_owned_states = self
-            .live_owned_states
+        let next_live_coroutine_states = self
+            .live_coroutine_states
             .checked_sub(1)
-            .expect("occupied owned slot requires a positive live count");
+            .expect("occupied coroutine slot requires a positive live count");
         self.vacate_slot(slot_index);
-        self.live_owned_states = next_live_owned_states;
+        self.live_coroutine_states = next_live_coroutine_states;
         // SAFETY: owned slots are created exclusively with Box::into_raw,
         // removed at most once, and have just been made vacant.
         unsafe {
@@ -1419,7 +1693,7 @@ impl StateArena {
         Ok(())
     }
 
-    /// Drain every arena-owned coroutine state in deterministic slot order.
+    /// Drain every arena-owned state in deterministic coroutine-before-main order.
     ///
     /// All occupied owned slots are preflighted for outstanding borrows before
     /// any mutation. Every state closes collector-validated open Upvalues
@@ -1432,34 +1706,50 @@ impl StateArena {
         self.validate_owned_drain()?;
 
         let mut report = StateArenaDrainReport::default();
-        for slot_index in 0..self.slots.len() {
-            let Some(state) = self.slots[slot_index].state else {
-                continue;
-            };
-            if !self.slots[slot_index].owned {
-                continue;
-            }
+        for drain_main in [false, true] {
+            for slot_index in 0..self.slots.len() {
+                let Some(state) = self.slots[slot_index].state else {
+                    continue;
+                };
+                if self.slots[slot_index].is_main != drain_main {
+                    continue;
+                }
 
-            let next_live_owned_states = self
-                .live_owned_states
-                .checked_sub(1)
-                .expect("occupied owned slot requires a positive live count");
-            // SAFETY: shutdown preflight proved that this occupied owned slot
-            // is not borrowed. Its handle generation is still current while
-            // the state closes every Upvalue that names it.
-            report
-                .state_shutdown
-                .merge(unsafe { &mut *state.as_ptr() }.prepare_for_runtime_shutdown(gc));
-            self.vacate_slot(slot_index);
-            self.live_owned_states = next_live_owned_states;
-            // SAFETY: each owned slot originates from exactly one Box::into_raw
-            // and was made vacant before ownership is reconstructed here.
-            let state = unsafe { Box::from_raw(state.as_ptr()) };
-            report.drained_owned_states += 1;
-            drop(state);
+                #[cfg(test)]
+                report
+                    .drained_state_handles
+                    .push(self.issue_handle(slot_index));
+
+                if drain_main {
+                    report.drained_main_states += 1;
+                } else {
+                    self.live_coroutine_states = self
+                        .live_coroutine_states
+                        .checked_sub(1)
+                        .expect("occupied coroutine slot requires a positive live count");
+                    report.drained_coroutine_states += 1;
+                }
+                // SAFETY: shutdown preflight proved that this occupied slot is
+                // not borrowed. Its handle generation is still current while
+                // the state closes every Upvalue that names it.
+                let handle = self.issue_handle(slot_index);
+                // SAFETY: shutdown preflight proved this occupied slot is unborrowed.
+                let state_ref = unsafe { &mut *state.as_ptr() };
+                let state_trace = state_ref.instruction_trace.clone();
+                report
+                    .state_shutdown
+                    .merge(state_ref.prepare_for_runtime_shutdown(gc));
+                if let Some(trace) = state_trace {
+                    retire_trace_state(&trace, handle);
+                }
+                self.vacate_slot(slot_index);
+                // SAFETY: each occupied slot originates from exactly one
+                // Box::into_raw and was made vacant before reconstruction.
+                drop(unsafe { Box::from_raw(state.as_ptr()) });
+            }
         }
 
-        debug_assert_eq!(self.live_owned_states, 0);
+        debug_assert_eq!(self.live_coroutine_states, 0);
         Ok(report)
     }
 
@@ -1483,7 +1773,7 @@ impl StateArena {
             let Some(state) = slot.state else {
                 continue;
             };
-            if !slot.owned {
+            if slot.is_main {
                 continue;
             }
             let handle = self.issue_handle(slot_index);
@@ -1502,35 +1792,41 @@ impl StateArena {
             state_shutdown: LuaStateShutdownReport::default(),
         };
         let expected_live_states = self
-            .live_owned_states
+            .live_coroutine_states
             .checked_sub(candidates.len())
-            .expect("unreachable candidates cannot exceed live owned states");
+            .expect("unreachable candidates cannot exceed live coroutine states");
 
         for (slot_index, handle, state) in candidates {
             // SAFETY: preflight proved the slot is an unborrowed owned state.
             // Its current generation remains valid while open Upvalues close.
+            // SAFETY: preflight proved this occupied slot is unborrowed.
+            let state_ref = unsafe { &mut *state.as_ptr() };
+            let state_trace = state_ref.instruction_trace.clone();
             report
                 .state_shutdown
-                .merge(unsafe { &mut *state.as_ptr() }.prepare_for_runtime_shutdown(gc));
+                .merge(state_ref.prepare_for_runtime_shutdown(gc));
+            if let Some(trace) = state_trace {
+                retire_trace_state(&trace, handle);
+            }
             self.vacate_slot(slot_index);
-            self.live_owned_states = self
-                .live_owned_states
+            self.live_coroutine_states = self
+                .live_coroutine_states
                 .checked_sub(1)
-                .expect("occupied owned slot requires a positive live count");
+                .expect("occupied coroutine slot requires a positive live count");
             // SAFETY: each owned slot originates from one Box::into_raw and
             // has just been made vacant before ownership is reconstructed.
             drop(unsafe { Box::from_raw(state.as_ptr()) });
             report.swept_state_handles.push(handle);
         }
 
-        debug_assert_eq!(self.live_owned_states, expected_live_states);
+        debug_assert_eq!(self.live_coroutine_states, expected_live_states);
         Ok(report)
     }
 
     fn validate_owned_drain(&self) -> Result<(), StateResolveError> {
         self.validate_internal_invariants()?;
         for (slot_index, slot) in self.slots.iter().enumerate() {
-            if slot.owned && slot.state.is_some() && slot.borrowed {
+            if slot.state.is_some() && slot.borrowed {
                 return Err(StateResolveError::AlreadyBorrowed {
                     slot: slot_index,
                     generation: slot.generation,
@@ -1541,6 +1837,19 @@ impl StateArena {
     }
 
     fn validate_internal_invariants(&self) -> Result<(), StateResolveError> {
+        if self.runtime_resource_drain_cursor > self.runtime_resources.len() {
+            return Err(StateResolveError::ArenaInvariant {
+                reason: "runtime resource drain cursor exceeds the registry",
+            });
+        }
+        let mut runtime_resource_ids = HashSet::new();
+        for entry in &self.runtime_resources {
+            if entry.object_id.is_null() || !runtime_resource_ids.insert(entry.object_id) {
+                return Err(StateResolveError::ArenaInvariant {
+                    reason: "runtime resource identity is null or duplicated",
+                });
+            }
+        }
         let mut temporary_root_ids = HashSet::new();
         for &slot_index in &self.free_slots {
             if slot_index >= self.slots.len() {
@@ -1550,7 +1859,8 @@ impl StateArena {
             }
         }
 
-        let mut occupied_owned = 0_usize;
+        let mut occupied_coroutines = 0_usize;
+        let mut occupied_main_states = 0_usize;
         for (slot_index, slot) in self.slots.iter().enumerate() {
             if slot.generation == 0 {
                 return Err(StateResolveError::ArenaInvariant {
@@ -1571,7 +1881,7 @@ impl StateArena {
 
             if slot.retired {
                 if slot.state.is_some()
-                    || slot.owned
+                    || slot.is_main
                     || slot.borrowed
                     || slot.temporary_root_id.is_some()
                     || free_entries != 0
@@ -1591,17 +1901,23 @@ impl StateArena {
                             reason: "occupied slot appears in the free-list",
                         });
                     }
-                    if slot.owned {
-                        occupied_owned = occupied_owned.checked_add(1).ok_or(
+                    if slot.is_main {
+                        occupied_main_states = occupied_main_states.checked_add(1).ok_or(
                             StateResolveError::ArenaInvariant {
-                                reason: "occupied owned-state count overflowed",
+                                reason: "occupied main-state count overflowed",
+                            },
+                        )?;
+                    } else {
+                        occupied_coroutines = occupied_coroutines.checked_add(1).ok_or(
+                            StateResolveError::ArenaInvariant {
+                                reason: "occupied coroutine-state count overflowed",
                             },
                         )?;
                     }
                     if let Some(temporary_root_id) = slot.temporary_root_id {
-                        if !slot.owned {
+                        if slot.is_main {
                             return Err(StateResolveError::ArenaInvariant {
-                                reason: "temporary state root names an external slot",
+                                reason: "temporary state root names the main-state slot",
                             });
                         }
                         if temporary_root_id == 0 || !temporary_root_ids.insert(temporary_root_id) {
@@ -1612,7 +1928,7 @@ impl StateArena {
                     }
                 }
                 None => {
-                    if slot.owned
+                    if slot.is_main
                         || slot.borrowed
                         || slot.temporary_root_id.is_some()
                         || free_entries != 1
@@ -1625,9 +1941,14 @@ impl StateArena {
             }
         }
 
-        if occupied_owned != self.live_owned_states {
+        if occupied_coroutines != self.live_coroutine_states {
             return Err(StateResolveError::ArenaInvariant {
-                reason: "live owned-state count disagrees with occupied slots",
+                reason: "live coroutine-state count disagrees with occupied slots",
+            });
+        }
+        if occupied_main_states > 1 {
+            return Err(StateResolveError::ArenaInvariant {
+                reason: "state arena contains more than one main state",
             });
         }
 
@@ -1676,11 +1997,16 @@ impl StateArena {
     }
 
     fn reconcile_allocation_account(&mut self) {
-        let live_bytes = self
+        let state_bytes = self
             .slots
             .iter()
             .map(|slot| slot.accounted_bytes)
             .fold(0usize, usize::saturating_add);
+        let resource_bytes = self
+            .runtime_resources
+            .capacity()
+            .saturating_mul(std::mem::size_of::<RuntimeResourceEntry>());
+        let live_bytes = state_bytes.saturating_add(resource_bytes);
         self.allocation_account.set_live_bytes(live_bytes);
     }
 
@@ -1703,7 +2029,7 @@ impl StateArena {
         let slot = &mut self.slots[slot_index];
         debug_assert!(!slot.retired);
         slot.state = None;
-        slot.owned = false;
+        slot.is_main = false;
         slot.borrowed = false;
         slot.temporary_root_id = None;
         if retires {
@@ -1717,29 +2043,29 @@ impl StateArena {
         }
     }
 
-    fn live_owned_state_count(&self) -> usize {
-        self.live_owned_states
+    fn live_coroutine_state_count(&self) -> usize {
+        self.live_coroutine_states
     }
 }
 
 impl Drop for StateArena {
     fn drop(&mut self) {
         self.turn_borrow = None;
+        self.runtime_resources.clear();
+        self.runtime_resource_drain_cursor = 0;
         for slot in &mut self.slots {
             let Some(state) = slot.state.take() else {
                 continue;
             };
-            if slot.owned {
-                // SAFETY: every owned occupied slot came from exactly one
-                // Box::into_raw and StateArena is its unique final owner.
-                unsafe {
-                    drop(Box::from_raw(state.as_ptr()));
-                }
+            // SAFETY: every occupied slot came from exactly one Box::into_raw
+            // and StateArena is its unique final owner.
+            unsafe {
+                drop(Box::from_raw(state.as_ptr()));
             }
             slot.borrowed = false;
             slot.temporary_root_id = None;
         }
-        self.live_owned_states = 0;
+        self.live_coroutine_states = 0;
         self.allocation_account.set_live_bytes(0);
     }
 }
@@ -1943,6 +2269,45 @@ impl LuaState {
         self.state_handle
     }
 
+    /// Reserve non-allocating publication capacity for Runtime resource hooks.
+    ///
+    /// Standalone states return `Ok(false)` because they have no Runtime
+    /// shutdown service. Runtime-attached callers must reserve before making
+    /// the corresponding object graph Lua-visible, so allocator failure
+    /// cannot leave a published but unregistered external resource.
+    pub fn reserve_runtime_resource_registrations(
+        &mut self,
+        additional: usize,
+    ) -> Result<bool, StateResolveError> {
+        let Some(arena_cell) = self.state_arena else {
+            return Ok(false);
+        };
+        // SAFETY: Runtime attaches only its pinned StateArena UnsafeCell. The
+        // state-side arena protocol permits this short service mutation while
+        // the current state slot is borrowed; no arena reference escapes.
+        let arena = unsafe { &mut *arena_cell.as_ref().get() };
+        arena.reserve_runtime_resources(additional)?;
+        Ok(true)
+    }
+
+    /// Register one weak collector identity for deterministic Runtime close.
+    ///
+    /// The registration adds no GC root. Capacity must have been reserved
+    /// before the resource became Lua-visible. Duplicate identities are
+    /// ignored. Standalone states return `Ok(false)`.
+    pub fn register_runtime_resource(
+        &mut self,
+        object_id: ObjectId,
+        drain: RuntimeResourceDrainHook,
+    ) -> Result<bool, StateResolveError> {
+        let Some(arena_cell) = self.state_arena else {
+            return Ok(false);
+        };
+        // SAFETY: same pinned arena and state-side service protocol as the
+        // reservation method above.
+        unsafe { &mut *arena_cell.as_ref().get() }.register_runtime_resource(object_id, drain)
+    }
+
     /// Move a coroutine state into this state's Runtime-owned arena.
     ///
     /// Standalone `LuaState` values are intentionally rejected: coroutine
@@ -1966,6 +2331,7 @@ impl LuaState {
             Box::new(state),
             None,
             Some(arena_cell),
+            false,
         )?;
         Ok(handle)
     }
@@ -2028,13 +2394,19 @@ impl LuaState {
     /// Resolve another state and confine its mutable reference to `f`.
     ///
     /// The target must belong to the same Runtime and must differ from this
-    /// currently borrowed state. Nested execution borrows are tracked by slot,
-    /// so a caller or other active coroutine cannot be aliased.
+    /// currently borrowed state. Nested borrows are tracked by slot, so a caller
+    /// or other active coroutine cannot be aliased. During a Runtime execution
+    /// turn this supports scoped debug/library inspection of another owned
+    /// coroutine; it is not an execution-switch API.
     pub fn with_resolved_state_mut<R>(
         &mut self,
         handle: StateHandle,
         f: impl for<'state> FnOnce(&'state mut LuaState) -> R,
     ) -> Result<R, StateResolveError> {
+        let active_services = self
+            .active_gc_ptr()
+            .and_then(NonNull::new)
+            .zip(self.active_string_pool_ptr().and_then(NonNull::new));
         let arena_cell = self
             .state_arena
             .ok_or(StateResolveError::ArenaUnavailable)?;
@@ -2045,7 +2417,20 @@ impl LuaState {
         // until the higher-ranked closure returns.
         let arena = NonNull::new(unsafe { arena_cell.as_ref() }.get())
             .expect("UnsafeCell::get never returns null");
-        StateArena::with_state_mut(arena, handle, current_state, f)
+        StateArena::with_state_mut(arena, handle, current_state, |target| {
+            // Native debug APIs inspect another coroutine while the caller's
+            // Runtime turn remains active. Switch the dynamic service identity
+            // for exactly this resolved-state borrow so validated Proto/String
+            // reads see the same Heap without installing persistent pointers on
+            // either LuaState.
+            let _target_context = active_services.map(|(gc, strings)| {
+                // SAFETY: the Runtime arena confines `target` to this HRTB
+                // callback, and the service pointers are borrowed from the
+                // caller's still-live dynamic Runtime context.
+                unsafe { enter_vm_context(NonNull::from(&mut *target), gc, strings) }
+            });
+            f(target)
+        })
     }
 }
 
@@ -2099,13 +2484,13 @@ pub struct Runtime {
     owner_thread: ThreadId,
     phase: RuntimePhase,
     active_executions: usize,
-    main_state: Option<Box<LuaState>>,
     main_state_handle: Option<StateHandle>,
     global_root: Option<GcRef<Table>>,
     registry_root: Option<GcRef<Table>>,
     fixed_strings: Vec<GcRef<GcString>>,
     shutdown_summary: Option<RuntimeShutdownSummary>,
     runtime_fault_injection: Option<RuntimeFaultInjection>,
+    instruction_trace: Option<SharedInstructionTrace>,
     heap: Pin<Box<RuntimeStorage>>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
@@ -2172,23 +2557,24 @@ impl Runtime {
 
         let mut main_state = Box::new(LuaState::with_global_table(global_root));
         main_state.registry = Some(registry_root);
-        let main_state_ptr = NonNull::from(main_state.as_mut());
         let arena_cell = heap_mut.state_arena_cell();
-        let main_state_handle = heap_mut.state_arena_mut().attach_external(main_state_ptr);
-        main_state.attach_runtime_state(main_state_handle, Some(arena_cell));
+        let main_state_handle = heap_mut
+            .state_arena_mut()
+            .insert_main_owned(main_state, arena_cell)
+            .expect("fresh Runtime main-state insertion cannot be fault-injected");
 
         Ok(Self {
             id,
             owner_thread: thread::current().id(),
             phase: RuntimePhase::Running,
             active_executions: 0,
-            main_state: Some(main_state),
             main_state_handle: Some(main_state_handle),
             global_root: Some(global_root),
             registry_root: Some(registry_root),
             fixed_strings,
             shutdown_summary: None,
             runtime_fault_injection: None,
+            instruction_trace: None,
             heap,
             _not_send_or_sync: PhantomData,
         })
@@ -2265,9 +2651,34 @@ impl Runtime {
         Ok(Some(string))
     }
 
-    /// Return the boxed main state while the runtime remains open.
+    /// Return the arena-owned main state while the runtime remains open.
     pub fn main_state(&self) -> Option<&LuaState> {
-        self.main_state.as_deref()
+        let handle = self.main_state_handle?;
+        self.heap
+            .as_ref()
+            .get_ref()
+            .state_arena()
+            .main_state_ref(handle)
+            .ok()
+    }
+
+    fn with_main_state_mut<R>(
+        &mut self,
+        f: impl for<'state> FnOnce(&'state mut LuaState) -> R,
+    ) -> Result<R, RuntimeAccessError> {
+        let handle = self
+            .main_state_handle
+            .ok_or(RuntimeAccessError::MainStateUnavailable {
+                runtime_id: self.id,
+            })?;
+        let runtime_id = self.id;
+        // SAFETY: RuntimeStorage remains pinned and this method owns the
+        // exclusive Runtime borrow for the complete scoped state callback.
+        let storage = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
+        let arena = NonNull::new(storage.state_arena.get())
+            .expect("pinned StateArena UnsafeCell never returns null");
+        StateArena::with_direct_state_mut(arena, handle, f)
+            .map_err(|source| RuntimeAccessError::StateArena { runtime_id, source })
     }
 
     /// Return coroutine states currently retained by the StateArena.
@@ -2276,7 +2687,7 @@ impl Runtime {
             .as_ref()
             .get_ref()
             .state_arena()
-            .live_owned_state_count()
+            .live_coroutine_state_count()
     }
 
     /// Snapshot managed allocator live/peak/cumulative payload bytes.
@@ -2289,6 +2700,50 @@ impl Runtime {
         let heap = self.heap.as_ref().get_ref();
         heap.native_activations
             .snapshot(heap.state_arena().peak_turn_borrowed_slots)
+    }
+
+    /// Begin a runtime-scoped pre-instruction register-snapshot stream.
+    ///
+    /// The writer is shared by every state turn in this Runtime, so coroutine
+    /// switches retain one monotonically increasing event sequence.
+    pub fn start_instruction_trace(
+        &mut self,
+        output: Box<dyn Write>,
+    ) -> Result<(), RuntimeAccessError> {
+        self.start_instruction_trace_with_mode(output, InstructionTraceMode::Snapshot)
+    }
+
+    /// Begin a runtime-scoped instruction trace with explicit snapshot or diff evidence.
+    pub fn start_instruction_trace_with_mode(
+        &mut self,
+        output: Box<dyn Write>,
+        mode: InstructionTraceMode,
+    ) -> Result<(), RuntimeAccessError> {
+        self.check_owner()?;
+        if self.phase != RuntimePhase::Running {
+            return Err(RuntimeAccessError::NotRunning {
+                runtime_id: self.id,
+                phase: self.phase,
+            });
+        }
+        if self.active_executions != 0 {
+            return Err(RuntimeAccessError::ActiveExecutions {
+                runtime_id: self.id,
+                count: self.active_executions,
+            });
+        }
+        self.instruction_trace = Some(Rc::new(RefCell::new(InstructionTrace::new(output, mode))));
+        Ok(())
+    }
+
+    /// Disable and flush the active instruction trace stream.
+    pub fn finish_instruction_trace(
+        &mut self,
+    ) -> Result<Option<InstructionTraceSummary>, InstructionTraceError> {
+        let Some(trace) = self.instruction_trace.take() else {
+            return Ok(None);
+        };
+        trace.borrow_mut().finish().map(Some)
     }
 
     /// Install a one-shot Runtime scheduler failure for durability tests.
@@ -2383,12 +2838,6 @@ impl Runtime {
             });
         }
 
-        let state =
-            self.main_state
-                .as_deref_mut()
-                .ok_or(RuntimeAccessError::MainStateUnavailable {
-                    runtime_id: self.id,
-                })?;
         let state_handle =
             self.main_state_handle
                 .ok_or(RuntimeAccessError::MainStateUnavailable {
@@ -2403,13 +2852,12 @@ impl Runtime {
             .active_executions
             .checked_add(1)
             .expect("runtime active-execution counter overflow");
-        let state_ptr = NonNull::from(&mut *state);
         let mut arena = NonNull::new(heap.state_arena.get())
             .expect("pinned StateArena UnsafeCell never returns null");
         // SAFETY: parts_mut holds the exclusive Runtime borrow, and this guard
         // releases the arena slot before that borrow ends.
-        unsafe { arena.as_mut() }
-            .begin_direct_borrow(state_handle, state_ptr)
+        let mut state_ptr = unsafe { arena.as_mut() }
+            .begin_direct_borrow(state_handle)
             .map_err(|source| RuntimeAccessError::StateArena {
                 runtime_id: self.id,
                 source,
@@ -2417,6 +2865,9 @@ impl Runtime {
         self.active_executions = next_active_executions;
 
         let (gc, string_pool) = heap.heap.parts_mut();
+        // SAFETY: the arena owns this allocation and marked the exact handle
+        // exclusively borrowed until RuntimePartsMut releases it on Drop.
+        let state = unsafe { state_ptr.as_mut() };
         // SAFETY: RuntimePartsMut owns the three exclusive borrows and drops
         // vm_context before releasing the arena borrow or any service.
         let vm_context = unsafe {
@@ -2456,12 +2907,7 @@ impl Runtime {
     pub(crate) fn drive_state_turns<T>(
         &mut self,
         initial: StateHandle,
-        mut execute_turn: impl for<'turn> FnMut(
-            StateHandle,
-            &'turn mut LuaState,
-            &'turn mut GarbageCollector,
-            &'turn mut StringPool,
-        ) -> RuntimeTurn<T>,
+        mut execute_turn: impl for<'turn> FnMut(StateHandle, &'turn mut LuaState) -> RuntimeTurn<T>,
     ) -> Result<T, RuntimeAccessError> {
         self.check_owner()?;
         if self.phase != RuntimePhase::Running {
@@ -2470,7 +2916,7 @@ impl Runtime {
                 phase: self.phase,
             });
         }
-        if self.main_state.is_none() || self.main_state_handle.is_none() {
+        if self.main_state_handle.is_none() {
             return Err(RuntimeAccessError::MainStateUnavailable {
                 runtime_id: self.id,
             });
@@ -2491,6 +2937,7 @@ impl Runtime {
             active_executions: &mut self.active_executions,
         };
         let runtime_id = self.id;
+        let instruction_trace = self.instruction_trace.clone();
 
         // SAFETY: RuntimeStorage was pinned during construction and no API moves
         // its fields. The arena and service fields are disjoint, and state
@@ -2503,9 +2950,8 @@ impl Runtime {
 
         loop {
             let outcome = StateArena::with_turn_state_mut(arena, current, |state| {
-                with_vm_context_parts(state, gc, string_pool, |state, gc, string_pool| {
-                    execute_turn(current, state, gc, string_pool)
-                })
+                state.instruction_trace = instruction_trace.clone();
+                with_vm_context(state, gc, string_pool, |state| execute_turn(current, state))
             })
             .map_err(|source| RuntimeAccessError::StateArena { runtime_id, source })?;
 
@@ -2540,12 +2986,6 @@ impl Runtime {
             .ok_or(RuntimeAccessError::MainStateUnavailable {
                 runtime_id: self.id,
             })?;
-        if self.main_state.is_none() {
-            return Err(RuntimeAccessError::MainStateUnavailable {
-                runtime_id: self.id,
-            }
-            .into());
-        }
         if self.active_executions != 0 {
             return Err(RuntimeAccessError::ActiveExecutions {
                 runtime_id: self.id,
@@ -2563,6 +3003,7 @@ impl Runtime {
         };
         let runtime_id = self.id;
         let runtime_fault_injection = &mut self.runtime_fault_injection;
+        let instruction_trace = self.instruction_trace.clone();
 
         // SAFETY: RuntimeStorage was pinned at construction. The arena, collector,
         // and activation stack are disjoint fields and remain at stable
@@ -2572,6 +3013,7 @@ impl Runtime {
             || !heap.native_activations.upvalue_transfers.is_empty()
             || !heap.native_activations.debug_upvalue_transfers.is_empty()
             || !heap.native_activations.protected_calls.is_empty()
+            || !heap.native_activations.callback_helpers.is_empty()
             || !heap.native_activations.gc_frames.is_empty()
         {
             return Err(RuntimeExecutionError::Protocol(
@@ -2591,6 +3033,7 @@ impl Runtime {
         let _activation_cleanup = NativeActivationSessionGuard {
             activations: NonNull::from(&mut *activations),
             gc: NonNull::from(&mut *gc),
+            arena,
         };
 
         let mut current = initial;
@@ -2619,10 +3062,13 @@ impl Runtime {
                 matches!(&action, NativeDriverAction::DeliverDebugUpvalue { .. });
             let completed_protected_call =
                 matches!(&action, NativeDriverAction::FinishProtectedCall { .. });
+            let completed_callback_helper =
+                matches!(&action, NativeDriverAction::FinishCallbackHelper { .. });
             let completed_collection =
                 matches!(&action, NativeDriverAction::DeliverCollection { .. });
             let mut event = StateArena::with_turn_state_mut(arena, current, |state| {
-                with_vm_context_parts(state, gc, string_pool, |state, gc, _| {
+                state.instruction_trace = instruction_trace.clone();
+                with_vm_context_gc(state, gc, string_pool, |state, gc| {
                     state
                         .with_native_request_scope(|state| {
                             let vm_result = execute_native_driver_action(state, gc, action);
@@ -2668,6 +3114,13 @@ impl Runtime {
                     )
                 })?;
             }
+            if completed_callback_helper {
+                activations.callback_helpers.pop().ok_or_else(|| {
+                    RuntimeExecutionError::Protocol(
+                        "callback helper delivery lost its rooted activation frame".to_string(),
+                    )
+                })?;
+            }
             if completed_collection {
                 activations.gc_frames.pop().ok_or_else(|| {
                     RuntimeExecutionError::Protocol(
@@ -2699,7 +3152,7 @@ impl Runtime {
                     && replayed == *thread
                 {
                     let error = StateArena::with_turn_state_mut(arena, current, |state| {
-                        with_vm_context_parts(state, gc, string_pool, |state, gc, _| {
+                        with_vm_context_gc(state, gc, string_pool, |state, gc| {
                             runtime_error_value(
                                 state,
                                 gc,
@@ -2789,21 +3242,83 @@ impl Runtime {
                             })?;
                             let role = NativeDriverRole::ProtectedCall {
                                 stop_ci: deferred.saved_ci + 1,
-                                call_pos: deferred.snapshot.top(),
+                                // The fixed C++ pcall executes its protected
+                                // target in-place over the native frame's first
+                                // argument. Starting above the argument window
+                                // leaves scratch objects in different GC-visible
+                                // slots and shifts the observable Diff registers.
+                                call_pos: deferred.func_pos + 1,
                                 saved_top: deferred.snapshot.top(),
                             };
+                            let parent_role = active_driver_role(activations, current);
+                            let sequence = activations.allocate_callback_sequence()?;
                             let frame = ProtectedCallActivationFrame {
                                 requester: current,
                                 request: request.clone(),
                                 phase: ProtectedCallPhase::Target,
                                 role,
-                                parent_role: active_driver_role(activations, current),
+                                parent_role,
+                                previous_allow_yield: deferred.snapshot.allow_yield(),
                                 pending_response: None,
+                                sequence,
                             };
                             activations.protected_calls.push(frame);
                             action = NativeDriverAction::StartProtectedCall {
                                 function: request.function,
                                 args: request.args,
+                                role,
+                            };
+                            continue;
+                        }
+                        RuntimeRequest::CallbackHelper(request) => {
+                            let request = *request;
+                            let role = match &request.kind {
+                                CallbackHelperKind::DebugHook {
+                                    stop_ci,
+                                    call_pos,
+                                    saved_top,
+                                    ..
+                                }
+                                | CallbackHelperKind::VmMetamethod {
+                                    stop_ci,
+                                    call_pos,
+                                    saved_top,
+                                    ..
+                                } => NativeDriverRole::CallbackHelper {
+                                    stop_ci: *stop_ci,
+                                    call_pos: *call_pos,
+                                    saved_top: *saved_top,
+                                },
+                                _ => {
+                                    let deferred = request.deferred.as_ref().ok_or_else(|| {
+                                        RuntimeExecutionError::Protocol(
+                                            "callback helper reached Runtime without deferred metadata"
+                                                .to_string(),
+                                        )
+                                    })?;
+                                    NativeDriverRole::CallbackHelper {
+                                        stop_ci: deferred.saved_ci + 1,
+                                        call_pos: deferred.snapshot.top(),
+                                        saved_top: deferred.snapshot.top(),
+                                    }
+                                }
+                            };
+                            let parent_role = active_driver_role(activations, current);
+                            let sequence = activations.allocate_callback_sequence()?;
+                            let frame = CallbackHelperActivationFrame {
+                                requester: current,
+                                request: request.clone(),
+                                role,
+                                parent_role,
+                                pending_response: None,
+                                sequence,
+                            };
+                            activations.callback_helpers.push(frame);
+                            let wanted_results = callback_helper_wanted_results(&request.kind);
+                            action = NativeDriverAction::StartCallbackHelper {
+                                function: request.function,
+                                args: request.args,
+                                wanted_results,
                                 role,
                             };
                             continue;
@@ -3085,14 +3600,9 @@ impl Runtime {
                     }
                     let response =
                         StateArena::with_turn_state_mut(arena, request.owner, |owner_state| {
-                            with_vm_context_parts(
-                                owner_state,
-                                gc,
-                                string_pool,
-                                |owner_state, gc, _| {
-                                    execute_upvalue_owner_access(owner_state, gc, &request)
-                                },
-                            )
+                            with_vm_context_gc(owner_state, gc, string_pool, |owner_state, gc| {
+                                execute_upvalue_owner_access(owner_state, gc, &request)
+                            })
                         })
                         .map_err(|source| {
                             RuntimeAccessError::StateArena { runtime_id, source }
@@ -3223,6 +3733,177 @@ impl Runtime {
                         }
                     }
                 }
+                NativeTurnEvent::CallbackHelper(response) => {
+                    let frame = activations.callback_helpers.last_mut().ok_or_else(|| {
+                        RuntimeExecutionError::Protocol(
+                            "callback helper stopped without an activation frame".to_string(),
+                        )
+                    })?;
+                    if frame.requester != current {
+                        return Err(RuntimeExecutionError::Protocol(
+                            "callback helper stopped on a different requester state".to_string(),
+                        ));
+                    }
+                    frame.pending_response = Some(response.clone());
+                    let mut next_callback = None;
+                    let continue_helper = match (&mut frame.request.kind, &response) {
+                        (
+                            CallbackHelperKind::LoadReader {
+                                source,
+                                terminal_error,
+                                ..
+                            },
+                            ResumeResponse::Success(values),
+                        ) => match values.first().unwrap_or(&Value::Nil) {
+                            Value::String(chunk) => {
+                                let chunk = gc.with_string_bytes(*chunk, <[u8]>::to_vec).map_err(
+                                    |error| {
+                                        RuntimeExecutionError::Protocol(format!(
+                                            "load reader returned an invalid string: {error}"
+                                        ))
+                                    },
+                                )?;
+                                if chunk.is_empty() {
+                                    false
+                                } else if source.try_reserve(chunk.len()).is_err() {
+                                    *terminal_error = Some(
+                                        "not enough memory while reading load source".to_string(),
+                                    );
+                                    false
+                                } else {
+                                    source.extend_from_slice(&chunk);
+                                    if source.len() >= 2
+                                        && let Some(message) = definite_load_syntax_error(source)
+                                    {
+                                        *terminal_error = Some(message);
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                }
+                            }
+                            Value::Nil
+                            | Value::Boolean(_)
+                            | Value::Number(_)
+                            | Value::Table(_)
+                            | Value::Function(_)
+                            | Value::Userdata(_)
+                            | Value::Thread(_)
+                            | Value::LightUserdata(_) => false,
+                        },
+                        (
+                            CallbackHelperKind::TableSort {
+                                state,
+                                terminal_error,
+                            },
+                            ResumeResponse::Success(values),
+                        ) => {
+                            let result = values.first().is_some_and(|value| !value.is_false());
+                            match advance_table_sort_state(gc, state, Some(result))? {
+                                TableSortAdvance::Callback { function, args } => {
+                                    next_callback = Some((function, args));
+                                    true
+                                }
+                                TableSortAdvance::Complete => {
+                                    if let Err(error) = commit_table_sort(gc, state) {
+                                        *terminal_error = Some(error.message);
+                                    }
+                                    false
+                                }
+                                TableSortAdvance::Error(message) => {
+                                    *terminal_error = Some(message);
+                                    false
+                                }
+                            }
+                        }
+                        (
+                            CallbackHelperKind::TableForeach { state },
+                            ResumeResponse::Success(values),
+                        ) if values.first().is_none_or(Value::is_nil) => {
+                            match advance_table_foreach_state(gc, state)? {
+                                TableForeachAdvance::Callback { function, args } => {
+                                    next_callback = Some((function, args));
+                                    true
+                                }
+                                TableForeachAdvance::Complete => false,
+                            }
+                        }
+                        (
+                            CallbackHelperKind::PackageModuleOptions {
+                                state,
+                                terminal_error,
+                            },
+                            ResumeResponse::Success(_),
+                        ) => {
+                            if let Some(option) = state.options.get(state.next).cloned() {
+                                state.next = state.next.saturating_add(1);
+                                if matches!(option, Value::Function(_)) {
+                                    next_callback =
+                                        Some((option, vec![Value::Table(state.module)]));
+                                    true
+                                } else {
+                                    *terminal_error =
+                                        Some("module option must be a function".to_string());
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                        (
+                            CallbackHelperKind::Gsub {
+                                state,
+                                terminal_error,
+                            },
+                            ResumeResponse::Success(values),
+                        ) => {
+                            let value = values.first().cloned().unwrap_or(Value::Nil);
+                            match advance_gsub_state(gc, state, Some(value))? {
+                                GsubAdvance::Callback { function, args } => {
+                                    next_callback = Some((function, args));
+                                    true
+                                }
+                                GsubAdvance::Complete => false,
+                                GsubAdvance::Error(message) => {
+                                    *terminal_error = Some(message);
+                                    false
+                                }
+                            }
+                        }
+                        (CallbackHelperKind::ToString, _)
+                        | (CallbackHelperKind::DoFile, _)
+                        | (CallbackHelperKind::LoadReader { .. }, ResumeResponse::Error(_))
+                        | (CallbackHelperKind::TableSort { .. }, ResumeResponse::Error(_))
+                        | (CallbackHelperKind::TableForeach { .. }, _)
+                        | (CallbackHelperKind::PackageRequire { .. }, _)
+                        | (
+                            CallbackHelperKind::PackageModuleOptions { .. },
+                            ResumeResponse::Error(_),
+                        )
+                        | (CallbackHelperKind::Gsub { .. }, ResumeResponse::Error(_))
+                        | (CallbackHelperKind::DebugHook { .. }, _)
+                        | (CallbackHelperKind::VmMetamethod { .. }, _) => false,
+                    };
+                    if continue_helper {
+                        if let Some((function, args)) = next_callback {
+                            frame.request.function = function;
+                            frame.request.args = args;
+                        }
+                        frame.pending_response = None;
+                        let wanted_results = callback_helper_wanted_results(&frame.request.kind);
+                        action = NativeDriverAction::StartCallbackHelper {
+                            function: frame.request.function.clone(),
+                            args: frame.request.args.clone(),
+                            wanted_results,
+                            role: frame.role,
+                        };
+                    } else {
+                        action = NativeDriverAction::FinishCallbackHelper {
+                            frame: frame.clone(),
+                            response,
+                        };
+                    }
+                }
                 NativeTurnEvent::Finalizer(result) => {
                     let frame = activations.gc_frames.last().ok_or_else(|| {
                         RuntimeExecutionError::Protocol(
@@ -3250,7 +3931,7 @@ impl Runtime {
                             .then(|| result.as_ref().err().cloned())
                             .flatten();
                     let callback_error = StateArena::with_turn_state_mut(arena, current, |state| {
-                        with_vm_context_parts(state, gc, string_pool, |state, gc, _| {
+                        with_vm_context_gc(state, gc, string_pool, |state, gc| {
                             let error =
                                 (!matches!(&frame.origin, GcActivationOrigin::Automatic { .. }))
                                     .then(|| {
@@ -3373,35 +4054,32 @@ impl Runtime {
             }
             .into());
         }
-        let state =
-            self.main_state
-                .as_deref_mut()
-                .ok_or(RuntimeAccessError::MainStateUnavailable {
-                    runtime_id: self.id,
-                })?;
-        state.unwind_call_info_to(0);
-        state.current_call_info_mut().reset();
-        state.current_call_info_mut().varargs = args;
-        state.top = 0;
-        state.status = crate::state::ThreadStatus::Ok;
+        self.with_main_state_mut(|state| {
+            state.unwind_call_info_to(0);
+            state.current_call_info_mut().reset();
+            state.current_call_info_mut().varargs = args;
+            state.top = 0;
+            state.status = crate::state::ThreadStatus::Ok;
+        })?;
 
         let execution = self.execute_proto(proto);
-        let state =
-            self.main_state
-                .as_deref_mut()
-                .ok_or(RuntimeAccessError::MainStateUnavailable {
-                    runtime_id: self.id,
-                })?;
-        let results = execution.is_ok().then(|| state_stack_values(state));
-        let reset = TopLevelStateResetGuard { state };
-        execution?;
-        consume_results(
-            &*reset.state,
-            results
-                .as_deref()
-                .expect("successful execution exposes its result buffer"),
-        );
-        Ok(())
+        let mut parts = self.parts_mut()?;
+        let (state, _, _) = parts.split_mut();
+        (|| -> Result<(), RuntimeExecutionError> {
+            let results = execution.is_ok().then(|| state_stack_values(state));
+            if let Err(RuntimeExecutionError::Vm(error)) = &execution {
+                emit_runtime_error_trace(state, &error.message);
+            }
+            let reset = TopLevelStateResetGuard { state };
+            execution?;
+            consume_results(
+                &*reset.state,
+                results
+                    .as_deref()
+                    .expect("successful execution exposes its result buffer"),
+            );
+            Ok(())
+        })()
     }
 
     /// Deterministically reclaim Runtime-owned Rust states and GC allocations.
@@ -3410,8 +4088,9 @@ impl Runtime {
     /// and newly allocated Lua `__gc` callbacks while isolating callback
     /// errors, closes validated open Upvalues, invalidates every StateArena
     /// slot, destroys non-fixed Threads before other non-fixed objects and
-    /// fixed objects last, and empties the live StringPool. Library-specific
-    /// resource callbacks remain an explicit capability debt in the report.
+    /// fixed objects last, and empties the live StringPool. Weakly registered
+    /// Runtime resources are explicitly drained after Lua finalizers and
+    /// before any state allocation is destroyed.
     pub fn close(&mut self) -> Result<RuntimeCloseReport, RuntimeAccessError> {
         self.check_owner()?;
         if self.active_executions != 0 {
@@ -3448,6 +4127,16 @@ impl Runtime {
                     });
                 }
                 let close_finalizers = self.drain_finalizers_for_close();
+                let close_resources = self.drain_runtime_resources_for_close();
+                self.heap
+                    .as_ref()
+                    .get_ref()
+                    .state_arena()
+                    .validate_runtime_resource_drain_complete()
+                    .map_err(|source| RuntimeAccessError::StateArena {
+                        runtime_id: self.id,
+                        source,
+                    })?;
                 self.validate_shutdown_state().map_err(|source| {
                     RuntimeAccessError::StateArena {
                         runtime_id: self.id,
@@ -3455,7 +4144,7 @@ impl Runtime {
                     }
                 })?;
                 self.phase = RuntimePhase::Closing;
-                let summary = match self.shutdown_contents(close_finalizers) {
+                let summary = match self.shutdown_contents(close_finalizers, close_resources) {
                     Ok(summary) => summary,
                     Err(source) => {
                         // All fallible arena ownership checks are preflighted
@@ -3475,13 +4164,10 @@ impl Runtime {
     }
 
     fn drain_finalizers_for_close(&mut self) -> (usize, usize) {
-        let Some(state) = self.main_state.as_deref_mut() else {
+        let Ok(mut parts) = self.parts_mut() else {
             return (0, 0);
         };
-        // SAFETY: close holds exclusive owner-thread Runtime access, there is
-        // no active execution, and RuntimeStorage remains pinned.
-        let storage = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
-        let (gc, strings) = storage.heap.parts_mut();
+        let (state, gc, strings) = parts.split_mut();
         gc.prepare_all_finalizable_userdata();
         if gc.pending_finalizer_count() == 0 || !gc.begin_finalizer_drain() {
             return (0, 0);
@@ -3493,7 +4179,7 @@ impl Runtime {
             let callback = gc.pending_finalizer_callback(userdata);
             if let Some(callback) = callback {
                 attempted = attempted.saturating_add(1);
-                let result = with_vm_context_parts(state, gc, strings, |state, gc, _| {
+                let result = with_vm_context_gc(state, gc, strings, |state, gc| {
                     call_value_with_results(
                         state,
                         gc,
@@ -3515,34 +4201,86 @@ impl Runtime {
         (attempted, errors)
     }
 
+    fn drain_runtime_resources_for_close(&mut self) -> RuntimeResourceDrainReport {
+        const MAX_CLOSE_RESOURCE_HOOKS: usize = 1_000_000;
+
+        let mut report = RuntimeResourceDrainReport::default();
+        while report.attempted < MAX_CLOSE_RESOURCE_HOOKS {
+            let entry = {
+                // SAFETY: close has exclusive owner-thread Runtime access.
+                let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
+                // SAFETY: no StateArena reference is retained while the hook
+                // runs through a scoped main-state borrow below.
+                unsafe { &mut *heap.state_arena.get() }.next_runtime_resource()
+            };
+            let Some(entry) = entry else {
+                break;
+            };
+
+            report.attempted = report.attempted.saturating_add(1);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut parts = self
+                    .parts_mut()
+                    .expect("shutdown preflight validated the main-state service turn");
+                let (state, gc, _) = parts.split_mut();
+                (entry.drain)(state, gc, entry.object_id)
+            }));
+            match outcome {
+                Ok(RuntimeResourceDrainOutcome::Drained) => {
+                    report.drained = report.drained.saturating_add(1);
+                }
+                Ok(RuntimeResourceDrainOutcome::AlreadyClosed) => {
+                    report.already_closed = report.already_closed.saturating_add(1);
+                }
+                Ok(RuntimeResourceDrainOutcome::Stale) => {
+                    report.stale = report.stale.saturating_add(1);
+                }
+                Ok(RuntimeResourceDrainOutcome::Failed) | Err(_) => {
+                    report.errors = report.errors.saturating_add(1);
+                }
+            }
+        }
+
+        // A hostile hook could continually append distinct registrations.
+        // Bound the drain, report discarded entries as errors, and release
+        // registry capacity before state/heap teardown regardless.
+        let pending = {
+            // SAFETY: same exclusive close access as above.
+            let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
+            // SAFETY: no StateArena state borrow is active here.
+            let arena = unsafe { &mut *heap.state_arena.get() };
+            let pending = arena.pending_runtime_resource_count();
+            arena.finish_runtime_resource_drain();
+            pending
+        };
+        report.errors = report.errors.saturating_add(pending);
+        report
+    }
+
     fn validate_shutdown_state(&self) -> Result<(), StateResolveError> {
-        let state = self
-            .main_state
-            .as_deref()
-            .ok_or(StateResolveError::ArenaUnavailable)?;
         let handle = self
             .main_state_handle
             .ok_or(StateResolveError::ArenaUnavailable)?;
-        let state_pointer = NonNull::from(state);
         let heap = self.heap.as_ref().get_ref();
         if !heap.native_activations.frames.is_empty()
             || !heap.native_activations.upvalue_transfers.is_empty()
             || !heap.native_activations.debug_upvalue_transfers.is_empty()
             || !heap.native_activations.protected_calls.is_empty()
+            || !heap.native_activations.callback_helpers.is_empty()
             || !heap.native_activations.gc_frames.is_empty()
         {
             return Err(StateResolveError::ArenaInvariant {
                 reason: "native activation stack is not empty at shutdown",
             });
         }
-        heap.state_arena()
-            .validate_external_detach(handle, state_pointer)?;
+        heap.state_arena().validate_main(handle)?;
         heap.state_arena().validate_owned_drain()
     }
 
     fn shutdown_contents(
         &mut self,
         close_finalizers: (usize, usize),
+        close_resources: RuntimeResourceDrainReport,
     ) -> Result<RuntimeShutdownSummary, StateResolveError> {
         let arena_report = {
             // SAFETY: RuntimeStorage remains pinned and shutdown has exclusive
@@ -3553,8 +4291,9 @@ impl Runtime {
             unsafe { &mut *heap.state_arena.get() }.drain_owned(heap.heap.collector_mut())?
         };
 
-        let mut state_shutdown = arena_report.state_shutdown;
-        state_shutdown.merge(self.detach_main_state_for_shutdown()?);
+        debug_assert_eq!(arena_report.drained_main_states, 1);
+        self.main_state_handle = None;
+        let state_shutdown = arena_report.state_shutdown;
 
         let global_root = self.global_root.take();
         let registry_root = self.registry_root.take();
@@ -3572,7 +4311,7 @@ impl Runtime {
         let gc_report = heap.heap.destroy_all();
 
         Ok(RuntimeShutdownSummary {
-            drained_coroutine_states: arena_report.drained_owned_states,
+            drained_coroutine_states: arena_report.drained_coroutine_states,
             state_shutdown,
             destroyed_objects: gc_report.destroyed_objects(),
             destroyed_threads: gc_report.destroyed_threads,
@@ -3580,13 +4319,14 @@ impl Runtime {
             pending_lua_finalizers_discarded: gc_report.pending_finalizers_discarded,
             lua_finalizers_attempted: close_finalizers.0,
             lua_finalizer_errors_ignored: close_finalizers.1,
+            resource_drain: close_resources,
         })
     }
 
     fn close_report(&self, already_closed: bool) -> RuntimeCloseReport {
         let heap = self.heap.as_ref().get_ref();
         let remaining_objects = heap.heap.object_count();
-        let remaining_coroutine_states = heap.state_arena().live_owned_state_count();
+        let remaining_coroutine_states = heap.state_arena().live_coroutine_state_count();
         let remaining_temporary_state_roots = heap.state_arena().temporary_state_root_count();
         let remaining_collector_queue_entries = heap.heap.collector().transient_queue_entry_count();
         let allocator = heap.heap.allocator_stats();
@@ -3627,35 +4367,14 @@ impl Runtime {
             pending_lua_finalizers_discarded: summary.pending_lua_finalizers_discarded,
             lua_finalizers_attempted: summary.lua_finalizers_attempted,
             lua_finalizer_errors_ignored: summary.lua_finalizer_errors_ignored,
+            runtime_resources_attempted: summary.resource_drain.attempted,
+            runtime_resources_drained: summary.resource_drain.drained,
+            runtime_resources_already_closed: summary.resource_drain.already_closed,
+            runtime_resources_stale: summary.resource_drain.stale,
+            runtime_resource_drain_errors: summary.resource_drain.errors,
             lua_gc_callback_debt: false,
-            io_resource_drain_debt: true,
+            io_resource_drain_debt: false,
         }
-    }
-
-    fn detach_main_state_for_shutdown(
-        &mut self,
-    ) -> Result<LuaStateShutdownReport, StateResolveError> {
-        let state = self
-            .main_state
-            .as_deref_mut()
-            .ok_or(StateResolveError::ArenaUnavailable)?;
-        let handle = self
-            .main_state_handle
-            .ok_or(StateResolveError::ArenaUnavailable)?;
-        let mut state_pointer = NonNull::from(state);
-        // SAFETY: RuntimeStorage is pinned, and close has exclusive Runtime access
-        // with no active execution guard. The preflight validated this exact
-        // external allocation and slot generation before any shutdown work.
-        let heap = unsafe { Pin::get_unchecked_mut(self.heap.as_mut()) };
-        let state_report =
-            // SAFETY: state_pointer names the still-owned main-state Box.
-            unsafe { state_pointer.as_mut() }
-                .prepare_for_runtime_shutdown(heap.heap.collector_mut());
-        // SAFETY: close has exclusive Runtime access and no state turn exists.
-        unsafe { &mut *heap.state_arena.get() }.detach_external(handle, state_pointer)?;
-        self.main_state_handle = None;
-        drop(self.main_state.take());
-        Ok(state_report)
     }
 
     fn close_for_drop(&mut self) {
@@ -3672,14 +4391,9 @@ impl Runtime {
 
         // Safe Rust cannot move Runtime across threads or enter Drop while a
         // RuntimePartsMut borrow exists. If unsafe host code violates those
-        // invariants, avoid cross-thread callbacks; field Drop releases state
-        // Boxes and Heap::Drop reclaims registered objects without Lua hooks.
-        if let Some(state) = self.main_state.as_deref_mut() {
-            state.state_handle = None;
-            state.state_arena = None;
-        }
+        // invariants, avoid cross-thread callbacks; StateArena::Drop releases
+        // every state Box and Heap::Drop reclaims objects without Lua hooks.
         self.main_state_handle = None;
-        drop(self.main_state.take());
         self.global_root.take();
         self.registry_root.take();
         self.fixed_strings.clear();
@@ -3715,13 +4429,21 @@ fn active_driver_role(
     activations: &NativeActivationStack,
     requester: StateHandle,
 ) -> NativeDriverRole {
-    activations
-        .protected_calls
-        .iter()
-        .rev()
-        .find_map(|frame| (frame.requester == requester).then_some(frame.role))
-        .or_else(|| active_finalizer_role(activations, requester))
-        .unwrap_or(NativeDriverRole::Program)
+    let protected =
+        activations.protected_calls.iter().rev().find_map(|frame| {
+            (frame.requester == requester).then_some((frame.sequence, frame.role))
+        });
+    let helper =
+        activations.callback_helpers.iter().rev().find_map(|frame| {
+            (frame.requester == requester).then_some((frame.sequence, frame.role))
+        });
+    match (protected, helper) {
+        (Some(left), Some(right)) => Some(if left.0 > right.0 { left.1 } else { right.1 }),
+        (Some((_, role)), None) | (None, Some((_, role))) => Some(role),
+        (None, None) => None,
+    }
+    .or_else(|| active_finalizer_role(activations, requester))
+    .unwrap_or(NativeDriverRole::Program)
 }
 
 fn active_finalizer_saved_top(
@@ -3811,6 +4533,13 @@ fn execute_native_driver_action(
                     thread.set_saved_nexeccalls(state.nccalls);
                 })
                 .map_err(|error| RuntimeError::new(format!("invalid coroutine Thread: {error}")))?;
+                if let Some(request_id) = dispatch_started_lua_call_hook(state, gc)? {
+                    return Ok(VmExit::NativeRequest(request_id));
+                }
+                if let Some(proto) = state.current_call_info().proto {
+                    let pc = state.current_call_info().savedpc.unwrap_or(0);
+                    emit_coroutine_resume_trace(state, gc, proto, pc);
+                }
                 resume_lua_thread(state, gc)
             } else if previous_status == CoroutineStatus::Normal {
                 let deferred = normal_deferred.ok_or_else(|| {
@@ -3818,10 +4547,29 @@ fn execute_native_driver_action(
                         "Normal coroutine re-entry has no deferred ancestor continuation",
                     )
                 })?;
-                finish_deferred_native_values(state, gc, &deferred, request.args)?;
-                resume_after_deferred_native_call(state, gc, &deferred)
+                let completion = finish_deferred_native_values(state, gc, &deferred, request.args)?;
+                if let Some(proto) = state.current_call_info().proto {
+                    let pc = state.current_call_info().savedpc.unwrap_or(0);
+                    emit_coroutine_resume_trace(state, gc, proto, pc);
+                }
+                resume_after_deferred_completion(
+                    state,
+                    gc,
+                    &deferred,
+                    NativeDriverRole::Program,
+                    completion,
+                )
             } else {
                 install_resume_args(state, &request.args);
+                record_trace_nil_range(state, state.top, state.current_call_info().top);
+                if let Some(proto) = state.current_call_info().proto {
+                    let pc = state
+                        .current_call_info()
+                        .savedpc
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    emit_coroutine_resume_trace(state, gc, proto, pc);
+                }
                 resume_lua_thread(state, gc)
             }
         }
@@ -3834,13 +4582,13 @@ fn execute_native_driver_action(
             let deferred = frame.request.deferred.as_ref().ok_or_else(|| {
                 RuntimeError::new("Runtime-native activation lost its deferred call")
             })?;
-            if replay_dead_ancestor {
+            let completion = if replay_dead_ancestor {
                 deferred.snapshot.restore(state);
-                finish_deferred_native_values(state, gc, deferred, Vec::new())?;
+                finish_deferred_native_values(state, gc, deferred, Vec::new())?
             } else {
-                finish_deferred_native_call(state, gc, deferred, frame.request.envelope, response)?;
-            }
-            resume_after_deferred_for_role(state, gc, deferred, resume)
+                finish_deferred_native_call(state, gc, deferred, frame.request.envelope, response)?
+            };
+            resume_after_deferred_completion(state, gc, deferred, resume, completion)
         }
         NativeDriverAction::StartProtectedCall {
             function,
@@ -3849,11 +4597,22 @@ fn execute_native_driver_action(
                 NativeDriverRole::ProtectedCall {
                     stop_ci, call_pos, ..
                 },
-        } => start_protected_call_target(state, gc, function, &args, stop_ci, call_pos),
+        } => {
+            // Runtime-owned pcall/xpcall targets are non-resumable boundaries.
+            // Keep the barrier on the LuaState itself so it remains effective
+            // while nested Runtime requests switch away from and back to this
+            // state. The activation frame restores the previous permission.
+            state.allow_yield = 0;
+            start_runtime_callback_target(state, gc, function, &args, stop_ci, call_pos, None)
+        }
         NativeDriverAction::StartProtectedCall { .. } => Err(RuntimeError::new(
             "VM: protected helper action lost its protected role",
         )),
         NativeDriverAction::FinishProtectedCall { frame, response } => {
+            // Restore before completing the deferred native call: completion can
+            // immediately resume an enclosing callback/coroutine and must observe
+            // the permission that was active outside this protected boundary.
+            state.allow_yield = frame.previous_allow_yield;
             let deferred = frame.request.deferred.as_ref().ok_or_else(|| {
                 RuntimeError::new("protected helper activation lost its deferred call")
             })?;
@@ -3881,8 +4640,228 @@ fn execute_native_driver_action(
                     vec![Value::Boolean(false), error]
                 }
             };
-            finish_deferred_native_values(state, gc, deferred, values)?;
-            resume_after_deferred_for_role(state, gc, deferred, frame.parent_role)
+            let completion = finish_deferred_protected_values(state, gc, deferred, values)?;
+            resume_after_deferred_completion(state, gc, deferred, frame.parent_role, completion)
+        }
+        NativeDriverAction::StartCallbackHelper {
+            function,
+            args,
+            wanted_results,
+            role:
+                NativeDriverRole::CallbackHelper {
+                    stop_ci, call_pos, ..
+                },
+        } => start_runtime_callback_target(
+            state,
+            gc,
+            function,
+            &args,
+            stop_ci,
+            call_pos,
+            wanted_results,
+        ),
+        NativeDriverAction::StartCallbackHelper { .. } => Err(RuntimeError::new(
+            "VM: callback helper action lost its callback role",
+        )),
+        NativeDriverAction::FinishCallbackHelper { frame, response } => {
+            let CallbackHelperActivationFrame {
+                request,
+                parent_role,
+                ..
+            } = frame;
+            let CallbackHelperRequest { kind, deferred, .. } = request;
+            let kind = match kind {
+                CallbackHelperKind::DebugHook {
+                    continuation,
+                    trace_barrier,
+                    ..
+                } => {
+                    state.debug_hook_active = false;
+                    end_trace_callback_barrier(state, trace_barrier);
+                    return match response {
+                        ResumeResponse::Success(_) => {
+                            resume_debug_hook_continuation(state, gc, *continuation, parent_role)
+                        }
+                        ResumeResponse::Error(error) => Err(RuntimeError::with_value(gc, error)),
+                    };
+                }
+                CallbackHelperKind::VmMetamethod {
+                    continuation,
+                    trace_barrier,
+                    ..
+                } => {
+                    return match response {
+                        ResumeResponse::Success(values) => {
+                            let completion =
+                                finish_vm_metamethod_callback(state, gc, continuation, values);
+                            end_trace_callback_barrier(state, trace_barrier);
+                            let completion = completion?;
+                            resume_after_callback_continuation(state, gc, parent_role, completion)
+                        }
+                        ResumeResponse::Error(error) => {
+                            end_trace_callback_barrier(state, trace_barrier);
+                            Err(RuntimeError::with_value(gc, error))
+                        }
+                    };
+                }
+                kind => kind,
+            };
+            let deferred = deferred.ok_or_else(|| {
+                RuntimeError::new("callback helper activation lost its deferred call")
+            })?;
+            let completion = match (kind, response) {
+                (CallbackHelperKind::ToString, ResumeResponse::Success(values)) => {
+                    finish_deferred_runtime_result(
+                        state,
+                        gc,
+                        &deferred,
+                        false,
+                        Ok(vec![values.into_iter().next().unwrap_or(Value::Nil)]),
+                    )
+                }
+                (CallbackHelperKind::ToString, ResumeResponse::Error(error)) => {
+                    finish_deferred_runtime_result(state, gc, &deferred, false, Err(error))
+                }
+                (
+                    CallbackHelperKind::LoadReader {
+                        terminal_error: Some(message),
+                        ..
+                    },
+                    _,
+                ) => finish_deferred_load_error_message(state, gc, &deferred, &message),
+                (
+                    CallbackHelperKind::LoadReader {
+                        terminal_error: None,
+                        ..
+                    },
+                    ResumeResponse::Error(error),
+                ) => finish_deferred_native_values(state, gc, &deferred, vec![Value::Nil, error]),
+                (
+                    CallbackHelperKind::LoadReader {
+                        chunk_name,
+                        source,
+                        terminal_error: None,
+                    },
+                    ResumeResponse::Success(values),
+                ) => match values.into_iter().next().unwrap_or(Value::Nil) {
+                    Value::Nil | Value::String(_) => {
+                        finish_deferred_load_source(state, gc, &deferred, &source, &chunk_name)
+                    }
+                    _ => finish_deferred_load_error_message(
+                        state,
+                        gc,
+                        &deferred,
+                        "reader function must return a string",
+                    ),
+                },
+                (
+                    CallbackHelperKind::TableSort {
+                        terminal_error: Some(message),
+                        ..
+                    },
+                    _,
+                ) => {
+                    let error = runtime_error_value(state, gc, &RuntimeError::new(message));
+                    finish_deferred_runtime_result(state, gc, &deferred, false, Err(error))
+                }
+                (
+                    CallbackHelperKind::TableSort {
+                        terminal_error: None,
+                        ..
+                    },
+                    ResumeResponse::Error(error),
+                ) => finish_deferred_runtime_result(state, gc, &deferred, false, Err(error)),
+                (
+                    CallbackHelperKind::TableSort {
+                        terminal_error: None,
+                        ..
+                    },
+                    ResumeResponse::Success(_),
+                ) => finish_deferred_runtime_result(state, gc, &deferred, false, Ok(Vec::new())),
+                (CallbackHelperKind::DoFile, ResumeResponse::Success(values)) => {
+                    finish_deferred_runtime_result(state, gc, &deferred, false, Ok(values))
+                }
+                (CallbackHelperKind::DoFile, ResumeResponse::Error(error)) => {
+                    finish_deferred_runtime_result(state, gc, &deferred, false, Err(error))
+                }
+                (CallbackHelperKind::TableForeach { .. }, ResumeResponse::Success(values)) => {
+                    finish_deferred_runtime_result(
+                        state,
+                        gc,
+                        &deferred,
+                        false,
+                        Ok(vec![values.into_iter().next().unwrap_or(Value::Nil)]),
+                    )
+                }
+                (CallbackHelperKind::TableForeach { .. }, ResumeResponse::Error(error)) => {
+                    finish_deferred_runtime_result(state, gc, &deferred, false, Err(error))
+                }
+                (
+                    CallbackHelperKind::PackageRequire { loaded, module_key },
+                    ResumeResponse::Success(values),
+                ) => {
+                    let values = finish_package_require_callback(gc, loaded, &module_key, values)?;
+                    finish_deferred_runtime_result(state, gc, &deferred, false, Ok(values))
+                }
+                (CallbackHelperKind::PackageRequire { .. }, ResumeResponse::Error(error)) => {
+                    finish_deferred_runtime_result(state, gc, &deferred, false, Err(error))
+                }
+                (
+                    CallbackHelperKind::PackageModuleOptions {
+                        terminal_error: Some(message),
+                        ..
+                    },
+                    _,
+                ) => {
+                    let error = runtime_error_value(state, gc, &RuntimeError::new(message));
+                    finish_deferred_runtime_result(state, gc, &deferred, false, Err(error))
+                }
+                (
+                    CallbackHelperKind::PackageModuleOptions {
+                        terminal_error: None,
+                        ..
+                    },
+                    ResumeResponse::Error(error),
+                ) => finish_deferred_runtime_result(state, gc, &deferred, false, Err(error)),
+                (
+                    CallbackHelperKind::PackageModuleOptions {
+                        terminal_error: None,
+                        ..
+                    },
+                    ResumeResponse::Success(_),
+                ) => finish_deferred_runtime_result(state, gc, &deferred, false, Ok(Vec::new())),
+                (
+                    CallbackHelperKind::Gsub {
+                        terminal_error: Some(message),
+                        ..
+                    },
+                    _,
+                ) => {
+                    let error = runtime_error_value(state, gc, &RuntimeError::new(message));
+                    finish_deferred_runtime_result(state, gc, &deferred, false, Err(error))
+                }
+                (
+                    CallbackHelperKind::Gsub {
+                        terminal_error: None,
+                        ..
+                    },
+                    ResumeResponse::Error(error),
+                ) => finish_deferred_runtime_result(state, gc, &deferred, false, Err(error)),
+                (
+                    CallbackHelperKind::Gsub {
+                        state: gsub,
+                        terminal_error: None,
+                    },
+                    ResumeResponse::Success(_),
+                ) => finish_deferred_gsub_result(state, gc, &deferred, &gsub.output, gsub.next),
+                (CallbackHelperKind::DebugHook { .. }, _) => {
+                    unreachable!("debug hook handled before deferred callback helpers")
+                }
+                (CallbackHelperKind::VmMetamethod { .. }, _) => {
+                    unreachable!("VM metamethod handled before deferred callback helpers")
+                }
+            }?;
+            resume_after_deferred_completion(state, gc, &deferred, parent_role, completion)
         }
         NativeDriverAction::DeliverUpvalue { frame, resume } => {
             if state.state_handle() != Some(frame.request.requester) {
@@ -3934,8 +4913,14 @@ fn execute_native_driver_action(
                     ));
                 }
             };
-            finish_deferred_runtime_result(state, gc, deferred, frame.request.protected, response)?;
-            resume_after_deferred_for_role(state, gc, deferred, resume)
+            let completion = finish_deferred_runtime_result(
+                state,
+                gc,
+                deferred,
+                frame.request.protected,
+                response,
+            )?;
+            resume_after_deferred_completion(state, gc, deferred, resume, completion)
         }
         NativeDriverAction::DeliverCollection {
             request,
@@ -3952,8 +4937,9 @@ fn execute_native_driver_action(
                 }
                 CollectionResponse::ErrorValue(error) => Err(error),
             };
-            finish_deferred_runtime_result(state, gc, deferred, request.protected, response)?;
-            resume_after_deferred_for_role(state, gc, deferred, resume)
+            let completion =
+                finish_deferred_runtime_result(state, gc, deferred, request.protected, response)?;
+            resume_after_deferred_completion(state, gc, deferred, resume, completion)
         }
         NativeDriverAction::ResumeAutomaticGc { resume } => {
             state.status = ThreadStatus::Yield;
@@ -4074,9 +5060,100 @@ fn resume_after_deferred_for_role(
     match role {
         NativeDriverRole::Program => resume_after_deferred_native_call(state, gc, deferred),
         NativeDriverRole::Finalizer { stop_ci } => resume_finalizer_callback(state, gc, stop_ci),
-        NativeDriverRole::ProtectedCall { stop_ci, .. } => {
-            resume_protected_call(state, gc, stop_ci)
+        NativeDriverRole::ProtectedCall { stop_ci, .. }
+        | NativeDriverRole::CallbackHelper { stop_ci, .. } => {
+            resume_runtime_callback(state, gc, stop_ci)
         }
+    }
+}
+
+fn resume_after_deferred_completion(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+    role: NativeDriverRole,
+    completion: VmExit,
+) -> Result<VmExit, RuntimeError> {
+    match completion {
+        VmExit::Complete(ExecResult::Returned) => {
+            resume_after_deferred_for_role(state, gc, deferred, role)
+        }
+        completion => Ok(completion),
+    }
+}
+
+fn resume_debug_hook_continuation(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    continuation: DebugHookContinuation,
+    parent_role: NativeDriverRole,
+) -> Result<VmExit, RuntimeError> {
+    let completion = match continuation {
+        DebugHookContinuation::LuaCall { proto } => {
+            state.status = ThreadStatus::Ok;
+            resume_lua_call_after_debug_hook(state, proto, gc)?
+        }
+        DebugHookContinuation::ResumeAt { proto, pc } => {
+            resume_lua_instruction_after_debug_hook(state, proto, pc, gc)?
+        }
+        DebugHookContinuation::InstructionAfterCount { proto, pc } => {
+            if let Some(request_id) = dispatch_debug_line_hook(state, gc, proto, pc)? {
+                return Ok(VmExit::NativeRequest(request_id));
+            }
+            resume_lua_instruction_after_debug_hook(state, proto, pc, gc)?
+        }
+        DebugHookContinuation::LuaReturn {
+            call_info,
+            results,
+            remaining_tail_returns,
+        } => {
+            if remaining_tail_returns > 0
+                && let Some(request_id) = publish_debug_hook_event(
+                    state,
+                    gc,
+                    "tail return",
+                    None,
+                    DebugHookContinuation::LuaReturn {
+                        call_info: call_info.clone(),
+                        results: results.clone(),
+                        remaining_tail_returns: remaining_tail_returns - 1,
+                    },
+                )?
+            {
+                return Ok(VmExit::NativeRequest(request_id));
+            }
+            finish_lua_return_after_debug_hook(state, &call_info, results)?
+        }
+        DebugHookContinuation::NativeCall { frame } => {
+            resume_native_call_after_debug_hook(state, gc, frame)?
+        }
+        DebugHookContinuation::NativeReturn {
+            frame,
+            result_count,
+        } => finish_native_call_after_debug_hook(state, gc, frame, result_count)?,
+    };
+
+    resume_after_callback_continuation(state, gc, parent_role, completion)
+}
+
+fn resume_after_callback_continuation(
+    state: &mut LuaState,
+    gc: &mut GarbageCollector,
+    parent_role: NativeDriverRole,
+    completion: VmExit,
+) -> Result<VmExit, RuntimeError> {
+    match completion {
+        VmExit::Complete(ExecResult::Returned) => {
+            if matches!(parent_role, NativeDriverRole::Program)
+                && state.current_ci == 0
+                && state.current_call_info().proto.is_none()
+            {
+                return Ok(VmExit::Complete(ExecResult::Returned));
+            }
+            state.status = ThreadStatus::Yield;
+            resume_after_suspension_for_role(state, gc, parent_role)
+        }
+        completion => Ok(completion),
     }
 }
 
@@ -4088,8 +5165,9 @@ fn resume_after_suspension_for_role(
     match role {
         NativeDriverRole::Program => resume_after_upvalue_access(state, gc),
         NativeDriverRole::Finalizer { stop_ci } => resume_finalizer_callback(state, gc, stop_ci),
-        NativeDriverRole::ProtectedCall { stop_ci, .. } => {
-            resume_protected_call(state, gc, stop_ci)
+        NativeDriverRole::ProtectedCall { stop_ci, .. }
+        | NativeDriverRole::CallbackHelper { stop_ci, .. } => {
+            resume_runtime_callback(state, gc, stop_ci)
         }
     }
 }
@@ -4102,7 +5180,7 @@ fn resolve_debug_upvalue_request(
     request: &DebugUpvalueRequest,
 ) -> DebugUpvalueResponse {
     match StateArena::with_turn_state_mut(arena, request.owner, |owner_state| {
-        with_vm_context_parts(owner_state, gc, string_pool, |owner_state, gc, _| {
+        with_vm_context_gc(owner_state, gc, string_pool, |owner_state, gc| {
             execute_debug_upvalue_owner_access(owner_state, gc, request)
         })
     }) {
@@ -4159,6 +5237,41 @@ fn classify_native_turn(
             saved_top: state.top,
         }),
         Ok(VmExit::Complete(ExecResult::Returned))
+            if matches!(role, NativeDriverRole::CallbackHelper { .. }) =>
+        {
+            let NativeDriverRole::CallbackHelper {
+                stop_ci,
+                call_pos,
+                saved_top,
+            } = role
+            else {
+                unreachable!("guarded callback helper role")
+            };
+            let values = finish_runtime_callback_turn(state, stop_ci, call_pos, saved_top)?;
+            Ok(NativeTurnEvent::CallbackHelper(ResumeResponse::Success(
+                values,
+            )))
+        }
+        Ok(VmExit::Complete(ExecResult::Yielded))
+            if matches!(role, NativeDriverRole::CallbackHelper { .. }) =>
+        {
+            let NativeDriverRole::CallbackHelper {
+                stop_ci, saved_top, ..
+            } = role
+            else {
+                unreachable!("guarded callback helper role")
+            };
+            abort_runtime_callback_turn(state, gc, stop_ci, saved_top)?;
+            let error = runtime_error_value(
+                state,
+                gc,
+                &RuntimeError::new("cannot yield across a callback helper"),
+            );
+            Ok(NativeTurnEvent::CallbackHelper(ResumeResponse::Error(
+                error,
+            )))
+        }
+        Ok(VmExit::Complete(ExecResult::Returned))
             if matches!(role, NativeDriverRole::ProtectedCall { .. }) =>
         {
             let NativeDriverRole::ProtectedCall {
@@ -4169,7 +5282,7 @@ fn classify_native_turn(
             else {
                 unreachable!("guarded protected helper role")
             };
-            let values = finish_protected_call_turn(state, stop_ci, call_pos, saved_top)?;
+            let values = finish_protected_callback_turn(state, stop_ci, call_pos, saved_top)?;
             Ok(NativeTurnEvent::ProtectedCall(ResumeResponse::Success(
                 values,
             )))
@@ -4183,7 +5296,7 @@ fn classify_native_turn(
             else {
                 unreachable!("guarded protected helper role")
             };
-            abort_protected_call_turn(state, gc, stop_ci, saved_top)?;
+            abort_runtime_callback_turn(state, gc, stop_ci, saved_top)?;
             let error =
                 runtime_error_value(state, gc, &RuntimeError::new("cannot yield across pcall"));
             Ok(NativeTurnEvent::ProtectedCall(ResumeResponse::Error(error)))
@@ -4231,20 +5344,33 @@ fn classify_native_turn(
             Ok(NativeTurnEvent::Coroutine { thread, response })
         }
         Err(error) => {
+            if let NativeDriverRole::CallbackHelper {
+                stop_ci, saved_top, ..
+            } = role
+            {
+                let error = runtime_error_value(state, gc, &error);
+                abort_runtime_callback_turn(state, gc, stop_ci, saved_top)?;
+                return Ok(NativeTurnEvent::CallbackHelper(ResumeResponse::Error(
+                    error,
+                )));
+            }
             if let NativeDriverRole::ProtectedCall {
                 stop_ci, saved_top, ..
             } = role
             {
                 let error = runtime_error_value(state, gc, &error);
-                abort_protected_call_turn(state, gc, stop_ci, saved_top)?;
+                abort_runtime_callback_turn(state, gc, stop_ci, saved_top)?;
                 return Ok(NativeTurnEvent::ProtectedCall(ResumeResponse::Error(error)));
             }
             if matches!(role, NativeDriverRole::Finalizer { .. }) {
                 return Ok(NativeTurnEvent::Finalizer(Err(error)));
             }
             let Some(thread) = state.current_thread else {
+                unwind_top_level_lua_error(state, gc)?;
+                discard_all_instruction_diffs(state);
                 return Ok(NativeTurnEvent::Main(Err(error)));
             };
+            discard_all_instruction_diffs(state);
             release_yield_permission(state)?;
             gc.with_mut(thread, |thread| {
                 thread.set_status(CoroutineStatus::Dead);
@@ -4430,6 +5556,7 @@ fn release_yield_permission(state: &mut LuaState) -> Result<(), RuntimeError> {
 struct NativeActivationSessionGuard {
     activations: NonNull<NativeActivationStack>,
     gc: NonNull<GarbageCollector>,
+    arena: NonNull<StateArena>,
 }
 
 impl Drop for NativeActivationSessionGuard {
@@ -4441,6 +5568,15 @@ impl Drop for NativeActivationSessionGuard {
         // SAFETY: see the invariant above; no other collector reference is used
         // during this cleanup loop.
         let gc = unsafe { self.gc.as_mut() };
+        // A fault can leave one or more nested protected-call barriers installed
+        // after the last state turn has ended. Restore them innermost-first so a
+        // nested frame saved under an outer barrier cannot make its requester
+        // spuriously yieldable while the outer frame is still active.
+        while let Some(frame) = activations.protected_calls.pop() {
+            let _ = StateArena::with_turn_state_mut(self.arena, frame.requester, |state| {
+                state.allow_yield = frame.previous_allow_yield;
+            });
+        }
         while let Some(frame) = activations.frames.pop() {
             if let Some(caller) = frame.caller_thread
                 && let Some(previous_status) = frame.previous_caller_status
@@ -4456,7 +5592,7 @@ impl Drop for NativeActivationSessionGuard {
         }
         activations.upvalue_transfers.clear();
         activations.debug_upvalue_transfers.clear();
-        activations.protected_calls.clear();
+        activations.callback_helpers.clear();
         if activations
             .gc_frames
             .iter()
@@ -4537,6 +5673,100 @@ mod tests {
     use lua_core::userdata::Userdata;
 
     use super::*;
+    use crate::native::NativeRequestId;
+
+    static RESOURCE_DRAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PREFLIGHT_RESOURCE_DRAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn activation_cleanup_restores_nested_protected_yield_barriers_in_stack_order() {
+        let issuer =
+            StateHandleIssuer::try_new().expect("test Runtime namespace should be available");
+        let mut arena = StateArena::new(issuer, AllocationLedger::new());
+        let requester = arena.insert_owned(Box::new(LuaState::new()));
+        StateArena::with_turn_state_mut(NonNull::from(&mut arena), requester, |state| {
+            state.allow_yield = 0;
+        })
+        .expect("requester state is available");
+
+        let role = NativeDriverRole::ProtectedCall {
+            stop_ci: 0,
+            call_pos: 0,
+            saved_top: 0,
+        };
+        let frame = |id, previous_allow_yield| ProtectedCallActivationFrame {
+            requester,
+            request: ProtectedCallRequest {
+                id: NativeRequestId::new(id),
+                kind: ProtectedCallKind::PCall,
+                function: Value::Nil,
+                args: Vec::new(),
+                handler: None,
+                deferred: None,
+            },
+            phase: ProtectedCallPhase::Target,
+            role,
+            parent_role: NativeDriverRole::Program,
+            previous_allow_yield,
+            pending_response: None,
+            sequence: id,
+        };
+        let mut activations = NativeActivationStack::default();
+        activations.protected_calls.push(frame(1, 1));
+        activations.protected_calls.push(frame(2, 0));
+        let mut gc = GarbageCollector::new();
+        gc.begin_automatic_checkpoint_driver();
+
+        {
+            let _cleanup = NativeActivationSessionGuard {
+                activations: NonNull::from(&mut activations),
+                gc: NonNull::from(&mut gc),
+                arena: NonNull::from(&mut arena),
+            };
+        }
+
+        assert!(activations.protected_calls.is_empty());
+        StateArena::with_turn_state_mut(NonNull::from(&mut arena), requester, |state| {
+            assert_eq!(state.allow_yield, 1);
+        })
+        .expect("cleanup leaves requester state available");
+    }
+
+    fn count_resource_drain(
+        _state: &mut LuaState,
+        gc: &mut GarbageCollector,
+        object_id: ObjectId,
+    ) -> RuntimeResourceDrainOutcome {
+        assert!(gc.registered_ref_by_id::<Userdata>(object_id).is_some());
+        RESOURCE_DRAIN_CALLS.fetch_add(1, Ordering::SeqCst);
+        RuntimeResourceDrainOutcome::Drained
+    }
+
+    fn panic_resource_drain(
+        _state: &mut LuaState,
+        _gc: &mut GarbageCollector,
+        _object_id: ObjectId,
+    ) -> RuntimeResourceDrainOutcome {
+        panic!("injected Runtime resource drain panic");
+    }
+
+    fn drain_resource_without_counter(
+        _state: &mut LuaState,
+        gc: &mut GarbageCollector,
+        object_id: ObjectId,
+    ) -> RuntimeResourceDrainOutcome {
+        assert!(gc.registered_ref_by_id::<Userdata>(object_id).is_some());
+        RuntimeResourceDrainOutcome::Drained
+    }
+
+    fn count_preflight_resource_drain(
+        state: &mut LuaState,
+        gc: &mut GarbageCollector,
+        object_id: ObjectId,
+    ) -> RuntimeResourceDrainOutcome {
+        PREFLIGHT_RESOURCE_DRAIN_CALLS.fetch_add(1, Ordering::SeqCst);
+        drain_resource_without_counter(state, gc, object_id)
+    }
 
     fn move_runtime(runtime: Runtime) -> Runtime {
         runtime
@@ -4590,10 +5820,27 @@ mod tests {
             .main_state_handle
             .expect("main state handle is registered");
         let main_state_address = runtime
-            .main_state
-            .as_deref()
+            .main_state()
             .map(std::ptr::from_ref)
             .expect("running runtime has a main state");
+        let arena = runtime.heap.as_ref().get_ref().state_arena();
+        assert_eq!(
+            arena
+                .validate_main(main_handle)
+                .expect("main handle resolves through the arena")
+                .as_ptr(),
+            main_state_address.cast_mut()
+        );
+        assert!(arena.slots[main_handle.slot()].is_main);
+        assert_eq!(arena.live_coroutine_state_count(), 0);
+        assert_eq!(
+            arena
+                .slots
+                .iter()
+                .filter(|slot| slot.state.is_some())
+                .count(),
+            1
+        );
         let (gc_address, string_pool_address) = {
             let mut parts = runtime.parts_mut().expect("parts are available");
             assert_eq!(parts.active_execution_count(), 1);
@@ -4866,6 +6113,38 @@ mod tests {
     }
 
     #[test]
+    fn top_level_error_unwind_closes_root_frame_upvalues_before_reset() {
+        let mut runtime = Runtime::new();
+        let upvalue = {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (main, gc, _) = parts.split_mut();
+            main.push_number(42.0);
+            let upvalue = main
+                .find_or_create_upvalue(0, gc)
+                .expect("root Upvalue is published");
+            assert!(
+                gc.with_ref(upvalue, Upvalue::is_open)
+                    .expect("root Upvalue remains registered")
+            );
+
+            unwind_top_level_lua_error(main, gc).expect("top-level unwind succeeds");
+
+            assert_eq!(main.current_ci, 0);
+            assert!(main.open_upvalues.is_empty());
+            upvalue
+        };
+
+        let collector = runtime.heap.as_ref().get_ref().heap.collector();
+        let (closed, value) = collector
+            .with_ref(upvalue, |upvalue| {
+                (upvalue.is_closed(), upvalue.get_closed_value().clone())
+            })
+            .expect("closed root Upvalue remains registered");
+        assert!(closed);
+        assert_eq!(value, Value::Number(42.0));
+    }
+
+    #[test]
     fn owner_and_execution_guard_are_enforced() {
         let mut runtime = Runtime::new();
         let owner_thread = thread::current().id();
@@ -4906,7 +6185,7 @@ mod tests {
 
         let mut turn_index = 0_usize;
         let completed = runtime
-            .drive_state_turns(main, |handle, state, _, _| {
+            .drive_state_turns(main, |handle, state| {
                 assert_eq!(state.state_handle(), Some(handle));
                 let nested_target = if handle == main { child } else { main };
                 assert!(matches!(
@@ -4958,6 +6237,55 @@ mod tests {
     }
 
     #[test]
+    fn runtime_turn_can_scope_debug_access_to_an_owned_coroutine() {
+        let mut runtime = Runtime::new();
+        let main = runtime
+            .main_state_handle
+            .expect("main state handle is registered");
+        let child = {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (state, gc, _) = parts.split_mut();
+            gc.with_publication(|transaction| {
+                let thread = transaction.alloc(Thread::new());
+                state
+                    .with_pending_coroutine_state(LuaState::new(), |pending, publisher| {
+                        pending
+                            .bind_thread(transaction, thread)
+                            .expect("both State↔Thread edges bind");
+                        pending.publish_thread_to_stack(publisher)
+                    })
+                    .expect("pending coroutine state is inserted")
+                    .expect("bound Thread publishes to the main stack")
+            })
+        };
+
+        runtime
+            .drive_state_turns(main, |handle, state| {
+                assert_eq!(handle, main);
+                assert!(state.active_gc_ptr().is_some());
+                state
+                    .with_resolved_state_mut(child, |child| {
+                        assert!(child.current_thread.is_some());
+                        assert!(child.active_gc_ptr().is_some());
+                        assert!(child.active_string_pool_ptr().is_some());
+                    })
+                    .expect("debug access resolves the inactive coroutine");
+                RuntimeTurn::Complete(())
+            })
+            .expect("turn completes after scoped coroutine inspection");
+
+        assert_eq!(
+            runtime
+                .heap
+                .as_ref()
+                .get_ref()
+                .state_arena()
+                .peak_turn_borrowed_slots,
+            2
+        );
+    }
+
+    #[test]
     fn turn_driver_restores_state_and_active_count_when_callback_panics() {
         let mut runtime = Runtime::new();
         let main = runtime
@@ -4965,8 +6293,7 @@ mod tests {
             .expect("main state handle is registered");
 
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = runtime
-                .drive_state_turns::<()>(main, |_, _, _, _| panic!("intentional turn panic"));
+            let _ = runtime.drive_state_turns::<()>(main, |_, _| panic!("intentional turn panic"));
         }));
         assert!(panic_result.is_err());
         assert_eq!(runtime.active_execution_count(), 0);
@@ -4984,7 +6311,7 @@ mod tests {
         }
 
         let result = runtime
-            .drive_state_turns(main, |handle, _, _, _| {
+            .drive_state_turns(main, |handle, _| {
                 assert_eq!(handle, main);
                 RuntimeTurn::Complete(7_u8)
             })
@@ -5005,7 +6332,7 @@ mod tests {
             .expect("foreign main handle is registered");
 
         assert!(matches!(
-            runtime.drive_state_turns(foreign_handle, |_, _, _, _| { RuntimeTurn::Complete(()) }),
+            runtime.drive_state_turns(foreign_handle, |_, _| RuntimeTurn::Complete(())),
             Err(RuntimeAccessError::StateArena {
                 source: StateResolveError::ForeignRuntime { .. },
                 ..
@@ -5026,7 +6353,7 @@ mod tests {
             .remove_owned(stale)
             .expect("test child can be removed");
         assert!(matches!(
-            runtime.drive_state_turns(stale, |_, _, _, _| RuntimeTurn::Complete(())),
+            runtime.drive_state_turns(stale, |_, _| RuntimeTurn::Complete(())),
             Err(RuntimeAccessError::StateArena {
                 source: StateResolveError::StaleGeneration { .. },
                 ..
@@ -5034,20 +6361,14 @@ mod tests {
         ));
         assert_eq!(runtime.active_execution_count(), 0);
 
-        let main_ptr = NonNull::from(
-            runtime
-                .main_state
-                .as_deref_mut()
-                .expect("main state remains available"),
-        );
         // SAFETY: RuntimeStorage is pinned and the test releases this synthetic
         // direct borrow before any teardown or further state access.
         let heap = unsafe { Pin::get_unchecked_mut(runtime.heap.as_mut()) };
         heap.state_arena_mut()
-            .begin_direct_borrow(main, main_ptr)
+            .begin_direct_borrow(main)
             .expect("test can mark the main slot borrowed");
         assert!(matches!(
-            runtime.drive_state_turns(main, |_, _, _, _| RuntimeTurn::Complete(())),
+            runtime.drive_state_turns(main, |_, _| RuntimeTurn::Complete(())),
             Err(RuntimeAccessError::StateArena {
                 source: StateResolveError::AlreadyBorrowed { .. },
                 ..
@@ -5131,7 +6452,7 @@ mod tests {
         runtime.owner_thread = receiver.recv().unwrap();
 
         assert!(matches!(
-            runtime.drive_state_turns(main, |_, _, _, _| RuntimeTurn::Complete(())),
+            runtime.drive_state_turns(main, |_, _| RuntimeTurn::Complete(())),
             Err(RuntimeAccessError::WrongThread { .. })
         ));
         assert_eq!(runtime.active_execution_count(), 0);
@@ -5139,7 +6460,7 @@ mod tests {
         runtime.owner_thread = owner;
         runtime.active_executions = 1;
         assert!(matches!(
-            runtime.drive_state_turns(main, |_, _, _, _| RuntimeTurn::Complete(())),
+            runtime.drive_state_turns(main, |_, _| RuntimeTurn::Complete(())),
             Err(RuntimeAccessError::ActiveExecutions { count: 1, .. })
         ));
         assert_eq!(runtime.active_execution_count(), 1);
@@ -5147,7 +6468,7 @@ mod tests {
 
         runtime.close().expect("runtime closes");
         assert!(matches!(
-            runtime.drive_state_turns(main, |_, _, _, _| RuntimeTurn::Complete(())),
+            runtime.drive_state_turns(main, |_, _| RuntimeTurn::Complete(())),
             Err(RuntimeAccessError::NotRunning {
                 phase: RuntimePhase::Closed,
                 ..
@@ -5189,9 +6510,14 @@ mod tests {
         assert!(!first.lua_gc_callback_debt);
         assert_eq!(first.lua_finalizers_attempted, 0);
         assert_eq!(first.lua_finalizer_errors_ignored, 0);
-        assert!(first.io_resource_drain_debt);
+        assert_eq!(first.runtime_resources_attempted, 0);
+        assert_eq!(first.runtime_resources_drained, 0);
+        assert_eq!(first.runtime_resources_already_closed, 0);
+        assert_eq!(first.runtime_resources_stale, 0);
+        assert_eq!(first.runtime_resource_drain_errors, 0);
+        assert!(!first.io_resource_drain_debt);
         assert_eq!(runtime.phase(), RuntimePhase::Closed);
-        assert!(runtime.main_state.is_none());
+        assert!(runtime.main_state().is_none());
         assert!(runtime.main_state_handle.is_none());
         assert!(runtime.global_root().is_none());
         assert!(runtime.registry_root().is_none());
@@ -5220,6 +6546,89 @@ mod tests {
     }
 
     #[test]
+    fn close_drains_runtime_resources_and_isolates_hook_panics() {
+        RESOURCE_DRAIN_CALLS.store(0, Ordering::SeqCst);
+        let mut runtime = Runtime::new();
+        {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (state, gc, _) = parts.split_mut();
+            assert!(
+                state
+                    .reserve_runtime_resource_registrations(2)
+                    .expect("resource registry capacity is reserved")
+            );
+            let drained = gc.create(Userdata::new(0)).object_id();
+            let panicking = gc.create(Userdata::new(0)).object_id();
+            assert!(
+                state
+                    .register_runtime_resource(drained, count_resource_drain)
+                    .expect("first resource registers")
+            );
+            assert!(
+                state
+                    .register_runtime_resource(panicking, panic_resource_drain)
+                    .expect("second resource registers")
+            );
+        }
+
+        let first = runtime.close().expect("resource hook panic is isolated");
+        assert_eq!(RESOURCE_DRAIN_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(first.runtime_resources_attempted, 2);
+        assert_eq!(first.runtime_resources_drained, 1);
+        assert_eq!(first.runtime_resources_already_closed, 0);
+        assert_eq!(first.runtime_resources_stale, 0);
+        assert_eq!(first.runtime_resource_drain_errors, 1);
+        assert_eq!(first.remaining_allocator_live_bytes, 0);
+        assert!(!first.io_resource_drain_debt);
+
+        let second = runtime.close().expect("closed Runtime remains idempotent");
+        assert!(second.already_closed);
+        assert_eq!(second.runtime_resources_attempted, 2);
+        assert_eq!(RESOURCE_DRAIN_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resource_registry_allocation_failure_is_transactional_and_retryable() {
+        let mut runtime = Runtime::new();
+        let before = runtime.allocator_stats();
+        runtime.inject_allocator_failure_after(AllocationSite::RuntimeResourceRegistry, 0);
+        {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (state, _, _) = parts.split_mut();
+            assert!(matches!(
+                state.reserve_runtime_resource_registrations(1),
+                Err(StateResolveError::Allocation(
+                    ManagedAllocationError::Injected {
+                        site: AllocationSite::RuntimeResourceRegistry,
+                        ..
+                    }
+                ))
+            ));
+        }
+        assert_eq!(runtime.allocator_stats(), before);
+
+        {
+            let mut parts = runtime.parts_mut().expect("retry parts are available");
+            let (state, gc, _) = parts.split_mut();
+            assert!(
+                state
+                    .reserve_runtime_resource_registrations(1)
+                    .expect("one-shot allocation fault permits retry")
+            );
+            let resource = gc.create(Userdata::new(0)).object_id();
+            assert!(
+                state
+                    .register_runtime_resource(resource, drain_resource_without_counter)
+                    .expect("reserved retry registration succeeds")
+            );
+        }
+        let report = runtime.close().expect("retry leaves Runtime closable");
+        assert_eq!(report.runtime_resources_attempted, 1);
+        assert_eq!(report.runtime_resources_drained, 1);
+        assert_eq!(report.remaining_allocator_live_bytes, 0);
+    }
+
+    #[test]
     fn close_rejects_active_execution_without_changing_phase() {
         let mut runtime = Runtime::new();
         runtime.active_executions = 1;
@@ -5229,7 +6638,7 @@ mod tests {
             Err(RuntimeAccessError::ActiveExecutions { count: 1, .. })
         ));
         assert_eq!(runtime.phase(), RuntimePhase::Running);
-        assert!(runtime.main_state.is_some());
+        assert!(runtime.main_state().is_some());
 
         runtime.active_executions = 0;
         runtime.close().expect("close succeeds once inactive");
@@ -5262,7 +6671,7 @@ mod tests {
             })
         ));
         assert_eq!(runtime.phase(), RuntimePhase::Running);
-        assert!(runtime.main_state.is_some());
+        assert!(runtime.main_state().is_some());
         assert!(runtime.global_root.is_some());
 
         // Repair the deliberately injected duplicate and prove normal shutdown
@@ -5277,6 +6686,78 @@ mod tests {
         runtime
             .close()
             .expect("close succeeds after test corruption is repaired");
+    }
+
+    #[test]
+    fn shutdown_preflight_fault_preserves_arena_owned_main_state_for_retry() {
+        PREFLIGHT_RESOURCE_DRAIN_CALLS.store(0, Ordering::SeqCst);
+        let mut runtime = Runtime::new();
+        let main_handle = runtime.main_state_handle.expect("main state handle");
+        let main_pointer = runtime
+            .main_state()
+            .map(std::ptr::from_ref)
+            .expect("main state is visible");
+        let child_handle = {
+            let mut parts = runtime.parts_mut().expect("parts are available");
+            let (main, gc, _) = parts.split_mut();
+            let child = main
+                .insert_coroutine_state(LuaState::new())
+                .expect("child is inserted");
+            assert!(
+                main.reserve_runtime_resource_registrations(1)
+                    .expect("resource capacity is reserved")
+            );
+            let resource = gc.create(Userdata::new(0)).object_id();
+            assert!(
+                main.register_runtime_resource(resource, count_preflight_resource_drain)
+                    .expect("resource registers")
+            );
+            child
+        };
+        let allocator_before = runtime.allocator_stats();
+
+        runtime.inject_runtime_fault_after(RuntimeFaultSite::ShutdownPreflight, 0);
+        assert!(matches!(
+            runtime.close(),
+            Err(RuntimeAccessError::InjectedFault {
+                site: RuntimeFaultSite::ShutdownPreflight,
+                ..
+            })
+        ));
+
+        assert_eq!(runtime.phase(), RuntimePhase::Running);
+        assert_eq!(runtime.main_state_handle, Some(main_handle));
+        assert_eq!(
+            runtime.main_state().map(std::ptr::from_ref),
+            Some(main_pointer)
+        );
+        assert_eq!(runtime.live_coroutine_state_count(), 1);
+        assert_eq!(runtime.allocator_stats(), allocator_before);
+        assert_eq!(PREFLIGHT_RESOURCE_DRAIN_CALLS.load(Ordering::SeqCst), 0);
+        let arena = runtime.heap.as_ref().get_ref().state_arena();
+        assert_eq!(
+            arena
+                .validate_main(main_handle)
+                .expect("fault leaves the main slot intact")
+                .as_ptr(),
+            main_pointer.cast_mut()
+        );
+        assert!(arena.validate(child_handle).is_ok());
+
+        let report = runtime.close().expect("one-shot fault permits retry");
+        assert_eq!(report.drained_coroutine_states, 1);
+        assert_eq!(report.runtime_resources_drained, 1);
+        assert_eq!(PREFLIGHT_RESOURCE_DRAIN_CALLS.load(Ordering::SeqCst), 1);
+        assert!(runtime.main_state().is_none());
+        assert!(matches!(
+            runtime
+                .heap
+                .as_ref()
+                .get_ref()
+                .state_arena()
+                .validate(main_handle),
+            Err(StateResolveError::StaleGeneration { .. })
+        ));
     }
 
     #[test]
@@ -5339,7 +6820,7 @@ mod tests {
         heap.state_arena_mut()
             .remove_owned(first_handle)
             .expect("owned child can be removed");
-        assert_eq!(heap.state_arena().live_owned_state_count(), 0);
+        assert_eq!(heap.state_arena().live_coroutine_state_count(), 0);
 
         let second_handle = {
             let mut parts = runtime.parts_mut().expect("parts are available");
@@ -5417,11 +6898,11 @@ mod tests {
         let replacement = arena.insert_owned(Box::new(LuaState::new()));
         assert_ne!(replacement.slot(), slot_index);
         assert_eq!(replacement.generation(), 1);
-        assert_eq!(arena.live_owned_state_count(), 1);
+        assert_eq!(arena.live_coroutine_state_count(), 1);
         arena
             .remove_owned(replacement)
             .expect("replacement state can be removed");
-        assert_eq!(arena.live_owned_state_count(), 0);
+        assert_eq!(arena.live_coroutine_state_count(), 0);
     }
 
     #[test]
@@ -5447,7 +6928,7 @@ mod tests {
             Err(PendingStateError::RootMismatch)
         ));
         assert_eq!(arena.temporary_state_root_count(), 1);
-        assert_eq!(arena.live_owned_state_count(), 1);
+        assert_eq!(arena.live_coroutine_state_count(), 1);
 
         let arena_ptr = NonNull::from(&mut arena);
         {
@@ -5469,7 +6950,7 @@ mod tests {
         assert!(slot.state.is_none());
         assert!(!arena.free_slots.contains(&slot_index));
         assert_eq!(arena.temporary_state_root_count(), 0);
-        assert_eq!(arena.live_owned_state_count(), 0);
+        assert_eq!(arena.live_coroutine_state_count(), 0);
         assert_eq!(arena.rejected_temporary_root_releases, 0);
         assert!(matches!(
             arena.validate(handle),
@@ -5500,7 +6981,7 @@ mod tests {
 
         let other = arena.insert_owned(Box::new(LuaState::new()));
         assert_ne!(other.slot(), recycled_slot);
-        assert_eq!(arena.live_owned_state_count(), 2);
+        assert_eq!(arena.live_coroutine_state_count(), 2);
         assert!(arena.validate(recycled).is_ok());
         assert!(arena.validate(other).is_ok());
 
@@ -5510,7 +6991,7 @@ mod tests {
         arena
             .remove_owned(other)
             .expect("other state can be removed");
-        assert_eq!(arena.live_owned_state_count(), 0);
+        assert_eq!(arena.live_coroutine_state_count(), 0);
     }
 
     #[test]
@@ -5518,7 +6999,7 @@ mod tests {
         let issuer =
             StateHandleIssuer::try_new().expect("test runtime namespace should be available");
         let mut arena = StateArena::new(issuer, AllocationLedger::new());
-        let baseline = arena.live_owned_state_count();
+        let baseline = arena.live_coroutine_state_count();
         let mut first_handle = None;
         let mut previous_generation = 0;
 
@@ -5527,11 +7008,11 @@ mod tests {
             first_handle.get_or_insert(handle);
             assert!(handle.generation() > previous_generation);
             previous_generation = handle.generation();
-            assert_eq!(arena.live_owned_state_count(), baseline + 1);
+            assert_eq!(arena.live_coroutine_state_count(), baseline + 1);
             arena
                 .remove_owned(handle)
                 .expect("an occupied owned slot can be released exactly once");
-            assert_eq!(arena.live_owned_state_count(), baseline);
+            assert_eq!(arena.live_coroutine_state_count(), baseline);
             assert!(matches!(
                 arena.validate(handle),
                 Err(StateResolveError::StaleGeneration { .. })
@@ -5589,7 +7070,8 @@ mod tests {
 
         let report = arena.drain_owned(&mut gc).expect("owned state drains");
 
-        assert_eq!(report.drained_owned_states, 1);
+        assert_eq!(report.drained_coroutine_states, 1);
+        assert_eq!(report.drained_main_states, 0);
         assert_eq!(report.state_shutdown.closed_open_upvalues, 1);
         assert_eq!(
             gc.with_ref(upvalue, |upvalue| {
@@ -5602,6 +7084,43 @@ mod tests {
             arena.validate(owner),
             Err(StateResolveError::StaleGeneration { .. })
         ));
+    }
+
+    #[test]
+    fn arena_drain_orders_coroutines_before_its_owned_main_state() {
+        let issuer =
+            StateHandleIssuer::try_new().expect("test runtime namespace should be available");
+        let mut storage = Box::pin(RuntimeStorage::new(issuer));
+        // SAFETY: RuntimeStorage is pinned for every arena owner pointer below.
+        let storage = unsafe { Pin::get_unchecked_mut(storage.as_mut()) };
+        let arena_cell = storage.state_arena_cell();
+        let main = storage
+            .state_arena_mut()
+            .insert_main_owned(Box::new(LuaState::new()), arena_cell)
+            .expect("main state enters the arena");
+        let first = storage
+            .state_arena_mut()
+            .insert_owned(Box::new(LuaState::new()));
+        let second = storage
+            .state_arena_mut()
+            .insert_owned(Box::new(LuaState::new()));
+
+        // SAFETY: the arena and collector are disjoint pinned storage fields,
+        // and no state borrow is active.
+        let report = unsafe { &mut *storage.state_arena.get() }
+            .drain_owned(storage.heap.collector_mut())
+            .expect("all states drain");
+
+        assert_eq!(report.drained_coroutine_states, 2);
+        assert_eq!(report.drained_main_states, 1);
+        assert_eq!(report.drained_state_handles, vec![first, second, main]);
+        assert_eq!(storage.state_arena().live_coroutine_state_count(), 0);
+        for handle in [first, second, main] {
+            assert!(matches!(
+                storage.state_arena().validate(handle),
+                Err(StateResolveError::StaleGeneration { .. })
+            ));
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@
   "description": "Fail-closed inventory of every runtime or collector root required before lua_rust may sweep a live VM.",
   "provenance_audit": {
     "implemented": "GcRef carries a process-global non-reused ObjectId; each collector validates address, ObjectId, and concrete tag in an authoritative live table. LightUserdata is a separate arbitrary-pointer type, and collector explicit roots retain erased pointer + ObjectId + tag handles.",
-    "remaining_sweep_blocker": "Runtime safe-point full and incremental collection consume the canonical tracer, prepare finalizers, retrace resurrected graphs, reconcile weak tables, pre-close unreachable coroutine states, sweep the object graph, and deliver protected callbacks. Production managed-object mutations use a checked post-write barrier and a separate fail-closed inventory. Broader transitional non-string GcRef::as_ref call sites, allocator live/peak accounting, and allocation-triggered automatic collection remain open."
+    "remaining_sweep_blocker": "Runtime safe-point full, incremental, and allocation-triggered automatic collection consume the canonical tracer, prepare finalizers, retrace resurrected graphs, reconcile weak tables, pre-close unreachable coroutine states, sweep the object graph, and deliver protected callbacks. Production managed-object mutations use a checked post-write barrier and a separate fail-closed inventory. Broader transitional non-string GcRef::as_ref call sites remain open."
   },
   "status_values": [
     "implemented",
@@ -167,29 +167,29 @@
       "source_locations": [
         {
           "path": "crates/lua_vm/src/runtime.rs",
-          "line": 574,
+          "line": 2226,
           "symbol": "Runtime::main_state_handle"
         },
         {
           "path": "crates/lua_vm/src/runtime/root_trace.rs",
-          "line": 292,
+          "line": 457,
           "symbol": "main StateHandle queue seed"
         }
       ],
-      "status": "partial",
+      "status": "implemented",
       "owner": {
-        "current": "Runtime owns the boxed main state and registers its stable address as one external generational StateArena slot.",
-        "target": "StateArena owns the main slot and GlobalRoots stores its StateHandle."
+        "current": "StateArena exclusively owns the boxed main state in a distinguished generational slot; Runtime retains only its StateHandle.",
+        "target": "StateArena owns the main slot and Runtime root tracing stores and seeds its StateHandle."
       },
       "tracer": {
         "current": "Runtime::trace_roots_mark_only always seeds and validates main_state_handle before scanning state roots.",
         "target": "RuntimeRootTracer enqueues the main StateHandle before object propagation."
       },
-      "missing_risk": "The main Box remains externally owned rather than arena-owned; explicit close now validates, detaches, advances or permanently retires its generation without wrap, and drops it, but live collection still lacks one arena-owned state model.",
+      "missing_risk": "No known main-state ownership gap: shared/direct/turn access validates the same arena slot, collection never sweeps the distinguished main slot, and shutdown drains it after coroutine states before collector teardown.",
       "planned_test": {
-        "name": "mark_only_traces_runtime_state_roots_and_excludes_retired_values",
+        "name": "heap_services_are_scoped_and_remain_stable_when_runtime_moves / arena_drain_orders_coroutines_before_its_owned_main_state",
         "layer": "lua_vm runtime_ownership",
-        "assertion": "The report contains exactly the Runtime main handle and all roots reachable only through its state snapshot."
+        "assertion": "The Runtime main handle resolves to the single stable arena-owned slot across Runtime moves, and shutdown invalidates coroutine generations before the main generation."
       }
     },
     {
@@ -742,29 +742,29 @@
       "source_locations": [
         {
           "path": "crates/lua_stdlib/src/io.rs",
-          "line": 109,
-          "symbol": "create_file"
+          "line": 52,
+          "symbol": "open_io and file publication resource registration"
         },
         {
-          "path": "crates/lua_stdlib/src/io.rs",
-          "line": 1488,
-          "symbol": "with_file_data and with_file_data_mut"
+          "path": "crates/lua_vm/src/runtime.rs",
+          "line": 937,
+          "symbol": "StateArena runtime_resources weak identity registry"
         }
       ],
-      "status": "partial",
+      "status": "implemented",
       "owner": {
-        "current": "IO resources live in graph-owned Userdata and typed access is confined to HRTB callbacks over an explicitly aligned payload.",
+        "current": "IO resources live in graph-owned Userdata and typed access is confined to HRTB callbacks over an explicitly aligned payload. StateArena additionally keeps only weak ObjectId plus static drain-hook registrations, so the shutdown service cannot keep otherwise unreachable userdata alive.",
         "target": "Object graphs or explicit runtime RootToken values own every live library handle; access is scoped by VmContext."
       },
       "tracer": {
-        "current": "There is no inventory-backed library root provider; correctness depends on informal stack/table comments.",
+        "current": "ObjectTracer follows every graph-owned IO handle. The Runtime resource registry is intentionally not a root; stale ObjectIds are resolved fail-closed through the collector live table only during deterministic close.",
         "target": "ObjectTracer follows graph-owned handles and RuntimeRootTracer labels any explicit service cache root."
       },
-      "missing_risk": "Runtime close runs Rust typed payload destructors, but library-specific Lua close hooks and a complete inventory-backed service-root provider remain absent.",
+      "missing_risk": "No known IO service-root gap. package.loadlib remains explicitly unsupported and therefore owns no native module handle; a future implementation must use the same registry or add a separately inventoried root provider.",
       "planned_test": {
-        "name": "library_resources_follow_graph_lifetime_and_close_once",
+        "name": "runtime_close_explicitly_drains_io_after_a_failing_lua_finalizer; runtime_close_drains_one_thousand_io_resources_without_lua_gc_hooks",
         "layer": "lua_stdlib gc_semantics",
-        "assertion": "A live file/iterator survives collection, unreachable resources close once, and runtime close leaves no service root."
+        "assertion": "A failed Lua __gc callback cannot prevent explicit file flush/close, 1,000 graph-owned resources drain before state teardown, and the weak registry releases all capacity with allocator live bytes at zero."
       }
     },
     {

@@ -10,7 +10,7 @@ use lua_vm::runtime::PendingStateError;
 use lua_vm::state::{LuaState, ThreadStatus};
 
 pub fn open_coroutine(l: &mut LuaState, gc: &mut GarbageCollector) {
-    let coroutine_table = find_lib_table(l, "coroutine");
+    let coroutine_table = find_lib_table(l, gc, "coroutine");
     if coroutine_table.is_null() {
         return;
     }
@@ -51,8 +51,8 @@ fn reg_runtime_native(
         .expect("coroutine Runtime-native publication must remain collector-valid");
 }
 
-fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
-    crate::registration::find_library_table(l, name.as_bytes())
+fn find_lib_table(l: &LuaState, gc: &GarbageCollector, name: &str) -> GcRef<Table> {
+    crate::registration::find_library_table_with_gc(l, gc, name.as_bytes())
         .ok()
         .flatten()
         .unwrap_or_else(GcRef::null)
@@ -96,7 +96,9 @@ unsafe extern "C" fn lua_coroutine_status(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    let status = with_thread(thread_ref, |thread| thread.status())
+    let status = l
+        .with_gc_ref(thread_ref, Thread::status)
+        .ok()
         .map(status_name)
         .unwrap_or(b"dead");
     push_lua_bytes(l, gc, status);
@@ -141,6 +143,9 @@ unsafe extern "C" fn lua_coroutine_wrap(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_coroutine_yield(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
+    if l.allow_yield == 0 {
+        return push_error(l, b"cannot yield across non-resumable call boundaries");
+    }
     l.yielded_values = args_from(l, 1);
     l.status = ThreadStatus::Yield;
     0
@@ -210,15 +215,6 @@ fn args_from(l: &LuaState, first: i32) -> Vec<Value> {
         .collect()
 }
 
-fn with_thread<T>(
-    thread_ref: GcRef<Thread>,
-    f: impl for<'thread> FnOnce(&'thread Thread) -> T,
-) -> Option<T> {
-    // SAFETY: the thread value is held on a Lua stack or in a closure upvalue.
-    let thread = unsafe { thread_ref.as_ref() }?;
-    Some(f(thread))
-}
-
 fn status_name(status: CoroutineStatus) -> &'static [u8] {
     match status {
         CoroutineStatus::Suspended => b"suspended",
@@ -262,9 +258,9 @@ mod byte_string_tests {
         let global_ref = gc.create(global);
         let mut state = LuaState::with_global_table(global_ref);
 
-        lua_vm::with_vm_context(&mut state, &mut gc, &mut string_pool, |state| {
-            assert_eq!(find_lib_table(state, "coroutine"), target);
-            assert_ne!(find_lib_table(state, "coroutine"), decoy);
+        lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut string_pool, |state, gc| {
+            assert_eq!(find_lib_table(state, gc, "coroutine"), target);
+            assert_ne!(find_lib_table(state, gc, "coroutine"), decoy);
         });
     }
 
@@ -277,20 +273,48 @@ mod byte_string_tests {
     }
 
     #[test]
+    fn yield_rejects_a_non_resumable_boundary_without_marking_the_state_yielded() {
+        let mut gc = GarbageCollector::new();
+        let mut string_pool = StringPool::new();
+        let mut state = LuaState::new();
+
+        let message = lua_vm::with_vm_context(&mut state, &mut gc, &mut string_pool, |state| {
+            // SAFETY: the VM context supplies the exact LuaState ABI expected by
+            // the registered native function for this direct contract test.
+            let result =
+                unsafe { lua_coroutine_yield(state as *mut LuaState as *mut std::ffi::c_void) };
+            assert_eq!(result, -1);
+            assert_eq!(state.status, ThreadStatus::Ok);
+            assert!(state.yielded_values.is_empty());
+            let Value::String(message) = state
+                .at_abs(state.top.saturating_sub(1))
+                .expect("yield error is pushed")
+            else {
+                panic!("expected a Lua string error");
+            };
+            *message
+        });
+        assert_eq!(
+            gc.with_string_bytes(message, <[u8]>::to_vec)
+                .expect("yield error string is live"),
+            b"cannot yield across non-resumable call boundaries"
+        );
+    }
+
+    #[test]
     fn lua_byte_results_preserve_nul_and_invalid_utf8() {
         let mut gc = GarbageCollector::new();
         let mut string_pool = StringPool::new();
         let mut state = LuaState::new();
         let bytes = [0, 0xff, 0x80, b'x'];
 
-        lua_vm::with_vm_context_parts(&mut state, &mut gc, &mut string_pool, |state, gc, _| {
+        lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut string_pool, |state, gc| {
             push_lua_bytes(state, gc, &bytes);
             let Value::String(string_ref) = state.at(-1).expect("result is pushed") else {
                 panic!("expected Lua string result");
             };
             assert_eq!(
-                state
-                    .copy_string_bytes(*string_ref)
+                gc.with_string_bytes(*string_ref, <[u8]>::to_vec)
                     .expect("test string is live"),
                 bytes
             );

@@ -58,6 +58,18 @@ pub enum RuntimeNativeFunction {
     ProtectedCall = 5,
     /// Base-library `xpcall`, including its Runtime-owned error-handler phase.
     ProtectedXCall = 6,
+    /// Base-library `tostring`; only the `__tostring` callback path suspends.
+    ToString = 7,
+    /// Base-library `load`; function readers are driven one callback turn at a time.
+    Load = 8,
+    /// `table.sort`; Lua comparators and default `__lt` callbacks suspend per comparison.
+    TableSort = 9,
+    /// Base-library `dofile`; the compiled chunk runs under the Runtime scheduler.
+    DoFile = 10,
+    /// `table.foreach`; each callback turn retains its exact table cursor.
+    TableForeach = 11,
+    /// `table.foreachi`; each callback turn retains its exact numeric index.
+    TableForeachi = 12,
 }
 
 // =====================================================================

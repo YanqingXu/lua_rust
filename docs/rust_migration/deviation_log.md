@@ -116,27 +116,30 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 - **日期：** 2026-07-26
 - **范围：** `io.stdin`、`io.stdout`、`io.stderr`、`io.read`、
   `io.write`、file handle `read/write/flush` 及进程重定向。
-- **Rust 位置：** `crates/lua_stdlib/src/io.rs`；
-  `crates/lua_app/tests/observable_io.rs`。
+- **Rust 位置：** `crates/lua_stdlib/src/host_io.rs`、`base.rs`、`io.rs`；
+  `crates/lua_app/src/main.rs`、`crates/lua_app/tests/observable_io.rs`。
 - **基线行为：** 提交 `6284135` 把三个默认流创建成 memory file，导致
   `io.write` 和 `io.stderr:write` 对父进程不可观察，stdin pipe 也不能作为
   默认输入。
-- **当前工作树：** M0 修复已把默认 handle 连接到宿主 stdin/stdout/stderr，
-  新增进程级 pipe/redirection 测试。本地 `rust_quality_gate.ps1 -SkipAudit`
-  在 M0 收口时已通过 596 个 Debug/Release workspace tests；当时的 129-item
-  manifest、101-case
-  non-official runner 和 4-case 双-oracle differential 均通过基础设施门，
-  其中两条 differential lane 都是 4/4。统一 M0 gate 为 `passed=true`、
+- **当前工作树：** M0 修复已把默认 handle 连接到宿主 stdin/stdout/stderr；M2.16
+  又以集中 byte-oriented host text layer 对齐 Windows CRT 的每个 `LF -> CRLF`
+  合同，包括已有 CRLF、高位/NUL、stdout/stderr 与 `"w"`/`"wb"` 文件差异。
+  文本文件读取执行 CRLF/Ctrl-Z 合同，binary/direct-write 路径保持 raw。fresh
+  workspace 914 项测试、fmt、all-targets Clippy 与完整 M0 gate 均通过；non-official
+  status 从 5/87 改善为 80/12，已声明文件副作用 92/92 一致。双 oracle focused
+  differential 仍是 4/4 × 2，统一 M0 gate 为 `passed=true`、`fullGatePassed=true`、
   `hardFailures=0`。远程 CI 尚待首次运行。
 - **Oracle：** stock Lua 5.1 CLI；`lua_cpp@87c15e6` 的进程级 stdout、
   stderr、stdin 和 exit-status 行为。
-- **测试与任务：** `crates/lua_app/tests/observable_io.rs`；
-  `tests/lua/differential/stderr.lua`；M0.4、M0.5、M2.8、M2.12。
+- **测试与任务：** `host_io` 的 byte translation 单元测试、
+  `crates/lua_app/tests/observable_io.rs` 的 pipe/redirection/text-vs-binary exact-byte
+  子进程测试、`tests/lua/differential/stderr.lua`；M0.4、M0.5、M2.8、M2.12、M2.16。
 - **影响：** 基线版本的 CLI 输出捕获、管道、重定向和 differential 会假绿或
   无输出。
-- **处置状态：** `remediation-verified-local`。本地 process、fixture、
-  双-oracle differential 和统一 M0 gate 已验证；只有远程 CI 首次运行通过
-  且修复合入后，才能改为 `resolved`。
+- **处置状态：** `remediation-verified-local`。宿主流连接、Windows text EOL 与
+  文件副作用、text `seek/tell` 与 `io.popen` 已由本地 process、fixture、双-oracle
+  differential 和统一 M0 gate 验证；CLI 18/18 与 REPL 8/8 合同也已进入 M0。只有远程 CI 首次运行通过
+  且修复合入后，本 NOTE 才能改为 `resolved`。
 
 ### NOTE-005: `package.loadlib` 明确不支持动态库
 
@@ -275,9 +278,11 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   object sweep 前完成 finalizer prepare/resurrection propagation、weak
   reconciliation，并关闭不可达 state 的 open Upvalue/失效 handle generation，
   再通过 Heap/StringPool sweep 全图和 protected callback delivery。
-  但 main state 仍是 external arena slot；任意 Lua 函数在 protected helper
-  内的 Runtime-native/ordinary Upvalue suspension、深链 coroutine fault
-  matrix、IO/module service drain 与公开 allocator callback 合同仍未闭环。
+  main state 现与 coroutine 一样由 StateArena 的 generational slot 独占，
+  Runtime 只保留 `StateHandle`；任意 Lua callback suspension 与深链 coroutine
+  fault matrix 已闭环。Runtime 资源注册表以不成 root 的 `ObjectId + static hook`
+  跟踪 IO handle，在 Lua finalizer 后、state/heap teardown 前显式 flush/close；
+  `package.loadlib` 未实现，当前没有动态 module handle。公开 allocator callback 合同仍开放。
   production barrier、explicit/automatic collection、allocator accounting 和
   生产字符串 Eq/Hash/canonical/scoped access 已由独立 inventory、静态门和
   回归本地闭合。
@@ -297,7 +302,9 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   cleanup 与 MAX-generation 单次退休。IO 回归另覆盖 file/iterator 图的
   mark-only 可达性与全回收、method/`__index`/metatable/environment 故障点、
   early return/panic 临时根归零、foreign/stale mutation rejection，以及从
-  Runtime main stack 出发的 canonical mark-only tracing。
+  Runtime main stack 出发的 canonical mark-only tracing；shutdown 服务回归覆盖
+  Lua `__gc` 失败后的真实文件刷盘、hook panic/error 隔离、前置 fault 零调用重试、
+  registry allocator failure 事务回滚，以及 1000 个无 Lua finalizer 的显式 IO drain。
   VM/app/result 回归还覆盖 result slice mark seed、foreign/panic exact-id 清理、
   callee stack 恢复后的同步发布，以及 CLI `arg` 与 chunk varargs 的进程级
   handoff；目标生产文件直接 `gc.create` 静态命中为 0。
@@ -308,20 +315,23 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
   typed Userdata Drop、reachable/unreachable state、Upvalue
   close-before-handle-invalid、cross-collector/root-gap/phase gates；heap
   contract 已接入 M1 foundation gate。
-  allocator live/peak、service close、Miri/ASan 等仍在
-  M1.4、M1.5、M1.7、M1.8、M1.10、M1.11、M1.13。
+  allocator live/peak、Miri/ASan 与通用 scoped access 等仍在
+  M1.4、M1.5、M1.7、M1.10、M1.11、M1.13。
 - **影响：** 已移除 resume/wrap 递归跨 state 借用和 raw open-Upvalue
   owner 风险，并能声称当前 Rust-owned 对象的 deterministic shutdown
   substrate；当前 production publication、唯一 Heap/service owner、full STW、
-  weak/finalizer/resurrection 与 public collector 切片已关闭，但剩余
-  main-state、allocator/service drain、barrier 与 incremental 风险仍不允许
-  声称完整 Lua lifecycle。
+  weak/finalizer/resurrection、public collector、barrier、incremental 与
+  main-state arena ownership、finalizer→resource→state→heap teardown 切片已关闭，
+  但剩余通用非字符串 scoped access 与公开 allocator 风险仍不允许声称完整 Lua lifecycle。
 - **处置状态：** `open`。temporary state、compiler Proto→Function、
   library/package、IO、VM/app/result publication、字符串 identity/access 与
   唯一 Heap/service owner、全图 collection、weak/finalizer/resurrection、
   public collection、Lua `__gc` close drain 与 sealed debug/protected
-  cross-state Upvalue 子项已关闭；main-state ownership、arbitrary protected
-  suspension、deep-chain fault matrix、service/allocator public contract 与完整
+  cross-state Upvalue、main-state ownership、arbitrary callback suspension、
+  deep-chain fault matrix 与显式 IO resource drain 子项已关闭；通用 scoped-read
+  API 与 stdlib 全面迁移也已落地；stdlib 生产直接访问为零，但 VM dispatch
+  仍有 Function/Proto/Table/Upvalue 共 24 处直接读取，VmContext/StringPool 全量
+  Miri alias 边界也保持开放。scoped access、allocator public contract 与完整
   lifecycle 验收全部完成前保持开放。
 
 ### NOTE-010: Lua 字符串 intern hash 选择固定 C++ 的前向采样

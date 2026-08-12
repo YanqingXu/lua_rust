@@ -136,6 +136,42 @@ fn real_file_direct_write_and_read_preserve_raw_bytes_and_offsets() {
 }
 
 #[test]
+fn regular_text_file_seek_reports_host_physical_offsets_and_preserves_logical_reads() {
+    let path = unique_temp_path("text-seek.txt");
+    let source = format!(
+        r#"
+        local path = {path}
+        local file = assert(io.open(path, "w+"))
+        assert(file:write("A\nB\r\nC"))
+        local at_end = file:seek("cur", 0)
+        local end_minus_three = file:seek("end", -3)
+        local suffix = file:read("*a")
+        assert(file:seek("set", 0) == 0)
+        local all = file:read("*a")
+        assert(file:close())
+        return at_end .. ":" .. end_minus_three .. ":" .. suffix .. ":" .. all
+        "#,
+        path = lua_path_literal(&path),
+    );
+
+    let mut runtime = compile_and_run(&source);
+    let expected = if cfg!(windows) {
+        b"8:5:\nC:A\nB\r\nC".as_slice()
+    } else {
+        b"7:4:\nC:A\nB\r\nC".as_slice()
+    };
+    assert_eq!(returned_bytes(&mut runtime), expected);
+    let physical = std::fs::read(&path).expect("text output file should be readable");
+    let expected_physical = if cfg!(windows) {
+        b"A\r\nB\r\r\nC".as_slice()
+    } else {
+        b"A\nB\r\nC".as_slice()
+    };
+    assert_eq!(physical, expected_physical);
+    std::fs::remove_file(path).expect("text output file should be removable");
+}
+
+#[test]
 fn invalid_utf8_host_path_returns_stable_nil_error_tuple() {
     let runtime = compile_and_run(
         r#"

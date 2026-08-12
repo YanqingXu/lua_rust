@@ -1,8 +1,8 @@
 ---
 status: accepted-design
-implementation_status: implemented-windows-asan-and-combined-lifecycle-slice
+implementation_status: implemented-local-shutdown-resource-drain-slice
 schema_version: 1
-last_updated: 2026-07-30
+last_updated: 2026-08-11
 cpp_oracle: 87c15e69ceb94eb74e28226ccbefb7e196635711
 ---
 
@@ -35,7 +35,7 @@ complete cycle at that safe point.
 The audited implementation now has one owner graph, a shared managed-payload
 ledger, explicit/automatic safe-point collection contracts, and deterministic
 one-shot allocation failure at GC object, StringPool key, publication-root,
-and StateArena-slot checkpoints. Public allocator callbacks and host
+StateArena-slot, and Runtime-resource-registry checkpoints. Public allocator callbacks and host
 usable-size accounting remain outside this slice:
 
 - `GarbageCollector` stores an intrusive raw-pointer list and raw-pointer work
@@ -47,9 +47,9 @@ usable-size accounting remain outside this slice:
   `Heap::Drop`, which destroys objects while its canonical StringPool lives;
 - `clear_all` keeps fixed objects at
   `crates/lua_core/src/gc/collector.rs:169-208`;
-- `StateArena` now owns coroutine `Box<LuaState>` allocations and reconstructs
+- `StateArena` now owns main and coroutine `Box<LuaState>` allocations and reconstructs
   them during removal/shutdown; `Thread` stores and traces a validated
-  `StateHandle`. The main state is still an externally owned arena slot.
+  `StateHandle`. Runtime retains only the distinguished main handle.
   Coroutine resume/wrap now transfer execution through the Runtime activation
   trampoline after releasing the caller state borrow;
 - coroutine/debug lookup is scoped through `with_resolved_state_mut`; open
@@ -475,8 +475,9 @@ protected finalizers and Lua-visible `collectgarbage("collect")` are
 implemented. Explicit incremental collection uses the same fail-closed tracer,
 the checked production mutation contract, and bounded Runtime safe points.
 M1.13 adds managed allocator live/peak/total accounting and a Runtime-only
-automatic checkpoint. General non-string `GcRef::as_ref` migration remains
-broader M1 work.
+automatic checkpoint. Production non-string managed-object reads in stdlib
+and VM dispatch now use scoped collector access; the direct-access inventory
+is zero and guarded by source tests.
 
 ## 5. Root tracing contract
 
@@ -707,7 +708,8 @@ This is a completed local trampoline slice, not completion of Phase B:
 - 1,000-level resume/wrap plus mailbox/owner/response/unwind/shutdown fault
   matrices now lock a peak of one borrowed state slot and zero retained
   activation frames after success or failure;
-- main-state external ownership remains;
+- main-state external ownership was subsequently closed by the arena-owned
+  main-slot implementation described in B.7;
 - raw GC/StringPool backpointers are removed and the activation buffer is a
   canonical Runtime root provider. Lua-visible full STW now runs at released
   state-turn safe points and supports nested collection during finalization;
@@ -790,10 +792,27 @@ resume/wrap, Runtime-native execution during the `xpcall` handler, ordinary
 cross-state Upvalue access in both target and handler phases, error identity,
 `error in error handling`, and 128 nested protected calls. The nested case
 observes 129 rooted protected activations, one borrowed StateArena slot, and
-zero retained activation depth after completion. Other synchronous
-`call_value_with_results` users—metamethod helpers, load readers, comparators,
-and debug hooks—still fail closed on suspension and require typed continuation
-variants rather than storing their Rust `FnOnce` publishers.
+zero retained activation depth after completion. All ordinary stdlib and VM
+callback users subsequently moved to typed Runtime callback-helper activations;
+only the explicitly bounded close-time finalizer drain retains synchronous
+callback execution.
+
+#### B.7 Implemented arena-owned main state
+
+`StateArena` now exclusively owns the main state and every coroutine state.
+`Runtime` retains only the distinguished main `StateHandle`; shared inspection,
+direct execution-part guards, Runtime scheduler turns, canonical root tracing,
+full/incremental collection, and shutdown all validate that same slot. No
+external state attachment/detachment path remains.
+
+The arena tracks coroutine counts separately so public coroutine metrics remain
+stable. Full collection skips the distinguished main slot even if a root-tracer
+defect omitted it. Shutdown preflights all state borrows and invariants, drains
+coroutines in deterministic slot order, then closes and invalidates the main
+slot before destroying Threads and other collector objects. Focused tests cover
+stable identity across Runtime moves, borrowed-slot rejection, transactional
+shutdown-preflight failure and retry, coroutine-before-main drain order, stale
+generation rejection, and allocator/state live-zero close.
 
 ### C. Registry and dump lifetime — M1.6
 
@@ -886,8 +905,8 @@ released state-turn safe point and rejects every reported gap/invalid edge
 before weak reconciliation, sweep, or protected callback delivery.
 Explicit incremental and automatic sweep are enabled only at released Runtime
 safe points and use the checked mutation contract. Automatic cycles run to
-completion at one safe point; broader scoped non-string access remains a
-separate unsafe-reduction task.
+completion at one safe point; scoped non-string access and the VmContext alias
+boundary are closed by D.7.
 
 #### D.2 Implemented temporary-object root foundation (partial)
 
@@ -967,10 +986,9 @@ result publication, and the production string identity/access boundary are
 migrated. Protected-call and top-level result callbacks are unit-returning, so
 collectable results cannot escape the rooted callback as Rust return values.
 The unique Heap, fixed strings, pending-finalizer root seed, Runtime tracer,
-full STW consumer, weak/finalizer/resurrection semantics, and Lua-visible
-explicit full collection are now implemented. Allocation-triggered collection
-remains disabled until broader non-string access, mutation barriers, and
-incremental phase/debt contracts are closed.
+full STW consumer, weak/finalizer/resurrection semantics, Lua-visible explicit
+full collection, mutation barriers, incremental phase/debt, allocation-triggered
+collection, and scoped non-string access are now implemented.
 
 #### D.3 Implemented temporary-state root transaction (local-complete slice)
 
@@ -1003,9 +1021,98 @@ This closes the inventory entry for coroutine state publication. Compiler
 Proto→Function builders, library/package, IO, VM/app, synchronous result
 construction, string identity/scoped access, unique Heap ownership, fixed
 strings, pending-finalizer roots, and Runtime state pre-sweep are now
-migrated. The checked mutation inventory and explicit incremental collector
-and managed allocator accounting are now implemented. Broader non-string
-access remains open.
+migrated. The checked mutation inventory, explicit incremental collector,
+managed allocator accounting, and scoped non-string access are now
+implemented; D.7 records the final VM and dynamic-context boundary.
+
+#### D.4 Generic scoped read and table-library first slice
+
+`LuaState::with_gc_ref<T, R>` is now the safe read-only entry point for a
+non-string managed object during an active state turn. It recovers only the
+collector paired with that exact state's dynamic VM context, then delegates to
+the collector live table for address, process-unique `ObjectId`, and concrete
+tag validation before invoking an HRTB callback. A detached state returns
+`CollectorUnavailable`; foreign and swept handles return `NotLive` without
+touching object memory. The callback result cannot contain the managed borrow.
+The owner/no-context/foreign/stale regression pair also passes Miri in an
+isolated target directory.
+
+The first consumer slice replaces the three direct `GcRef<Table>` reads in
+`table.getn`, `table.maxn`, and `table.concat`. Concat copies `Value` snapshots
+inside the table scope, then performs nested string reads, result allocation,
+and stack publication only after that scope ends. A source guard fixes this
+boundary at zero direct `table_ref.as_ref()` uses.
+
+The production audit distinguishes raw GC handles from unrelated `Option`,
+`Pin`, `NonNull`, arena, test, and collector-internal validated-pointer uses.
+After this slice, `lua_vm` plus `lua_stdlib` contain 60 exact transitional
+direct reads: Table 20, Function 17, Proto 16, Userdata 4, Thread 2, and
+Upvalue 1. This is an intermediate unsafe-reduction checkpoint, not M1.7
+completion. The next bounded batch is Function/Table access in
+base/package/debug, followed by VM dispatch.
+
+#### D.5 Base/package/debug Function and Table slice
+
+The next 16 direct reads are now scoped: six Table plus one Function read in
+base, two Table plus one Function read in package, and two Table plus four
+Function reads in debug. Multi-value operations snapshot owned `Value`s before
+growing the Lua stack. Debug environment-name lookup copies only the canonical
+string handle inside the Table callback, then reads its bytes after the Table
+borrow ends. Package paths that already hold the collector use
+`GarbageCollector::with_ref`; state-turn paths use `LuaState::with_gc_ref`.
+
+A source guard prohibits those three libraries from reintroducing direct
+Function/Table access. The exact production baseline is now 44: Table 10,
+Function 11, Proto 16, Userdata 4, Thread 2, and Upvalue 1. The next slice
+removes the remaining stdlib reads before the VM dispatch migration.
+
+#### D.6 Standard-library direct-access elimination
+
+The remaining 20 stdlib reads are now scoped, including eight Proto, five
+Table, four Userdata, two Thread, and one Function access. Debug operations
+copy source handles, line metadata, active-line sets, or cloned `LocVar`
+records before touching strings or state stacks. Coroutine and debug copy a
+status or `StateHandle` before leaving the Thread scope. Gmatch, os.time, and
+IO iterators similarly snapshot owned values and scalars.
+
+IO no longer reconstructs a mutable Userdata from `GcRef::as_ptr`.
+Read-only Userdata/metatable/payload access uses state-scoped validation at
+each edge; direct-handle mutation uses `GarbageCollector::with_mut`. A guard
+enumerates all twelve `lua_stdlib/src` Rust files and rejects production
+`unsafe ... .as_ref()/.as_mut()` lines. The remaining exact baseline is 24,
+all in VM dispatch: Function 10, Proto 8, Table 5, and Upvalue 1.
+
+Two source guards pass Miri. A full stdlib-lib Miri run reaches an older,
+separate alias boundary first: `with_vm_context_parts` retains closure
+`&mut StringPool` access while `registration::rooted_bytes` reconstructs
+another mutable pool reference from the dynamic context. VM dispatch
+migration must close or redesign this boundary; the failed full run is not
+counted as either a regression in this slice or full Miri evidence. D.7 records
+the subsequent redesign and passing full run.
+
+#### D.7 VM direct-access elimination and VmContext alias closure
+
+The remaining 24 VM dispatch reads are scoped: Function 10, Proto 8, Table 5,
+and Upvalue 1. Instruction/constant metadata, function classification,
+varargs, upvalues, metatables, and diagnostics copy owned handles, `Value`s,
+or scalars inside short `GarbageCollector::{with_ref,with_mut}` callbacks. A
+source guard rejects `.as_ref()` and `.as_mut()` in the execution engine.
+
+`with_vm_context_parts` is removed. `with_vm_context_gc` gives its callback the
+explicit collector while making that collector unavailable through
+`LuaState`'s dynamic service recovery; the disjoint StringPool remains
+available. Ordinary C ABI calls install a narrow nested context derived from
+the current collector reborrow and restore the hidden outer state on return.
+Stdlib registration, package, IO, debug, Runtime-native argument parsing, and
+VM string/table lookup use explicit collector access whenever one is already
+available.
+
+Debug and Release each pass 871 workspace tests. Stable all-targets Clippy and
+warning-free rustdoc pass. Pinned-nightly Miri passes all 23 stdlib library
+tests plus focused ordinary-C-callback reentry and explicit-context
+fail-closed tests. The nightly-only `Atomic::fetch_update` rename warning does
+not affect the stable `-D warnings` gate. This closes the local M1.7 scoped
+access slice; it does not declare all of M1 complete.
 
 ### E. Shutdown substrate — M1.8
 
@@ -1016,10 +1123,10 @@ access remains open.
 - run typed Userdata payload destructors exactly once;
 - add real live/peak counters.
 
-This phase establishes destruction mechanics. M1.8 is not fully complete until
-phase G supplies finalizer drain semantics.
+This phase establishes destruction mechanics. With phase G finalizer delivery
+and the explicit Runtime resource registry below, M1.8 is locally complete.
 
-#### E.1 Implemented shutdown substrate (partial)
+#### E.1 Implemented shutdown and resource-drain substrate
 
 The C++ audit confirmed that `lua_tryclose` first runs `finalizeAll`, then
 destroys the main state; collector teardown subsequently destroys non-fixed
@@ -1030,28 +1137,31 @@ freed. The relevant oracle paths are
 `lua_cpp/src/vm/state/lua_state.cpp:357-374,459-466`, and
 `lua_cpp/src/gc/garbage_collector.cpp:102-118,852-896,933-988`.
 
-The current Rust partial implements the C++-style remaining-finalizer drain,
+The Rust implementation provides the C++-style remaining-finalizer drain,
 including callbacks that allocate more finalizable userdata and error
-isolation. Explicit IO/module service drain still prevents a complete M1.8
-claim; managed allocator live/peak/total and close-time live-zero proof are
-implemented. `Runtime::close` now performs this terminal
+isolation. It then drains Runtime-registered external resources before any
+state or heap allocation is destroyed. Managed allocator live/peak/total and
+close-time live-zero proof include the resource registry. `Runtime::close` now performs this terminal
 order:
 
-1. validate owner thread, zero active executions, the main external arena slot,
-   and every owned arena slot before mutation;
+1. validate owner thread, zero active executions, the distinguished arena-owned
+   main slot, and every coroutine slot before mutation;
 2. prepare and drain all not-yet-finalized Lua userdata, acknowledge each
    callback exactly once, isolate errors, and discover callback allocations;
-3. drain owned coroutine states in deterministic slot order, close only
+3. resolve every weak `ObjectId + drain hook` service registration against the
+   collector live table, isolate hook errors/panics, release registry capacity,
+   and continue even for stale or already-closed resources;
+4. drain arena-owned coroutine states in deterministic slot order, close only
    collector-validated open Upvalues, advance or permanently retire each
    generation without wrap, and drop the state;
-4. close validated main-state Upvalues, detach and advance/retire its external
-   slot, and drop the main Box;
-5. clear Runtime global/registry handles and collector roots;
-6. call `GarbageCollector::destroy_all` with the live StringPool;
-7. destroy non-fixed Threads, other non-fixed objects, and fixed objects in
+5. close validated main-state Upvalues, advance/retire its arena slot, and drop
+   its arena-owned Box;
+6. clear Runtime global/registry handles and collector roots;
+7. call `GarbageCollector::destroy_all` with the live StringPool;
+8. destroy non-fixed Threads, other non-fixed objects, and fixed objects in
    three passes, removing every object from roots, gray, weak, pending
    finalizer, and external queues before concrete Box destruction;
-8. clear the pool and verify state/object/root/string/estimated-byte,
+9. clear the pool and verify state/object/root/string/estimated-byte,
    managed-allocator-live, and work-queue counts are zero before transitioning
    to `Closed`.
 
@@ -1064,10 +1174,11 @@ rejected before mutation.
 
 `RuntimeCloseReport` exposes rejected open-Upvalue edges, checked owner-handle
 mismatches, missing active stack values, attempted/failed Lua finalizers,
-pending entries discarded after the drain, and the remaining unconditional
-capability debt:
-
-- library-specific IO/resource drain hooks are not run.
+pending entries discarded after the drain, and resource attempted/drained/
+already-closed/stale/error counters. The legacy `io_resource_drain_debt` flag
+is now false. `package.loadlib` remains explicitly unsupported, so the current
+package library owns no dynamic-module handle; future native-module support
+must register its resources before publication.
 
 Rust typed Userdata payload destructors still run exactly once during concrete
 Box destruction. Their backing storage is now explicitly 16-byte aligned;
@@ -1079,7 +1190,10 @@ aliasing contract, including the `IoFileData` payload.
 Tests cover all seven concrete GC dispatch layouts, non-fixed Thread-first and
 fixed-last order, ordinary/fixed byte DropProbes, stale Upvalue rejection,
 main/coroutine Upvalue closure, finalizer error/continue, idempotence, Drop
-delegation, zeroed reports, and 1,000 Runtime/coroutine close cycles. The
+delegation, zeroed reports, preflight retry before resource mutation,
+transactional resource-registry allocation failure, hook panic isolation,
+failed Lua IO finalizer followed by explicit flush, 1,000 explicit IO drains,
+and 1,000 Runtime/coroutine close cycles. The
 terminal destruction path never calls `collect`, `sweep`, `clear_all`, or weak
 reconciliation; Runtime drains Lua callbacks before entering that path.
 
@@ -1257,12 +1371,12 @@ requirements:
 - [x] automatic cycles are Runtime-driver-only, keep explicit step-cycle
       ownership separate, and cover stop/restart, weak cleanup, and finalizers.
 
-The remaining risk is broader than this automatic entry: generic non-string
-scoped access, suspension in synchronous callback helpers other than
-`pcall/xpcall`, deferred cross-platform sanitizer execution, public allocator
-callbacks, binary-dump lifecycle, and explicit IO/module service drain still
-gate later production milestones. Deep-chain and named scheduler fault
-boundaries now have local coverage.
+The remaining risk is broader than this automatic entry: close-time finalizer
+Runtime-native/cross-state reentry, deferred cross-platform sanitizer
+execution, public allocator callbacks, and binary-dump lifecycle still gate
+later production milestones. Ordinary
+callback suspension, explicit IO resource drain, deep-chain, and named
+scheduler fault boundaries now have local coverage.
 
 ## 11. Acceptance commands
 

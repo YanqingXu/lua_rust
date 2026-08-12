@@ -11,7 +11,7 @@ use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::table::Table;
 use lua_core::value::Value;
-use lua_vm::execute::call_value_with_results;
+use lua_vm::execute::{request_package_module_option_callbacks, request_package_require_callback};
 use lua_vm::state::LuaState;
 
 const DEFAULT_PATH: &str = "?.lua;?/init.lua";
@@ -69,7 +69,7 @@ pub fn add_script_directory_to_path(
         std::path::MAIN_SEPARATOR
     );
     let current =
-        table_string_field(l, package, "path").unwrap_or_else(|| DEFAULT_PATH.to_string());
+        table_string_field(l, gc, package, "path").unwrap_or_else(|| DEFAULT_PATH.to_string());
     let path = if current.is_empty() {
         prefix
     } else {
@@ -99,7 +99,7 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
     let loaded = ensure_loaded_table(l, gc, package);
     let module_key = Value::String(module_ref);
 
-    let cached = table_get(loaded, &module_key);
+    let cached = table_get(gc, loaded, &module_key);
     if !cached.is_nil() && !matches!(cached, Value::Boolean(false)) {
         l.push_value(cached);
         return 1;
@@ -122,7 +122,7 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
                 Some(name) => name,
                 None => return raise_string(l, "module name must be valid UTF-8"),
             };
-            let (path, source) = match find_module_source(l, package, &module_name) {
+            let (path, source) = match find_module_source(l, gc, package, &module_name) {
                 Ok(found) => found,
                 Err(message) => return raise_string(l, &message),
             };
@@ -137,36 +137,12 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
     };
 
-    let execution = call_value_with_results(
-        l,
-        gc,
-        loader,
-        &[Value::String(module_ref)],
-        None,
-        |l, gc, results| {
+    match request_package_require_callback(l, loader, module_key, loaded) {
+        Ok(()) => 0,
+        Err(err) => {
             if compiled_loader_on_stack {
                 let _ = l.pop();
             }
-            if let Some(result) = results.first()
-                && !result.is_nil()
-            {
-                table_set(l, gc, loaded, &module_key, result);
-            }
-
-            let loaded_value = table_get(loaded, &module_key);
-            if loaded_value.is_nil() {
-                table_set(l, gc, loaded, &module_key, &Value::Boolean(true));
-            }
-
-            l.push_value(table_get(loaded, &module_key));
-        },
-    );
-    if compiled_loader_on_stack && execution.is_err() {
-        let _ = l.pop();
-    }
-    match execution {
-        Ok(()) => 1,
-        Err(err) => {
             push_runtime_error_value(l, gc, &err);
             -1
         }
@@ -199,10 +175,7 @@ unsafe extern "C" fn lua_package_seeall(l_ptr: *mut std::ffi::c_void) -> i32 {
     if let Some(global) = global {
         crate::registration::set_value(l, gc, module_ref, b"_G", &Value::Table(global))
             .expect("module _G publication must remain collector-valid");
-        let mt = {
-            // SAFETY: module_ref is an active argument.
-            unsafe { module_ref.as_ref() }.and_then(|module| module.metatable())
-        };
+        let mt = gc.with_ref(module_ref, Table::metatable).ok().flatten();
         if let Some(mt) = mt {
             crate::registration::set_value(l, gc, mt, b"__index", &Value::Table(global))
                 .expect("module __index publication must remain collector-valid");
@@ -265,21 +238,11 @@ unsafe extern "C" fn lua_package_module(l_ptr: *mut std::ffi::c_void) -> i32 {
     let options: Vec<Value> = (2..=l.get_top())
         .filter_map(|idx| l.at(idx).cloned())
         .collect();
-    for option in options {
-        if !matches!(option, Value::Function(_)) {
-            return raise_string(l, "module option must be a function");
-        }
-        if let Err(err) = call_value_with_results(
-            l,
-            gc,
-            option,
-            &[Value::Table(module_ref)],
-            Some(0),
-            |_, _, _| (),
-        ) {
-            push_runtime_error_value(l, gc, &err);
-            return -1;
-        }
+    if !options.is_empty()
+        && let Err(err) = request_package_module_option_callbacks(l, module_ref, options)
+    {
+        push_runtime_error_value(l, gc, &err);
+        return -1;
     }
 
     0
@@ -287,10 +250,12 @@ unsafe extern "C" fn lua_package_module(l_ptr: *mut std::ffi::c_void) -> i32 {
 
 fn find_module_source(
     l: &LuaState,
+    gc: &GarbageCollector,
     package: GcRef<Table>,
     module_name: &str,
 ) -> Result<(PathBuf, Vec<u8>), String> {
-    let path = table_string_field(l, package, "path").unwrap_or_else(|| DEFAULT_PATH.to_string());
+    let path =
+        table_string_field(l, gc, package, "path").unwrap_or_else(|| DEFAULT_PATH.to_string());
     let module_path = module_path_name(module_name);
     let mut attempted = Vec::new();
 
@@ -334,9 +299,15 @@ fn compile_chunk_function(
     chunk_name: &str,
 ) -> Result<GcRef<Function>, String> {
     let mut parser = Parser::from_bytes(source);
-    let chunk = parser
-        .parse()
-        .map_err(|err| format!("{chunk_name}:{}:{}: {}", err.line, err.column, err.message))?;
+    let chunk = parser.parse().map_err(|err| {
+        format!(
+            "{}:{}:{}: {}",
+            lua_vm::execute::chunk_name_for_diagnostic(chunk_name.as_bytes()),
+            err.line,
+            err.column,
+            err.message
+        )
+    })?;
     let pool_ptr = l
         .active_string_pool_ptr()
         .ok_or_else(|| format!("{chunk_name}: loader unavailable without an active StringPool"))?;
@@ -345,9 +316,12 @@ fn compile_chunk_function(
         // SAFETY: the pool belongs to the dynamically scoped Runtime turn.
         let generator =
             CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr });
-        let proto = generator
-            .generate(&chunk, chunk_name)
-            .map_err(|err| format!("{chunk_name}:{err}"))?;
+        let proto = generator.generate(&chunk, chunk_name).map_err(|err| {
+            format!(
+                "{}:{err}",
+                lua_vm::execute::chunk_name_for_diagnostic(chunk_name.as_bytes())
+            )
+        })?;
         let proto = transaction.alloc(proto);
         let function = transaction
             .alloc_lua_function(&proto)
@@ -369,7 +343,7 @@ fn compile_chunk_function(
 }
 
 fn ensure_package_table(l: &mut LuaState, gc: &mut GarbageCollector) -> GcRef<Table> {
-    if let Some(Value::Table(package)) = global_value(l, "package") {
+    if let Some(Value::Table(package)) = global_value(l, gc, "package") {
         return package;
     }
 
@@ -405,10 +379,7 @@ fn active_package_table(l: &mut LuaState, gc: &mut GarbageCollector) -> GcRef<Ta
 fn current_c_function_env(l: &LuaState) -> Option<GcRef<Table>> {
     let ci = l.current_call_info();
     match l.stack.at(ci.func) {
-        Some(Value::Function(func_ref)) => {
-            // SAFETY: the current call frame keeps its function live.
-            unsafe { func_ref.as_ref() }.and_then(|func| func.env())
-        }
+        Some(Value::Function(func_ref)) => l.with_gc_ref(*func_ref, Function::env).ok().flatten(),
         _ => None,
     }
 }
@@ -425,7 +396,7 @@ fn preload_global_libraries(l: &mut LuaState, gc: &mut GarbageCollector, loaded:
         "coroutine",
         "package",
     ] {
-        if let Some(value) = global_value(l, name)
+        if let Some(value) = global_value(l, gc, name)
             && !value.is_nil()
         {
             crate::registration::set_value(l, gc, loaded, name.as_bytes(), &value)
@@ -464,7 +435,7 @@ fn preload_loader(
     module_key: &Value,
 ) -> Option<Value> {
     let preload = ensure_preload_table(l, gc, package);
-    match table_get(preload, module_key) {
+    match table_get(gc, preload, module_key) {
         loader @ Value::Function(_) => Some(loader),
         _ => None,
     }
@@ -477,7 +448,7 @@ fn module_table(
     module_name: &[u8],
     module_key: &Value,
 ) -> Result<GcRef<Table>, String> {
-    if let Value::Table(module_ref) = table_get(loaded, module_key) {
+    if let Value::Table(module_ref) = table_get(gc, loaded, module_key) {
         ensure_global_module_path(l, gc, module_name, module_ref)?;
         return Ok(module_ref);
     }
@@ -620,27 +591,32 @@ fn set_caller_env(l: &mut LuaState, module_ref: GcRef<Table>) -> bool {
         .is_ok()
 }
 
-fn table_string_field(l: &LuaState, table: GcRef<Table>, key: &str) -> Option<String> {
-    let Value::String(value) = crate::registration::find_table_field(l, table, key.as_bytes())
-        .ok()
-        .flatten()?
+fn table_string_field(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    table: GcRef<Table>,
+    key: &str,
+) -> Option<String> {
+    let Value::String(value) =
+        crate::registration::find_table_field_with_gc(l, gc, table, key.as_bytes())
+            .ok()
+            .flatten()?
     else {
         return None;
     };
-    l.with_string_bytes(value, |bytes| {
+    gc.with_string_bytes(value, |bytes| {
         std::str::from_utf8(bytes).ok().map(str::to_owned)
     })
     .ok()
     .flatten()
 }
 
-fn table_get(table: GcRef<Table>, key: &Value) -> Value {
+fn table_get(gc: &GarbageCollector, table: GcRef<Table>, key: &Value) -> Value {
     if table.is_null() {
         return Value::Nil;
     }
-    // SAFETY: table is reachable from globals/package.loaded during require.
-    unsafe { table.as_ref() }
-        .map(|table| table.get(key))
+    gc.with_ref(table, |table| table.get(key))
+        .ok()
         .unwrap_or(Value::Nil)
 }
 
@@ -670,9 +646,9 @@ fn table_set(
     });
 }
 
-fn global_value(l: &LuaState, name: &str) -> Option<Value> {
+fn global_value(l: &LuaState, gc: &GarbageCollector, name: &str) -> Option<Value> {
     let global = l.global_table?;
-    crate::registration::find_table_field(l, global, name.as_bytes())
+    crate::registration::find_table_field_with_gc(l, gc, global, name.as_bytes())
         .ok()
         .flatten()
 }

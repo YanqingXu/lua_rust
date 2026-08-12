@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
+use lua_core::gc::gc_object::GcObject;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
 use lua_core::proto::Proto;
@@ -20,11 +21,14 @@ use lua_core::value::Value;
 use super::call_info::CallInfo;
 use super::stack::Stack;
 use crate::native::{
-    DebugUpvalueOperation, DebugUpvalueRequest, DeferredNativeCall, DeferredVmContinuation,
-    FullCollectionRequest, FullCollectionResult, NativeRequestId, NativeRequestPublishError,
-    ProtectedCallKind, ProtectedCallRequest, ResumeEnvelope, ResumeRequest, RuntimeRequest,
+    CallbackHelperKind, CallbackHelperRequest, DebugUpvalueOperation, DebugUpvalueRequest,
+    DeferredNativeCall, DeferredVmContinuation, FullCollectionRequest, FullCollectionResult,
+    NativeRequestId, NativeRequestPublishError, ProtectedCallKind, ProtectedCallRequest,
+    ResumeEnvelope, ResumeRequest, RuntimeRequest,
 };
 use crate::runtime::StateArena;
+use crate::trace::SharedInstructionTrace;
+use crate::trace::record_trace_shutdown_upvalue_close;
 use thiserror::Error;
 
 /// 线程执行状态
@@ -161,6 +165,8 @@ pub struct LuaState {
     pub last_error: Option<Value>,
     /// Countdown for lightweight automatic weak-table cleanup.
     pub auto_gc_countdown: i32,
+    /// Runtime-scoped diagnostic instruction stream, when enabled by the host.
+    pub(crate) instruction_trace: Option<SharedInstructionTrace>,
 }
 
 impl LuaState {
@@ -204,6 +210,7 @@ impl LuaState {
             yield_wanted_results: None,
             last_error: None,
             auto_gc_countdown: 0,
+            instruction_trace: None,
         }
     }
 
@@ -267,6 +274,24 @@ impl LuaState {
         unsafe { gc.as_ref() }.with_string_bytes(string, read)
     }
 
+    /// Read one managed object only within the active Runtime collector scope.
+    ///
+    /// Validation checks address, process-unique object identity, and concrete
+    /// type before object memory is touched. The higher-ranked callback keeps
+    /// the managed borrow from escaping or overlapping destructive collection.
+    pub fn with_gc_ref<T: GcObject, R>(
+        &self,
+        reference: GcRef<T>,
+        read: impl for<'a> FnOnce(&'a T) -> R,
+    ) -> Result<R, GcRefValidationError> {
+        let (gc, _) = super::vm_context::active_service_pointers(self)
+            .ok_or(GcRefValidationError::CollectorUnavailable)?;
+        // SAFETY: the dynamically scoped context is installed only while this
+        // exact state and Heap are exclusively active. GarbageCollector then
+        // validates the typed handle before invoking the HRTB callback.
+        unsafe { gc.as_ref() }.with_ref(reference, read)
+    }
+
     /// Copy one live Lua string after collector validation.
     pub fn copy_string_bytes(
         &self,
@@ -298,7 +323,7 @@ impl LuaState {
     /// stored past the current callback.
     #[doc(hidden)]
     pub fn active_gc_ptr(&self) -> Option<*mut GarbageCollector> {
-        super::vm_context::active_service_pointers(self).map(|(collector, _)| collector.as_ptr())
+        super::vm_context::active_collector_pointer(self).map(|pointer| pointer.as_ptr())
     }
 
     /// Return the active canonical StringPool pointer for this state turn.
@@ -307,7 +332,7 @@ impl LuaState {
     /// stored past the current callback.
     #[doc(hidden)]
     pub fn active_string_pool_ptr(&self) -> Option<*mut StringPool> {
-        super::vm_context::active_service_pointers(self).map(|(_, strings)| strings.as_ptr())
+        super::vm_context::active_string_pool_pointer(self).map(|pointer| pointer.as_ptr())
     }
 
     /// 创建带全局表的 Lua 线程
@@ -569,6 +594,7 @@ impl LuaState {
                 report.rejected_open_upvalue_edges += 1;
                 continue;
             }
+            record_trace_shutdown_upvalue_close(self, stack_index);
             report.closed_open_upvalues += 1;
         }
 
@@ -740,6 +766,35 @@ impl LuaState {
         Ok(id)
     }
 
+    pub(crate) fn publish_callback_helper_request(
+        &mut self,
+        kind: CallbackHelperKind,
+        function: Value,
+        args: Vec<Value>,
+    ) -> Result<NativeRequestId, NativeRequestPublishError> {
+        if !self.native_request_scope {
+            return Err(NativeRequestPublishError::ScopeUnavailable);
+        }
+        if self.pending_native_request.is_some() {
+            return Err(NativeRequestPublishError::MailboxOccupied);
+        }
+        let id = NativeRequestId::new(self.next_native_request_id);
+        self.next_native_request_id = self
+            .next_native_request_id
+            .checked_add(1)
+            .ok_or(NativeRequestPublishError::IdExhausted)?;
+        self.pending_native_request = Some(RuntimeRequest::CallbackHelper(Box::new(
+            CallbackHelperRequest {
+                id,
+                kind,
+                function,
+                args,
+                deferred: None,
+            },
+        )));
+        Ok(id)
+    }
+
     pub(crate) fn pending_native_request_id(&self) -> Option<NativeRequestId> {
         self.pending_native_request.as_ref().map(RuntimeRequest::id)
     }
@@ -763,7 +818,7 @@ impl LuaState {
         if self
             .pending_native_request
             .as_ref()
-            .is_some_and(|request| request.id() == id && request.deferred().is_some())
+            .is_some_and(|request| request.id() == id && request.is_ready_for_runtime())
         {
             self.pending_native_request.take()
         } else {
@@ -825,7 +880,7 @@ impl LuaState {
                 request.protected = true;
                 request.deferred = None;
             }
-            RuntimeRequest::ProtectedCall(_) => return false,
+            RuntimeRequest::ProtectedCall(_) | RuntimeRequest::CallbackHelper(_) => return false,
         }
         true
     }
@@ -855,6 +910,8 @@ impl Default for LuaState {
 
 #[cfg(test)]
 mod tests {
+    use lua_core::heap::Heap;
+
     use super::*;
 
     fn test_deferred_call(state: &LuaState, request_id: NativeRequestId) -> DeferredNativeCall {
@@ -900,6 +957,58 @@ mod tests {
         assert_eq!(ls.current_call_info().func, 10);
         ls.pop_call_info();
         assert_eq!(ls.current_call_info().func, 0);
+    }
+
+    #[test]
+    fn scoped_gc_ref_requires_the_active_owner_collector() {
+        let mut state = LuaState::new();
+        let mut owner = Heap::new();
+        let table = owner.collector_mut().create(Table::new());
+
+        assert_eq!(
+            state.with_gc_ref(table, Table::length),
+            Err(GcRefValidationError::CollectorUnavailable)
+        );
+
+        owner.with_parts_mut(|collector, strings| {
+            let length = crate::with_vm_context(&mut state, collector, strings, |state| {
+                state.with_gc_ref(table, Table::length)
+            });
+            assert_eq!(length, Ok(0));
+        });
+
+        let mut foreign = Heap::new();
+        foreign.with_parts_mut(|collector, strings| {
+            let rejected = crate::with_vm_context(&mut state, collector, strings, |state| {
+                state.with_gc_ref(table, Table::length)
+            });
+            assert_eq!(
+                rejected,
+                Err(GcRefValidationError::NotLive {
+                    object_id: table.object_id()
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn scoped_gc_ref_rejects_a_swept_handle_before_dereference() {
+        let mut state = LuaState::new();
+        let mut heap = Heap::new();
+        let table = heap.collector_mut().create(Table::new());
+
+        heap.with_parts_mut(|collector, strings| {
+            assert_eq!(collector.sweep(strings), 1);
+            let rejected = crate::with_vm_context(&mut state, collector, strings, |state| {
+                state.with_gc_ref(table, Table::length)
+            });
+            assert_eq!(
+                rejected,
+                Err(GcRefValidationError::NotLive {
+                    object_id: table.object_id()
+                })
+            );
+        });
     }
 
     #[test]

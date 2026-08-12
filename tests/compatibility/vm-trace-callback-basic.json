@@ -1,0 +1,6 @@
+{
+  "files": [
+    "callback_barrier_debug_hook.lua",
+    "callback_barrier_metamethod.lua"
+  ]
+}

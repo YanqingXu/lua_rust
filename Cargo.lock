@@ -16,6 +16,7 @@ dependencies = [
  "lua_core",
  "lua_stdlib",
  "lua_vm",
+ "serde_json",
  "thiserror",
 ]
 

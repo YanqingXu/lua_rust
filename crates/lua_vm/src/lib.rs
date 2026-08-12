@@ -15,6 +15,7 @@ pub mod execute;
 mod native;
 pub mod runtime;
 pub mod state;
+mod trace;
 
 pub use execute::{
     ExecResult, RuntimeError, VmExit, execute_proto, resume_lua_thread, start_lua_call_at_stack,
@@ -23,8 +24,10 @@ pub use native::{NativeRequestId, UpvalueAccessOperation, UpvalueAccessRequest};
 pub use runtime::{
     PendingState, PendingStateError, Runtime, RuntimeAccessError, RuntimeActivationStats,
     RuntimeCloseReport, RuntimeExecutionError, RuntimeFaultSite, RuntimeId, RuntimeIdExhausted,
-    RuntimePartsMut, RuntimePhase, StateArena, StateHandle, StateResolveError,
+    RuntimePartsMut, RuntimePhase, RuntimeResourceDrainHook, RuntimeResourceDrainOutcome,
+    StateArena, StateHandle, StateResolveError,
 };
 pub use state::{
-    CallInfo, LUA_MULTRET, LuaState, Stack, ThreadStatus, with_vm_context, with_vm_context_parts,
+    CallInfo, LUA_MULTRET, LuaState, Stack, ThreadStatus, with_vm_context, with_vm_context_gc,
 };
+pub use trace::{InstructionTraceError, InstructionTraceMode, InstructionTraceSummary};

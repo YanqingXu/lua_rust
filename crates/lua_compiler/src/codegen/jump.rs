@@ -143,8 +143,8 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         let offset = dest - (pc + 1);
         // 跳转偏移范围检查
         if !(-MAXARG_SBX..=MAXARG_SBX).contains(&offset) {
-            // TODO: emit proper CodegenError instead of panic
-            panic!("control structure too long");
+            self.record_codegen_error("control structure too long");
+            return;
         }
         opcode::set_arg_sbx(&mut jump, offset);
         self.builder.replace_instruction(pc, jump);

@@ -56,3 +56,36 @@ fn json_cli_emits_recursive_byte_evidence() {
         "6361707475726564"
     );
 }
+
+#[test]
+fn syntax_errors_return_a_nonzero_process_status() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after the Unix epoch")
+        .as_nanos();
+    let input = std::env::temp_dir().join(format!(
+        "lua-bytecode-invalid-{}-{nonce}.lua",
+        std::process::id()
+    ));
+    fs::write(&input, b"local unfinished =")
+        .expect("temporary invalid Lua source should be writable");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lua_bytecode"))
+        .arg(&input)
+        .arg("--format=json")
+        .output()
+        .expect("lua_bytecode should start");
+    fs::remove_file(&input).expect("temporary Lua source should be removable");
+
+    assert!(!output.status.success(), "syntax errors must fail closed");
+    assert!(
+        output.stdout.is_empty(),
+        "syntax errors must not emit partial bytecode JSON: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unexpected symbol"),
+        "syntax error should be reported on stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

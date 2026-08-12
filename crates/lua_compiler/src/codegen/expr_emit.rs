@@ -17,6 +17,59 @@ use crate::opcode::{self, LFIELDS_PER_FLUSH, MAXARG_C, MAXINDEXRK, OpCode};
 
 use crate::opcode::rk_ask;
 
+fn literal_truthiness(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Nil(_) => Some(false),
+        Expr::Boolean(boolean) => Some(boolean.value),
+        Expr::Number(_) | Expr::String(_) => Some(true),
+        Expr::Paren(paren) => literal_truthiness(&paren.expression),
+        _ => None,
+    }
+}
+
+fn produces_boolean(expr: &Expr) -> bool {
+    match expr {
+        Expr::Boolean(_) => true,
+        Expr::Paren(paren) => produces_boolean(&paren.expression),
+        Expr::Unary(unary) => unary.op == UnaryOp::Not,
+        Expr::Binary(binary) => match binary.op {
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => true,
+            BinaryOp::And | BinaryOp::Or => {
+                produces_boolean(&binary.left) && produces_boolean(&binary.right)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn owned_register(value: &ValueResult) -> Option<i32> {
+    match value {
+        ValueResult::RegisterRef {
+            reg,
+            owns_register: true,
+            ..
+        } => Some(*reg),
+        _ => None,
+    }
+}
+
+fn collect_concat_operands<'a>(expr: &'a Expr, operands: &mut Vec<&'a Expr>) {
+    if let Expr::Binary(binary) = expr
+        && binary.op == BinaryOp::Concat
+    {
+        collect_concat_operands(&binary.left, operands);
+        collect_concat_operands(&binary.right, operands);
+    } else {
+        operands.push(expr);
+    }
+}
+
 impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // ═══════════════════════════════════════════════════════════════
     // 公开入口
@@ -25,7 +78,9 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     /// 发射表达式右值
     ///
     pub fn emit_value(&mut self, expr: &Expr) -> ValueResult {
-        match expr {
+        let saved_line = self.current_line;
+        self.current_line = expr.line();
+        let result = match expr {
             Expr::Nil(_) => ValueResult::make_nil(),
             Expr::Boolean(b) => ValueResult::make_boolean(b.value),
             Expr::Number(n) => ValueResult::make_number(n.value),
@@ -59,15 +114,36 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
             Expr::Paren(p) => {
                 let mut inner = self.emit_value(&p.expression);
                 inner = self.force_single_value(inner);
-                let reg = self.value_to_any_reg(inner);
-                ValueResult::make_register(reg, true, AccessKind::None)
+                if matches!(
+                    inner,
+                    ValueResult::Immediate { .. } | ValueResult::ConstantRef { .. }
+                ) {
+                    inner
+                } else {
+                    let reg = self.value_to_any_reg(inner);
+                    ValueResult::make_register(reg, true, AccessKind::None)
+                }
             }
-        }
+        };
+        self.current_line = saved_line;
+        result
     }
 
     /// 发射条件结果
     ///
     pub fn emit_cond_result(&mut self, expr: &Expr) -> CondResult {
+        let saved_line = self.current_line;
+        self.current_line = expr.line();
+        let result = self.emit_cond_result_inner(expr);
+        self.current_line = saved_line;
+        result
+    }
+
+    fn emit_cond_result_inner(&mut self, expr: &Expr) -> CondResult {
+        if let Expr::Paren(paren) = expr {
+            return self.emit_cond_result(&paren.expression);
+        }
+
         // 短路求值: and/or
         if let Expr::Binary(b) = expr {
             match b.op {
@@ -139,6 +215,18 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
     /// 条件"真路径"结果（用于 and/or 短路求值的右侧）
     fn emit_cond_result_true(&mut self, expr: &Expr) -> CondResult {
+        let saved_line = self.current_line;
+        self.current_line = expr.line();
+        let result = self.emit_cond_result_true_inner(expr);
+        self.current_line = saved_line;
+        result
+    }
+
+    fn emit_cond_result_true_inner(&mut self, expr: &Expr) -> CondResult {
+        if let Expr::Paren(paren) = expr {
+            return self.emit_cond_result_true(&paren.expression);
+        }
+
         if let Expr::Binary(b) = expr {
             match b.op {
                 BinaryOp::And => {
@@ -300,13 +388,20 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     pub fn value_to_rk(&mut self, val: ValueResult) -> i32 {
         match &val {
             ValueResult::Immediate {
-                kind, number_value, ..
+                kind,
+                boolean_value,
+                number_value,
             } => {
-                if *kind == ImmediateKind::Number {
-                    let k = self.builder.add_number_constant(*number_value);
-                    if k <= MAXINDEXRK {
-                        return rk_ask(k);
-                    }
+                let constant = match kind {
+                    ImmediateKind::Number => Some(self.builder.add_number_constant(*number_value)),
+                    ImmediateKind::Boolean => Some(self.builder.add_bool_constant(*boolean_value)),
+                    ImmediateKind::Nil => Some(self.builder.add_nil_constant()),
+                    ImmediateKind::None => None,
+                };
+                if let Some(constant) = constant
+                    && constant <= MAXINDEXRK
+                {
+                    return rk_ask(constant);
                 }
             }
             ValueResult::ConstantRef { const_index } if *const_index <= MAXINDEXRK => {
@@ -389,10 +484,37 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
         // And/Or 短路求值
         if op == BinaryOp::And || op == BinaryOp::Or {
+            if produces_boolean(&e.left) && produces_boolean(&e.right) {
+                let cond = if op == BinaryOp::And {
+                    let left = self.emit_cond_result(&e.left);
+                    let right = self.emit_cond_result_true(&e.right);
+                    self.patch_list_to_here(&left.false_list);
+                    CondResult {
+                        true_list: right.true_list,
+                        ..Default::default()
+                    }
+                } else {
+                    let left = self.emit_cond_result_true(&e.left);
+                    let right = self.emit_cond_result_true(&e.right);
+                    CondResult {
+                        true_list: PatchList::merge(left.true_list, &right.true_list),
+                        ..Default::default()
+                    }
+                };
+                let result_reg = self.reg_alloc.alloc();
+                self.materialize_cond_result(&cond, result_reg, false);
+                return ValueResult::make_register(result_reg, true, AccessKind::None);
+            }
+
             let left = self.emit_value(&e.left);
             let left = self.force_single_value(left);
-            let result_reg = self.reg_alloc.alloc();
-            self.materialize_value(left, result_reg);
+            let result_reg = if let Some(reg) = owned_register(&left) {
+                reg
+            } else {
+                let reg = self.reg_alloc.alloc();
+                self.materialize_value(left, reg);
+                reg
+            };
             let test_cond = if op == BinaryOp::And { 0 } else { 1 };
             self.code_abc(OpCode::TEST, result_reg, 0, test_cond, self.current_line);
             let skip_right = self.code_as_bx(OpCode::JMP, 0, NO_JUMP, self.current_line);
@@ -405,6 +527,29 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
         // Concat
         if op == BinaryOp::Concat {
+            let mut operands = Vec::new();
+            collect_concat_operands(&e.left, &mut operands);
+            collect_concat_operands(&e.right, &mut operands);
+            if operands.len() > 2 {
+                let target = self.reg_alloc.current();
+                let operand_count = operands.len() as i32;
+                self.reg_alloc.reserve(operand_count);
+                for (index, operand) in operands.into_iter().enumerate() {
+                    let value = self.emit_value(operand);
+                    let value = self.force_single_value(value);
+                    self.materialize_value(value, target + index as i32);
+                }
+                self.code_abc(
+                    OpCode::CONCAT,
+                    target,
+                    target,
+                    target + operand_count - 1,
+                    self.current_line,
+                );
+                self.reg_alloc.set_freereg(target + 1);
+                return ValueResult::make_register(target, true, AccessKind::None);
+            }
+
             let left = self.emit_value(&e.left);
             let left = self.force_single_value(left);
             let left_reg = self.value_to_any_reg(left);
@@ -447,27 +592,36 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         };
 
         let left = self.emit_value(&e.left);
-        let right = self.emit_value(&e.right);
+        let left_number = match &left {
+            ValueResult::Immediate {
+                kind: ImmediateKind::Number,
+                number_value,
+                ..
+            } => Some(*number_value),
+            _ => None,
+        };
+        let fixed_left = if left_number.is_none() {
+            Some(self.value_to_rk(left.clone()))
+        } else {
+            None
+        };
 
-        // 尝试常量折叠
-        if let (
+        let right = self.emit_value(&e.right);
+        let right_number = match &right {
             ValueResult::Immediate {
                 kind: ImmediateKind::Number,
-                number_value: ln,
+                number_value,
                 ..
-            },
-            ValueResult::Immediate {
-                kind: ImmediateKind::Number,
-                number_value: rn,
-                ..
-            },
-        ) = (&left, &right)
-            && let Some(folded) = Self::fold_arithmetic(op, *ln, *rn)
+            } => Some(*number_value),
+            _ => None,
+        };
+        if let (Some(left), Some(right)) = (left_number, right_number)
+            && let Some(folded) = Self::fold_arithmetic(op, left, right)
         {
             return ValueResult::make_number(folded);
         }
 
-        let rk_left = self.value_to_rk(left);
+        let rk_left = fixed_left.unwrap_or_else(|| self.value_to_rk(left));
         let rk_right = self.value_to_rk(right);
 
         if rk_left > rk_right {
@@ -478,9 +632,8 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
             self.free_reg(rk_left);
         }
 
-        let result_reg = self.reg_alloc.alloc();
-        self.code_abc(arith_op, result_reg, rk_left, rk_right, self.current_line);
-        ValueResult::make_register(result_reg, true, AccessKind::None)
+        let pc = self.code_abc(arith_op, 0, rk_left, rk_right, self.current_line);
+        ValueResult::make_relocatable(pc)
     }
 
     /// 常量算术折叠
@@ -514,6 +667,13 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     fn emit_value_unary(&mut self, e: &UnaryExpr) -> ValueResult {
         match e.op {
             UnaryOp::Not => {
+                if let Expr::Unary(inner_not) = e.operand.as_ref()
+                    && inner_not.op == UnaryOp::Not
+                    && let Some(folded) = literal_truthiness(&inner_not.operand)
+                {
+                    return ValueResult::make_boolean(folded);
+                }
+
                 let cond = CondResult {
                     true_list: self.emit_cond_result(&e.operand).false_list,
                     ..Default::default()
@@ -586,7 +746,6 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
                 pending_array += 1;
 
                 let target_reg = table_reg + pending_array;
-                self.reg_alloc.ensure_at_least(target_reg + 1);
 
                 let is_last_field = field_index + 1 == table.fields.len();
                 if is_last_field && let Expr::Call(call) = field.value.as_ref() {
@@ -596,6 +755,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
                     self.emit_setlist(table_reg, 0, block);
                     self.reg_alloc.set_freereg(table_reg + 1);
                     pending_array = 0;
+                    array_count -= 1;
                     continue;
                 }
 
@@ -607,13 +767,14 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
                     self.emit_setlist(table_reg, 0, block);
                     self.reg_alloc.set_freereg(table_reg + 1);
                     pending_array = 0;
+                    array_count -= 1;
                     continue;
                 }
 
                 let value = self.emit_value(&field.value);
                 let value = self.force_single_value(value);
                 self.materialize_value(value, target_reg);
-                self.reg_alloc.ensure_at_least(target_reg + 1);
+                self.reg_alloc.set_freereg(target_reg + 1);
 
                 if pending_array == LFIELDS_PER_FLUSH {
                     let block = (array_count - 1) / LFIELDS_PER_FLUSH + 1;
@@ -680,15 +841,19 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         } else {
             linedefined
         };
-        let function = self
-            .compile_function(
-                &e.params,
-                e.is_vararg,
-                &e.body,
-                linedefined,
-                lastlinedefined.max(linedefined),
-            )
-            .expect("function expression compilation should succeed");
+        let function = match self.compile_function(
+            &e.params,
+            e.is_vararg,
+            &e.body,
+            linedefined,
+            lastlinedefined.max(linedefined),
+        ) {
+            Ok(function) => function,
+            Err(message) => {
+                self.record_codegen_error(message);
+                return ValueResult::make_nil();
+            }
+        };
         let reg = self.reg_alloc.alloc();
         self.code_abx(
             OpCode::CLOSURE,
@@ -704,10 +869,26 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // 调用表达式
     // ═══════════════════════════════════════════════════════════════
 
-    pub fn emit_call_expr(&mut self, e: &CallExpr, _target_base: i32) -> CallResultInfo {
-        let (base, first_arg_reg, implicit_args) = if e.is_method_call {
+    pub fn emit_call_expr(&mut self, e: &CallExpr, target_base: i32) -> CallResultInfo {
+        let saved_line = self.current_line;
+        self.current_line = e.location.line;
+        let mut has_implicit_self = false;
+        let mut func_base_is_disposable = false;
+        let mut base;
+
+        if e.is_method_call {
             let Expr::Member(member) = e.func.as_ref() else {
-                panic!("method call must use a member expression as callee");
+                self.record_codegen_error("Method call must have MemberExpr as func");
+                let base = self.reg_alloc.alloc();
+                self.code_abc(OpCode::LOADNIL, base, base, 0, self.current_line);
+                let call_pc = self.code_abc(OpCode::CALL, base, 1, 2, self.current_line);
+                self.current_line = saved_line;
+                return CallResultInfo {
+                    kind: CallResultKind::Call,
+                    base_reg: base,
+                    instruction_pc: call_pc,
+                    open_multi_ret: false,
+                };
             };
             let obj = self.emit_value(&member.table);
             let obj_reg = self.value_to_any_reg(obj);
@@ -716,46 +897,39 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
                 .add_string_constant(&member.member)
                 .unwrap_or_else(|| self.builder.add_number_constant(0.0));
             let rk_key = if method_key <= MAXINDEXRK {
+                self.free_reg(obj_reg);
                 rk_ask(method_key)
             } else {
                 self.value_to_any_reg(ValueResult::make_constant(method_key))
             };
 
-            let base = if _target_base >= 0 {
-                _target_base
-            } else {
-                self.reg_alloc.current()
-            };
+            base = self.reg_alloc.current();
             self.reg_alloc.ensure_at_least(base + 2);
             self.code_abc(OpCode::SELF, base, obj_reg, rk_key, self.current_line);
-            (base, base + 2, 1)
+            has_implicit_self = true;
         } else {
             let func_val = self.emit_value(&e.func);
-            let base = if _target_base >= 0 {
-                self.materialize_value(func_val, _target_base);
-                self.reg_alloc.ensure_at_least(_target_base + 1);
-                _target_base
-            } else {
-                match &func_val {
-                    ValueResult::RegisterRef {
-                        reg,
-                        owns_register: true,
-                        ..
-                    } if *reg >= self.active_var_count && *reg == self.reg_alloc.current() - 1 => {
-                        *reg
-                    }
-                    _ => {
-                        let base = self.reg_alloc.current();
-                        self.materialize_value(func_val, base);
-                        self.reg_alloc.ensure_at_least(base + 1);
-                        base
-                    }
-                }
+            func_base_is_disposable = match &func_val {
+                ValueResult::RegisterRef { owns_register, .. } => *owns_register,
+                _ => true,
             };
-            (base, base + 1, 0)
-        };
+            base = self.value_to_any_reg(func_val);
+            func_base_is_disposable &= base == self.reg_alloc.current() - 1;
+        }
 
         let saved_free_reg = self.reg_alloc.current();
+        let base_count = if has_implicit_self { 2 } else { 1 };
+        if target_base >= 0 {
+            self.move_reg_range(target_base, base, base_count);
+            base = target_base;
+        } else if base < saved_free_reg && (has_implicit_self || !func_base_is_disposable) {
+            let new_base = saved_free_reg;
+            self.move_reg_range(new_base, base, base_count);
+            base = new_base;
+        }
+
+        let first_arg_reg = base + base_count;
+        let implicit_args = i32::from(has_implicit_self);
         self.reg_alloc.set_freereg(first_arg_reg);
         let _ = self
             .reg_alloc
@@ -792,12 +966,14 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
         self.reg_alloc.set_freereg(saved_free_reg.max(base + 1));
 
-        CallResultInfo {
+        let result = CallResultInfo {
             kind: CallResultKind::Call,
             base_reg: base,
             instruction_pc: call_pc,
             open_multi_ret: false,
-        }
+        };
+        self.current_line = saved_line;
+        result
     }
 
     /// Vararg 表达式
@@ -987,6 +1163,34 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
     fn free_reg(&mut self, reg: i32) {
         self.reg_alloc.free_reg(reg, self.active_var_count);
+    }
+
+    pub(crate) fn move_reg_range(&mut self, dst: i32, src: i32, count: i32) {
+        if count <= 0 || dst == src {
+            return;
+        }
+
+        if dst < src {
+            for offset in 0..count {
+                self.code_abc(
+                    OpCode::MOVE,
+                    dst + offset,
+                    src + offset,
+                    0,
+                    self.current_line,
+                );
+            }
+        } else {
+            for offset in (0..count).rev() {
+                self.code_abc(
+                    OpCode::MOVE,
+                    dst + offset,
+                    src + offset,
+                    0,
+                    self.current_line,
+                );
+            }
+        }
     }
 }
 

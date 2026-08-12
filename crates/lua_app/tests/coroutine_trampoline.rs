@@ -8,6 +8,14 @@ fn run_lua(args: &[&str]) -> std::process::Output {
         .expect("lua_app should start")
 }
 
+fn host_text(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_string()
+    }
+}
+
 #[test]
 fn normal_ancestor_reentry_matches_the_fixed_cpp_oracle() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,7 +30,7 @@ fn normal_ancestor_reentry_matches_the_fixed_cpp_oracle() {
     assert!(output.stderr.is_empty(), "{output:?}");
     assert_eq!(
         String::from_utf8(output.stdout).expect("oracle output is UTF-8"),
-        concat!(
+        host_text(concat!(
             "1\tmain:before\tsuspended\tsuspended\t-\t-\n",
             "2\tA:enter\tfrom-main\trunning\tsuspended\t-\n",
             "3\tB:enter\tfrom-A\tnormal\trunning\t-\n",
@@ -30,7 +38,7 @@ fn normal_ancestor_reentry_matches_the_fixed_cpp_oracle() {
             "5\tB:after-A\ttrue\tA-done\tdead\trunning\n",
             "6\tA:after-B\tnil\tnil\trunning\tdead\n",
             "7\tmain:after-A\tfalse\t<resume-error>\tdead\tdead\n",
-        )
+        ))
     );
 }
 
@@ -101,7 +109,7 @@ fn closure_can_read_and_write_an_open_upvalue_owned_by_a_suspended_coroutine() {
     assert!(output.stderr.is_empty(), "{output:?}");
     assert_eq!(
         String::from_utf8(output.stdout).expect("test output is UTF-8"),
-        "true\t15\ntrue\t15\n"
+        host_text("true\t15\ntrue\t15\n")
     );
 }
 
@@ -160,9 +168,71 @@ fn three_level_normal_ancestor_with_open_upvalue_matches_cpp_oracle() {
     assert!(output.stderr.is_empty(), "{output:?}");
     assert_eq!(
         String::from_utf8(output.stdout).expect("oracle output is UTF-8"),
-        concat!(
+        host_text(concat!(
             "false\t<resume-error>\ttrue\t76\t",
             "Ae1;Be3;Ce6;Aa16:from-main:from-C:nil;\n"
-        )
+        ))
     );
+}
+
+#[test]
+fn failed_coroutine_retains_traceback_frames_and_open_upvalue_owner() {
+    let output = run_lua(&[
+        "-e",
+        concat!(
+            "local saved; ",
+            "local function outer() ",
+            "  local value=41; ",
+            "  local function inner() ",
+            "    saved=function() return value end; error('boom') ",
+            "  end; ",
+            "  inner() ",
+            "end; ",
+            "local co=coroutine.create(outer); ",
+            "local ok=coroutine.resume(co); ",
+            "print(ok, coroutine.status(co), saved()); ",
+            "print(debug.traceback(co))"
+        ),
+    ]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("test output is UTF-8");
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.first().copied(), Some("false\tdead\t41"));
+    assert!(lines.contains(&"stack traceback:"), "{stdout}");
+    assert!(stdout.contains("[C]: in function 'error'"), "{stdout}");
+    assert!(
+        lines
+            .iter()
+            .filter(|line| line.contains("(command line):1: in function"))
+            .count()
+            >= 2,
+        "failed coroutine lost one or more Lua frames: {stdout}"
+    );
+}
+
+#[test]
+fn protected_error_unwinds_only_its_callback_frames() {
+    let output = run_lua(&[
+        "-e",
+        concat!(
+            "local saved; ",
+            "local co=coroutine.create(function() ",
+            "  local caught=pcall(function() ",
+            "    local value=9; saved=function() return value end; error('caught') ",
+            "  end); ",
+            "  coroutine.yield(caught, saved()) ",
+            "end); ",
+            "local ok,caught,value=coroutine.resume(co); ",
+            "print(ok,caught,value); print(debug.traceback(co))"
+        ),
+    ]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("test output is UTF-8");
+    assert_eq!(stdout.lines().next(), Some("true\tfalse\t9"));
+    assert!(stdout.contains("[C]: in function 'yield'"), "{stdout}");
+    assert!(!stdout.contains("in function 'error'"), "{stdout}");
 }

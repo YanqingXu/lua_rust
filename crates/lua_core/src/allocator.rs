@@ -41,6 +41,8 @@ pub enum AllocationSite {
     PublicationRoot,
     /// One new StateArena slot for a LuaState.
     StateArenaSlot,
+    /// Capacity for one Runtime-owned external-resource drain registration.
+    RuntimeResourceRegistry,
 }
 
 impl fmt::Display for AllocationSite {
@@ -50,6 +52,7 @@ impl fmt::Display for AllocationSite {
             Self::StringPoolKey => "string-pool-key",
             Self::PublicationRoot => "publication-root",
             Self::StateArenaSlot => "state-arena-slot",
+            Self::RuntimeResourceRegistry => "runtime-resource-registry",
         })
     }
 }

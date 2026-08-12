@@ -100,6 +100,17 @@ fn lua_path_literal(path: &Path) -> String {
     format!("\"{}\"", path.replace('"', "\\\""))
 }
 
+fn lua_string_literal(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    )
+}
+
 fn alien_signals_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -209,6 +220,109 @@ fn io_tmpfile_supports_memory_file_workflow() {
 }
 
 #[test]
+fn io_popen_read_mode_round_trips_output_and_closes_successfully() {
+    let (runtime, _) = compile_and_run(
+        r#"
+        local pipe = assert(io.popen("echo popen-read", "r"))
+        local output = assert(pipe:read("*a"))
+        assert(pipe:close())
+        return output
+        "#,
+    );
+
+    assert_eq!(returned_bytes(&runtime), b"popen-read\n");
+}
+
+#[test]
+fn io_popen_write_mode_flushes_input_before_waiting_for_child() {
+    let path = write_temp_lua_file("popen-write-output", "");
+    let command = if cfg!(windows) {
+        format!("more > {}", path.to_string_lossy())
+    } else {
+        format!("cat > {}", path.to_string_lossy())
+    };
+    let source = format!(
+        r#"
+        local pipe = assert(io.popen({}, "w"))
+        assert(pipe:write("A\nB"))
+        assert(pipe:close())
+        return 1
+        "#,
+        lua_string_literal(&command),
+    );
+
+    let (runtime, _) = compile_and_run(&source);
+    assert_eq!(return_value(&runtime), Value::Number(1.0));
+    let output = std::fs::read(&path).expect("pipe child should create its output file");
+    let expected = if cfg!(windows) {
+        b"A\r\nB\r\n".as_slice()
+    } else {
+        b"A\nB".as_slice()
+    };
+    assert_eq!(output, expected);
+    std::fs::remove_file(path).expect("pipe output file should be removable");
+}
+
+#[test]
+fn io_popen_nonzero_exit_returns_lua_io_error_tuple() {
+    let command = if cfg!(windows) {
+        "cmd /C exit 7"
+    } else {
+        "exit 7"
+    };
+    let source = format!(
+        r#"
+        local pipe = assert(io.popen({}, "r"))
+        local ok, message, code = pipe:close()
+        assert(ok == nil and type(message) == "string" and code == 0)
+        return message
+        "#,
+        lua_string_literal(command),
+    );
+
+    let (runtime, _) = compile_and_run(&source);
+    assert_eq!(
+        returned_string(&runtime),
+        if cfg!(windows) { "No error" } else { "Success" }
+    );
+}
+
+#[test]
+fn runtime_close_drains_unclosed_write_pipe() {
+    let path = write_temp_lua_file("popen-runtime-close", "");
+    let command = if cfg!(windows) {
+        format!("more > {}", path.to_string_lossy())
+    } else {
+        format!("cat > {}", path.to_string_lossy())
+    };
+    let source = format!(
+        r#"
+        local pipe = assert(io.popen({}, "w"))
+        assert(pipe:write("runtime-close\n"))
+        pipe = nil
+        return 1
+        "#,
+        lua_string_literal(&command),
+    );
+
+    let (mut runtime, _) = compile_and_run(&source);
+    let report = runtime
+        .close()
+        .expect("Runtime close should drain pipe resources");
+    assert!(report.runtime_resources_drained + report.runtime_resources_already_closed >= 4);
+    assert_eq!(report.runtime_resource_drain_errors, 0);
+    assert!(!report.io_resource_drain_debt);
+    let output = std::fs::read(&path).expect("drained pipe should publish child output");
+    let expected = if cfg!(windows) {
+        b"runtime-close\r\n\r\n".as_slice()
+    } else {
+        b"runtime-close\n".as_slice()
+    };
+    assert_eq!(output, expected);
+    std::fs::remove_file(path).expect("pipe output file should be removable");
+}
+
+#[test]
 fn io_file_handles_lines_and_os_file_helpers_work() {
     let path = write_temp_lua_file("io_file", "");
     let mut other = path.clone();
@@ -224,6 +338,70 @@ fn io_file_handles_lines_and_os_file_helpers_work() {
     assert_eq!(return_value(&state), Value::Number(1.0));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&other);
+}
+
+#[test]
+fn runtime_close_explicitly_drains_io_after_a_failing_lua_finalizer() {
+    let path = write_temp_lua_file("io_shutdown_drain", "");
+    let _ = std::fs::remove_file(&path);
+    let source = format!(
+        r#"
+        local f = assert(io.open({}, "w"))
+        assert(f:write("persisted-by-runtime-close"))
+        getmetatable(f).__gc = function()
+            error("injected IO finalizer failure")
+        end
+        leaked_shutdown_file = f
+        return 1
+        "#,
+        lua_path_literal(&path),
+    );
+    let (mut runtime, ()) = compile_and_run(&source);
+    assert_eq!(return_value(&runtime), Value::Number(1.0));
+
+    let report = runtime
+        .close()
+        .expect("explicit IO drain continues after a Lua finalizer error");
+    assert!(report.lua_finalizer_errors_ignored >= 1);
+    assert_eq!(report.runtime_resources_attempted, 4);
+    assert_eq!(report.runtime_resources_drained, 1);
+    assert!(report.runtime_resources_already_closed >= 3);
+    assert_eq!(report.runtime_resources_stale, 0);
+    assert_eq!(report.runtime_resource_drain_errors, 0);
+    assert!(!report.io_resource_drain_debt);
+    assert_eq!(
+        std::fs::read(&path).expect("Runtime close flushes the open file"),
+        b"persisted-by-runtime-close"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn runtime_close_drains_one_thousand_io_resources_without_lua_gc_hooks() {
+    let (mut runtime, ()) = compile_and_run(
+        r#"
+        shutdown_files = {}
+        for cycle = 1, 1000 do
+            local file = assert(io.tmpfile())
+            assert(file:write("resource-", cycle))
+            getmetatable(file).__gc = nil
+            shutdown_files[cycle] = file
+        end
+        return #shutdown_files
+        "#,
+    );
+    assert_eq!(return_value(&runtime), Value::Number(1_000.0));
+
+    let report = runtime
+        .close()
+        .expect("one thousand explicit IO resources drain at Runtime close");
+    assert_eq!(report.runtime_resources_attempted, 1_003);
+    assert_eq!(report.runtime_resources_drained, 1_000);
+    assert_eq!(report.runtime_resources_already_closed, 3);
+    assert_eq!(report.runtime_resources_stale, 0);
+    assert_eq!(report.runtime_resource_drain_errors, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+    assert!(!report.io_resource_drain_debt);
 }
 
 #[test]
@@ -541,6 +719,92 @@ fn base_tostring_returns_a_string_value() {
 }
 
 #[test]
+fn tostring_callback_continuation_composes_with_protected_calls_gc_and_open_upvalues() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local owner = coroutine.create(function()
+            local value = 41
+            local function read()
+                value = value + 1
+                return value
+            end
+            coroutine.yield(read)
+            return value
+        end)
+        local resumed, read = coroutine.resume(owner)
+        assert(resumed and type(read) == "function")
+
+        local inner = setmetatable({}, {
+            __tostring = function()
+                collectgarbage("collect")
+                return "inner:" .. read()
+            end
+        })
+        local outer = setmetatable({}, {
+            __tostring = function()
+                local ok, text = pcall(tostring, inner)
+                assert(ok, text)
+                return "outer:" .. text
+            end
+        })
+
+        local ok, text = pcall(tostring, outer)
+        assert(ok, text)
+        local done, value = coroutine.resume(owner)
+        assert(done and value == 42)
+        return text
+        "#,
+    );
+
+    assert_eq!(returned_string(&runtime), "outer:inner:42");
+    let stats = runtime.activation_stats();
+    assert_eq!(stats.peak_protected_call_depth, 2);
+    assert_eq!(stats.peak_callback_helper_depth, 2);
+    assert_eq!(stats.peak_upvalue_transfer_depth, 1);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+
+    let report = runtime
+        .close()
+        .expect("tostring continuation Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
+fn tostring_callback_error_reaches_pcall_and_releases_its_activation() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local value = setmetatable({}, {
+            __tostring = function()
+                error("tostring boom")
+            end
+        })
+        local ok, message = pcall(tostring, value)
+        assert(
+            not ok
+                and type(message) == "string"
+                and string.find(message, "tostring boom", 1, true),
+            message
+        )
+        return "caught"
+        "#,
+    );
+
+    assert_eq!(returned_string(&runtime), "caught");
+    let stats = runtime.activation_stats();
+    assert_eq!(stats.peak_protected_call_depth, 1);
+    assert_eq!(stats.peak_callback_helper_depth, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+
+    let report = runtime.close().expect("failed tostring Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
 fn base_assert_select_tonumber_and_unpack_work() {
     let (state, _gc) =
         compile_and_run("local ok, value = assert(true, 42); if ok then return value end return 0");
@@ -607,6 +871,138 @@ fn base_load_reads_source_from_reader_functions() {
 }
 
 #[test]
+fn load_reader_continuation_accumulates_across_nested_runtime_suspensions() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local marker = setmetatable({}, {
+            __tostring = function()
+                collectgarbage("collect")
+                return "reader-marker"
+            end
+        })
+        local owner = coroutine.create(function(captured_marker)
+            local pieces = {"local value = 40\n", "return value + 2"}
+            local index = 0
+            local function reader()
+                index = index + 1
+                local ok, text = pcall(tostring, captured_marker)
+                assert(ok and text == "reader-marker", text)
+                return pieces[index]
+            end
+            coroutine.yield(reader)
+            return index
+        end)
+        local resumed, reader = coroutine.resume(owner, marker)
+        assert(resumed and type(reader) == "function")
+
+        local ok, chunk, message = pcall(load, reader, "reader-suspend")
+        assert(ok and type(chunk) == "function", message)
+        assert(debug.getinfo(chunk).source == "reader-suspend")
+        local result = chunk()
+        local done, calls = coroutine.resume(owner)
+        assert(done and calls == 3, calls)
+        return result
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(42.0));
+    let stats = runtime.activation_stats();
+    assert_eq!(stats.peak_callback_helper_depth, 2);
+    assert_eq!(stats.peak_protected_call_depth, 2);
+    assert_eq!(stats.peak_upvalue_transfer_depth, 1);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+
+    let report = runtime
+        .close()
+        .expect("load reader continuation Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
+fn load_reader_errors_are_results_and_release_multiturn_state() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local owner = coroutine.create(function()
+            local calls = 0
+            local function reader()
+                calls = calls + 1
+                if calls == 1 then return "return " end
+                local ok, message = pcall(function() error("scheduled reader boom") end)
+                assert(not ok and type(message) == "string")
+                error(message)
+            end
+            coroutine.yield(reader)
+            return calls
+        end)
+        local resumed, reader = coroutine.resume(owner)
+        assert(resumed)
+
+        local chunk, message = load(reader, "reader-error")
+        assert(
+            chunk == nil
+                and type(message) == "string"
+                and string.find(message, "scheduled reader boom", 1, true),
+            message
+        )
+        local invalid, invalid_message = load(function() return {} end)
+        assert(
+            invalid == nil
+                and string.find(invalid_message, "reader function must return a string", 1, true),
+            invalid_message
+        )
+        local done, calls = coroutine.resume(owner)
+        assert(done and calls == 2)
+        return "caught"
+        "#,
+    );
+
+    assert_eq!(returned_string(&runtime), "caught");
+    let stats = runtime.activation_stats();
+    assert_eq!(stats.peak_callback_helper_depth, 1);
+    assert_eq!(stats.peak_protected_call_depth, 1);
+    assert_eq!(stats.peak_upvalue_transfer_depth, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+
+    let report = runtime.close().expect("failed load reader Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
+fn load_reader_continuation_preserves_arbitrary_source_bytes() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local pieces = {"return '", string.char(0, 128, 255), "'"}
+        local index = 0
+        local chunk = assert(load(function()
+            index = index + 1
+            return pieces[index]
+        end, "raw-reader"))
+        return chunk()
+        "#,
+    );
+
+    let Value::String(result) = return_value(&runtime) else {
+        panic!("raw reader chunk must return a Lua string");
+    };
+    runtime
+        .with_string_bytes(result, |bytes| assert_eq!(bytes, [0, 128, 255]))
+        .expect("raw reader result remains collector-valid");
+    let stats = runtime.activation_stats();
+    assert_eq!(stats.peak_callback_helper_depth, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+
+    let report = runtime.close().expect("raw load reader Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
 fn debug_getinfo_reports_lua_function_source() {
     let (state, _gc) = compile_and_run(
         "local done = false; local f = assert(load(function() if done then return nil end; done = true; return 'return 42' end, 'modname')); if debug.getinfo(f).source == 'modname' then return f() end return 0",
@@ -617,6 +1013,193 @@ fn debug_getinfo_reports_lua_function_source() {
         "local f = assert(loadstring('local x = 1\\nreturn debug.getinfo(1).currentline')); return f()",
     );
     assert_eq!(return_value(&state), Value::Number(2.0));
+}
+
+#[test]
+fn debug_hook_events_resume_through_nested_runtime_callbacks() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local seen = {}
+        local inside = false
+        local marker = setmetatable({}, {
+            __tostring = function()
+                collectgarbage("collect")
+                return "hook-marker"
+            end
+        })
+
+        local function hook(event, line)
+            assert(not inside, "debug hook recursed")
+            inside = true
+            local ok, text = pcall(tostring, marker)
+            assert(ok and text == "hook-marker")
+            seen[event] = (seen[event] or 0) + 1
+            if event == "line" then
+                assert(type(line) == "number")
+            else
+                assert(line == nil)
+            end
+            inside = false
+        end
+
+        local function leaf(value)
+            local result = { value = value + 1 }
+            return result
+        end
+        local function tail(value)
+            return leaf(value)
+        end
+
+        debug.sethook(hook, "crl", 3)
+        local result = tail(40)
+        local native_result = string.rep("x", 2)
+        debug.sethook()
+
+        assert(result.value == 41, "result")
+        assert(native_result == "xx", "native result")
+        assert((seen.call or 0) > 0, "call")
+        assert((seen["return"] or 0) > 0, "return")
+        assert((seen["tail return"] or 0) > 0, "tail return")
+        assert((seen.line or 0) > 0, "line")
+        assert((seen.count or 0) > 0, "count")
+        return 1
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(1.0));
+    let stats = runtime.activation_stats();
+    assert!(stats.peak_callback_helper_depth >= 2);
+    assert!(stats.peak_protected_call_depth >= 1);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    assert_eq!(runtime.active_execution_count(), 0);
+
+    let report = runtime.close().expect("debug-hook Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
+fn debug_count_hook_precedes_line_hook_for_the_same_instruction() {
+    let (runtime, _) = compile_and_run(
+        r#"
+        local events = {}
+        debug.sethook(function(event)
+            events[#events + 1] = event
+        end, "l", 1)
+        local value = 41
+        debug.sethook()
+        assert(value == 41)
+        assert(events[1] == "count", events[1])
+        assert(events[2] == "line", events[2])
+        return 1
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(1.0));
+}
+
+#[test]
+fn debug_hook_on_coroutine_schedules_cross_state_open_upvalues() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local captured = 7
+        local observed = 0
+        local hook_calls = 0
+        _G.__debug_hook_calls = 0
+        local function hook(event)
+            if event == "line" then
+                _G.__debug_hook_calls = _G.__debug_hook_calls + 1
+                observed = observed + captured
+                hook_calls = hook_calls + 1
+                collectgarbage("count")
+            end
+        end
+
+        local thread = coroutine.create(function(installed_hook)
+            debug.sethook(installed_hook, "l")
+            local value = 1
+            value = value + 1
+            value = value + 1
+            debug.sethook()
+            return value
+        end)
+        local ok, result = coroutine.resume(thread, hook)
+        assert(ok, result)
+        assert(result == 3, "result")
+        assert(_G.__debug_hook_calls > 0, "global hook calls")
+        assert(hook_calls > 0, "open-upvalue hook calls")
+        assert(observed == hook_calls * captured, "observed")
+        return 1
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(1.0));
+    let stats = runtime.activation_stats();
+    assert!(stats.peak_callback_helper_depth >= 1);
+    assert!(stats.peak_upvalue_transfer_depth >= 1);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    assert_eq!(runtime.active_execution_count(), 0);
+    assert_eq!(runtime.temporary_state_root_count(), 0);
+
+    let report = runtime
+        .close()
+        .expect("cross-state debug-hook Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
+fn debug_hook_errors_preserve_identity_and_replacement_stays_non_recursive() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local marker = {}
+        local failures = 0
+        local ok, error_value = pcall(function()
+            debug.sethook(function()
+                failures = failures + 1
+                debug.sethook()
+                error(marker)
+            end, "l")
+            local value = 1
+            return value
+        end)
+        assert(not ok and error_value == marker)
+        assert(failures == 1)
+
+        local first_calls = 0
+        local replacement_calls = 0
+        local function replacement()
+            replacement_calls = replacement_calls + 1
+            debug.sethook()
+        end
+        debug.sethook(function()
+            first_calls = first_calls + 1
+            debug.sethook(replacement, "crl")
+        end, "l")
+        local after_first = 1
+        local after_replacement = after_first + 1
+        assert(after_replacement == 2)
+        assert(first_calls == 1)
+        assert(replacement_calls == 1)
+        return 1
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(1.0));
+    let stats = runtime.activation_stats();
+    assert!(stats.peak_callback_helper_depth >= 1);
+    assert!(stats.peak_protected_call_depth >= 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    assert_eq!(runtime.active_execution_count(), 0);
+
+    let report = runtime.close().expect("debug-hook error Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
 }
 
 #[test]
@@ -779,6 +1362,74 @@ fn base_loadfile_and_dofile_report_file_errors() {
 }
 
 #[test]
+fn dofile_continuation_forwards_multiret_and_nested_runtime_suspensions() {
+    let path = write_temp_lua_file(
+        "dofile_continuation",
+        r#"
+        local ok, text = pcall(tostring, __dofile_marker)
+        assert(ok and string.find(text, "marker:", 1, true), text)
+        return __dofile_touch("file"), 42
+        "#,
+    );
+    let error_path = write_temp_lua_file("dofile_error_identity", "error(__dofile_token)");
+    let path_lit = lua_path_literal(&path);
+    let error_path_lit = lua_path_literal(&error_path);
+    let (mut runtime, _) = compile_and_run(&format!(
+        r#"
+        local owner = coroutine.create(function()
+            local calls = 0
+            local function touch(tag)
+                calls = calls + 1
+                return tag .. ":" .. calls
+            end
+            coroutine.yield(touch)
+            return calls
+        end)
+        local resumed, touch = coroutine.resume(owner)
+        assert(resumed and type(touch) == "function")
+        __dofile_touch = touch
+        __dofile_marker = setmetatable({{}}, {{
+            __tostring = function()
+                collectgarbage("collect")
+                return touch("marker")
+            end
+        }})
+        __dofile_token = {{}}
+
+        local first, number = dofile({path_lit})
+        assert(first == "file:2" and number == 42, first)
+        local function tail()
+            return dofile({path_lit})
+        end
+        local second, tail_number = tail()
+        assert(second == "file:4" and tail_number == 42, second)
+
+        local ok, error_value = pcall(dofile, {error_path_lit})
+        assert(not ok and error_value == __dofile_token)
+        local done, calls = coroutine.resume(owner)
+        assert(done and calls == 4, calls)
+        return first .. "|" .. second
+        "#,
+    ));
+
+    assert_eq!(returned_string(&runtime), "file:2|file:4");
+    let stats = runtime.activation_stats();
+    assert!(stats.peak_callback_helper_depth >= 2);
+    assert!(stats.peak_protected_call_depth >= 1);
+    assert!(stats.peak_upvalue_transfer_depth >= 1);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    assert_eq!(runtime.active_execution_count(), 0);
+
+    let report = runtime.close().expect("dofile continuation Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(error_path);
+}
+
+#[test]
 fn package_require_returns_builtin_libraries() {
     let (state, _gc) = compile_and_run(
         "if require('math') == math and require('table') == table and package.loaded.math == math then return 1 end return 0",
@@ -874,6 +1525,110 @@ fn package_module_preload_and_io_output_support_require_workflows() {
     assert_eq!(return_value(&state), Value::Number(1.0));
 
     std::fs::remove_file(module_path).ok();
+}
+
+#[test]
+fn package_callback_continuations_survive_nested_suspensions_and_preserve_errors() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local marker = setmetatable({}, {
+            __tostring = function()
+                collectgarbage("collect")
+                return __package_touch("marker")
+            end
+        })
+        local owner = coroutine.create(function(captured_marker)
+            local calls = 0
+            local function touch(tag)
+                calls = calls + 1
+                return tag .. ":" .. calls
+            end
+            coroutine.yield(touch)
+            return calls
+        end)
+        local resumed, touch = coroutine.resume(owner, marker)
+        assert(resumed and type(touch) == "function")
+        __package_touch = touch
+
+        package.preload.inner_continuation = function(name)
+            local ok, text = pcall(tostring, marker)
+            assert(ok and string.find(text, "marker:", 1, true), text)
+            return touch("inner")
+        end
+        package.preload.outer_continuation = function(name)
+            local ok, text = pcall(tostring, marker)
+            assert(ok and string.find(text, "marker:", 1, true), text)
+            return require("inner_continuation") .. "|" .. touch("outer")
+        end
+        local loaded = require("outer_continuation")
+        assert(loaded == "inner:3|outer:4", loaded)
+        assert(require("outer_continuation") == loaded)
+
+        package.preload.nil_continuation = function() return nil end
+        assert(require("nil_continuation") == true)
+        assert(package.loaded.nil_continuation == true)
+
+        local function option(field)
+            return function(module_table)
+                local ok, text = pcall(tostring, marker)
+                assert(ok and string.find(text, "marker:", 1, true), text)
+                module_table[field] = touch("option-" .. field)
+            end
+        end
+        local module_name = "continuation.module"
+        local function configure()
+            module(module_name, option("first"), option("second"))
+        end
+        configure()
+        local configured = package.loaded[module_name]
+        assert(configured.first == "option-first:6", configured.first)
+        assert(configured.second == "option-second:8", configured.second)
+
+        local require_token = {}
+        package.preload.failed_continuation = function() error(require_token) end
+        local require_ok, require_error = pcall(require, "failed_continuation")
+        assert(not require_ok and require_error == require_token)
+
+        local module_token = {}
+        local function configure_failure()
+            module("continuation.failure", function() error(module_token) end)
+        end
+        local module_ok, module_error = pcall(configure_failure)
+        assert(not module_ok and module_error == module_token)
+
+        local ordered = 0
+        local function configure_invalid()
+            module("continuation.invalid", function() ordered = ordered + 1 end, {})
+        end
+        local invalid_ok, invalid_error = pcall(configure_invalid)
+        assert(not invalid_ok)
+        assert(ordered == 1)
+        assert(string.find(invalid_error, "module option must be a function", 1, true))
+
+        local done, calls = coroutine.resume(owner)
+        assert(done and calls == 8, calls)
+        return loaded .. "|" .. configured.first .. "|" .. configured.second
+        "#,
+    );
+
+    assert_eq!(
+        returned_string(&runtime),
+        "inner:3|outer:4|option-first:6|option-second:8"
+    );
+    let stats = runtime.activation_stats();
+    assert!(stats.peak_callback_helper_depth >= 3);
+    assert!(stats.peak_protected_call_depth >= 1);
+    assert!(stats.peak_upvalue_transfer_depth >= 1);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    assert_eq!(runtime.active_execution_count(), 0);
+
+    let report = runtime
+        .close()
+        .expect("package callback continuation Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
 }
 
 #[test]
@@ -1555,6 +2310,22 @@ fn table_sort_accepts_lua_comparators() {
 }
 
 #[test]
+fn table_sort_comparator_trace_matches_the_fixed_cpp_oracle() {
+    let (state, _gc) = compile_and_run(
+        r#"
+        local trace = {}
+        local values = {3, 1, 2}
+        table.sort(values, function(left, right)
+            trace[table.getn(trace) + 1] = left .. "<" .. right
+            return left < right
+        end)
+        return table.concat(trace, "|")
+        "#,
+    );
+    assert_eq!(returned_string(&state), "3<3|1<1|2<2|1<3|3<1|2<1|2<3|3<2");
+}
+
+#[test]
 fn table_sort_comparator_path_is_not_quadratic() {
     let (state, _gc) = compile_and_run(
         "local t = {}; for i = 1, 512 do t[i] = 513 - i end; local comparisons = 0; table.sort(t, function(a, b) comparisons = comparisons + 1; return a < b end); if t[1] == 1 and t[512] == 512 and comparisons < 20000 then return comparisons end return 0",
@@ -1563,6 +2334,145 @@ fn table_sort_comparator_path_is_not_quadratic() {
         Value::Number(n) => assert!(n > 0.0 && n < 20000.0),
         value => panic!("expected comparison count, got {value:?}"),
     }
+}
+
+#[test]
+fn table_sort_comparator_continuation_survives_nested_runtime_suspensions() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local marker = setmetatable({}, {
+            __tostring = function()
+                collectgarbage("collect")
+                return "sort-marker"
+            end
+        })
+        local owner = coroutine.create(function(captured_marker)
+            local calls = 0
+            local function less(left, right)
+                calls = calls + 1
+                local ok, text = pcall(tostring, captured_marker)
+                assert(ok and text == "sort-marker", text)
+                return left < right
+            end
+            coroutine.yield(less)
+            return calls
+        end)
+        local resumed, less = coroutine.resume(owner, marker)
+        assert(resumed and type(less) == "function")
+
+        local values = {5, 1, 4, 2, 3}
+        local ok, message = pcall(table.sort, values, less)
+        assert(ok, message)
+        assert(table.concat(values, ",") == "1,2,3,4,5")
+        local done, calls = coroutine.resume(owner)
+        assert(done and calls > 5, calls)
+        return values[1] * 10000 + values[2] * 1000 + values[3] * 100
+            + values[4] * 10 + values[5]
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(12345.0));
+    let stats = runtime.activation_stats();
+    assert_eq!(stats.peak_callback_helper_depth, 2);
+    assert_eq!(stats.peak_protected_call_depth, 2);
+    assert_eq!(stats.peak_upvalue_transfer_depth, 1);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+
+    let report = runtime
+        .close()
+        .expect("table.sort comparator continuation Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
+fn table_sort_default_metamethod_continuation_uses_the_runtime_scheduler() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local marker = setmetatable({}, {
+            __tostring = function()
+                collectgarbage("collect")
+                return "metamethod-marker"
+            end
+        })
+        local comparisons = 0
+        local mt = {
+            __lt = function(left, right)
+                comparisons = comparisons + 1
+                local ok, text = pcall(tostring, marker)
+                assert(ok and text == "metamethod-marker", text)
+                return left.rank < right.rank
+            end
+        }
+        local values = {
+            setmetatable({rank = 4}, mt),
+            setmetatable({rank = 1}, mt),
+            setmetatable({rank = 3}, mt),
+            setmetatable({rank = 2}, mt)
+        }
+        local ok, message = pcall(table.sort, values)
+        assert(ok, message)
+        assert(comparisons > 0)
+        return values[1].rank * 1000 + values[2].rank * 100
+            + values[3].rank * 10 + values[4].rank
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(1234.0));
+    let stats = runtime.activation_stats();
+    assert_eq!(stats.peak_callback_helper_depth, 2);
+    assert_eq!(stats.peak_protected_call_depth, 2);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+
+    let report = runtime
+        .close()
+        .expect("table.sort metamethod continuation Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
+fn table_sort_errors_preserve_identity_and_never_publish_partial_working_copies() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local token = {}
+        local values = {3, 1, 2}
+        local ok, result = pcall(table.sort, values, function(left, right)
+            local nested_ok, nested_value = pcall(function() return left == right end)
+            assert(nested_ok)
+            if not nested_value then error(token) end
+            return false
+        end)
+        assert(not ok and result == token)
+        assert(table.concat(values, ",") == "3,1,2")
+
+        local invalid = {2, 1}
+        local valid_order, message = pcall(table.sort, invalid, function() return true end)
+        assert(
+            not valid_order
+                and string.find(message, "invalid order function for sorting", 1, true),
+            message
+        )
+        assert(table.concat(invalid, ",") == "2,1")
+        return "caught"
+        "#,
+    );
+
+    assert_eq!(returned_string(&runtime), "caught");
+    let stats = runtime.activation_stats();
+    assert_eq!(stats.peak_callback_helper_depth, 1);
+    assert_eq!(stats.peak_protected_call_depth, 2);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+
+    let report = runtime.close().expect("failed table.sort Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
 }
 
 #[test]
@@ -1587,6 +2497,64 @@ fn vm_comparisons_use_lt_and_le_metamethods() {
 }
 
 #[test]
+fn table_foreach_continuations_survive_nested_suspensions_and_preserve_errors() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local marker = setmetatable({}, {
+            __tostring = function()
+                collectgarbage("collect")
+                return "foreach-marker"
+            end
+        })
+        local owner = coroutine.create(function(captured_marker)
+            local calls = 0
+            local function visit(index, value)
+                calls = calls + 1
+                local ok, text = pcall(tostring, captured_marker)
+                assert(ok and text == "foreach-marker", text)
+                if value == 20 then return index end
+            end
+            coroutine.yield(visit)
+            return calls
+        end)
+        local resumed, visit = coroutine.resume(owner, marker)
+        assert(resumed and type(visit) == "function")
+
+        local values = {10, 20, 30}
+        assert(table.foreachi(values, visit) == 2)
+        assert(table.foreach(values, visit) == 2)
+
+        local token = {}
+        local function fail() error(token) end
+        local foreach_ok, foreach_error = pcall(table.foreach, values, fail)
+        assert(not foreach_ok and foreach_error == token)
+        local foreachi_ok, foreachi_error = pcall(table.foreachi, values, fail)
+        assert(not foreachi_ok and foreachi_error == token)
+
+        local done, calls = coroutine.resume(owner)
+        assert(done and calls == 4, calls)
+        return calls
+        "#,
+    );
+
+    assert_eq!(return_value(&runtime), Value::Number(4.0));
+    let stats = runtime.activation_stats();
+    assert!(stats.peak_callback_helper_depth >= 2);
+    assert!(stats.peak_protected_call_depth >= 1);
+    assert!(stats.peak_upvalue_transfer_depth >= 1);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    assert_eq!(runtime.active_execution_count(), 0);
+
+    let report = runtime
+        .close()
+        .expect("table.foreach continuation Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
 fn table_sort_results_pass_official_style_metamethod_check() {
     let (state, _gc) = compile_and_run(
         "local mt = {__lt = function(a, b) return a.val < b.val end}; local a = {}; for i = 1, 10 do a[i] = setmetatable({val = 11 - i}, mt) end; table.sort(a); for n = table.getn(a), 2, -1 do assert(not (a[n] < a[n - 1])) end; return a[1].val * 100 + a[10].val",
@@ -1597,7 +2565,7 @@ fn table_sort_results_pass_official_style_metamethod_check() {
 #[test]
 fn table_sort_reports_invalid_comparator() {
     let (state, _gc) = compile_and_run(
-        "local ok, msg = pcall(table.sort, {1, 2}, 1); if not ok and string.match(msg, 'function expected') then return 1 end return 0",
+        "local ok1, msg1 = pcall(table.sort, {1, 2}, 1); local ok2, msg2 = pcall(table.sort, {1, 2}, nil); if not ok1 and not ok2 and string.match(msg1, 'function expected') and string.match(msg2, 'function expected') then return 1 end return 0",
     );
     assert_eq!(return_value(&state), Value::Number(1.0));
 }
@@ -1836,6 +2804,111 @@ fn string_gsub_supports_pattern_replacement_counts_and_tables() {
 }
 
 #[test]
+fn string_gsub_continuations_survive_nested_suspensions_and_preserve_errors() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local marker
+        local owner = coroutine.create(function()
+            local calls = 0
+            local function touch(tag)
+                calls = calls + 1
+                return tag .. ":" .. calls
+            end
+            local function replace(letter, digit)
+                local ok, text = pcall(tostring, marker)
+                assert(ok and string.find(text, "marker:", 1, true), text)
+                return touch("fn-" .. letter .. digit)
+            end
+            local function indexer(_, key)
+                local ok, text = pcall(tostring, marker)
+                assert(ok and string.find(text, "marker:", 1, true), text)
+                return touch("table-" .. key)
+            end
+            coroutine.yield(replace, indexer, touch)
+            return calls
+        end)
+        local resumed, replace, indexer, touch = coroutine.resume(owner)
+        assert(
+            resumed
+                and type(replace) == "function"
+                and type(indexer) == "function"
+                and type(touch) == "function"
+        )
+        marker = setmetatable({}, {
+            __tostring = function()
+                collectgarbage("collect")
+                return touch("marker")
+            end
+        })
+
+        local function_result, function_count = string.gsub(
+            "a1 b2 c3",
+            "(%a)(%d)",
+            replace
+        )
+        assert(function_result == "fn-a1:2 fn-b2:4 fn-c3:6", function_result)
+        assert(function_count == 3)
+
+        local replacements = setmetatable({}, { __index = indexer })
+        local table_result, table_count = string.gsub("x y", "%a", replacements)
+        assert(table_result == "table-x:8 table-y:10", table_result)
+        assert(table_count == 2)
+
+        local untouched, zero_count = string.gsub("stay", ".", replace, 0)
+        assert(untouched == "stay" and zero_count == 0)
+
+        local function_token = {}
+        local function_ok, function_error = pcall(
+            string.gsub,
+            "a",
+            ".",
+            function() error(function_token) end
+        )
+        assert(not function_ok and function_error == function_token)
+
+        local table_token = {}
+        local failed_table = setmetatable({}, {
+            __index = function() error(table_token) end
+        })
+        local table_ok, table_error = pcall(string.gsub, "a", ".", failed_table)
+        assert(not table_ok and table_error == table_token)
+
+        local invalid_ok, invalid_error = pcall(
+            string.gsub,
+            "a",
+            ".",
+            function() return {} end
+        )
+        assert(not invalid_ok)
+        assert(string.find(invalid_error, "invalid replacement value", 1, true))
+
+        local done, calls = coroutine.resume(owner)
+        assert(done and calls == 10, calls)
+        return function_result .. "|" .. table_result
+        "#,
+    );
+
+    assert_eq!(
+        returned_string(&runtime),
+        "fn-a1:2 fn-b2:4 fn-c3:6|table-x:8 table-y:10"
+    );
+    let stats = runtime.activation_stats();
+    assert!(stats.peak_callback_helper_depth >= 2);
+    assert!(stats.peak_protected_call_depth >= 1);
+    assert!(stats.peak_upvalue_transfer_depth >= 1);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    assert_eq!(runtime.active_execution_count(), 0);
+
+    let report = runtime
+        .close()
+        .expect("string.gsub callback continuation Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
 fn string_gmatch_iterates_matches_and_captures() {
     let (state, _gc) = compile_and_run(
         "local result = ''; local count = 0; for w in string.gmatch('hello world foo', '%a+') do result = result .. w .. ','; count = count + 1 end; if string.gfind == string.gmatch and count == 3 then return result end return 'bad'",
@@ -1914,6 +2987,183 @@ fn metatable_call_arithmetic_concat_and_eq_work() {
         "local t = {}; t.__call = function(self, ...) return {...} end; t.__add = function(a, b) return a end; t.__concat = function(a, b) return 'joined' end; t.__eq = function(a, b) return true end; local a = setmetatable({val = 'a'}, t); local b = setmetatable({val = 'b'}, t); local r = a(1, 2, 3); if r[1] == 1 and r[3] == 3 and a + 5 == a and a .. b == 'joined' and a == b then return 1 end return 0",
     );
     assert_eq!(return_value(&state), Value::Number(1.0));
+}
+
+#[test]
+fn vm_metamethod_continuations_survive_nested_runtime_suspensions() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local owner = coroutine.create(function()
+            local value = 0
+            local function touch(tag)
+                value = value + 1
+                return tag .. ":" .. value
+            end
+            coroutine.yield(touch)
+            return value
+        end)
+        local resumed, touch = coroutine.resume(owner)
+        assert(resumed and type(touch) == "function")
+        local function check(condition, label)
+            if not condition then error(label) end
+        end
+
+        local marker = setmetatable({}, {
+            __tostring = function()
+                collectgarbage("collect")
+                return touch("tick")
+            end
+        })
+        local calls = 0
+        local function pause()
+            calls = calls + 1
+            local ok, text = pcall(tostring, marker)
+            check(ok, "pause-pcall")
+            check(text == "tick:" .. calls, "pause-text")
+        end
+
+        local indexed = setmetatable({}, {
+            __index = function(_, key)
+                pause()
+                check(key == "missing", "index-key")
+                return "read"
+            end,
+            __newindex = function(self, key, value)
+                pause()
+                rawset(self, key, value + 1)
+            end
+        })
+        check(indexed.missing == "read", "index")
+        indexed.answer = 41
+        check(rawget(indexed, "answer") == 42, "newindex")
+
+        local mt = {}
+        mt.__add = function() pause(); return 43 end
+        mt.__unm = function() pause(); return 44 end
+        mt.__concat = function() pause(); return "joined" end
+        mt.__eq = function() pause(); return true end
+        mt.__lt = function(left, right) pause(); return left.rank < right.rank end
+        mt.__le = function(left, right) pause(); return left.rank <= right.rank end
+        local left = setmetatable({rank = 1}, mt)
+        local middle = setmetatable({rank = 2}, mt)
+        local right = setmetatable({rank = 3}, mt)
+        check(left + middle == 43, "add")
+        check(-left == 44, "unm")
+        check(left .. middle .. right == "joined", "concat")
+        check(left == middle, "eq")
+        check(left < middle, "lt-true")
+        check(not (middle < left), "lt-false")
+        check(left <= middle, "le-true")
+        check(not (middle <= left), "le-false")
+
+        local length_value = newproxy(true)
+        getmetatable(length_value).__len = function()
+            pause()
+            return 45
+        end
+        check(#length_value == 45, "len")
+
+        local fallback_mt = {}
+        fallback_mt.__lt = function(first, second)
+            pause()
+            return first.rank < second.rank
+        end
+        local first = setmetatable({rank = 1}, fallback_mt)
+        local second = setmetatable({rank = 2}, fallback_mt)
+        check(first <= second, "le-fallback-true")
+        check(not (second <= first), "le-fallback-false")
+
+        local env_values = {}
+        local function env_ops()
+            TO_ENV = 47
+            return FROM_ENV
+        end
+        setfenv(env_ops, setmetatable({}, {
+            __index = function(_, key)
+                pause()
+                check(key == "FROM_ENV", "global-index-key")
+                return 46
+            end,
+            __newindex = function(_, key, value)
+                pause()
+                rawset(env_values, key, value)
+            end
+        }))
+        check(env_ops() == 46, "global-index")
+        check(env_values.TO_ENV == 47, "global-newindex")
+
+        local method_target
+        method_target = setmetatable({}, {
+            __index = function(_, key)
+                pause()
+                check(key == "method", "self-key")
+                return function(self, value)
+                    check(self == method_target, "self-value")
+                    return value + 1
+                end
+            end
+        })
+        check(method_target:method(47) == 48, "self-index")
+
+        local done, owner_calls = coroutine.resume(owner)
+        check(done, "owner-resume")
+        check(owner_calls == calls, "owner-calls")
+        check(calls >= 17, "call-count")
+        return calls
+        "#,
+    );
+
+    match return_value(&runtime) {
+        Value::Number(calls) => assert!(calls >= 17.0),
+        value => panic!("expected metamethod callback count, got {value:?}"),
+    }
+    let stats = runtime.activation_stats();
+    assert!(stats.peak_callback_helper_depth >= 2);
+    assert!(stats.peak_protected_call_depth >= 1);
+    assert!(stats.peak_upvalue_transfer_depth >= 1);
+    assert_eq!(stats.peak_borrowed_state_slots, 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    assert_eq!(runtime.active_execution_count(), 0);
+
+    let report = runtime
+        .close()
+        .expect("VM metamethod continuation Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+}
+
+#[test]
+fn vm_metamethod_errors_preserve_identity_and_release_activations() {
+    let (mut runtime, _) = compile_and_run(
+        r#"
+        local token = {}
+        local value = setmetatable({}, {
+            __add = function()
+                collectgarbage("collect")
+                error(token)
+            end
+        })
+        local ok, result = pcall(function() return value + 1 end)
+        assert(not ok and result == token)
+        assert(1 + 2 == 3)
+        return "caught"
+        "#,
+    );
+
+    assert_eq!(returned_string(&runtime), "caught");
+    let stats = runtime.activation_stats();
+    assert!(stats.peak_callback_helper_depth >= 1);
+    assert!(stats.peak_protected_call_depth >= 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    assert_eq!(runtime.active_execution_count(), 0);
+
+    let report = runtime
+        .close()
+        .expect("failed VM metamethod Runtime closes");
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
 }
 
 #[test]
@@ -2097,7 +3347,13 @@ fn thousand_level_resume_and_wrap_chains_bound_borrows_and_release_transfers() {
     assert_eq!(stats.current_rooted_activation_depth(), 0);
     assert_eq!(runtime.active_execution_count(), 0);
     assert_eq!(runtime.temporary_state_root_count(), 0);
-    assert_eq!(runtime.live_coroutine_state_count(), 0);
+    // The fixed C++ compiler freezes the `coroutine.wrap(function ...)` lvalue
+    // before its RHS call. The last wrapper/closure therefore remains in a dead
+    // temporary register while this chunk's frame is active, and Lua 5.1-style
+    // conservative frame tracing keeps exactly one coroutine state alive during
+    // the in-script collection. Runtime shutdown below must still reclaim it
+    // after the frame has unwound.
+    assert_eq!(runtime.live_coroutine_state_count(), 1);
 
     let report = runtime.close().expect("deep-chain Runtime closes");
     assert_eq!(report.remaining_objects, 0);

@@ -18,7 +18,7 @@ static CLOCK_START: OnceLock<Instant> = OnceLock::new();
 static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn open_os(l: &mut LuaState, gc: &mut GarbageCollector) {
-    let os_table = find_lib_table(l, "os");
+    let os_table = find_lib_table(l, gc, "os");
     if os_table.is_null() {
         return;
     }
@@ -45,8 +45,8 @@ fn reg(
         .expect("OS Function publication must remain collector-valid");
 }
 
-fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
-    crate::registration::find_library_table(l, name.as_bytes())
+fn find_lib_table(l: &LuaState, gc: &GarbageCollector, name: &str) -> GcRef<Table> {
+    crate::registration::find_library_table_with_gc(l, gc, name.as_bytes())
         .ok()
         .flatten()
         .unwrap_or_else(GcRef::null)
@@ -73,17 +73,20 @@ unsafe extern "C" fn lua_os_time(l_ptr: *mut std::ffi::c_void) -> i32 {
             1
         }
         Value::Table(table_ref) => {
-            // SAFETY: the time table is held on the active Lua stack.
-            let Some(table) = (unsafe { table_ref.as_ref() }) else {
+            let fields = l.with_gc_ref(table_ref, |table| {
+                (
+                    table_number_field(l, table, "year").unwrap_or(1970.0) as i64,
+                    table_number_field(l, table, "month").unwrap_or(1.0) as i64,
+                    table_number_field(l, table, "day").unwrap_or(1.0) as i64,
+                    table_number_field(l, table, "hour").unwrap_or(12.0) as i64,
+                    table_number_field(l, table, "min").unwrap_or(0.0) as i64,
+                    table_number_field(l, table, "sec").unwrap_or(0.0) as i64,
+                )
+            });
+            let Ok((year, month, day, hour, min, sec)) = fields else {
                 l.push_nil();
                 return 1;
             };
-            let year = table_number_field(l, table, "year").unwrap_or(1970.0) as i64;
-            let month = table_number_field(l, table, "month").unwrap_or(1.0) as i64;
-            let day = table_number_field(l, table, "day").unwrap_or(1.0) as i64;
-            let hour = table_number_field(l, table, "hour").unwrap_or(12.0) as i64;
-            let min = table_number_field(l, table, "min").unwrap_or(0.0) as i64;
-            let sec = table_number_field(l, table, "sec").unwrap_or(0.0) as i64;
             let days = days_from_civil(year, month, day);
             l.push_value(Value::Number(
                 (days * 86_400 + hour * 3_600 + min * 60 + sec) as f64,

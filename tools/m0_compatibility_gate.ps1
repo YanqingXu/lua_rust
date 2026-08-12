@@ -326,6 +326,8 @@ if ([string]::IsNullOrWhiteSpace($CppLua)) {
     $CppLua = Resolve-RootedPath $CppLua
 }
 $cppBytecode = Join-Path $cppExecutableRoot "lua_bytecode$executableSuffix"
+$cppEvidence = Join-Path $cppExecutableRoot "lua_bytecode_evidence$executableSuffix"
+$cppTraceEvidence = Join-Path $cppExecutableRoot "lua_vm_trace_evidence$executableSuffix"
 
 $lua51OracleOutput = Join-Path $Root "target/oracles/lua-5.1.5"
 if ([string]::IsNullOrWhiteSpace($OfficialLua)) {
@@ -349,8 +351,26 @@ $bytecodeSelfTestReport = Join-Path $paritySelfTestRoot "bytecode/report.json"
 $bytecodeDirectorySelfTestReport = Join-Path $paritySelfTestRoot `
     "bytecode-directory-representative/report.json"
 $vmTraceSelfTestReport = Join-Path $paritySelfTestRoot "vm-trace/report.json"
+$vmTraceCppSelfTestReport = Join-Path $paritySelfTestRoot "vm-trace-cpp-snapshot/report.json"
+$vmTraceRustSelfTestReport = Join-Path $paritySelfTestRoot "vm-trace-rust-snapshot/report.json"
+$vmTraceCppDiffSelfTestReport = Join-Path $paritySelfTestRoot "vm-trace-cpp-diff/report.json"
+$vmTraceRustDiffSelfTestReport = Join-Path $paritySelfTestRoot "vm-trace-rust-diff/report.json"
+$vmTraceCompleteSelfTestReport = Join-Path $paritySelfTestRoot `
+    "vm-trace-complete-lifecycle/report.json"
+$vmTraceStateRetirementCppReport = Join-Path $paritySelfTestRoot `
+    "vm-trace-state-retirement-cpp/report.json"
+$vmTraceStateRetirementRustReport = Join-Path $paritySelfTestRoot `
+    "vm-trace-state-retirement-rust/report.json"
+$cliContractSelfTestReport = Join-Path $paritySelfTestRoot "cli-contract/report.json"
+$replContractSelfTestReport = Join-Path $paritySelfTestRoot "repl-contract/report.json"
+$bytecodeToolContractSelfTestReport = Join-Path $paritySelfTestRoot `
+    "bytecode-tool-contract/report.json"
 $representativeBytecodeRoot = Join-Path $resultRoot "bytecode-representative"
 $representativeBytecodeReport = Join-Path $representativeBytecodeRoot "report.json"
+$representativeVmTraceRoot = Join-Path $resultRoot "vm-trace-snapshot-basic"
+$representativeVmTraceReport = Join-Path $representativeVmTraceRoot "report.json"
+$representativeVmDiffRoot = Join-Path $resultRoot "vm-trace-diff-basic"
+$representativeVmDiffReport = Join-Path $representativeVmDiffRoot "report.json"
 $runnerManifest = Join-Path $Root "tools/lua_fixture_runner/Cargo.toml"
 $fixtureManifest = Join-Path $Root "tests/compatibility/lua_fixtures.json"
 $fixtureInventoryTotal = 0
@@ -477,7 +497,7 @@ try {
             -Artifact $lua51BuildArtifact
     }
 
-    $missingOracleTools = @(@($CppLua, $cppBytecode, $OfficialLua) |
+    $missingOracleTools = @(@($CppLua, $cppBytecode, $cppEvidence, $cppTraceEvidence, $OfficialLua) |
         Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
     if ($missingOracleTools.Count -gt 0) {
         Add-Step `
@@ -488,7 +508,7 @@ try {
         Add-Step `
             -Name "oracle-artifacts" `
             -Status "passed" `
-            -Detail "lua_cpp app/bytecode and official Lua 5.1.5 are present"
+            -Detail "lua_cpp app/bytecode/bytecode-evidence/trace-evidence and official Lua 5.1.5 are present"
     }
 
     $paritySelfTestExit = Invoke-PowerShellStep `
@@ -496,7 +516,12 @@ try {
         -ScriptPath (Join-Path $Root "tools/test_parity_runners.ps1") `
         -Arguments @(
             "-InputPath", (Join-Path $Root "tests/lua/bytecode/test_bytecode.lua"),
+            "-CppAppExe", $CppLua,
             "-CppBytecodeExe", $cppBytecode,
+            "-CppEvidenceExe", $cppEvidence,
+            "-CppTraceExe", $cppTraceEvidence,
+            "-RustAppExe", $CandidateLua,
+            "-RustBytecodeExe", $CandidateBytecode,
             "-OutputDir", $paritySelfTestRoot
         ) `
         -Artifact $paritySelfTestArtifact
@@ -511,6 +536,15 @@ try {
         bytecodeReport = $bytecodeSelfTestReport
         bytecodeDirectoryReport = $bytecodeDirectorySelfTestReport
         vmTraceReport = $vmTraceSelfTestReport
+        vmTraceCppSnapshotReport = $vmTraceCppSelfTestReport
+        vmTraceRustSnapshotReport = $vmTraceRustSelfTestReport
+        vmTraceCppDiffReport = $vmTraceCppDiffSelfTestReport
+        vmTraceRustDiffReport = $vmTraceRustDiffSelfTestReport
+        vmTraceCompleteReport = $vmTraceCompleteSelfTestReport
+        vmTraceStateRetirementCppReport = $vmTraceStateRetirementCppReport
+        vmTraceStateRetirementRustReport = $vmTraceStateRetirementRustReport
+        cliContractReport = $cliContractSelfTestReport
+        replContractReport = $replContractSelfTestReport
         failure = $null
     }
     try {
@@ -529,6 +563,22 @@ try {
             [ordered]@{
                 name = "synthetic-vm-trace"
                 path = $vmTraceSelfTestReport
+            },
+            [ordered]@{
+                name = "cpp-vm-trace-snapshot"
+                path = $vmTraceCppSelfTestReport
+            },
+            [ordered]@{
+                name = "rust-vm-trace-snapshot"
+                path = $vmTraceRustSelfTestReport
+            },
+            [ordered]@{
+                name = "cpp-vm-trace-diff"
+                path = $vmTraceCppDiffSelfTestReport
+            },
+            [ordered]@{
+                name = "rust-vm-trace-diff"
+                path = $vmTraceRustDiffSelfTestReport
             }
         )) {
             if (-not (Test-Path -LiteralPath $reportItem.path -PathType Leaf)) {
@@ -544,6 +594,155 @@ try {
                 $report.summary.infrastructureFailures -ne 0) {
                 throw "$($reportItem.name) self-test did not produce clean fail-closed evidence"
             }
+        }
+        if (-not (Test-Path -LiteralPath $vmTraceCompleteSelfTestReport -PathType Leaf)) {
+            throw "VM Complete-profile lifecycle report is missing"
+        }
+        $completeLifecycle = Get-Content -LiteralPath $vmTraceCompleteSelfTestReport -Raw |
+            ConvertFrom-Json
+        $expectedCompleteEvidence = @(
+            "eventSequence", "pcOpcode", "activeCallFrames", "stackTop",
+            "changedRegisters", "upvalueLifecycle", "callReturnYieldResume", "errorValueCategory"
+        )
+        if ($completeLifecycle.schemaVersion -ne 2 -or
+            $completeLifecycle.purpose -ne "cross-language-parity" -or
+            $completeLifecycle.traceMode -ne "Diff" -or
+            $completeLifecycle.evidenceProfile -ne "Complete" -or
+            $completeLifecycle.status -ne "passed" -or
+            $completeLifecycle.summary.selected -ne 4 -or
+            $completeLifecycle.summary.passed -ne 4 -or
+            $completeLifecycle.summary.failed -ne 0 -or
+            $completeLifecycle.summary.infrastructureFailures -ne 0 -or
+            $completeLifecycle.summary.semanticFailures -ne 0 -or
+            $completeLifecycle.cases.Count -ne 4 -or
+            @(Compare-Object @($completeLifecycle.requiredEvidence) $expectedCompleteEvidence).Count -ne 0 -or
+            @($completeLifecycle.cases | Where-Object { $_.differenceCount -ne 0 }).Count -ne 0) {
+            throw "VM Complete-profile lifecycle parity did not pass cleanly"
+        }
+        foreach ($completeCase in @($completeLifecycle.cases)) {
+            foreach ($evidenceName in $expectedCompleteEvidence) {
+                if (-not [bool]$completeCase.evidence.left.$evidenceName -or
+                    -not [bool]$completeCase.evidence.right.$evidenceName) {
+                    throw "VM Complete-profile lifecycle case '$($completeCase.relativeInput)' lacks '$evidenceName' evidence"
+                }
+            }
+        }
+        $leftCompleteKinds = @($completeLifecycle.cases | ForEach-Object {
+            @($_.evidence.left.observedEventKinds)
+        })
+        $rightCompleteKinds = @($completeLifecycle.cases | ForEach-Object {
+            @($_.evidence.right.observedEventKinds)
+        })
+        foreach ($kind in @("instruction", "call", "return", "yield", "resume", "upvalue-open", "upvalue-close", "error")) {
+            if (-not ($leftCompleteKinds -contains $kind) -or
+                -not ($rightCompleteKinds -contains $kind)) {
+                throw "VM Complete-profile lifecycle parity did not observe '$kind' on both sides"
+            }
+        }
+        foreach ($completeCase in @($completeLifecycle.cases)) {
+            foreach ($execution in @($completeCase.executions.left, $completeCase.executions.right)) {
+                if ($execution.timedOut -or $null -ne $execution.startError -or $execution.exitCode -ne 1) {
+                    throw "VM Complete-profile lifecycle case '$($completeCase.relativeInput)' lacks the expected matched exit-1 process evidence"
+                }
+            }
+        }
+        foreach ($retirementItem in @(
+            [ordered]@{ name = "cpp"; path = $vmTraceStateRetirementCppReport },
+            [ordered]@{ name = "rust"; path = $vmTraceStateRetirementRustReport }
+        )) {
+            if (-not (Test-Path -LiteralPath $retirementItem.path -PathType Leaf)) {
+                throw "$($retirementItem.name) VM trace state-retirement report is missing"
+            }
+            $retirement = Get-Content -LiteralPath $retirementItem.path -Raw | ConvertFrom-Json
+            if ($retirement.schemaVersion -ne 1 -or
+                $retirement.purpose -ne "producer-lifecycle-self-test" -or
+                $retirement.status -ne "passed" -or
+                $retirement.traceMode -ne "Diff" -or
+                $retirement.evidenceProfile -ne "Complete" -or
+                $retirement.execution.exitCode -ne 1 -or
+                $retirement.execution.timedOut -or
+                $null -ne $retirement.execution.startError -or
+                $retirement.observed.totalUpvalueOpens -ne 6 -or
+                $retirement.observed.totalUpvalueCloses -ne 5 -or
+                $retirement.observed.capturedUpvalueOpens -ne 3 -or
+                $retirement.observed.capturedUpvalueCloses -ne 2 -or
+                @($retirement.issues).Count -ne 0) {
+                throw "$($retirementItem.name) VM trace state-retirement evidence did not pass cleanly"
+            }
+            foreach ($kind in @("instruction", "call", "return", "yield", "resume", "upvalue-open", "upvalue-close", "error")) {
+                if (-not (@($retirement.observed.eventKinds) -contains $kind)) {
+                    throw "$($retirementItem.name) VM trace state-retirement evidence lacks '$kind'"
+                }
+            }
+        }
+        if (-not (Test-Path -LiteralPath $cliContractSelfTestReport -PathType Leaf)) {
+            throw "CLI contract report is missing"
+        }
+        $cliContract = Get-Content -LiteralPath $cliContractSelfTestReport -Raw | ConvertFrom-Json
+        $expectedCliCoverage = @(
+            "arguments", "stdin", "-e", "-l", "-i", "--", "script-args",
+            "hash-bang", "file-errors", "source-name", "stdout-stderr-exit"
+        )
+        if ($cliContract.schemaVersion -ne 1 -or
+            $cliContract.purpose -ne "cross-language-cli-contract" -or
+            $cliContract.status -ne "passed" -or
+            $cliContract.summary.selected -ne 18 -or
+            $cliContract.summary.passed -ne 18 -or
+            $cliContract.summary.failed -ne 0 -or
+            $cliContract.summary.infrastructureFailures -ne 0 -or
+            $cliContract.cases.Count -ne 18 -or
+            @(Compare-Object @($cliContract.covered) $expectedCliCoverage).Count -ne 0 -or
+            @($cliContract.cases | Where-Object { $_.status -ne "passed" }).Count -ne 0 -or
+            @($cliContract.issues).Count -ne 0 -or
+            $cliContract.deferred.Count -ne 1 -or
+            $cliContract.deferred[0].id -ne "binary-chunk-execution" -or
+            $cliContract.deferred[0].milestone -ne "M3") {
+            throw "CLI contract evidence did not pass cleanly"
+        }
+        if (-not (Test-Path -LiteralPath $replContractSelfTestReport -PathType Leaf)) {
+            throw "REPL contract report is missing"
+        }
+        $replContract = Get-Content -LiteralPath $replContractSelfTestReport -Raw | ConvertFrom-Json
+        $expectedReplCoverage = @(
+            "multiline", "incomplete-eof", "expression", "syntax-runtime-recovery",
+            "state-stack-reset", "history", "meta-command", "submitted-completion",
+            "prompt", "stdout-stderr-exit"
+        )
+        if ($replContract.schemaVersion -ne 1 -or
+            $replContract.purpose -ne "cross-language-repl-contract" -or
+            $replContract.status -ne "passed" -or
+            $replContract.summary.selected -ne 8 -or
+            $replContract.summary.passed -ne 8 -or
+            $replContract.summary.failed -ne 0 -or
+            $replContract.cases.Count -ne 8 -or
+            @(Compare-Object @($replContract.covered) $expectedReplCoverage).Count -ne 0 -or
+            @($replContract.cases | Where-Object { $_.status -ne "passed" }).Count -ne 0 -or
+            @($replContract.issues).Count -ne 0) {
+            throw "REPL contract evidence did not pass cleanly"
+        }
+        if (-not (Test-Path -LiteralPath $bytecodeToolContractSelfTestReport -PathType Leaf)) {
+            throw "bytecode tool contract report is missing"
+        }
+        $bytecodeToolContract = Get-Content -LiteralPath $bytecodeToolContractSelfTestReport -Raw |
+            ConvertFrom-Json
+        $expectedBytecodeToolCoverage = @(
+            "arguments", "exit-status", "compact", "full", "cfg", "diff",
+            "string-escaping", "nested-proto", "file-error", "compile-error",
+            "json-schema", "strict-format"
+        )
+        if ($bytecodeToolContract.schemaVersion -ne 1 -or
+            $bytecodeToolContract.purpose -ne "bytecode-viewer-contract" -or
+            $bytecodeToolContract.status -ne "passed" -or
+            $bytecodeToolContract.summary.selected -ne 15 -or
+            $bytecodeToolContract.summary.passed -ne 15 -or
+            $bytecodeToolContract.summary.failed -ne 0 -or
+            $bytecodeToolContract.summary.crossLanguage -ne 12 -or
+            $bytecodeToolContract.summary.rustExtensions -ne 3 -or
+            $bytecodeToolContract.cases.Count -ne 15 -or
+            @(Compare-Object @($bytecodeToolContract.covered) $expectedBytecodeToolCoverage).Count -ne 0 -or
+            @($bytecodeToolContract.cases | Where-Object { $_.status -ne "passed" }).Count -ne 0 -or
+            @($bytecodeToolContract.issues).Count -ne 0) {
+            throw "bytecode tool contract evidence did not pass cleanly"
         }
         $paritySummary.passed = $true
     } catch {
@@ -573,6 +772,7 @@ try {
         "-InputPath", (Join-Path $Root "tests/lua/bytecode"),
         "-CorpusMode", "Representative",
         "-CppBytecodeExe", $cppBytecode,
+        "-CppEvidenceExe", $cppEvidence,
         "-RustBytecodeExe", $CandidateBytecode,
         "-OutputDir", $representativeBytecodeRoot,
         "-ResultPath", $representativeBytecodeReport
@@ -613,6 +813,7 @@ try {
             foreach ($case in @($document.cases)) {
                 foreach ($execution in @(
                     $case.executions.left,
+                    $case.executions.leftEvidence,
                     $case.executions.right
                 )) {
                     if ($execution.timedOut -or
@@ -624,13 +825,125 @@ try {
             }
         }
 
-    $debts.Add([ordered]@{
-        id = "real-vm-trace-parity-unsupported"
-        acceptedBy = "M0.6 parity migration policy"
-        artifact = ""
-        reason = "Synthetic fail-closed runner evidence passes; real lua_cpp/lua_rust --trace-diff support remains a local parity task"
-        localCommand = "powershell -File tools/compare_vm_trace.ps1 -InputPath tests/lua -CorpusMode Representative"
-    })
+    $vmTraceChildArguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", (Join-Path $Root "tools/compare_vm_trace.ps1"),
+        "-InputPath", (Join-Path $Root "tests/lua"),
+        "-CorpusMode", "Representative",
+        "-RepresentativeCount", "12",
+        "-RepresentativeManifest", (Join-Path $Root "tests/compatibility/vm-trace-snapshot-basic-12.json"),
+        "-CppAppExe", $CppLua,
+        "-CppTraceExe", $cppTraceEvidence,
+        "-RustAppExe", $CandidateLua,
+        "-TraceMode", "Snapshot",
+        "-EvidenceProfile", "Basic",
+        "-OutputDir", $representativeVmTraceRoot,
+        "-ResultPath", $representativeVmTraceReport
+    )
+    $null = Invoke-ExternalStep `
+        -Name "representative-vm-trace-snapshot-parity" `
+        -FilePath $hostExecutable `
+        -Arguments $vmTraceChildArguments `
+        -Artifact $representativeVmTraceReport
+    Add-ArtifactValidation `
+        -Name "representative-vm-trace-snapshot-artifact" `
+        -Artifact $representativeVmTraceReport `
+        -Validate {
+            param($document)
+
+            if ($document.schemaVersion -ne 2 -or
+                $document.purpose -ne "cross-language-parity" -or
+                $document.traceMode -ne "Snapshot" -or
+                $document.evidenceProfile -ne "Basic") {
+                throw "unsupported representative VM snapshot report"
+            }
+            if ($document.status -ne "passed" -or
+                $document.summary.selected -ne 12 -or
+                $document.summary.passed -ne 12 -or
+                $document.summary.failed -ne 0 -or
+                $document.summary.infrastructureFailures -ne 0) {
+                throw "representative VM snapshot parity did not pass 12/12"
+            }
+            foreach ($case in @($document.cases)) {
+                foreach ($evidenceName in @($document.requiredEvidence)) {
+                    if (-not [bool]$case.evidence.left.$evidenceName -or
+                        -not [bool]$case.evidence.right.$evidenceName) {
+                        throw "representative VM snapshot case lacks '$evidenceName' evidence"
+                    }
+                }
+                foreach ($execution in @($case.executions.left, $case.executions.right)) {
+                    if ($execution.timedOut -or
+                        $null -ne $execution.startError -or
+                        $execution.exitCode -ne 0) {
+                        throw "representative VM snapshot case lacks clean process evidence"
+                    }
+                }
+                if ($case.differenceCount -ne 0) {
+                    throw "representative VM snapshot case contains semantic differences"
+                }
+            }
+        }
+
+    $vmDiffChildArguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", (Join-Path $Root "tools/compare_vm_trace.ps1"),
+        "-InputPath", (Join-Path $Root "tests/lua"),
+        "-CorpusMode", "Representative",
+        "-RepresentativeCount", "12",
+        "-RepresentativeManifest", (Join-Path $Root "tests/compatibility/vm-trace-snapshot-basic-12.json"),
+        "-CppAppExe", $CppLua,
+        "-CppTraceExe", $cppTraceEvidence,
+        "-RustAppExe", $CandidateLua,
+        "-TraceMode", "Diff",
+        "-EvidenceProfile", "Basic",
+        "-OutputDir", $representativeVmDiffRoot,
+        "-ResultPath", $representativeVmDiffReport
+    )
+    $null = Invoke-ExternalStep `
+        -Name "representative-vm-trace-diff-parity" `
+        -FilePath $hostExecutable `
+        -Arguments $vmDiffChildArguments `
+        -Artifact $representativeVmDiffReport
+    Add-ArtifactValidation `
+        -Name "representative-vm-trace-diff-artifact" `
+        -Artifact $representativeVmDiffReport `
+        -Validate {
+            param($document)
+
+            if ($document.schemaVersion -ne 2 -or
+                $document.purpose -ne "cross-language-parity" -or
+                $document.traceMode -ne "Diff" -or
+                $document.evidenceProfile -ne "Basic") {
+                throw "unsupported representative VM diff report"
+            }
+            if ($document.status -ne "passed" -or
+                $document.summary.selected -ne 12 -or
+                $document.summary.passed -ne 12 -or
+                $document.summary.failed -ne 0 -or
+                $document.summary.infrastructureFailures -ne 0) {
+                throw "representative VM diff parity did not pass 12/12"
+            }
+            foreach ($case in @($document.cases)) {
+                foreach ($evidenceName in @($document.requiredEvidence)) {
+                    if (-not [bool]$case.evidence.left.$evidenceName -or
+                        -not [bool]$case.evidence.right.$evidenceName) {
+                        throw "representative VM diff case lacks '$evidenceName' evidence"
+                    }
+                }
+                foreach ($execution in @($case.executions.left, $case.executions.right)) {
+                    if ($execution.timedOut -or
+                        $null -ne $execution.startError -or
+                        $execution.exitCode -ne 0) {
+                        throw "representative VM diff case lacks clean process evidence"
+                    }
+                }
+                if ($case.differenceCount -ne 0) {
+                    throw "representative VM diff case contains semantic differences"
+                }
+            }
+        }
 
     $null = Invoke-ExternalStep `
         -Name "fixture-manifest-complete" `

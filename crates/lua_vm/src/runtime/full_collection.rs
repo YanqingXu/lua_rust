@@ -70,6 +70,17 @@ pub(crate) enum RuntimeFullCollectionError {
 }
 
 impl Runtime {
+    /// Run one non-reentrant full collection from an idle host boundary.
+    ///
+    /// This is the host-facing counterpart of Lua's `collectgarbage("collect")`:
+    /// it preserves the Runtime root inventory and StateArena retirement rules
+    /// instead of invoking the collector without the canonical Runtime roots.
+    pub fn collect_garbage_full(&mut self) -> Result<usize, String> {
+        self.collect_full_stw()
+            .map(|report| report.collected_objects)
+            .map_err(|error| error.to_string())
+    }
+
     /// Run one direct, non-reentrant stop-the-world full collection.
     ///
     /// The Runtime must be running on its owner thread with no active
@@ -141,7 +152,7 @@ pub(super) fn collect_full_stw_at_safe_point(
     let objects_before = gc.object_count();
     let accounted_bytes_before = gc.total_memory();
     let interned_strings_before = strings.len();
-    let coroutine_states_before = state_arena.live_owned_state_count();
+    let coroutine_states_before = state_arena.live_coroutine_state_count();
 
     let newly_discovered = gc.prepare_finalizable_userdata().len();
 
@@ -170,7 +181,7 @@ pub(super) fn collect_full_stw_at_safe_point(
     let objects_after = gc.object_count();
     let accounted_bytes_after = gc.total_memory();
     let interned_strings_after = strings.len();
-    let coroutine_states_after = state_arena.live_owned_state_count();
+    let coroutine_states_after = state_arena.live_coroutine_state_count();
     let pending_finalizers_after = gc.pending_finalizer_count();
 
     debug_assert_eq!(

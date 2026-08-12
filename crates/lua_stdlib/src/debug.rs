@@ -1,7 +1,6 @@
 //! Minimal debug library.
 
 use std::collections::BTreeSet;
-use std::ptr::NonNull;
 
 use lua_compiler::opcode::{self, OpCode};
 use lua_core::function::{Function, RuntimeNativeFunction};
@@ -40,7 +39,7 @@ enum ResolvedFrame {
 }
 
 pub fn open_debug(l: &mut LuaState, gc: &mut GarbageCollector) {
-    let debug_table = find_lib_table(l, "debug");
+    let debug_table = find_lib_table(l, gc, "debug");
     if debug_table.is_null() {
         return;
     }
@@ -93,8 +92,8 @@ fn reg_runtime_native(
         .expect("debug Runtime-native publication must remain collector-valid");
 }
 
-fn find_lib_table(l: &LuaState, name: &str) -> GcRef<Table> {
-    crate::registration::find_library_table(l, name.as_bytes())
+fn find_lib_table(l: &LuaState, gc: &GarbageCollector, name: &str) -> GcRef<Table> {
+    crate::registration::find_library_table_with_gc(l, gc, name.as_bytes())
         .ok()
         .flatten()
         .unwrap_or_else(GcRef::null)
@@ -271,10 +270,11 @@ unsafe extern "C" fn lua_debug_traceback(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    // SAFETY: LuaState::gc is installed by the VM before calling C functions.
-    let gc = unsafe { &mut *gc_ptr };
     if let Some(Value::Thread(thread_ref)) = l.at(1).cloned() {
         let traceback = thread_traceback(l, thread_ref);
+        // SAFETY: dynamic collector reads above have ended; the active callback
+        // now takes the sole mutable collector borrow for publication.
+        let gc = unsafe { &mut *gc_ptr };
         let _ = crate::registration::push_string(l, gc, &traceback);
         return 1;
     }
@@ -299,6 +299,9 @@ unsafe extern "C" fn lua_debug_traceback(l_ptr: *mut std::ffi::c_void) -> i32 {
     if level <= 0 {
         traceback.extend_from_slice(b"\t[C]: in function 'traceback'\n");
     }
+    // SAFETY: all dynamic collector reads have ended before this publication
+    // borrow is created.
+    let gc = unsafe { &mut *gc_ptr };
     let _ = crate::registration::push_string(l, gc, &traceback);
     1
 }
@@ -323,16 +326,23 @@ fn state_traceback(state: &mut LuaState) -> Vec<u8> {
         let Some(ci) = state.call_stack.get(idx) else {
             continue;
         };
-        let Some(proto_ptr) = frame_proto_ptr(state, ci) else {
+        let Some(proto_ref) = frame_proto_handle(state, ci) else {
             continue;
         };
-        // SAFETY: frame_proto_ptr validated the managed handle against the
-        // owning collector; destructive sweep is disabled during callbacks.
-        let proto = unsafe { proto_ptr.as_ref() };
+        let Ok((source_ref, line, line_defined)) = state.with_gc_ref(proto_ref, |proto| {
+            (
+                proto.source(),
+                ci.savedpc.map(|pc| proto.line(pc)).unwrap_or(0),
+                proto.line_defined(),
+            )
+        }) else {
+            continue;
+        };
         let func_ref = frame_function_ref(state, ci);
-        let source = proto_source(state, proto);
+        let source = source_ref
+            .and_then(|source| state.copy_string_bytes(source).ok())
+            .unwrap_or_default();
         let short = short_source(&source);
-        let line = ci.savedpc.map(|pc| proto.line(pc)).unwrap_or(0);
         if line == 0 {
             continue;
         }
@@ -355,7 +365,7 @@ fn state_traceback(state: &mut LuaState) -> Vec<u8> {
             frame_line.extend_from_slice(b": in function <");
             frame_line.extend_from_slice(&short);
             frame_line.push(b':');
-            frame_line.extend_from_slice(proto.line_defined().to_string().as_bytes());
+            frame_line.extend_from_slice(line_defined.to_string().as_bytes());
             frame_line.extend_from_slice(b">\n");
         }
         out.extend_from_slice(&frame_line);
@@ -418,11 +428,12 @@ fn install_hook(
     count: i32,
     current_location: Option<(i32, usize, Option<GcRef<Proto>>)>,
 ) {
+    let hook_was_active = target.debug_hook_active;
     target.debug_hook = Some(hook);
     target.debug_hook_mask = mask_bytes_to_storage(&mask);
     target.debug_hook_count = count;
     target.debug_hook_countdown = count;
-    target.debug_hook_active = false;
+    target.debug_hook_active = hook_was_active;
     if let Some((line, pc, proto)) = current_location {
         target.debug_hook_last_line = line;
         target.debug_hook_last_pc = pc;
@@ -508,18 +519,15 @@ fn current_caller_location(l: &LuaState) -> Option<(i32, usize, Option<GcRef<Pro
     let ci = l.call_stack.get(frame_idx)?;
     let pc = ci.savedpc?;
     let proto_ref = frame_proto_handle(l, ci)?;
-    let proto_ptr = validated_proto_ptr(l, proto_ref)?;
-    // SAFETY: validated_proto_ptr checked this handle against the state
-    // collector, and destructive sweep is disabled during debug callbacks.
-    let proto = unsafe { proto_ptr.as_ref() };
-    Some((proto.line(pc), pc, Some(proto_ref)))
+    let line = l.with_gc_ref(proto_ref, |proto| proto.line(pc)).ok()?;
+    Some((line, pc, Some(proto_ref)))
 }
 
 unsafe extern "C" fn lua_debug_getfenv(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l = unsafe { &mut *(l_ptr as *mut LuaState) };
     let env = match l.at(1).cloned().unwrap_or(Value::Nil) {
-        Value::Function(func_ref) => function_env(func_ref).or(l.global_table),
+        Value::Function(func_ref) => function_env(l, func_ref).or(l.global_table),
         Value::Thread(thread_ref) => thread_env(l, thread_ref).or(l.global_table),
         _ => None,
     };
@@ -707,12 +715,17 @@ fn function_info(gc: &GarbageCollector, func_ref: GcRef<Function>) -> Option<Deb
         return Some(c_debug_info(Some(Value::Function(func_ref)), None));
     }
     let proto_ref = proto_ref?;
-    let proto_ptr = gc.validate_ref(proto_ref).ok()?;
-    // SAFETY: validated above; destructive sweep is disabled throughout this
-    // debug C callback.
-    let proto = unsafe { proto_ptr.as_ref() };
-    let source = proto
-        .source()
+    let (source_ref, line_defined, last_line_defined, active_lines) = gc
+        .with_ref(proto_ref, |proto| {
+            (
+                proto.source(),
+                proto.line_defined(),
+                proto.last_line_defined(),
+                active_lines(proto),
+            )
+        })
+        .ok()?;
+    let source = source_ref
         .and_then(|source_ref| gc.with_string_bytes(source_ref, <[u8]>::to_vec).ok())
         .unwrap_or_default();
     let short_src = short_source(&source);
@@ -721,13 +734,13 @@ fn function_info(gc: &GarbageCollector, func_ref: GcRef<Function>) -> Option<Deb
         short_src,
         what: b"Lua".to_vec(),
         currentline: None,
-        linedefined: Some(proto.line_defined()),
-        lastlinedefined: Some(proto.last_line_defined()),
+        linedefined: Some(line_defined),
+        lastlinedefined: Some(last_line_defined),
         name: None,
         namewhat: Vec::new(),
         func: Some(Value::Function(func_ref)),
         nups: Some(num_upvalues),
-        active_lines: active_lines(proto),
+        active_lines,
     })
 }
 
@@ -739,10 +752,7 @@ fn stack_frame_info(l: &LuaState, level: usize, include_current: bool) -> Option
     let ci = l.call_stack.get(frame_idx)?;
     let func_ref = frame_function_ref(l, ci);
     let is_c_function = func_ref
-        .and_then(|func_ref| {
-            // SAFETY: validated function refs are held by live call frame slots.
-            unsafe { func_ref.as_ref() }.map(|func| func.is_c_function())
-        })
+        .and_then(|func_ref| l.with_gc_ref(func_ref, Function::is_c_function).ok())
         .unwrap_or(false);
     let (name, namewhat) = debug_name_for_frame(l, frame_idx, func_ref);
     if is_c_function && let Some(func_ref) = func_ref {
@@ -750,15 +760,21 @@ fn stack_frame_info(l: &LuaState, level: usize, include_current: bool) -> Option
         info.namewhat = namewhat;
         return Some(info);
     }
-    let proto_ptr = frame_proto_ptr(l, ci)?;
-    // SAFETY: frame_proto_ptr validated the managed handle against the owning
-    // collector; destructive sweep is disabled during callbacks.
-    let proto = unsafe { proto_ptr.as_ref() };
-    let source = proto
-        .source()
+    let proto_ref = frame_proto_handle(l, ci)?;
+    let (source_ref, line, line_defined, last_line_defined, active_lines) = l
+        .with_gc_ref(proto_ref, |proto| {
+            (
+                proto.source(),
+                ci.savedpc.map(|pc| proto.line(pc)),
+                proto.line_defined(),
+                proto.last_line_defined(),
+                active_lines(proto),
+            )
+        })
+        .ok()?;
+    let source = source_ref
         .and_then(|source_ref| l.copy_string_bytes(source_ref).ok())
         .unwrap_or_default();
-    let line = ci.savedpc.map(|pc| proto.line(pc));
     if include_current && (ci.savedpc.is_none() || line == Some(0)) {
         return None;
     }
@@ -766,26 +782,26 @@ fn stack_frame_info(l: &LuaState, level: usize, include_current: bool) -> Option
     Some(DebugInfo {
         source,
         short_src,
-        what: if proto.line_defined() == 0 {
+        what: if line_defined == 0 {
             b"main".to_vec()
         } else {
             b"Lua".to_vec()
         },
         currentline: line,
-        linedefined: Some(proto.line_defined()),
-        lastlinedefined: Some(proto.last_line_defined()),
+        linedefined: Some(line_defined),
+        lastlinedefined: Some(last_line_defined),
         name,
         namewhat,
         func: func_ref.map(Value::Function),
         nups: Some(
             func_ref
                 .and_then(|func_ref| {
-                    // SAFETY: validated function refs are held by live call frame slots.
-                    unsafe { func_ref.as_ref() }.map(|func| func.num_upvalues() as i32)
+                    l.with_gc_ref(func_ref, |func| func.num_upvalues() as i32)
+                        .ok()
                 })
                 .unwrap_or(0),
         ),
-        active_lines: active_lines(proto),
+        active_lines,
     })
 }
 
@@ -866,22 +882,26 @@ fn get_local_value(
         return get_temporary(l, frame_idx, local_number, None);
     }
 
-    let ci = l.call_stack.get(frame_idx)?;
-    let (proto_ptr, pc) = frame_proto_and_pc(l, frame_idx)?;
-    // SAFETY: frame_proto_and_pc validated the managed handle against the
-    // owning collector.
-    let proto = unsafe { proto_ptr.as_ref() };
-    if let Some(loc) = proto.local_var_info(local_number, pc as i32) {
+    let base = l.call_stack.get(frame_idx)?.base;
+    let (proto_ref, pc) = frame_proto_and_pc(l, frame_idx)?;
+    let (local, temp_number) = l
+        .with_gc_ref(proto_ref, |proto| {
+            (
+                proto.local_var_info(local_number, pc as i32).cloned(),
+                active_named_local_count(proto, pc) + 1,
+            )
+        })
+        .ok()?;
+    if let Some(loc) = local {
         let name = loc.varname.and_then(|name| gc_string_bytes(l, name))?;
         let value = l
             .stack
-            .at(ci.base + loc.reg as usize)
+            .at(base + loc.reg as usize)
             .cloned()
             .unwrap_or(Value::Nil);
         return Some((name, value));
     }
 
-    let temp_number = active_named_local_count(proto, pc) + 1;
     get_temporary(l, frame_idx, local_number, Some(temp_number))
 }
 
@@ -897,11 +917,16 @@ fn set_local_value(
         return set_temporary(l, frame_idx, local_number, value, None);
     }
 
-    let (proto_ptr, pc) = frame_proto_and_pc(l, frame_idx)?;
-    // SAFETY: frame_proto_and_pc validated the managed handle against the
-    // owning collector.
-    let proto = unsafe { proto_ptr.as_ref() };
-    if let Some(loc) = proto.local_var_info(local_number, pc as i32) {
+    let (proto_ref, pc) = frame_proto_and_pc(l, frame_idx)?;
+    let (local, temp_number) = l
+        .with_gc_ref(proto_ref, |proto| {
+            (
+                proto.local_var_info(local_number, pc as i32).cloned(),
+                active_named_local_count(proto, pc) + 1,
+            )
+        })
+        .ok()?;
+    if let Some(loc) = local {
         let name = loc.varname.and_then(|name| gc_string_bytes(l, name))?;
         let slot = l.call_stack.get(frame_idx)?.base + loc.reg as usize;
         if let Some(dst) = l.stack.at_mut(slot) {
@@ -911,7 +936,6 @@ fn set_local_value(
         return None;
     }
 
-    let temp_number = active_named_local_count(proto, pc) + 1;
     set_temporary(l, frame_idx, local_number, value, Some(temp_number))
 }
 
@@ -1007,10 +1031,10 @@ fn frame_index_for_level(l: &LuaState, level: usize, include_current: bool) -> O
     }
 }
 
-fn frame_proto_and_pc(l: &LuaState, frame_idx: usize) -> Option<(NonNull<Proto>, usize)> {
+fn frame_proto_and_pc(l: &LuaState, frame_idx: usize) -> Option<(GcRef<Proto>, usize)> {
     let ci = l.call_stack.get(frame_idx)?;
     let pc = ci.savedpc.unwrap_or(0);
-    frame_proto_ptr(l, ci).map(|proto| (proto, pc))
+    frame_proto_handle(l, ci).map(|proto| (proto, pc))
 }
 
 fn frame_function_ref(l: &LuaState, ci: &lua_vm::state::CallInfo) -> Option<GcRef<Function>> {
@@ -1023,9 +1047,7 @@ fn frame_function_ref(l: &LuaState, ci: &lua_vm::state::CallInfo) -> Option<GcRe
     };
 
     if let Some(frame_proto) = ci.proto {
-        let func_proto = state_gc(l)
-            .and_then(|gc| gc.with_ref(func_ref, Function::proto).ok())
-            .flatten()?;
+        let func_proto = l.with_gc_ref(func_ref, Function::proto).ok().flatten()?;
         if func_proto != frame_proto {
             return None;
         }
@@ -1039,24 +1061,7 @@ fn frame_proto_handle(l: &LuaState, ci: &lua_vm::state::CallInfo) -> Option<GcRe
         return Some(proto);
     }
     let func_ref = frame_function_ref(l, ci)?;
-    state_gc(l)
-        .and_then(|gc| gc.with_ref(func_ref, Function::proto).ok())
-        .flatten()
-}
-
-fn frame_proto_ptr(l: &LuaState, ci: &lua_vm::state::CallInfo) -> Option<NonNull<Proto>> {
-    validated_proto_ptr(l, frame_proto_handle(l, ci)?)
-}
-
-fn validated_proto_ptr(l: &LuaState, proto: GcRef<Proto>) -> Option<NonNull<Proto>> {
-    state_gc(l)?.validate_ref(proto).ok()
-}
-
-fn state_gc(l: &LuaState) -> Option<&GarbageCollector> {
-    let gc = l.active_gc_ptr()?;
-    // SAFETY: the VM installs the owning collector for the complete duration
-    // of C/debug callbacks. This immutable borrow is scoped to one helper call.
-    Some(unsafe { &*gc })
+    l.with_gc_ref(func_ref, Function::proto).ok().flatten()
 }
 
 fn active_lines(proto: &lua_core::proto::Proto) -> Vec<i32> {
@@ -1073,13 +1078,6 @@ fn active_lines(proto: &lua_core::proto::Proto) -> Vec<i32> {
         lines.insert(last);
     }
     lines.into_iter().collect()
-}
-
-fn proto_source(l: &LuaState, proto: &Proto) -> Vec<u8> {
-    proto
-        .source()
-        .and_then(|source_ref| l.copy_string_bytes(source_ref).ok())
-        .unwrap_or_default()
 }
 
 fn debug_name_for_frame(
@@ -1104,28 +1102,29 @@ fn call_site_name(l: &LuaState, frame_idx: usize) -> Option<DebugName> {
     let caller_idx = frame_idx.checked_sub(1)?;
     let caller_ci = l.call_stack.get(caller_idx)?;
     let pc = caller_ci.savedpc?;
-    let caller_proto_ptr = frame_proto_ptr(l, caller_ci)?;
-    // SAFETY: frame_proto_ptr validated the managed handle against the owning
-    // collector.
-    let caller_proto = unsafe { caller_proto_ptr.as_ref() };
-    let call_pc = if pc < caller_proto.instruction_count() {
-        pc
-    } else {
-        let previous = pc.checked_sub(1)?;
-        if previous < caller_proto.instruction_count() {
-            previous
+    let caller_proto = frame_proto_handle(l, caller_ci)?;
+    l.with_gc_ref(caller_proto, |caller_proto| {
+        let call_pc = if pc < caller_proto.instruction_count() {
+            pc
         } else {
-            return None;
+            let previous = pc.checked_sub(1)?;
+            if previous < caller_proto.instruction_count() {
+                previous
+            } else {
+                return None;
+            }
+        };
+        let inst = caller_proto.instruction(call_pc);
+        match opcode::get_opcode(inst) {
+            OpCode::CALL | OpCode::TAILCALL => {
+                let reg = opcode::get_arg_a(inst) as usize;
+                register_name(l, caller_proto, call_pc, reg, 8)
+            }
+            _ => None,
         }
-    };
-    let inst = caller_proto.instruction(call_pc);
-    match opcode::get_opcode(inst) {
-        OpCode::CALL | OpCode::TAILCALL => {
-            let reg = opcode::get_arg_a(inst) as usize;
-            register_name(l, caller_proto, call_pc, reg, 8)
-        }
-        _ => None,
-    }
+    })
+    .ok()
+    .flatten()
 }
 
 fn register_name(
@@ -1276,36 +1275,39 @@ fn string_chunk_id(source: &[u8]) -> Vec<u8> {
 }
 
 fn function_name_in_env(l: &LuaState, func_ref: GcRef<Function>) -> Option<Vec<u8>> {
-    // SAFETY: the function is held by the active stack frame or an argument.
-    let env = unsafe { func_ref.as_ref() }
-        .and_then(|function| function.env())
+    let env = l
+        .with_gc_ref(func_ref, Function::env)
+        .ok()
+        .flatten()
         .or(l.global_table)?;
-    // SAFETY: env is reachable from the function/global state while getinfo runs.
-    let table = unsafe { env.as_ref() }?;
-    for (key, value) in table.hash_entries() {
-        if let (Value::String(key_ref), Value::Function(value_func)) = (key, value)
-            && *value_func == func_ref
-            && let Ok(key_string) = l.copy_string_bytes(*key_ref)
-        {
-            return Some(key_string);
-        }
-    }
-    None
+    let key = function_key_in_table(l, env, func_ref)?;
+    l.copy_string_bytes(key).ok()
 }
 
 fn function_name_in_global(l: &LuaState, func_ref: GcRef<Function>) -> Option<Vec<u8>> {
     let env = l.global_table?;
-    // SAFETY: global table is rooted by the Lua state while debugging.
-    let table = unsafe { env.as_ref() }?;
-    for (key, value) in table.hash_entries() {
-        if let (Value::String(key_ref), Value::Function(value_func)) = (key, value)
-            && *value_func == func_ref
-            && let Ok(key_string) = l.copy_string_bytes(*key_ref)
-        {
-            return Some(key_string);
-        }
-    }
-    None
+    let key = function_key_in_table(l, env, func_ref)?;
+    l.copy_string_bytes(key).ok()
+}
+
+fn function_key_in_table(
+    l: &LuaState,
+    table_ref: GcRef<Table>,
+    func_ref: GcRef<Function>,
+) -> Option<GcRef<GcString>> {
+    l.with_gc_ref(table_ref, |table| {
+        table.hash_entries().find_map(|(key, value)| {
+            if let (Value::String(key_ref), Value::Function(value_func)) = (key, value)
+                && *value_func == func_ref
+            {
+                Some(*key_ref)
+            } else {
+                None
+            }
+        })
+    })
+    .ok()
+    .flatten()
 }
 
 fn publish_debug_info(
@@ -1393,9 +1395,8 @@ fn active_lines_table<'scope>(
     Ok(table)
 }
 
-fn function_env(func_ref: GcRef<Function>) -> Option<GcRef<Table>> {
-    // SAFETY: function refs are held by a Lua stack or GC object.
-    unsafe { func_ref.as_ref() }.and_then(|function| function.env())
+fn function_env(l: &LuaState, func_ref: GcRef<Function>) -> Option<GcRef<Table>> {
+    l.with_gc_ref(func_ref, Function::env).ok().flatten()
 }
 
 fn set_function_env(l: &LuaState, func_ref: GcRef<Function>, env: GcRef<Table>) {
@@ -1421,9 +1422,10 @@ fn with_thread_state_mut<T>(
     if thread_ref.is_null() {
         return None;
     }
-    // SAFETY: thread_ref is held by a Lua stack or GC object.
-    let thread = unsafe { thread_ref.as_ref() }?;
-    let handle = thread.state_handle()?;
+    let handle = current
+        .with_gc_ref(thread_ref, Thread::state_handle)
+        .ok()
+        .flatten()?;
     current.with_resolved_state_mut(handle, f).ok()
 }
 

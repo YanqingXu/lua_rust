@@ -24,6 +24,7 @@ struct ActiveServices {
     state: NonNull<LuaState>,
     collector: NonNull<GarbageCollector>,
     strings: NonNull<StringPool>,
+    collector_accessible: bool,
 }
 
 thread_local! {
@@ -58,8 +59,19 @@ impl Drop for ActiveVmContext {
 /// dropped before any pointed-to state or service can be moved or destroyed.
 pub(crate) unsafe fn enter_vm_context(
     state: NonNull<LuaState>,
+    collector: NonNull<GarbageCollector>,
+    strings: NonNull<StringPool>,
+) -> ActiveVmContext {
+    // SAFETY: forwarded caller contract; ordinary contexts expose both
+    // services through LuaState's dynamic scoped APIs.
+    unsafe { enter_vm_context_with_access(state, collector, strings, true) }
+}
+
+unsafe fn enter_vm_context_with_access(
+    state: NonNull<LuaState>,
     mut collector: NonNull<GarbageCollector>,
     mut strings: NonNull<StringPool>,
+    collector_accessible: bool,
 ) -> ActiveVmContext {
     // SAFETY: caller guarantees exclusive live access for the scope.
     let collector_ref = unsafe { collector.as_mut() };
@@ -81,6 +93,7 @@ pub(crate) unsafe fn enter_vm_context(
         state,
         collector,
         strings,
+        collector_accessible,
     };
     ACTIVE_SERVICES.with(|active| active.borrow_mut().push(entry));
     ActiveVmContext {
@@ -97,31 +110,57 @@ pub(crate) fn active_service_pointers(
         active
             .borrow()
             .last()
-            .filter(|entry| entry.state == state)
+            .filter(|entry| entry.state == state && entry.collector_accessible)
             .map(|entry| (entry.collector, entry.strings))
     })
 }
 
-/// Run code with one state and both services from the same Heap active.
+pub(crate) fn active_collector_pointer(state: &LuaState) -> Option<NonNull<GarbageCollector>> {
+    let state = NonNull::from(state);
+    ACTIVE_SERVICES.with(|active| {
+        active
+            .borrow()
+            .last()
+            .filter(|entry| entry.state == state && entry.collector_accessible)
+            .map(|entry| entry.collector)
+    })
+}
+
+pub(crate) fn active_string_pool_pointer(state: &LuaState) -> Option<NonNull<StringPool>> {
+    let state = NonNull::from(state);
+    ACTIVE_SERVICES.with(|active| {
+        active
+            .borrow()
+            .last()
+            .filter(|entry| entry.state == state)
+            .map(|entry| entry.strings)
+    })
+}
+
+/// Run code with an explicit collector while the canonical StringPool remains
+/// available only through the state's dynamic context.
 ///
-/// This is primarily for host integration and tests that must call lower-level
-/// VM helpers while preserving the same dynamic context as Runtime execution.
-pub fn with_vm_context_parts<R>(
+/// Keeping the pool out of the callback prevents a closure-wide `&mut
+/// StringPool` from overlapping short interning borrows recovered by native
+/// library publication helpers.
+/// Dynamic collector recovery is disabled for the outer callback, so accidental
+/// `LuaState::with_gc_ref` calls fail closed instead of aliasing the explicit
+/// collector. The VM installs a fresh nested context before ordinary C calls.
+pub fn with_vm_context_gc<R>(
     state: &mut LuaState,
     collector: &mut GarbageCollector,
     strings: &mut StringPool,
-    execute: impl FnOnce(&mut LuaState, &mut GarbageCollector, &mut StringPool) -> R,
+    execute: impl FnOnce(&mut LuaState, &mut GarbageCollector) -> R,
 ) -> R {
-    // SAFETY: the closure cannot outlive these exclusive references and the
-    // token is dropped before this function returns or unwinds.
-    let _scope = unsafe {
-        enter_vm_context(
-            NonNull::from(&mut *state),
-            NonNull::from(&mut *collector),
-            NonNull::from(&mut *strings),
-        )
-    };
-    execute(state, collector, strings)
+    let mut state = NonNull::from(state);
+    let mut collector = NonNull::from(collector);
+    let strings = NonNull::from(strings);
+    // SAFETY: all pointers come from exclusive input borrows, the callback is
+    // synchronous, and the token is dropped before any input can be reused.
+    let _scope = unsafe { enter_vm_context_with_access(state, collector, strings, false) };
+    // SAFETY: the callback is the sole lexical consumer of state and collector
+    // for this scope. StringPool access stays behind the dynamic context.
+    unsafe { execute(state.as_mut(), collector.as_mut()) }
 }
 
 /// Run host/test code with one state and one Heap service pair active.
@@ -148,6 +187,7 @@ pub fn with_vm_context<R>(
 #[cfg(test)]
 mod tests {
     use lua_core::heap::Heap;
+    use lua_core::table::Table;
 
     use super::*;
 
@@ -165,6 +205,25 @@ mod tests {
                 assert!(inactive.active_gc_ptr().is_none());
             });
             assert!(active.active_gc_ptr().is_none());
+        });
+    }
+
+    #[test]
+    fn explicit_collector_context_hides_dynamic_collector_but_keeps_strings() {
+        let mut heap = Heap::new();
+        let mut state = LuaState::new();
+
+        heap.with_parts_mut(|collector, strings| {
+            let table = collector.create(Table::new());
+            with_vm_context_gc(&mut state, collector, strings, |state, collector| {
+                assert!(state.active_gc_ptr().is_none());
+                assert!(state.active_string_pool_ptr().is_some());
+                assert_eq!(
+                    state.with_gc_ref(table, Table::length),
+                    Err(lua_core::gc::collector::GcRefValidationError::CollectorUnavailable)
+                );
+                assert_eq!(collector.with_ref(table, Table::length), Ok(0));
+            });
         });
     }
 

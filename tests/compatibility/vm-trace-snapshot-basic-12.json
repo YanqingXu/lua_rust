@@ -1,0 +1,16 @@
+{
+  "files": [
+    "alien_signals/bit.lua",
+    "basic/test_arithmetic.lua",
+    "bytecode/test_bytecode_debug.lua",
+    "control_flow/test_break_counter.lua",
+    "control_flow/test_for_simple.lua",
+    "control_flow/test_if_nested.lua",
+    "functions/test_closure_simple.lua",
+    "functions/test_multiret.lua",
+    "functions/test_table_constructor_multret.lua",
+    "functions/test_vararg.lua",
+    "step01_basic.lua",
+    "step03_table.lua"
+  ]
+}

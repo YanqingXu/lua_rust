@@ -32,6 +32,8 @@ pub use types::{
     SymbolRef, UpvalueCapture, ValueResult,
 };
 
+use std::collections::HashSet;
+
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc::publication::PublicationTxn;
@@ -140,12 +142,22 @@ pub struct CodeGenerator<'services, A: CodegenObjectAllocator + ?Sized = Garbage
     pub reg_alloc: RegisterAllocator,
     pub current_line: i32,
 
+    /// First user-triggered lowering failure recorded by an infallible emitter.
+    ///
+    /// Most of the legacy emitter surface predates `CodegenError` and is used
+    /// from expression helpers that return values directly.  Recording the
+    /// first failure lets those helpers finish unwinding their local state
+    /// while the public generation boundary still rejects the partial Proto.
+    pub(crate) pending_error: Option<CodegenError>,
+
     // ── 跳转管理 ──────────────────────────────────────────────
     pub jpc: i32,
 
     // ── 局部变量 ──────────────────────────────────────────────
     pub local_vars: Vec<LocalVar>,
     pub active_var_count: i32,
+    pub(crate) future_reads: Option<HashSet<String>>,
+    pub(crate) force_nil_local_initialization: bool,
 
     // ── Upvalue ───────────────────────────────────────────────
     pub upvalues: Vec<UpvalueCapture>,
@@ -181,6 +193,12 @@ impl<'services, 'scope> CodeGenerator<'services, PublicationTxn<'scope>> {
 }
 
 impl<'services, A: CodegenObjectAllocator + ?Sized> CodeGenerator<'services, A> {
+    pub(crate) fn record_codegen_error(&mut self, message: impl Into<String>) {
+        if self.pending_error.is_none() {
+            self.pending_error = Some(CodegenError::new(message, 0, 0));
+        }
+    }
+
     fn from_services(allocator: &'services mut A, string_pool: &'services mut StringPool) -> Self {
         let mut proto = Proto::new();
         proto.set_max_stack_size(2);
@@ -188,9 +206,12 @@ impl<'services, A: CodegenObjectAllocator + ?Sized> CodeGenerator<'services, A> 
             builder: BytecodeBuilder::new(proto),
             reg_alloc: RegisterAllocator::new(0),
             current_line: 0,
+            pending_error: None,
             jpc: NO_JUMP,
             local_vars: Vec::new(),
             active_var_count: 0,
+            future_reads: None,
+            force_nil_local_initialization: false,
             upvalues: Vec::new(),
             parent_functions: Vec::new(),
             blocks: Vec::new(),
@@ -221,8 +242,15 @@ impl<'services, A: CodegenObjectAllocator + ?Sized> CodeGenerator<'services, A> 
 
         self.emit_block(&chunk.statements)
             .map_err(|msg| CodegenError::new(msg, 0, 0))?;
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
 
         let final_line = chunk.statements.last().map(|s| s.end_line()).unwrap_or(1);
+        // The pinned C++ top-level block closes captured root locals before
+        // appending its implicit fallthrough RETURN. Its ambient root line is 0.
+        self.current_line = 0;
+        self.remove_local_vars(0);
         self.code_abc(OpCode::RETURN, 0, 1, 0, final_line);
 
         // Lua 5.1 keeps a two-slot minimum, then records the exact highest
@@ -235,6 +263,10 @@ impl<'services, A: CodegenObjectAllocator + ?Sized> CodeGenerator<'services, A> 
             .max(2);
         self.builder.set_max_stack_size(max_stack as u8);
         self.attach_local_debug();
+
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
 
         Ok(self.builder.into_proto())
     }

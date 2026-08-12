@@ -4,7 +4,7 @@
 //! upvalue 闭包元数据和调试信息附加。
 //!
 
-use lua_core::proto::{Proto, VARARG_ISVARARG, VARARG_NEEDSARG};
+use lua_core::proto::{Proto, VARARG_HASARG, VARARG_ISVARARG, VARARG_NEEDSARG};
 
 use crate::ast::expr::Expr;
 use crate::ast::stmt::Stmt;
@@ -25,7 +25,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         is_vararg: bool,
         body: &[Box<crate::ast::stmt::Stmt>],
         linedefined: i32,
-        _lastlinedefined: i32,
+        lastlinedefined: i32,
     ) -> Result<CompiledFunction, String> {
         let vararg_usage = scan_vararg_usage(body);
         let needs_arg = is_vararg && !vararg_usage.uses_vararg_expr;
@@ -35,14 +35,19 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         let mut sub_proto = Proto::new();
         sub_proto.set_max_stack_size(2);
         let vararg_flags = if is_vararg {
-            VARARG_ISVARARG | if needs_arg { VARARG_NEEDSARG } else { 0 }
+            VARARG_ISVARARG
+                | if needs_arg {
+                    VARARG_HASARG | VARARG_NEEDSARG
+                } else {
+                    0
+                }
         } else {
             0
         };
         sub_proto.set_source(source);
         sub_proto.set_vararg_flags(vararg_flags);
         sub_proto.set_line_defined(linedefined);
-        sub_proto.set_last_line_defined(_lastlinedefined);
+        sub_proto.set_last_line_defined(lastlinedefined);
 
         // 保存当前状态
         let saved_builder = std::mem::replace(
@@ -64,6 +69,11 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         let saved_blocks = std::mem::take(&mut self.blocks);
         let saved_jpc = self.jpc;
         self.jpc = crate::codegen::types::NO_JUMP;
+        let saved_current_line = self.current_line;
+        self.current_line = linedefined;
+        let saved_future_reads = self.future_reads.take();
+        let saved_force_nil_local_initialization = self.force_nil_local_initialization;
+        self.force_nil_local_initialization = false;
 
         // 设置参数数量
         let num_params = params.len();
@@ -82,37 +92,44 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
             self.adjust_local_vars(1);
         }
 
-        // 编译函数体
-        self.emit_block(body)?;
+        // Compile the body, but always restore the parent generator state even
+        // when a user-triggered lowering error occurs inside the child.
+        let body_error = self.emit_block(body).err();
+        let upvalues = if body_error.is_none() {
+            // 末尾兜底 RETURN
+            let final_line = if lastlinedefined > 0 {
+                lastlinedefined
+            } else {
+                linedefined
+            };
+            self.code_abc(OpCode::RETURN, 0, 1, 0, final_line);
 
-        // 末尾兜底 RETURN
-        self.code_abc(OpCode::RETURN, 0, 1, 0, self.current_line);
+            // 附加调试信息
+            self.attach_local_debug();
 
-        // 附加调试信息
-        self.attach_local_debug();
-
-        // 保存编译结果
-        let upvalues = self.upvalues.clone();
-        self.builder.set_num_upvalues(upvalues.len() as u8);
-        for upvalue in &upvalues {
-            let name = self
-                .allocator
-                .allocate_string(self.string_pool, upvalue.name.as_bytes());
-            self.builder.add_upvalue_name(name);
-        }
-        let max_stack = self
-            .reg_alloc
-            .max_used()
-            .max(self.active_var_count)
-            .max(self.builder.max_stack_size() as i32)
-            .max(2);
-        self.builder.set_max_stack_size(max_stack as u8);
+            // 保存编译结果
+            let upvalues = self.upvalues.clone();
+            self.builder.set_num_upvalues(upvalues.len() as u8);
+            for upvalue in &upvalues {
+                let name = self
+                    .allocator
+                    .allocate_string(self.string_pool, upvalue.name.as_bytes());
+                self.builder.add_upvalue_name(name);
+            }
+            let max_stack = self
+                .reg_alloc
+                .max_used()
+                .max(self.active_var_count)
+                .max(self.builder.max_stack_size() as i32)
+                .max(2);
+            self.builder.set_max_stack_size(max_stack as u8);
+            Some(upvalues)
+        } else {
+            None
+        };
 
         let child_builder = std::mem::replace(&mut self.builder, saved_builder);
         let child_proto = child_builder.into_proto();
-
-        let child_ref = self.allocator.allocate_proto(child_proto);
-        let proto_index = self.builder.add_sub_proto(child_ref);
 
         // 恢复状态
         let parent_context = self
@@ -125,6 +142,19 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         self.upvalues = parent_context.upvalues;
         self.blocks = saved_blocks;
         self.jpc = saved_jpc;
+        self.current_line = saved_current_line;
+        self.future_reads = saved_future_reads;
+        self.force_nil_local_initialization = saved_force_nil_local_initialization;
+
+        if let Some(error) = body_error {
+            return Err(error);
+        }
+        let Some(upvalues) = upvalues else {
+            return Err("function compilation failed".to_string());
+        };
+
+        let child_ref = self.allocator.allocate_proto(child_proto);
+        let proto_index = self.builder.add_sub_proto(child_ref);
 
         Ok(CompiledFunction {
             proto_index,

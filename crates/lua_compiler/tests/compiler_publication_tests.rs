@@ -146,6 +146,28 @@ fn compiler_consumer_error_drops_builder_roots_without_a_top_proto() {
 }
 
 #[test]
+fn nested_codegen_error_restores_parent_and_releases_partial_publication_roots() {
+    let chunk = parse(b"return function() 1 = 2 end");
+    let mut gc = GarbageCollector::new();
+    let mut pool = StringPool::new();
+
+    let result = gc.with_publication(|transaction| {
+        CodeGenerator::new_in_publication_with_pool(transaction, &mut pool)
+            .generate(&chunk, "@compiler-publication-codegen-error")
+    });
+
+    let error = result.expect_err("invalid child lvalue must reject the partial Proto tree");
+    assert_eq!(error.message, "Expression is not a valid lvalue");
+    assert_eq!(gc.temporary_root_count(), 0);
+    assert_eq!(gc.rejected_temporary_root_release_count(), 0);
+    gc.mark();
+    let object_count = gc.object_count();
+    assert_eq!(gc.sweep(&mut pool), object_count);
+    assert_eq!(gc.object_count(), 0);
+    assert!(pool.is_empty());
+}
+
+#[test]
 fn published_function_layout_is_lua_not_native() {
     let chunk = parse(b"return 42");
     let mut gc = GarbageCollector::new();

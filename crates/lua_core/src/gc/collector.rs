@@ -930,6 +930,31 @@ impl GarbageCollector {
         Some(unsafe { GcRef::from_registered(pointer, live.object_id) })
     }
 
+    /// Reconstitute a typed handle from an exact live allocation identity.
+    ///
+    /// This is intended for weak service registries that must not retain a
+    /// pointer or add a collector root. The authoritative side table is
+    /// searched as integer metadata; object memory is not touched until the
+    /// identity and concrete type both match.
+    pub fn registered_ref_by_id<T: GcObject>(&self, object_id: ObjectId) -> Option<GcRef<T>> {
+        if object_id.is_null() {
+            return None;
+        }
+        let expected = T::expected_gc_type();
+        self.live_allocations
+            .iter()
+            .find_map(|(address, live)| {
+                (live.object_id == object_id && live.object_type == expected)
+                    .then_some((*address, live.object_id))
+            })
+            .and_then(|(address, object_id)| {
+                let pointer = NonNull::new(address as *mut T)?;
+                // SAFETY: the authoritative table matched this address,
+                // process-unique identity, and concrete object type.
+                Some(unsafe { GcRef::from_registered(pointer, object_id) })
+            })
+    }
+
     /// Count objects reached by the current mark-only traversal.
     pub fn marked_object_count(&self) -> usize {
         let mut count = 0;
@@ -1180,6 +1205,33 @@ mod tests {
             owner.validate_ref(table),
             Err(GcRefValidationError::NotLive { .. })
         ));
+    }
+
+    #[test]
+    fn weak_identity_lookup_requires_live_exact_type() {
+        let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let userdata = gc.create(Userdata::new(0));
+        let table = gc.create(Table::new());
+
+        assert_eq!(
+            gc.registered_ref_by_id::<Userdata>(userdata.object_id()),
+            Some(userdata)
+        );
+        assert!(
+            gc.registered_ref_by_id::<Table>(userdata.object_id())
+                .is_none()
+        );
+        assert!(
+            gc.registered_ref_by_id::<Userdata>(table.object_id())
+                .is_none()
+        );
+
+        assert_eq!(gc.sweep(&mut pool), 2);
+        assert!(
+            gc.registered_ref_by_id::<Userdata>(userdata.object_id())
+                .is_none()
+        );
     }
 
     #[test]

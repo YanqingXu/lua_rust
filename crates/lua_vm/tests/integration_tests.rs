@@ -62,6 +62,43 @@ fn test_return_boolean() {
 }
 
 #[test]
+fn indexed_assignment_evaluates_lvalue_before_rhs() {
+    let source = r#"
+        local order = 0
+        local target = {}
+        local function key()
+            order = order * 10 + 1
+            return 1
+        end
+        local function value()
+            order = order * 10 + 2
+            return 42
+        end
+        target[key()] = value()
+        return order
+    "#;
+    let (result, _runtime) = compile_and_run(source);
+    assert_eq!(return_value(&result), Value::Number(12.0));
+}
+
+#[test]
+fn boolean_comparison_chains_preserve_short_circuit_side_effects() {
+    let source = r#"
+        local calls = 0
+        local function probe(value)
+            calls = calls + 1
+            return value
+        end
+        local conjunction = probe(false) == true and probe(true) == true
+        local disjunction = probe(true) == true or probe(false) == true
+        if conjunction or not disjunction then return -1 end
+        return calls
+    "#;
+    let (result, _runtime) = compile_and_run(source);
+    assert_eq!(return_value(&result), Value::Number(2.0));
+}
+
+#[test]
 fn test_arithmetic_add() {
     let (state, _gc) = compile_and_run("return 10 + 20");
     assert_eq!(return_value(&state), Value::Number(30.0));

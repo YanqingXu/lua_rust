@@ -65,6 +65,11 @@ if ([string]::IsNullOrWhiteSpace($CppRoot)) {
 $cppPath = Resolve-RootedPath $CppRoot
 $outputRoot = Resolve-RootedPath $OutputDirectory
 $buildDirectory = Join-Path $outputRoot "build"
+$installDirectory = Join-Path $outputRoot "install"
+$evidenceBuildDirectory = Join-Path $outputRoot "evidence-build"
+$evidenceSourceDirectory = Join-Path $Root "tools/cpp_bytecode_evidence"
+$traceEvidenceBuildDirectory = Join-Path $outputRoot "trace-evidence-build"
+$traceEvidenceSourceDirectory = Join-Path $Root "tools/cpp_vm_trace_evidence"
 $runningOnWindows = $env:OS -eq "Windows_NT"
 $executableDirectory = if ($runningOnWindows) {
     Join-Path $buildDirectory $Configuration
@@ -73,8 +78,20 @@ $executableDirectory = if ($runningOnWindows) {
 }
 $appName = if ($runningOnWindows) { "lua_app.exe" } else { "lua_app" }
 $bytecodeName = if ($runningOnWindows) { "lua_bytecode.exe" } else { "lua_bytecode" }
+$evidenceName = if ($runningOnWindows) {
+    "lua_bytecode_evidence.exe"
+} else {
+    "lua_bytecode_evidence"
+}
+$traceEvidenceName = if ($runningOnWindows) {
+    "lua_vm_trace_evidence.exe"
+} else {
+    "lua_vm_trace_evidence"
+}
 $appPath = Join-Path $executableDirectory $appName
 $bytecodePath = Join-Path $executableDirectory $bytecodeName
+$evidencePath = Join-Path $executableDirectory $evidenceName
+$traceEvidencePath = Join-Path $executableDirectory $traceEvidenceName
 
 $document = [ordered]@{
     schemaVersion = 1
@@ -88,6 +105,18 @@ $document = [ordered]@{
     executables = [ordered]@{
         luaApp = [ordered]@{ path = $appPath; sha256 = "" }
         luaBytecode = [ordered]@{ path = $bytecodePath; sha256 = "" }
+        luaBytecodeEvidence = [ordered]@{ path = $evidencePath; sha256 = "" }
+        luaVmTraceEvidence = [ordered]@{ path = $traceEvidencePath; sha256 = "" }
+    }
+    evidenceAdapter = [ordered]@{
+        sourceDirectory = $evidenceSourceDirectory
+        cmakeSha256 = ""
+        sourceSha256 = ""
+    }
+    traceEvidenceAdapter = [ordered]@{
+        sourceDirectory = $traceEvidenceSourceDirectory
+        cmakeSha256 = ""
+        sourceSha256 = ""
     }
     failure = $null
 }
@@ -145,11 +174,95 @@ try {
         }
     }
 
+    & cmake --install $buildDirectory --config $Configuration `
+        --prefix $installDirectory
+    if ($LASTEXITCODE -ne 0) {
+        throw "CMake install failed for the pinned C++ oracle library"
+    }
+
+    $evidenceConfigureArguments = @(
+        "-S", $evidenceSourceDirectory,
+        "-B", $evidenceBuildDirectory,
+        "-DLUA_CPP_SOURCE_ROOT=$cppPath",
+        "-DLUA_CPP_PACKAGE_ROOT=$installDirectory",
+        "-DLUA_CPP_EVIDENCE_OUTPUT_DIRECTORY=$executableDirectory"
+    )
+    if ($runningOnWindows) {
+        $evidenceConfigureArguments += @("-A", "x64")
+    } else {
+        $evidenceConfigureArguments += "-DCMAKE_BUILD_TYPE=$Configuration"
+    }
+    & cmake @evidenceConfigureArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "CMake configure failed for the C++ bytecode evidence adapter"
+    }
+
+    & cmake --build $evidenceBuildDirectory --config $Configuration `
+        --target lua_bytecode_evidence
+    if ($LASTEXITCODE -ne 0) {
+        throw "CMake build failed for the C++ bytecode evidence adapter"
+    }
+    if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf)) {
+        throw "C++ bytecode evidence executable was not produced: $evidencePath"
+    }
+
+    $traceEvidenceConfigureArguments = @(
+        "-S", $traceEvidenceSourceDirectory,
+        "-B", $traceEvidenceBuildDirectory,
+        "-DLUA_CPP_SOURCE_ROOT=$cppPath",
+        "-DLUA_CPP_PACKAGE_ROOT=$installDirectory",
+        "-DLUA_CPP_EVIDENCE_OUTPUT_DIRECTORY=$executableDirectory"
+    )
+    if ($runningOnWindows) {
+        $traceEvidenceConfigureArguments += @("-A", "x64")
+    } else {
+        $traceEvidenceConfigureArguments += "-DCMAKE_BUILD_TYPE=$Configuration"
+    }
+    & cmake @traceEvidenceConfigureArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "CMake configure failed for the C++ VM trace evidence adapter"
+    }
+
+    & cmake --build $traceEvidenceBuildDirectory --config $Configuration `
+        --target lua_vm_trace_evidence
+    if ($LASTEXITCODE -ne 0) {
+        throw "CMake build failed for the C++ VM trace evidence adapter"
+    }
+    if (-not (Test-Path -LiteralPath $traceEvidencePath -PathType Leaf)) {
+        throw "C++ VM trace evidence executable was not produced: $traceEvidencePath"
+    }
+
     $document.executables.luaApp.sha256 = (
         Get-FileHash -LiteralPath $appPath -Algorithm SHA256
     ).Hash.ToLowerInvariant()
     $document.executables.luaBytecode.sha256 = (
         Get-FileHash -LiteralPath $bytecodePath -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    $document.executables.luaBytecodeEvidence.sha256 = (
+        Get-FileHash -LiteralPath $evidencePath -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    $document.executables.luaVmTraceEvidence.sha256 = (
+        Get-FileHash -LiteralPath $traceEvidencePath -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    $document.evidenceAdapter.cmakeSha256 = (
+        Get-FileHash -LiteralPath (
+            Join-Path $evidenceSourceDirectory "CMakeLists.txt"
+        ) -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    $document.evidenceAdapter.sourceSha256 = (
+        Get-FileHash -LiteralPath (
+            Join-Path $evidenceSourceDirectory "bytecode_evidence_main.cpp"
+        ) -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    $document.traceEvidenceAdapter.cmakeSha256 = (
+        Get-FileHash -LiteralPath (
+            Join-Path $traceEvidenceSourceDirectory "CMakeLists.txt"
+        ) -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    $document.traceEvidenceAdapter.sourceSha256 = (
+        Get-FileHash -LiteralPath (
+            Join-Path $traceEvidenceSourceDirectory "vm_trace_evidence_main.cpp"
+        ) -Algorithm SHA256
     ).Hash.ToLowerInvariant()
     $document.passed = $true
 } catch {
@@ -163,4 +276,7 @@ if (-not $document.passed) {
     exit 1
 }
 
-Write-Host "[OK] Pinned C++ oracle tools built: $appPath, $bytecodePath"
+Write-Host (
+    "[OK] Pinned C++ oracle tools built: " +
+    "$appPath, $bytecodePath, $evidencePath, $traceEvidencePath"
+)

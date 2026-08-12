@@ -1,0 +1,8 @@
+{
+  "files": [
+    "call_return_error.lua",
+    "coroutine_control_first_resume.lua",
+    "coroutine_nested_protected_errors.lua",
+    "coroutine_same_proto_upvalues.lua"
+  ]
+}

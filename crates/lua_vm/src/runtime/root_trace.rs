@@ -1216,7 +1216,7 @@ mod tests {
             .rollback_pending(pending_handle, temporary_root_id)
             .expect("exact pending root rolls back");
         assert_eq!(heap.state_arena().temporary_state_root_count(), 0);
-        assert_eq!(heap.state_arena().live_owned_state_count(), 0);
+        assert_eq!(heap.state_arena().live_coroutine_state_count(), 0);
     }
 
     #[test]

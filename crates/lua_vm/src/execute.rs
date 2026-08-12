@@ -4,7 +4,9 @@
 //! 基于寄存器的字节码解释器，实现全部 38 条 Lua 5.1 指令。
 //!
 
+use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::opcode::{self, OpCode};
+use lua_compiler::parser::Parser;
 use lua_core::function::{CFunction, Function, RuntimeNativeFunction};
 use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_ref::GcRef;
@@ -16,13 +18,24 @@ use lua_core::thread::{CoroutineStatus, Thread};
 use lua_core::upvalue::Upvalue;
 use lua_core::value::Value;
 use std::cmp::Ordering;
+use std::ptr::NonNull;
 
 use crate::native::{
-    DebugUpvalueOperation, DeferredNativeCall, DeferredVmContinuation, FullCollectionResult,
-    NativeRequestId, NativeRequestPublishError, ProtectedCallKind, ResumeEnvelope, ResumeResponse,
-    UpvalueAccessOperation, UpvalueAccessRequest,
+    CallbackHelperKind, DebugHookContinuation, DebugHookNativeCall, DebugUpvalueOperation,
+    DeferredNativeCall, DeferredVmContinuation, FullCollectionResult, GsubReplacement, GsubState,
+    GsubStep, NativeRequestId, NativeRequestPublishError, PackageModuleOptionsState,
+    ProtectedCallKind, ResumeEnvelope, ResumeResponse, TableForeachCursor, TableForeachState,
+    TableSortPending, TableSortStage, TableSortState, UpvalueAccessOperation, UpvalueAccessRequest,
+    VmMetamethodContinuation,
 };
-use crate::state::{LUA_MULTRET, LuaState, ThreadStatus};
+use crate::state::{LUA_MULTRET, LuaState, ThreadStatus, enter_vm_context};
+use crate::trace::{
+    begin_trace_callback_barrier, begin_trace_callback_barrier_for_frame,
+    discard_instruction_diffs_above_frame, emit_call_trace, emit_coroutine_yield_trace,
+    emit_instruction_snapshot, emit_return_trace, end_trace_callback_barrier,
+    flush_instruction_diff, record_fused_jump_trace_suppression, record_trace_nil_range,
+    record_trace_number_override, record_trace_upvalue_closes, record_trace_upvalue_open,
+};
 
 /// 执行结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +58,38 @@ pub enum VmExit {
     AutomaticGc,
 }
 
+/// Immutable callback metadata for one match selected by the stdlib `gsub`
+/// pattern engine.
+#[derive(Clone, Debug)]
+pub struct GsubCallbackStep {
+    pub prefix: Vec<u8>,
+    pub matched: Vec<u8>,
+    pub arguments: Vec<Value>,
+    pub table_key: Value,
+}
+
+/// Callback-capable `gsub` replacement owned by the Runtime continuation.
+#[derive(Clone, Debug)]
+pub enum GsubCallbackReplacement {
+    Function(Value),
+    Table {
+        table: GcRef<Table>,
+        index_key: Value,
+    },
+}
+
+/// Initial result of preparing callback-capable `gsub` work.
+#[derive(Debug)]
+pub enum GsubCallbackRequestOutcome {
+    Suspended,
+    Complete { output: Vec<u8>, count: usize },
+}
+
+enum VmMetamethodOutcome<T> {
+    Ready(T),
+    Suspended(NativeRequestId),
+}
+
 /// 最大嵌套调用深度
 const MAX_CALLS: i32 = 512;
 const MAX_STRING_LENGTH: usize = 64 * 1024 * 1024;
@@ -60,6 +105,156 @@ fn rooted_vm_bytes<'scope>(
     // SAFETY: the pointer belongs to the dynamically scoped VM context for
     // this exact state turn.
     transaction.intern_bytes(unsafe { &mut *pool }, bytes)
+}
+
+/// Compile one byte-oriented Lua chunk and publish the resulting closure onto
+/// the active state stack before releasing construction roots.
+pub fn compile_chunk_function(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    source: &[u8],
+    chunk_name: &[u8],
+) -> Result<GcRef<Function>, String> {
+    let mut parser = Parser::from_bytes(source);
+    let chunk = parser.parse().map_err(|err| {
+        format!(
+            "{}:{}: {}",
+            chunk_name_for_diagnostic(chunk_name),
+            err.line,
+            err.message
+        )
+    })?;
+
+    let environment = l.thread_env.or(l.global_table);
+    let pool_ptr = l
+        .active_string_pool_ptr()
+        .ok_or_else(|| "chunk compilation unavailable without an active StringPool".to_string())?;
+    gc.with_publication(|transaction| {
+        // SAFETY: the pool belongs to this dynamically scoped Runtime turn.
+        let generator =
+            CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr });
+        let proto = generator
+            .generate_with_source_bytes(&chunk, chunk_name)
+            .map_err(|err| format!("{}:{err}", chunk_name_for_diagnostic(chunk_name)))?;
+        let proto = transaction.alloc(proto);
+        let function = transaction
+            .alloc_lua_function(&proto)
+            .map_err(|err| format!("invalid chunk Function publication: {err}"))?;
+        transaction
+            .set_lua_function_environment(&function, environment)
+            .map_err(|err| format!("invalid chunk environment publication: {err}"))?;
+
+        // SAFETY: the callback installs the Function on the active Lua stack
+        // before its object root is released.
+        unsafe {
+            transaction.publish_function_value(function, |value| {
+                let Value::Function(function) = value.clone() else {
+                    unreachable!("typed Function publication produced another Value kind");
+                };
+                l.push_value(value);
+                function
+            })
+        }
+        .map_err(|err| format!("invalid chunk stack publication: {err}"))
+    })
+}
+
+/// Render an internal Lua source name as the chunk id used in diagnostics.
+///
+/// `@file` and `=literal` are storage conventions; neither marker is part of
+/// the user-facing name. Other names are source snippets and use the fixed
+/// C++ oracle's `[string "..."]` envelope.
+pub fn chunk_name_for_diagnostic(chunk_name: &[u8]) -> String {
+    if let Some(name) = chunk_name
+        .strip_prefix(b"=")
+        .or_else(|| chunk_name.strip_prefix(b"@"))
+    {
+        return diagnostic_bytes(name);
+    }
+
+    const SNIPPET_LIMIT: usize = 60;
+    let mut snippet = String::new();
+    let mut truncated = false;
+    for &byte in chunk_name {
+        if matches!(byte, b'\n' | b'\r') || snippet.len() >= SNIPPET_LIMIT {
+            truncated = true;
+            break;
+        }
+        if matches!(byte, b'"' | b'\\') {
+            snippet.push('\\');
+        }
+        push_diagnostic_byte(&mut snippet, byte);
+    }
+    if truncated {
+        snippet.push_str("...");
+    }
+    format!("[string \"{snippet}\"]")
+}
+
+fn diagnostic_bytes(bytes: &[u8]) -> String {
+    let mut rendered = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        push_diagnostic_byte(&mut rendered, byte);
+    }
+    rendered
+}
+
+fn push_diagnostic_byte(rendered: &mut String, byte: u8) {
+    if byte.is_ascii_graphic() || byte == b' ' {
+        rendered.push(char::from(byte));
+    } else {
+        use std::fmt::Write as _;
+        let _ = write!(rendered, "\\x{byte:02x}");
+    }
+}
+
+#[cfg(test)]
+mod chunk_name_diagnostic_tests {
+    use super::chunk_name_for_diagnostic;
+
+    #[test]
+    fn storage_markers_are_not_exposed_in_diagnostics() {
+        assert_eq!(chunk_name_for_diagnostic(b"@dir/file.lua"), "dir/file.lua");
+        assert_eq!(
+            chunk_name_for_diagnostic(b"=(command line)"),
+            "(command line)"
+        );
+    }
+
+    #[test]
+    fn source_names_use_the_lua_string_chunk_envelope() {
+        assert_eq!(
+            chunk_name_for_diagnostic(b"return \"value\""),
+            "[string \"return \\\"value\\\"\"]"
+        );
+        assert_eq!(
+            chunk_name_for_diagnostic(b"first line\nsecond line"),
+            "[string \"first line...\"]"
+        );
+    }
+}
+
+pub(crate) fn definite_load_syntax_error(source: &[u8]) -> Option<String> {
+    let first = source
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())?;
+    if !matches!(
+        first,
+        b'*' | b'/' | b'%' | b'^' | b')' | b']' | b'}' | b',' | b'=' | b'<' | b'>'
+    ) {
+        return None;
+    }
+
+    let mut parser = Parser::from_bytes(source);
+    match parser.parse() {
+        Ok(_) => None,
+        Err(err) if err.message.contains("<eof>") => None,
+        Err(err) => Some(format!(
+            "=(load):{}:{}: {}",
+            err.line, err.column, err.message
+        )),
+    }
 }
 
 /// 虚拟机主执行循环
@@ -81,7 +276,7 @@ pub fn execute_proto(
     gc: &mut GarbageCollector,
 ) -> Result<VmExit, RuntimeError> {
     let entry_ci = l.current_ci;
-    let result = execute_proto_inner(l, proto, gc);
+    let result = execute_proto_inner(l, proto, gc, None);
     if result.is_err() && entry_ci == 0 && l.current_ci == 0 {
         let ci = l.current_call_info_mut();
         if ci.proto == Some(proto) {
@@ -92,10 +287,39 @@ pub fn execute_proto(
     result
 }
 
+/// Resume the instruction whose pre-execution debug hook just completed.
+/// The first iteration deliberately skips hook selection because count/line
+/// bookkeeping for this exact PC was already performed before suspension.
+pub(crate) fn resume_lua_instruction_after_debug_hook(
+    l: &mut LuaState,
+    proto: GcRef<Proto>,
+    pc: usize,
+    gc: &mut GarbageCollector,
+) -> Result<VmExit, RuntimeError> {
+    if l.current_call_info().proto != Some(proto) {
+        return Err(RuntimeError::new(
+            "debug-hook instruction continuation no longer matches its Lua frame",
+        ));
+    }
+    execute_proto_inner(l, proto, gc, Some(pc))
+}
+
+/// Resume a freshly pushed Lua CALL frame after its call hook completes while
+/// preserving the ordinary nested-call depth contract.
+pub(crate) fn resume_lua_call_after_debug_hook(
+    l: &mut LuaState,
+    proto: GcRef<Proto>,
+    gc: &mut GarbageCollector,
+) -> Result<VmExit, RuntimeError> {
+    let overflow = stack_overflow_error(l, gc, proto, 0);
+    execute_counted_proto(l, proto, gc, overflow)
+}
+
 fn execute_proto_inner(
     l: &mut LuaState,
     proto: GcRef<Proto>,
     gc: &mut GarbageCollector,
+    forced_pc: Option<usize>,
 ) -> Result<VmExit, RuntimeError> {
     if l.nccalls > MAX_CALLS {
         return Err(RuntimeError::new(
@@ -108,7 +332,14 @@ fn execute_proto_inner(
         .map_err(invalid_proto_error)?;
     let _nresults = l.current_call_info().nresults;
     let resume_from_yield = l.status == ThreadStatus::Yield;
-    let mut pc: usize = if resume_from_yield {
+    let mut skip_debug_hooks_once = forced_pc.is_some();
+    let mut pc: usize = if let Some(pc) = forced_pc {
+        l.status = ThreadStatus::Ok;
+        let ci = l.current_call_info_mut();
+        ci.savedpc = Some(pc);
+        ci.proto = Some(active_proto_ref);
+        pc
+    } else if resume_from_yield {
         l.status = ThreadStatus::Ok;
         l.current_call_info_mut().proto = Some(active_proto_ref);
         l.current_call_info()
@@ -133,26 +364,17 @@ fn execute_proto_inner(
     }
 
     // 主解释循环
-    loop {
-        let active_proto_ptr = gc
-            .validate_ref(active_proto_ref)
-            .map_err(invalid_proto_error)?;
-        // SAFETY: validate_ref checked address, ObjectId, and type against this
-        // collector immediately before the dereference. Destructive sweep is
-        // forbidden while the VM executes, so the allocation cannot disappear
-        // during this interpreter iteration.
-        let active_proto = unsafe { active_proto_ptr.as_ref() };
-        let code = active_proto.code();
-        if pc >= code.len() {
-            break;
-        }
-        let constants = active_proto.constants();
-        let inst = code[pc];
+    while let Some(inst) = proto_instruction(gc, active_proto_ref, pc)? {
         let op = opcode::get_opcode(inst);
         let base_idx = l.current_call_info().base;
         l.current_call_info_mut().savedpc = Some(pc);
-        run_debug_instruction_hooks(l, gc, active_proto_ref, pc, op)?;
+        if skip_debug_hooks_once {
+            skip_debug_hooks_once = false;
+        } else if let Some(request_id) = run_debug_instruction_hooks(l, gc, active_proto_ref, pc)? {
+            return Ok(VmExit::NativeRequest(request_id));
+        }
         run_auto_weak_gc(l, gc);
+        emit_instruction_snapshot(l, gc, active_proto_ref, pc, inst);
 
         match op {
             // ── 数据移动 (4) ─────────────────────────────────
@@ -168,7 +390,7 @@ fn execute_proto_inner(
             OpCode::LOADK => {
                 let a = opcode::get_arg_a(inst) as usize;
                 let bx = opcode::get_arg_bx(inst) as usize;
-                let val = constants.get(bx).cloned().unwrap_or(Value::Nil);
+                let val = proto_constant(gc, active_proto_ref, bx)?;
                 if let Some(dst) = l.stack.at_mut(base_idx + a) {
                     *dst = val;
                 }
@@ -235,9 +457,12 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst) as usize;
                 let bx = opcode::get_arg_bx(inst) as usize;
                 // R(A) := _G[K(Bx)]
-                let name = constants.get(bx).cloned().unwrap_or(Value::Nil);
-                let stack_limit = base_idx + active_proto.max_stack_size() as usize;
-                get_global_into(l, gc, stack_limit, &name, base_idx + a)?;
+                let name = proto_constant(gc, active_proto_ref, bx)?;
+                if let VmMetamethodOutcome::Suspended(request_id) =
+                    get_global_into(l, gc, &name, base_idx + a, active_proto_ref, pc)?
+                {
+                    return Ok(VmExit::NativeRequest(request_id));
+                }
             }
 
             OpCode::GETTABLE => {
@@ -245,17 +470,29 @@ fn execute_proto_inner(
                 let b = opcode::get_arg_b(inst) as usize;
                 let c = opcode::get_arg_c(inst);
                 let table = l.stack.at(base_idx + b).cloned().unwrap_or(Value::Nil);
-                let key = get_rk(l, base_idx, c, constants);
-                let stack_limit = base_idx + active_proto.max_stack_size() as usize;
+                let key = get_rk(l, gc, active_proto_ref, base_idx, c)?;
                 if should_error_index(l, gc, &table) {
                     return Err(runtime_error_at(
                         gc,
-                        active_proto,
+                        active_proto_ref,
                         pc,
-                        index_error_message(gc, active_proto, pc, b, constants, &table),
+                        index_error_message(gc, active_proto_ref, pc, b, &table),
                     ));
                 }
-                get_table_into(l, gc, stack_limit, &table, &key, base_idx + a)?;
+                if let VmMetamethodOutcome::Suspended(request_id) = get_table_into(
+                    l,
+                    gc,
+                    &table,
+                    &key,
+                    base_idx + a,
+                    VmMetamethodContinuation::StoreResult {
+                        proto: active_proto_ref,
+                        pc,
+                        destination: base_idx + a,
+                    },
+                )? {
+                    return Ok(VmExit::NativeRequest(request_id));
+                }
             }
 
             // ── 变量赋值 (3) ─────────────────────────────────
@@ -263,10 +500,13 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst) as usize;
                 let bx = opcode::get_arg_bx(inst) as usize;
                 // _G[K(Bx)] := R(A)
-                let name = constants.get(bx).cloned().unwrap_or(Value::Nil);
+                let name = proto_constant(gc, active_proto_ref, bx)?;
                 let val = l.stack.at(base_idx + a).cloned().unwrap_or(Value::Nil);
-                let stack_limit = base_idx + active_proto.max_stack_size() as usize;
-                set_global(l, gc, stack_limit, &name, &val)?;
+                if let VmMetamethodOutcome::Suspended(request_id) =
+                    set_global(l, gc, &name, &val, active_proto_ref, pc)?
+                {
+                    return Ok(VmExit::NativeRequest(request_id));
+                }
             }
 
             OpCode::SETUPVAL => {
@@ -293,19 +533,30 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst) as usize;
                 let b = opcode::get_arg_b(inst);
                 let c = opcode::get_arg_c(inst);
-                let key = get_rk(l, base_idx, b, constants);
-                let value = get_rk(l, base_idx, c, constants);
+                let key = get_rk(l, gc, active_proto_ref, base_idx, b)?;
+                let value = get_rk(l, gc, active_proto_ref, base_idx, c)?;
                 let table_val = l.stack.at(base_idx + a).cloned().unwrap_or(Value::Nil);
-                let stack_limit = base_idx + active_proto.max_stack_size() as usize;
                 if should_error_newindex(l, gc, &table_val) {
                     return Err(runtime_error_at(
                         gc,
-                        active_proto,
+                        active_proto_ref,
                         pc,
-                        index_error_message(gc, active_proto, pc, a, constants, &table_val),
+                        index_error_message(gc, active_proto_ref, pc, a, &table_val),
                     ));
                 }
-                set_table_value(l, gc, stack_limit, &table_val, &key, &value)?;
+                if let VmMetamethodOutcome::Suspended(request_id) = set_table_value(
+                    l,
+                    gc,
+                    &table_val,
+                    &key,
+                    &value,
+                    VmMetamethodContinuation::CompleteSet {
+                        proto: active_proto_ref,
+                        pc,
+                    },
+                )? {
+                    return Ok(VmExit::NativeRequest(request_id));
+                }
             }
 
             // ── 表操作 (2) ───────────────────────────────────
@@ -336,13 +587,13 @@ fn execute_proto_inner(
                 let b = opcode::get_arg_b(inst) as usize;
                 let c = opcode::get_arg_c(inst);
                 let obj = l.stack.at(base_idx + b).cloned().unwrap_or(Value::Nil);
-                let key = get_rk(l, base_idx, c, constants);
+                let key = get_rk(l, gc, active_proto_ref, base_idx, c)?;
                 if should_error_index(l, gc, &obj) {
                     return Err(runtime_error_at(
                         gc,
-                        active_proto,
+                        active_proto_ref,
                         pc,
-                        index_error_message(gc, active_proto, pc, b, constants, &obj),
+                        index_error_message(gc, active_proto_ref, pc, b, &obj),
                     ));
                 }
                 // R(A+1) = R(B)
@@ -350,8 +601,22 @@ fn execute_proto_inner(
                     *dst = obj.clone();
                 }
                 // R(A) = R(B)[RK(C)]
-                let stack_limit = base_idx + active_proto.max_stack_size() as usize;
-                get_table_into(l, gc, stack_limit, &obj, &key, base_idx + a)?;
+                if let VmMetamethodOutcome::Suspended(request_id) = get_table_into(
+                    l,
+                    gc,
+                    &obj,
+                    &key,
+                    base_idx + a,
+                    VmMetamethodContinuation::StoreSelfResult {
+                        proto: active_proto_ref,
+                        pc,
+                        destination: base_idx + a,
+                        self_destination: base_idx + a + 1,
+                        object: obj.clone(),
+                    },
+                )? {
+                    return Ok(VmExit::NativeRequest(request_id));
+                }
             }
 
             // ── 算术运算 (6) ─────────────────────────────────
@@ -359,19 +624,32 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst) as usize;
                 let b = opcode::get_arg_b(inst);
                 let c = opcode::get_arg_c(inst);
-                let lhs = get_rk(l, base_idx, b, constants);
-                let rhs = get_rk(l, base_idx, c, constants);
-                let stack_limit = base_idx + active_proto.max_stack_size() as usize;
-                match exec_arith_into(l, gc, stack_limit, op, &lhs, &rhs, base_idx + a) {
-                    Ok(()) => {}
+                let lhs = get_rk(l, gc, active_proto_ref, base_idx, b)?;
+                let rhs = get_rk(l, gc, active_proto_ref, base_idx, c)?;
+                match exec_arith_into(
+                    l,
+                    gc,
+                    op,
+                    &lhs,
+                    &rhs,
+                    base_idx + a,
+                    VmMetamethodContinuation::StoreResult {
+                        proto: active_proto_ref,
+                        pc,
+                        destination: base_idx + a,
+                    },
+                ) {
+                    Ok(VmMetamethodOutcome::Ready(())) => {}
+                    Ok(VmMetamethodOutcome::Suspended(request_id)) => {
+                        return Ok(VmExit::NativeRequest(request_id));
+                    }
                     Err(err)
                         if err.message == "attempt to perform arithmetic on a non-number value" =>
                     {
                         return Err(RuntimeError::new(arith_error_message(
                             gc,
-                            active_proto,
+                            active_proto_ref,
                             pc,
-                            constants,
                             (b, &lhs),
                             (c, &rhs),
                         )));
@@ -385,18 +663,29 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst) as usize;
                 let b = opcode::get_arg_b(inst) as usize;
                 let val = l.stack.at(base_idx + b).cloned().unwrap_or(Value::Nil);
-                let stack_limit = base_idx + active_proto.max_stack_size() as usize;
-                match exec_unm_into(l, gc, stack_limit, &val, base_idx + a) {
-                    Ok(()) => {}
+                match exec_unm_into(
+                    l,
+                    gc,
+                    &val,
+                    base_idx + a,
+                    VmMetamethodContinuation::StoreResult {
+                        proto: active_proto_ref,
+                        pc,
+                        destination: base_idx + a,
+                    },
+                ) {
+                    Ok(VmMetamethodOutcome::Ready(())) => {}
+                    Ok(VmMetamethodOutcome::Suspended(request_id)) => {
+                        return Ok(VmExit::NativeRequest(request_id));
+                    }
                     Err(err)
                         if err.message == "attempt to perform arithmetic on a non-number value" =>
                     {
                         return Err(RuntimeError::new(unm_error_message(
                             gc,
-                            active_proto,
+                            active_proto_ref,
                             pc,
                             b,
-                            constants,
                             &val,
                         )));
                     }
@@ -418,9 +707,22 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst) as usize;
                 let b = opcode::get_arg_b(inst) as usize;
                 let val = l.stack.at(base_idx + b).cloned().unwrap_or(Value::Nil);
-                let len = exec_len(gc, &val);
-                if let Some(dst) = l.stack.at_mut(base_idx + a) {
-                    *dst = len;
+                let destination = base_idx + a;
+                match exec_len_into(
+                    l,
+                    gc,
+                    &val,
+                    destination,
+                    VmMetamethodContinuation::StoreResult {
+                        proto: active_proto_ref,
+                        pc,
+                        destination,
+                    },
+                )? {
+                    VmMetamethodOutcome::Ready(()) => {}
+                    VmMetamethodOutcome::Suspended(request_id) => {
+                        return Ok(VmExit::NativeRequest(request_id));
+                    }
                 }
             }
 
@@ -429,7 +731,7 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst) as usize;
                 let b = opcode::get_arg_b(inst) as usize;
                 let c = opcode::get_arg_c(inst) as usize;
-                let stack_limit = base_idx + active_proto.max_stack_size() as usize;
+                let stack_limit = base_idx + proto_max_stack_size(gc, active_proto_ref)?;
                 let destination = base_idx + a;
                 let initial = l.stack.at(base_idx + b).cloned().unwrap_or(Value::Nil);
                 if let Some(dst) = l.stack.at_mut(destination) {
@@ -438,7 +740,26 @@ fn execute_proto_inner(
                 for i in (b + 1)..=c {
                     let rhs = l.stack.at(base_idx + i).cloned().unwrap_or(Value::Nil);
                     let lhs = l.stack.at(destination).cloned().unwrap_or(Value::Nil);
-                    exec_concat_into(l, gc, stack_limit, &lhs, &rhs, destination)?;
+                    match exec_concat_into(
+                        l,
+                        gc,
+                        &lhs,
+                        &rhs,
+                        destination,
+                        VmMetamethodContinuation::Concat {
+                            proto: active_proto_ref,
+                            pc,
+                            destination,
+                            next_slot: base_idx + i + 1,
+                            end_slot: base_idx + c,
+                            stack_limit,
+                        },
+                    )? {
+                        VmMetamethodOutcome::Ready(()) => {}
+                        VmMetamethodOutcome::Suspended(request_id) => {
+                            return Ok(VmExit::NativeRequest(request_id));
+                        }
+                    }
                 }
             }
 
@@ -454,10 +775,25 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst);
                 let b = opcode::get_arg_b(inst);
                 let c = opcode::get_arg_c(inst);
-                let lhs = get_rk(l, base_idx, b, constants);
-                let rhs = get_rk(l, base_idx, c, constants);
-                let stack_limit = base_idx + active_proto.max_stack_size() as usize;
-                let equal = exec_eq(l, gc, stack_limit, &lhs, &rhs)?;
+                let lhs = get_rk(l, gc, active_proto_ref, base_idx, b)?;
+                let rhs = get_rk(l, gc, active_proto_ref, base_idx, c)?;
+                let equal = match exec_eq(
+                    l,
+                    gc,
+                    &lhs,
+                    &rhs,
+                    VmMetamethodContinuation::Compare {
+                        proto: active_proto_ref,
+                        pc,
+                        expected: a != 0,
+                        invert_result: false,
+                    },
+                )? {
+                    VmMetamethodOutcome::Ready(equal) => equal,
+                    VmMetamethodOutcome::Suspended(request_id) => {
+                        return Ok(VmExit::NativeRequest(request_id));
+                    }
+                };
                 // Lua 5.1: skip when (equal as i32) != A
                 if (equal && a == 0) || (!equal && a != 0) {
                     pc += 1; // skip next
@@ -468,10 +804,25 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst);
                 let b = opcode::get_arg_b(inst);
                 let c = opcode::get_arg_c(inst);
-                let lhs = get_rk(l, base_idx, b, constants);
-                let rhs = get_rk(l, base_idx, c, constants);
-                let stack_limit = base_idx + active_proto.max_stack_size() as usize;
-                let less = exec_lt(l, gc, stack_limit, &lhs, &rhs)?;
+                let lhs = get_rk(l, gc, active_proto_ref, base_idx, b)?;
+                let rhs = get_rk(l, gc, active_proto_ref, base_idx, c)?;
+                let less = match exec_lt(
+                    l,
+                    gc,
+                    &lhs,
+                    &rhs,
+                    VmMetamethodContinuation::Compare {
+                        proto: active_proto_ref,
+                        pc,
+                        expected: a != 0,
+                        invert_result: false,
+                    },
+                )? {
+                    VmMetamethodOutcome::Ready(less) => less,
+                    VmMetamethodOutcome::Suspended(request_id) => {
+                        return Ok(VmExit::NativeRequest(request_id));
+                    }
+                };
                 if (less && a == 0) || (!less && a != 0) {
                     pc += 1;
                 }
@@ -481,10 +832,25 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst);
                 let b = opcode::get_arg_b(inst);
                 let c = opcode::get_arg_c(inst);
-                let lhs = get_rk(l, base_idx, b, constants);
-                let rhs = get_rk(l, base_idx, c, constants);
-                let stack_limit = base_idx + active_proto.max_stack_size() as usize;
-                let le = exec_le(l, gc, stack_limit, &lhs, &rhs)?;
+                let lhs = get_rk(l, gc, active_proto_ref, base_idx, b)?;
+                let rhs = get_rk(l, gc, active_proto_ref, base_idx, c)?;
+                let le = match exec_le(
+                    l,
+                    gc,
+                    &lhs,
+                    &rhs,
+                    VmMetamethodContinuation::Compare {
+                        proto: active_proto_ref,
+                        pc,
+                        expected: a != 0,
+                        invert_result: false,
+                    },
+                )? {
+                    VmMetamethodOutcome::Ready(le) => le,
+                    VmMetamethodOutcome::Suspended(request_id) => {
+                        return Ok(VmExit::NativeRequest(request_id));
+                    }
+                };
                 if (le && a == 0) || (!le && a != 0) {
                     pc += 1;
                 }
@@ -495,6 +861,12 @@ fn execute_proto_inner(
                 let c = opcode::get_arg_c(inst);
                 let val = l.stack.at(base_idx + a).cloned().unwrap_or(Value::Nil);
                 let truthy = !val.is_false();
+                if truthy == (c != 0)
+                    && let Some(jump) = proto_instruction(gc, active_proto_ref, pc + 1)?
+                    && opcode::get_opcode(jump) == OpCode::JMP
+                {
+                    record_fused_jump_trace_suppression(l, active_proto_ref, pc + 1);
+                }
                 // Lua 5.1: skip when (truthy as i32) != C
                 if (truthy && c == 0) || (!truthy && c != 0) {
                     pc += 1;
@@ -516,6 +888,11 @@ fn execute_proto_inner(
                             *dst = src;
                         }
                     }
+                    if let Some(jump) = proto_instruction(gc, active_proto_ref, pc + 1)?
+                        && opcode::get_opcode(jump) == OpCode::JMP
+                    {
+                        record_fused_jump_trace_suppression(l, active_proto_ref, pc + 1);
+                    }
                 }
             }
 
@@ -532,120 +909,129 @@ fn execute_proto_inner(
                 };
                 let nresults = if c == 0 { LUA_MULTRET } else { c - 1 };
                 let func = l.stack.at(func_pos).cloned().unwrap_or(Value::Nil);
+                emit_call_trace(l, gc, active_proto_ref, pc, &func);
 
                 if let Value::Function(func_ref) = func {
-                    // SAFETY: GC is not running during VM execution; GcRef remains valid
-                    if let Some(func_obj) = unsafe { func_ref.as_ref() } {
-                        if func_obj.is_lua_function() {
-                            if let Some(callee_proto_ref) = func_obj.proto() {
-                                let callee_proto_ptr = gc
-                                    .validate_ref(callee_proto_ref)
-                                    .map_err(invalid_proto_error)?;
-                                // SAFETY: validated above; destructive sweep is disabled
-                                // throughout VM execution.
-                                let callee_proto = unsafe { callee_proto_ptr.as_ref() };
-                                // Setup new call frame
-                                let new_base = base_idx + a + 1;
-                                let varargs =
-                                    prepare_lua_varargs(l, gc, callee_proto, new_base, nargs);
-                                let saved_ci = l.current_ci;
-                                let ci = l.push_call_info();
-                                ci.func = base_idx + a;
-                                ci.base = new_base;
-                                ci.top = new_base + callee_proto.max_stack_size() as usize;
-                                ci.nresults = nresults;
-                                ci.nargs = nargs;
-                                ci.varargs = varargs;
-                                ci.savedpc = None;
-                                ci.proto = Some(callee_proto_ref);
-                                ci.tailcalls = 0;
+                    let (callee_proto, callable) = inspect_function(gc, func_ref)?;
+                    if let Some(callee_proto_ref) = callee_proto {
+                        // Setup new call frame
+                        let new_base = base_idx + a + 1;
+                        let (varargs, max_stack_size) =
+                            prepare_lua_varargs(l, gc, callee_proto_ref, new_base, nargs)?;
+                        let saved_ci = l.current_ci;
+                        let ci = l.push_call_info();
+                        ci.func = base_idx + a;
+                        ci.base = new_base;
+                        ci.top = new_base + max_stack_size;
+                        ci.nresults = nresults;
+                        ci.nargs = nargs;
+                        ci.varargs = varargs;
+                        ci.savedpc = None;
+                        ci.proto = Some(callee_proto_ref);
+                        ci.tailcalls = 0;
 
-                                if let Err(e) = fire_debug_hook(l, gc, "call", None) {
+                        match publish_debug_hook_event(
+                            l,
+                            gc,
+                            "call",
+                            None,
+                            DebugHookContinuation::LuaCall {
+                                proto: callee_proto_ref,
+                            },
+                        ) {
+                            Ok(Some(request_id)) => {
+                                return Ok(VmExit::NativeRequest(request_id));
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                if l.current_thread.is_none() {
                                     unwind_lua_frames_to(l, gc, saved_ci)?;
-                                    return Err(e);
                                 }
+                                return Err(error);
+                            }
+                        }
 
-                                // Recursively execute the called function
-                                match execute_nested_proto_at(
-                                    l,
+                        // Recursively execute the called function
+                        match execute_nested_proto_at(l, active_proto_ref, pc, callee_proto_ref, gc)
+                        {
+                            Ok(VmExit::Complete(ExecResult::Returned)) => {
+                                // Results already placed by RETURN handler
+                            }
+                            Ok(VmExit::Complete(ExecResult::Yielded)) => {
+                                return Ok(VmExit::Complete(ExecResult::Yielded));
+                            }
+                            Ok(VmExit::NativeRequest(id)) => {
+                                return Ok(VmExit::NativeRequest(id));
+                            }
+                            Ok(VmExit::UpvalueAccess(request)) => {
+                                return Ok(VmExit::UpvalueAccess(request));
+                            }
+                            Ok(VmExit::AutomaticGc) => {
+                                return Ok(VmExit::AutomaticGc);
+                            }
+                            Err(e) => {
+                                // A failed coroutine keeps its Lua frames intact so
+                                // debug.traceback(thread) can inspect the complete
+                                // failure stack and any still-open Upvalues keep
+                                // reading their owning registers. Main-state calls
+                                // retain the eager unwind used by top-level errors;
+                                // protected Runtime callbacks unwind explicitly at
+                                // their stop_ci boundary.
+                                if l.current_thread.is_none() {
+                                    unwind_lua_frames_to(l, gc, saved_ci)?;
+                                }
+                                return Err(e);
+                            }
+                        }
+
+                        if l.current_ci != saved_ci {
+                            unwind_lua_frames_to(l, gc, saved_ci)?;
+                            return Err(RuntimeError::new("VM: call frame imbalance"));
+                        }
+                        pc += 1;
+                        continue;
+                    } else if let Some(callable) = callable {
+                        let func_pos = base_idx + a;
+                        let actual_nargs = if b == 0 {
+                            l.top.saturating_sub(func_pos + 1)
+                        } else {
+                            nargs as usize
+                        };
+                        let wanted_results = if c == 0 {
+                            None
+                        } else {
+                            Some(nresults as usize)
+                        };
+                        match call_native_function(
+                            l,
+                            gc,
+                            func_pos,
+                            actual_nargs,
+                            wanted_results,
+                            callable,
+                        ) {
+                            Ok(VmExit::Complete(ExecResult::Yielded)) => {
+                                return Ok(VmExit::Complete(ExecResult::Yielded));
+                            }
+                            Ok(VmExit::Complete(ExecResult::Returned)) => {}
+                            Ok(VmExit::NativeRequest(id)) => {
+                                return Ok(VmExit::NativeRequest(id));
+                            }
+                            Ok(VmExit::UpvalueAccess(request)) => {
+                                return Ok(VmExit::UpvalueAccess(request));
+                            }
+                            Ok(VmExit::AutomaticGc) => {
+                                return Ok(VmExit::AutomaticGc);
+                            }
+                            Err(err) if err.message.starts_with("bad argument") => {
+                                return Err(runtime_error_at(
+                                    gc,
                                     active_proto_ref,
                                     pc,
-                                    callee_proto_ref,
-                                    gc,
-                                ) {
-                                    Ok(VmExit::Complete(ExecResult::Returned)) => {
-                                        // Results already placed by RETURN handler
-                                    }
-                                    Ok(VmExit::Complete(ExecResult::Yielded)) => {
-                                        return Ok(VmExit::Complete(ExecResult::Yielded));
-                                    }
-                                    Ok(VmExit::NativeRequest(id)) => {
-                                        return Ok(VmExit::NativeRequest(id));
-                                    }
-                                    Ok(VmExit::UpvalueAccess(request)) => {
-                                        return Ok(VmExit::UpvalueAccess(request));
-                                    }
-                                    Ok(VmExit::AutomaticGc) => {
-                                        return Ok(VmExit::AutomaticGc);
-                                    }
-                                    Err(e) => {
-                                        // Restore call frame and propagate error
-                                        unwind_lua_frames_to(l, gc, saved_ci)?;
-                                        return Err(e);
-                                    }
-                                }
-
-                                if l.current_ci != saved_ci {
-                                    unwind_lua_frames_to(l, gc, saved_ci)?;
-                                    return Err(RuntimeError::new("VM: call frame imbalance"));
-                                }
-                                pc += 1;
-                                continue;
+                                    err.message,
+                                ));
                             }
-                            return Err(RuntimeError::new("Lua function has no proto"));
-                        } else if let Some(callable) = native_callable(func_obj) {
-                            let func_pos = base_idx + a;
-                            let actual_nargs = if b == 0 {
-                                l.top.saturating_sub(func_pos + 1)
-                            } else {
-                                nargs as usize
-                            };
-                            let wanted_results = if c == 0 {
-                                None
-                            } else {
-                                Some(nresults as usize)
-                            };
-                            match call_native_function(
-                                l,
-                                gc,
-                                func_pos,
-                                actual_nargs,
-                                wanted_results,
-                                callable,
-                            ) {
-                                Ok(VmExit::Complete(ExecResult::Yielded)) => {
-                                    return Ok(VmExit::Complete(ExecResult::Yielded));
-                                }
-                                Ok(VmExit::Complete(ExecResult::Returned)) => {}
-                                Ok(VmExit::NativeRequest(id)) => {
-                                    return Ok(VmExit::NativeRequest(id));
-                                }
-                                Ok(VmExit::UpvalueAccess(request)) => {
-                                    return Ok(VmExit::UpvalueAccess(request));
-                                }
-                                Ok(VmExit::AutomaticGc) => {
-                                    return Ok(VmExit::AutomaticGc);
-                                }
-                                Err(err) if err.message.starts_with("bad argument") => {
-                                    return Err(runtime_error_at(
-                                        gc,
-                                        active_proto,
-                                        pc,
-                                        err.message,
-                                    ));
-                                }
-                                Err(err) => return Err(err),
-                            }
+                            Err(err) => return Err(err),
                         }
                     }
                 } else if let Some(metamethod) = find_metamethod(l, gc, &func, &func, "__call") {
@@ -674,10 +1060,15 @@ fn execute_proto_inner(
                         Value::String(_) => "string",
                         _ => "userdata",
                     };
-                    let detail = describe_register(gc, active_proto, pc, a, constants, 8)
+                    let detail = describe_register_at(gc, active_proto_ref, pc, a, 8)
                         .map(|name| format!("{} (a {} value)", name, type_desc))
                         .unwrap_or_else(|| format!("a {} value", type_desc));
-                    return Err(RuntimeError::new(format!("attempt to call {detail}")));
+                    return Err(runtime_error_at(
+                        gc,
+                        active_proto_ref,
+                        pc,
+                        format!("attempt to call {detail}"),
+                    ));
                 }
             }
 
@@ -711,131 +1102,118 @@ fn execute_proto_inner(
 
                 if l.current_call_info().func == base_idx {
                     let ci = l.current_call_info().clone();
-                    call_value_at_stack(l, gc, func_pos, actual_nargs, None)?;
-                    let available = l.top.saturating_sub(func_pos);
-                    let mut results = Vec::with_capacity(available);
-                    for i in 0..available {
-                        results.push(l.stack.at(func_pos + i).cloned().unwrap_or(Value::Nil));
-                    }
+                    let callable = match &func {
+                        Value::Function(function) => inspect_function(gc, *function)?.1,
+                        _ => None,
+                    };
                     close_state_upvalues(l, gc, ci.base)?;
-                    if available > 0 {
-                        ensure_stack_slot(l, ci.func + available - 1);
-                    }
-                    for (i, result) in results.into_iter().enumerate() {
-                        if let Some(dst) = l.stack.at_mut(ci.func + i) {
-                            *dst = result;
+                    if let Some(callable) = callable {
+                        match call_native_function(l, gc, func_pos, actual_nargs, None, callable)? {
+                            VmExit::Complete(ExecResult::Returned) => {}
+                            VmExit::Complete(ExecResult::Yielded) => {
+                                return Ok(VmExit::Complete(ExecResult::Yielded));
+                            }
+                            VmExit::NativeRequest(id) => {
+                                if !l.set_native_request_continuation(
+                                    id,
+                                    DeferredVmContinuation::TailCall,
+                                ) {
+                                    return Err(RuntimeError::new(
+                                        "VM: failed to retain native tail-call continuation",
+                                    ));
+                                }
+                                return Ok(VmExit::NativeRequest(id));
+                            }
+                            VmExit::UpvalueAccess(request) => {
+                                return Ok(VmExit::UpvalueAccess(request));
+                            }
+                            VmExit::AutomaticGc => return Ok(VmExit::AutomaticGc),
                         }
+                    } else {
+                        call_value_at_stack(l, gc, func_pos, actual_nargs, None)?;
                     }
-                    l.top = ci.func + available;
-                    l.pop_call_info();
-                    return Ok(VmExit::Complete(ExecResult::Returned));
+                    pc += 1;
+                    continue;
                 }
 
                 if let Value::Function(func_ref) = func {
-                    // SAFETY: GC is not running during VM execution; GcRef remains valid
-                    if let Some(func_obj) = unsafe { func_ref.as_ref() } {
-                        if func_obj.is_lua_function() {
-                            if let Some(tail_proto_ref) = func_obj.proto() {
-                                if !tail_proto_ref.is_null() {
-                                    let tail_proto_ptr = gc
-                                        .validate_ref(tail_proto_ref)
-                                        .map_err(invalid_proto_error)?;
-                                    // SAFETY: validated above; destructive sweep is disabled
-                                    // throughout VM execution.
-                                    let tail_proto = unsafe { tail_proto_ptr.as_ref() };
-                                    let args: Vec<Value> = (0..actual_nargs)
-                                        .map(|i| {
-                                            l.stack
-                                                .at(func_pos + 1 + i)
-                                                .cloned()
-                                                .unwrap_or(Value::Nil)
-                                        })
-                                        .collect();
-                                    close_state_upvalues(l, gc, base_idx)?;
-                                    for (i, arg) in args.iter().enumerate().take(actual_nargs) {
-                                        if let Some(dst) = l.stack.at_mut(base_idx + i) {
-                                            *dst = arg.clone();
-                                        }
-                                    }
-
-                                    let tail_nargs = actual_nargs as i32;
-                                    let varargs = prepare_lua_varargs(
-                                        l, gc, tail_proto, base_idx, tail_nargs,
-                                    );
-                                    let new_top = base_idx + tail_proto.max_stack_size() as usize;
-                                    let frame_func = l.current_call_info().func;
-                                    if let Some(slot) = l.stack.at_mut(frame_func) {
-                                        *slot = Value::Function(func_ref);
-                                    }
-                                    let ci = l.current_call_info_mut();
-                                    ci.base = base_idx;
-                                    ci.top = new_top;
-                                    ci.nargs = tail_nargs;
-                                    ci.varargs = varargs;
-                                    ci.savedpc = Some(0);
-                                    ci.proto = Some(tail_proto_ref);
-                                    ci.tailcalls += 1;
-
-                                    if l.stack.size() < new_top {
-                                        l.stack.set_top(new_top);
-                                    }
-                                    fire_debug_hook(l, gc, "call", None)?;
-                                    active_proto_ref = tail_proto_ref;
-                                    pc = 0;
-                                    continue;
-                                }
+                    let (tail_proto, callable) = inspect_function(gc, func_ref)?;
+                    if let Some(tail_proto_ref) = tail_proto.filter(|proto| !proto.is_null()) {
+                        let args: Vec<Value> = (0..actual_nargs)
+                            .map(|i| l.stack.at(func_pos + 1 + i).cloned().unwrap_or(Value::Nil))
+                            .collect();
+                        let old_frame_top = l.current_call_info().top;
+                        close_state_upvalues(l, gc, base_idx)?;
+                        for (i, arg) in args.iter().enumerate().take(actual_nargs) {
+                            if let Some(dst) = l.stack.at_mut(base_idx + i) {
+                                *dst = arg.clone();
                             }
-                        } else if let Some(callable) = native_callable(func_obj) {
-                            match call_native_function(
-                                l,
-                                gc,
-                                func_pos,
-                                actual_nargs,
-                                None,
-                                callable,
-                            )? {
-                                VmExit::Complete(ExecResult::Yielded) => {
-                                    return Ok(VmExit::Complete(ExecResult::Yielded));
-                                }
-                                VmExit::NativeRequest(id) => {
-                                    return Ok(VmExit::NativeRequest(id));
-                                }
-                                VmExit::UpvalueAccess(request) => {
-                                    return Ok(VmExit::UpvalueAccess(request));
-                                }
-                                VmExit::AutomaticGc => return Ok(VmExit::AutomaticGc),
-                                VmExit::Complete(ExecResult::Returned) => {}
-                            }
-                            let available = l.top.saturating_sub(func_pos);
-                            let ci = l.current_call_info().clone();
-                            let wanted = if l.current_ci == 0 || ci.nresults == LUA_MULTRET {
-                                available
-                            } else {
-                                ci.nresults.max(0) as usize
-                            };
-                            let mut results = Vec::with_capacity(wanted);
-                            for i in 0..wanted {
-                                let result = if i < available {
-                                    l.stack.at(func_pos + i).cloned().unwrap_or(Value::Nil)
-                                } else {
-                                    Value::Nil
-                                };
-                                results.push(result);
-                            }
-
-                            close_state_upvalues(l, gc, ci.base)?;
-                            if wanted > 0 {
-                                ensure_stack_slot(l, ci.func + wanted - 1);
-                            }
-                            for (i, result) in results.into_iter().enumerate() {
-                                if let Some(dst) = l.stack.at_mut(ci.func + i) {
-                                    *dst = result;
-                                }
-                            }
-                            l.top = ci.func + wanted;
-                            l.pop_call_info();
-                            return Ok(VmExit::Complete(ExecResult::Returned));
                         }
+
+                        let tail_nargs = actual_nargs as i32;
+                        let (varargs, max_stack_size) =
+                            prepare_lua_varargs(l, gc, tail_proto_ref, base_idx, tail_nargs)?;
+                        let new_top = base_idx + max_stack_size;
+                        for slot in new_top..old_frame_top.min(l.stack.size()) {
+                            if let Some(value) = l.stack.at_mut(slot) {
+                                *value = Value::Nil;
+                            }
+                        }
+                        let frame_func = l.current_call_info().func;
+                        if let Some(slot) = l.stack.at_mut(frame_func) {
+                            *slot = Value::Function(func_ref);
+                        }
+                        let ci = l.current_call_info_mut();
+                        ci.base = base_idx;
+                        ci.top = new_top;
+                        ci.nargs = tail_nargs;
+                        ci.varargs = varargs;
+                        ci.savedpc = Some(0);
+                        ci.proto = Some(tail_proto_ref);
+                        ci.tailcalls += 1;
+
+                        if l.stack.size() < new_top {
+                            l.stack.set_top(new_top);
+                        }
+                        if let Some(request_id) = publish_debug_hook_event(
+                            l,
+                            gc,
+                            "call",
+                            None,
+                            DebugHookContinuation::LuaCall {
+                                proto: tail_proto_ref,
+                            },
+                        )? {
+                            return Ok(VmExit::NativeRequest(request_id));
+                        }
+                        active_proto_ref = tail_proto_ref;
+                        pc = 0;
+                        continue;
+                    } else if let Some(callable) = callable {
+                        close_state_upvalues(l, gc, base_idx)?;
+                        match call_native_function(l, gc, func_pos, actual_nargs, None, callable)? {
+                            VmExit::Complete(ExecResult::Yielded) => {
+                                return Ok(VmExit::Complete(ExecResult::Yielded));
+                            }
+                            VmExit::NativeRequest(id) => {
+                                if !l.set_native_request_continuation(
+                                    id,
+                                    DeferredVmContinuation::TailCall,
+                                ) {
+                                    return Err(RuntimeError::new(
+                                        "VM: failed to retain native tail-call continuation",
+                                    ));
+                                }
+                                return Ok(VmExit::NativeRequest(id));
+                            }
+                            VmExit::UpvalueAccess(request) => {
+                                return Ok(VmExit::UpvalueAccess(request));
+                            }
+                            VmExit::AutomaticGc => return Ok(VmExit::AutomaticGc),
+                            VmExit::Complete(ExecResult::Returned) => {}
+                        }
+                        pc += 1;
+                        continue;
                     }
                 }
                 return Err(RuntimeError::new("tail call: only Lua functions supported"));
@@ -844,6 +1222,7 @@ fn execute_proto_inner(
             OpCode::RETURN => {
                 let a = opcode::get_arg_a(inst) as usize;
                 let b = opcode::get_arg_b(inst) as i32;
+                emit_return_trace(l, gc, active_proto_ref, pc);
                 let ci = l.current_call_info().clone();
                 let available = if b == 0 {
                     l.top.saturating_sub(base_idx + a)
@@ -867,24 +1246,28 @@ fn execute_proto_inner(
                 }
 
                 close_state_upvalues(l, gc, ci.base)?;
-
-                fire_debug_hook(l, gc, "return", None)?;
-                for _ in 0..ci.tailcalls {
-                    fire_debug_hook(l, gc, "tail return", None)?;
+                if debug_hook_event_enabled(l, "return") {
+                    let remaining_tail_returns = ci.tailcalls;
+                    let request_id = publish_debug_hook_event(
+                        l,
+                        gc,
+                        "return",
+                        None,
+                        DebugHookContinuation::LuaReturn {
+                            call_info: ci,
+                            results,
+                            remaining_tail_returns,
+                        },
+                    )?
+                    .ok_or_else(|| {
+                        RuntimeError::new("enabled Lua return hook was not published")
+                    })?;
+                    return Ok(VmExit::NativeRequest(request_id));
                 }
 
-                if wanted > 0 {
-                    ensure_stack_slot(l, ci.func + wanted - 1);
-                }
-                for (i, src) in results.into_iter().enumerate() {
-                    let dst_idx = ci.func + i;
-                    if let Some(dst) = l.stack.at_mut(dst_idx) {
-                        *dst = src;
-                    }
-                }
-                l.top = ci.func + wanted;
-                l.pop_call_info();
-                return Ok(VmExit::Complete(ExecResult::Returned));
+                let result = finish_lua_return_after_debug_hook(l, &ci, results);
+                flush_instruction_diff(l, gc);
+                return result;
             }
 
             // ── 循环 (3) ─────────────────────────────────────
@@ -910,16 +1293,20 @@ fn execute_proto_inner(
                 let step_num = as_number(gc, &step);
                 let limit_num = as_number(gc, &limit);
                 let idx_num = as_number(gc, &idx_val) + step_num;
-                // Update R(A) and R(A+3)
+                let continues = (step_num > 0.0 && idx_num <= limit_num)
+                    || (step_num < 0.0 && idx_num >= limit_num);
                 if let Some(dst) = l.stack.at_mut(base_idx + a) {
                     *dst = Value::Number(idx_num);
                 }
                 if let Some(dst) = l.stack.at_mut(base_idx + a + 3) {
                     *dst = Value::Number(idx_num);
                 }
-                if (step_num > 0.0 && idx_num <= limit_num)
-                    || (step_num < 0.0 && idx_num >= limit_num)
-                {
+                if !continues {
+                    let last_accepted = as_number(gc, &idx_val);
+                    record_trace_number_override(l, base_idx + a, last_accepted);
+                    record_trace_number_override(l, base_idx + a + 3, last_accepted);
+                }
+                if continues {
                     // +1 compensates for Lua C's pre-increment fetch
                     pc = ((pc as i32) + sbx + 1) as usize;
                     continue;
@@ -946,7 +1333,7 @@ fn execute_proto_inner(
                     None => {
                         return Err(runtime_error_at(
                             gc,
-                            active_proto,
+                            active_proto_ref,
                             pc,
                             "'for' step must be a number",
                         ));
@@ -955,7 +1342,7 @@ fn execute_proto_inner(
                 if to_arith_number(gc, &limit).is_none() {
                     return Err(runtime_error_at(
                         gc,
-                        active_proto,
+                        active_proto_ref,
                         pc,
                         "'for' limit must be a number",
                     ));
@@ -965,7 +1352,7 @@ fn execute_proto_inner(
                     None => {
                         return Err(runtime_error_at(
                             gc,
-                            active_proto,
+                            active_proto_ref,
                             pc,
                             "'for' initial value must be a number",
                         ));
@@ -988,120 +1375,114 @@ fn execute_proto_inner(
 
                 match &func {
                     Value::Function(func_ref) => {
-                        // SAFETY: iterator function is kept alive by the stack.
-                        if let Some(func_obj) = unsafe { func_ref.as_ref() } {
-                            if let Some(callable) = native_callable(func_obj) {
-                                let call_pos = base_idx + a + 3;
-                                ensure_stack_slot(l, call_pos + 2);
-                                if let Some(dst) = l.stack.at_mut(call_pos) {
-                                    *dst = func.clone();
+                        let (iter_proto, callable) = inspect_function(gc, *func_ref)?;
+                        if let Some(callable) = callable {
+                            let call_pos = base_idx + a + 3;
+                            ensure_stack_slot(l, call_pos + 2);
+                            if let Some(dst) = l.stack.at_mut(call_pos) {
+                                *dst = func.clone();
+                            }
+                            if let Some(dst) = l.stack.at_mut(call_pos + 1) {
+                                *dst = state;
+                            }
+                            if let Some(dst) = l.stack.at_mut(call_pos + 2) {
+                                *dst = control;
+                            }
+                            match call_native_function(l, gc, call_pos, 2, Some(c), callable)? {
+                                VmExit::Complete(ExecResult::Yielded) => {
+                                    return Ok(VmExit::Complete(ExecResult::Yielded));
                                 }
-                                if let Some(dst) = l.stack.at_mut(call_pos + 1) {
-                                    *dst = state;
-                                }
-                                if let Some(dst) = l.stack.at_mut(call_pos + 2) {
-                                    *dst = control;
-                                }
-                                match call_native_function(l, gc, call_pos, 2, Some(c), callable)? {
-                                    VmExit::Complete(ExecResult::Yielded) => {
-                                        return Ok(VmExit::Complete(ExecResult::Yielded));
+                                VmExit::NativeRequest(id) => {
+                                    if !l.set_native_request_continuation(
+                                        id,
+                                        DeferredVmContinuation::GenericFor {
+                                            base: base_idx,
+                                            register: a,
+                                        },
+                                    ) {
+                                        return Err(RuntimeError::new(
+                                            "VM: failed to attach generic-for continuation",
+                                        ));
                                     }
-                                    VmExit::NativeRequest(id) => {
-                                        if !l.set_native_request_continuation(
-                                            id,
-                                            DeferredVmContinuation::GenericFor {
-                                                base: base_idx,
-                                                register: a,
-                                            },
-                                        ) {
-                                            return Err(RuntimeError::new(
-                                                "VM: failed to attach generic-for continuation",
-                                            ));
-                                        }
-                                        return Ok(VmExit::NativeRequest(id));
-                                    }
-                                    VmExit::UpvalueAccess(request) => {
-                                        return Ok(VmExit::UpvalueAccess(request));
-                                    }
-                                    VmExit::AutomaticGc => return Ok(VmExit::AutomaticGc),
-                                    VmExit::Complete(ExecResult::Returned) => {}
+                                    return Ok(VmExit::NativeRequest(id));
                                 }
-                            } else if let Some(iter_proto_ref) = func_obj.proto() {
-                                let iter_proto_ptr = gc
-                                    .validate_ref(iter_proto_ref)
-                                    .map_err(invalid_proto_error)?;
-                                // SAFETY: validated above; destructive sweep is disabled
-                                // throughout VM execution.
-                                let iter_proto = unsafe { iter_proto_ptr.as_ref() };
-                                let call_pos = base_idx + a + 3;
-                                ensure_stack_slot(l, call_pos + 2);
-                                if let Some(dst) = l.stack.at_mut(call_pos) {
-                                    *dst = func.clone();
+                                VmExit::UpvalueAccess(request) => {
+                                    return Ok(VmExit::UpvalueAccess(request));
                                 }
-                                if let Some(dst) = l.stack.at_mut(call_pos + 1) {
-                                    *dst = state;
-                                }
-                                if let Some(dst) = l.stack.at_mut(call_pos + 2) {
-                                    *dst = control;
-                                }
+                                VmExit::AutomaticGc => return Ok(VmExit::AutomaticGc),
+                                VmExit::Complete(ExecResult::Returned) => {}
+                            }
+                        } else if let Some(iter_proto_ref) = iter_proto {
+                            let call_pos = base_idx + a + 3;
+                            ensure_stack_slot(l, call_pos + 2);
+                            if let Some(dst) = l.stack.at_mut(call_pos) {
+                                *dst = func.clone();
+                            }
+                            if let Some(dst) = l.stack.at_mut(call_pos + 1) {
+                                *dst = state;
+                            }
+                            if let Some(dst) = l.stack.at_mut(call_pos + 2) {
+                                *dst = control;
+                            }
 
-                                let saved_ci = l.current_ci;
-                                let varargs =
-                                    prepare_lua_varargs(l, gc, iter_proto, call_pos + 1, 2);
-                                let ci = l.push_call_info();
-                                ci.func = call_pos;
-                                ci.base = call_pos + 1;
-                                ci.top = ci.base + iter_proto.max_stack_size() as usize;
-                                ci.nresults = c as i32;
-                                ci.nargs = 2;
-                                ci.varargs = varargs;
-                                ci.savedpc = None;
-                                ci.proto = Some(iter_proto_ref);
-                                ci.tailcalls = 0;
+                            let saved_ci = l.current_ci;
+                            let (varargs, max_stack_size) =
+                                prepare_lua_varargs(l, gc, iter_proto_ref, call_pos + 1, 2)?;
+                            let ci = l.push_call_info();
+                            ci.func = call_pos;
+                            ci.base = call_pos + 1;
+                            ci.top = ci.base + max_stack_size;
+                            ci.nresults = c as i32;
+                            ci.nargs = 2;
+                            ci.varargs = varargs;
+                            ci.savedpc = None;
+                            ci.proto = Some(iter_proto_ref);
+                            ci.tailcalls = 0;
 
-                                match execute_nested_proto_at(
-                                    l,
-                                    active_proto_ref,
-                                    pc,
-                                    iter_proto_ref,
-                                    gc,
-                                ) {
-                                    Ok(VmExit::Complete(ExecResult::Returned)) => {}
-                                    Ok(VmExit::Complete(ExecResult::Yielded)) => {
-                                        return Ok(VmExit::Complete(ExecResult::Yielded));
-                                    }
-                                    Ok(VmExit::NativeRequest(id)) => {
-                                        return Ok(VmExit::NativeRequest(id));
-                                    }
-                                    Ok(VmExit::UpvalueAccess(request)) => {
-                                        return Ok(VmExit::UpvalueAccess(request));
-                                    }
-                                    Ok(VmExit::AutomaticGc) => {
-                                        return Ok(VmExit::AutomaticGc);
-                                    }
-                                    Err(e) => {
+                            match execute_nested_proto_at(
+                                l,
+                                active_proto_ref,
+                                pc,
+                                iter_proto_ref,
+                                gc,
+                            ) {
+                                Ok(VmExit::Complete(ExecResult::Returned)) => {}
+                                Ok(VmExit::Complete(ExecResult::Yielded)) => {
+                                    return Ok(VmExit::Complete(ExecResult::Yielded));
+                                }
+                                Ok(VmExit::NativeRequest(id)) => {
+                                    return Ok(VmExit::NativeRequest(id));
+                                }
+                                Ok(VmExit::UpvalueAccess(request)) => {
+                                    return Ok(VmExit::UpvalueAccess(request));
+                                }
+                                Ok(VmExit::AutomaticGc) => {
+                                    return Ok(VmExit::AutomaticGc);
+                                }
+                                Err(e) => {
+                                    if l.current_thread.is_none() {
                                         unwind_lua_frames_to(l, gc, saved_ci)?;
-                                        return Err(e);
                                     }
+                                    return Err(e);
                                 }
+                            }
 
-                                if l.current_ci != saved_ci {
-                                    unwind_lua_frames_to(l, gc, saved_ci)?;
-                                    return Err(RuntimeError::new(
-                                        "VM: generic-for call frame imbalance",
-                                    ));
-                                }
-                            } else {
+                            if l.current_ci != saved_ci {
+                                unwind_lua_frames_to(l, gc, saved_ci)?;
                                 return Err(RuntimeError::new(
-                                    "generic for: iterator function has no callable body",
+                                    "VM: generic-for call frame imbalance",
                                 ));
                             }
+                        } else {
+                            return Err(RuntimeError::new(
+                                "generic for: iterator function has no callable body",
+                            ));
                         }
                     }
                     _ => {
                         return Err(runtime_error_at(
                             gc,
-                            active_proto,
+                            active_proto_ref,
                             pc,
                             "generic for: iterator function expected",
                         ));
@@ -1125,8 +1506,7 @@ fn execute_proto_inner(
                 let mut c = opcode::get_arg_c(inst) as usize;
                 if c == 0 {
                     pc += 1;
-                    c = *code
-                        .get(pc)
+                    c = proto_instruction(gc, active_proto_ref, pc)?
                         .ok_or_else(|| RuntimeError::new("VM: SETLIST missing block argument"))?
                         as usize;
                     if c == 0 {
@@ -1170,45 +1550,62 @@ fn execute_proto_inner(
                 let a = opcode::get_arg_a(inst) as usize;
                 let bx = opcode::get_arg_bx(inst) as usize;
                 // Create closure from sub-proto Bx
-                if bx >= active_proto.sub_proto_count() {
+                let sub_proto_ref = gc
+                    .with_ref(active_proto_ref, |proto| {
+                        (bx < proto.sub_proto_count()).then(|| proto.sub_proto(bx))
+                    })
+                    .map_err(invalid_proto_error)?
+                    .ok_or_else(|| RuntimeError::new("VM: CLOSURE proto index out of range"))?;
+                if sub_proto_ref.is_null() {
                     return Err(RuntimeError::new("VM: CLOSURE proto index out of range"));
                 }
-                let sub_proto_ref = active_proto.sub_proto(bx);
-                if !sub_proto_ref.is_null() {
-                    let environment = current_env(l);
-                    let child_proto_ptr = gc
-                        .validate_ref(sub_proto_ref)
+                {
+                    let environment = current_env(l, gc);
+                    let child_upvalue_count = gc
+                        .with_ref(sub_proto_ref, |proto| proto.num_upvalues() as usize)
                         .map_err(invalid_proto_error)?;
-                    // SAFETY: validated above; destructive sweep is disabled
-                    // throughout VM execution.
-                    let child_proto = unsafe { child_proto_ptr.as_ref() };
                     let mut next_pc = pc + 1;
-                    let mut upvalues = Vec::with_capacity(child_proto.num_upvalues() as usize);
-                    for _ in 0..child_proto.num_upvalues() {
-                        let pseudo = *code.get(next_pc).ok_or_else(|| {
-                            RuntimeError::new("VM: CLOSURE missing upvalue pseudo instruction")
-                        })?;
+                    let mut upvalues = Vec::with_capacity(child_upvalue_count);
+                    for upvalue_index in 0..child_upvalue_count {
+                        let pseudo =
+                            proto_instruction(gc, active_proto_ref, next_pc)?.ok_or_else(|| {
+                                RuntimeError::new("VM: CLOSURE missing upvalue pseudo instruction")
+                            })?;
                         next_pc += 1;
 
                         let upvalue_ref = match opcode::get_opcode(pseudo) {
                             OpCode::MOVE => {
                                 let b = opcode::get_arg_b(pseudo) as usize;
-                                l.find_or_create_upvalue(base_idx + b, gc)
-                                    .map_err(|error| {
+                                let open_count = l.open_upvalues.len();
+                                let upvalue = l.find_or_create_upvalue(base_idx + b, gc).map_err(
+                                    |error| {
                                         RuntimeError::new(format!(
                                             "VM: could not publish open Upvalue: {error}"
                                         ))
-                                    })?
+                                    },
+                                )?;
+                                if l.open_upvalues.len() > open_count {
+                                    let name = gc
+                                        .with_ref(sub_proto_ref, |proto| {
+                                            proto.upvalue_name(upvalue_index)
+                                        })
+                                        .map_err(invalid_proto_error)?;
+                                    record_trace_upvalue_open(
+                                        l,
+                                        gc,
+                                        active_proto_ref,
+                                        pc,
+                                        base_idx + b,
+                                        name,
+                                    );
+                                }
+                                upvalue
                             }
                             OpCode::GETUPVAL => {
                                 let b = opcode::get_arg_b(pseudo) as usize;
-                                current_lua_function(l)
-                                    .and_then(|current| current.upvalue(b))
-                                    .ok_or_else(|| {
-                                        RuntimeError::new(
-                                            "VM: CLOSURE invalid parent upvalue index",
-                                        )
-                                    })?
+                                current_lua_upvalue(l, gc, b).ok_or_else(|| {
+                                    RuntimeError::new("VM: CLOSURE invalid parent upvalue index")
+                                })?
                             }
                             _ => {
                                 return Err(RuntimeError::new(
@@ -1267,11 +1664,23 @@ fn execute_proto_inner(
 
         pc += 1;
         if gc.automatic_step_due() {
+            // Diff snapshots own cloned Values that are not part of the GC root
+            // graph. Complete the just-executed instruction before Runtime can
+            // advance the collector at this instruction boundary.
+            flush_instruction_diff(l, gc);
+            // Some instructions consume following pseudo words or rewrite the
+            // control PC (CLOSURE bindings, SETLIST extra words, LOADBOOL
+            // skips, jumps). Persist the completed instruction's successor
+            // before suspending for Runtime-owned GC; otherwise resume derives
+            // the next PC from the stale opcode entry and can execute data as
+            // bytecode.
+            l.current_call_info_mut().savedpc = Some(pc.saturating_sub(1));
             l.status = ThreadStatus::Yield;
             return Ok(VmExit::AutomaticGc);
         }
     }
 
+    flush_instruction_diff(l, gc);
     l.pop_call_info();
     Ok(VmExit::Complete(ExecResult::Returned))
 }
@@ -1281,25 +1690,37 @@ fn run_debug_instruction_hooks(
     gc: &mut GarbageCollector,
     proto: GcRef<Proto>,
     pc: usize,
-    op: OpCode,
-) -> Result<(), RuntimeError> {
+) -> Result<Option<NativeRequestId>, RuntimeError> {
     if l.debug_hook.is_none() || l.debug_hook_active {
-        return Ok(());
+        return Ok(None);
     }
 
-    if l.debug_hook_count > 0
-        && matches!(
-            op,
-            OpCode::LOADK | OpCode::FORPREP | OpCode::FORLOOP | OpCode::TFORLOOP
-        )
-    {
+    if l.debug_hook_count > 0 {
         l.debug_hook_countdown -= 1;
         if l.debug_hook_countdown <= 0 {
             l.debug_hook_countdown = l.debug_hook_count;
-            fire_debug_hook(l, gc, "count", None)?;
+            return publish_debug_hook_event(
+                l,
+                gc,
+                "count",
+                None,
+                DebugHookContinuation::InstructionAfterCount { proto, pc },
+            );
         }
     }
 
+    dispatch_debug_line_hook(l, gc, proto, pc)
+}
+
+pub(crate) fn dispatch_debug_line_hook(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    proto: GcRef<Proto>,
+    pc: usize,
+) -> Result<Option<NativeRequestId>, RuntimeError> {
+    if l.debug_hook.is_none() || l.debug_hook_active {
+        return Ok(None);
+    }
     if l.debug_hook_mask.contains('l') {
         let line = gc
             .with_ref(proto, |active| active.line(pc))
@@ -1315,13 +1736,19 @@ fn run_debug_instruction_hooks(
         } else if line > 0 && (line != l.debug_hook_last_line || repeated_line_from_jump) {
             l.debug_hook_last_line = line;
             l.debug_hook_last_pc = pc;
-            fire_debug_hook(l, gc, "line", Some(line))?;
+            return publish_debug_hook_event(
+                l,
+                gc,
+                "line",
+                Some(line),
+                DebugHookContinuation::ResumeAt { proto, pc },
+            );
         } else {
             l.debug_hook_last_pc = pc;
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn run_auto_weak_gc(l: &mut LuaState, gc: &mut GarbageCollector) {
@@ -1447,55 +1874,268 @@ fn close_state_upvalues(
     level: usize,
 ) -> Result<(), RuntimeError> {
     l.close_upvalues(level, gc)
-        .map_err(|error| RuntimeError::new(format!("VM: could not close open Upvalue: {error}")))
+        .map_err(|error| RuntimeError::new(format!("VM: could not close open Upvalue: {error}")))?;
+    record_trace_upvalue_closes(l, gc, level);
+    Ok(())
 }
 
-fn fire_debug_hook(
+fn debug_hook_event_enabled(l: &LuaState, event: &str) -> bool {
+    l.debug_hook.is_some()
+        && !l.debug_hook_active
+        && (!matches!(event, "call") || l.debug_hook_mask.contains('c'))
+        && (!matches!(event, "return" | "tail return") || l.debug_hook_mask.contains('r'))
+}
+
+pub(crate) fn publish_debug_hook_event(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     event: &str,
     line: Option<i32>,
-) -> Result<(), RuntimeError> {
-    let Some(hook) = l.debug_hook.clone() else {
-        return Ok(());
-    };
-    if l.debug_hook_active {
-        return Ok(());
+    continuation: DebugHookContinuation,
+) -> Result<Option<NativeRequestId>, RuntimeError> {
+    if !debug_hook_event_enabled(l, event) {
+        return Ok(None);
     }
-    if matches!(event, "call") && !l.debug_hook_mask.contains('c') {
-        return Ok(());
-    }
-    if matches!(event, "return" | "tail return") && !l.debug_hook_mask.contains('r') {
-        return Ok(());
-    }
+    let hook = l
+        .debug_hook
+        .clone()
+        .expect("enabled debug hook has a function value");
 
     let saved_top = l.top;
-    gc.with_publication(|transaction| {
+    let stop_ci = l.current_ci;
+    let call_pos = l.current_call_info().top.max(saved_top.saturating_add(1));
+    let trace_barrier = match &continuation {
+        DebugHookContinuation::ResumeAt { .. }
+        | DebugHookContinuation::InstructionAfterCount { .. } => None,
+        DebugHookContinuation::LuaReturn { .. } => begin_trace_callback_barrier(l),
+        DebugHookContinuation::LuaCall { .. } => begin_trace_callback_barrier(l).or_else(|| {
+            stop_ci
+                .checked_sub(1)
+                .and_then(|frame| begin_trace_callback_barrier_for_frame(l, frame))
+        }),
+        DebugHookContinuation::NativeCall { frame }
+        | DebugHookContinuation::NativeReturn { frame, .. } => {
+            begin_trace_callback_barrier_for_frame(l, frame.saved_ci)
+        }
+    };
+    l.debug_hook_active = true;
+    let publication = gc.with_publication(|transaction| {
         let event = rooted_vm_bytes(l, transaction, event.as_bytes())?;
-        // SAFETY: the callback installs the string in the active Lua stack.
+        // SAFETY: the callback installs the event string in the rooted Runtime
+        // request before its publication root is released.
         unsafe {
-            transaction.publish_string_value(event, |value| {
-                l.push_value(value);
+            transaction.publish_string_value(event, |event| {
+                let line = line.map_or(Value::Nil, |line| Value::Number(line as f64));
+                l.publish_callback_helper_request(
+                    CallbackHelperKind::DebugHook {
+                        stop_ci,
+                        call_pos,
+                        saved_top,
+                        trace_barrier,
+                        continuation: Box::new(continuation),
+                    },
+                    hook,
+                    vec![event, line],
+                )
             })
         }
-    })
-    .map_err(|error| RuntimeError::new(format!("invalid debug-hook event: {error}")))?;
-    let event_value = l.stack.at(saved_top).cloned().unwrap_or(Value::Nil);
-    let line_value = line.map_or(Value::Nil, |line| Value::Number(line as f64));
-    let frame_top = l.current_call_info().top.max(saved_top + 1);
-    l.top = frame_top;
-    l.debug_hook_active = true;
-    let result = call_value_with_results(
-        l,
-        gc,
-        hook,
-        &[event_value, line_value],
-        Some(0),
-        |_, _, _| (),
+    });
+    match publication {
+        Ok(Ok(request_id)) => Ok(Some(request_id)),
+        Ok(Err(error)) => {
+            l.debug_hook_active = false;
+            end_trace_callback_barrier(l, trace_barrier);
+            let message = match error {
+                NativeRequestPublishError::ScopeUnavailable => {
+                    "debug hook requires the Runtime dispatcher"
+                }
+                NativeRequestPublishError::MailboxOccupied => {
+                    "debug hook found an occupied Runtime-native mailbox"
+                }
+                NativeRequestPublishError::IdExhausted => {
+                    "debug hook Runtime-native request id exhausted"
+                }
+            };
+            Err(RuntimeError::new(message))
+        }
+        Err(error) => {
+            l.debug_hook_active = false;
+            end_trace_callback_barrier(l, trace_barrier);
+            Err(RuntimeError::new(format!(
+                "invalid debug-hook event: {error}"
+            )))
+        }
+    }
+}
+
+fn publish_vm_metamethod_call(
+    l: &mut LuaState,
+    function: Value,
+    args: Vec<Value>,
+    continuation: VmMetamethodContinuation,
+) -> Result<NativeRequestId, RuntimeError> {
+    let saved_top = l.top;
+    let stop_ci = l.current_ci;
+    let call_pos = l.current_call_info().top.max(saved_top.saturating_add(1));
+    let trace_barrier = begin_trace_callback_barrier(l);
+    let publication = l.publish_callback_helper_request(
+        CallbackHelperKind::VmMetamethod {
+            stop_ci,
+            call_pos,
+            saved_top,
+            trace_barrier,
+            continuation,
+        },
+        function,
+        args,
     );
-    l.debug_hook_active = false;
-    l.top = saved_top;
-    result.map(|_| ())
+    publication.map_err(|error| {
+        end_trace_callback_barrier(l, trace_barrier);
+        let message = match error {
+            NativeRequestPublishError::ScopeUnavailable => {
+                "VM metamethod requires the Runtime dispatcher"
+            }
+            NativeRequestPublishError::MailboxOccupied => {
+                "VM metamethod found an occupied Runtime-native mailbox"
+            }
+            NativeRequestPublishError::IdExhausted => {
+                "VM metamethod Runtime-native request id exhausted"
+            }
+        };
+        RuntimeError::new(message)
+    })
+}
+
+pub(crate) fn finish_vm_metamethod_callback(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    continuation: VmMetamethodContinuation,
+    results: Vec<Value>,
+) -> Result<VmExit, RuntimeError> {
+    let (proto, pc) = match &continuation {
+        VmMetamethodContinuation::StoreResult { proto, pc, .. }
+        | VmMetamethodContinuation::StoreSelfResult { proto, pc, .. }
+        | VmMetamethodContinuation::CompleteSet { proto, pc }
+        | VmMetamethodContinuation::Compare { proto, pc, .. }
+        | VmMetamethodContinuation::Concat { proto, pc, .. } => (*proto, *pc),
+    };
+    if l.current_call_info().proto != Some(proto) || l.current_call_info().savedpc != Some(pc) {
+        return Err(RuntimeError::new(
+            "VM metamethod continuation no longer matches its opcode frame",
+        ));
+    }
+    let result = results.into_iter().next().unwrap_or(Value::Nil);
+    match continuation {
+        VmMetamethodContinuation::StoreResult { destination, .. } => {
+            ensure_stack_slot(l, destination);
+            if let Some(slot) = l.stack.at_mut(destination) {
+                *slot = result;
+            }
+        }
+        VmMetamethodContinuation::StoreSelfResult {
+            destination,
+            self_destination,
+            object,
+            ..
+        } => {
+            ensure_stack_slot(l, destination.max(self_destination));
+            if let Some(slot) = l.stack.at_mut(destination) {
+                *slot = result;
+            }
+            if let Some(slot) = l.stack.at_mut(self_destination) {
+                *slot = object;
+            }
+        }
+        VmMetamethodContinuation::CompleteSet { .. } => {}
+        VmMetamethodContinuation::Compare {
+            expected,
+            invert_result,
+            ..
+        } => {
+            let mut comparison = !result.is_false();
+            if invert_result {
+                comparison = !comparison;
+            }
+            if comparison != expected {
+                l.current_call_info_mut().savedpc = pc.checked_add(1);
+            }
+        }
+        VmMetamethodContinuation::Concat {
+            destination,
+            next_slot,
+            end_slot,
+            stack_limit,
+            ..
+        } => {
+            ensure_stack_slot(l, destination);
+            if let Some(slot) = l.stack.at_mut(destination) {
+                *slot = result;
+            }
+            if next_slot <= end_slot {
+                for slot in next_slot..=end_slot {
+                    let lhs = l.stack.at(destination).cloned().unwrap_or(Value::Nil);
+                    let rhs = l.stack.at(slot).cloned().unwrap_or(Value::Nil);
+                    match exec_concat_into(
+                        l,
+                        gc,
+                        &lhs,
+                        &rhs,
+                        destination,
+                        VmMetamethodContinuation::Concat {
+                            proto,
+                            pc,
+                            destination,
+                            next_slot: slot.saturating_add(1),
+                            end_slot,
+                            stack_limit,
+                        },
+                    )? {
+                        VmMetamethodOutcome::Ready(()) => {}
+                        VmMetamethodOutcome::Suspended(request_id) => {
+                            return Ok(VmExit::NativeRequest(request_id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(VmExit::Complete(ExecResult::Returned))
+}
+
+pub(crate) fn finish_lua_return_after_debug_hook(
+    l: &mut LuaState,
+    call_info: &crate::state::CallInfo,
+    results: Vec<Value>,
+) -> Result<VmExit, RuntimeError> {
+    let current = l.current_call_info();
+    if current.func != call_info.func
+        || current.base != call_info.base
+        || current.proto != call_info.proto
+        || current.nresults != call_info.nresults
+    {
+        return Err(RuntimeError::new(
+            "debug-hook Lua return continuation no longer matches its frame",
+        ));
+    }
+    let result_count = results.len();
+    if result_count > 0 {
+        ensure_stack_slot(l, call_info.func + result_count - 1);
+    }
+    for (index, value) in results.into_iter().enumerate() {
+        if let Some(destination) = l.stack.at_mut(call_info.func + index) {
+            *destination = value;
+        }
+    }
+    // The result vector was already sized to the caller-visible wanted count.
+    let new_top = call_info.func + result_count;
+    for slot in new_top..l.stack.size() {
+        if let Some(value) = l.stack.at_mut(slot) {
+            *value = Value::Nil;
+        }
+    }
+    l.top = new_top;
+    l.pop_call_info();
+    Ok(VmExit::Complete(ExecResult::Returned))
 }
 
 fn execute_nested_proto_at(
@@ -1505,10 +2145,6 @@ fn execute_nested_proto_at(
     callee_proto: GcRef<Proto>,
     gc: &mut GarbageCollector,
 ) -> Result<VmExit, RuntimeError> {
-    let caller_proto_ptr = gc.validate_ref(caller_proto).map_err(invalid_proto_error)?;
-    // SAFETY: validated above; destructive sweep is disabled throughout VM
-    // execution.
-    let caller_proto = unsafe { caller_proto_ptr.as_ref() };
     let overflow = stack_overflow_error(l, gc, caller_proto, caller_pc);
     execute_counted_proto(l, callee_proto, gc, overflow)
 }
@@ -1533,12 +2169,26 @@ fn unwind_lua_frames_to(
     gc: &mut GarbageCollector,
     target_ci: usize,
 ) -> Result<(), RuntimeError> {
+    discard_instruction_diffs_above_frame(l, target_ci);
     while l.current_ci > target_ci {
         let base = l.current_call_info().base;
         close_state_upvalues(l, gc, base)?;
         l.pop_call_info();
     }
     Ok(())
+}
+
+/// Finish the eager unwind required when an unprotected error escapes the
+/// main state. Nested frames close while they are popped, then the root frame
+/// closes the Upvalues owned by its register window before the top-level state
+/// reset clears the stack.
+pub(crate) fn unwind_top_level_lua_error(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+) -> Result<(), RuntimeError> {
+    unwind_lua_frames_to(l, gc, 0)?;
+    let root_base = l.current_call_info().base;
+    close_state_upvalues(l, gc, root_base)
 }
 
 /// Call a Lua value from host/stdlib code and publish its results synchronously.
@@ -1617,26 +2267,17 @@ pub fn start_lua_call_at_stack(
         )));
     };
 
-    // SAFETY: function value is on the coroutine stack and GC is not running.
-    let Some(func_obj) = (unsafe { func_ref.as_ref() }) else {
-        return Err(RuntimeError::new("attempt to call an invalid function"));
-    };
-    let Some(callee_proto_ref) = func_obj.proto() else {
+    let Some(callee_proto_ref) = inspect_function(gc, func_ref)?.0 else {
         return Err(RuntimeError::new("coroutine entry must be a Lua function"));
     };
-    let callee_proto_ptr = gc
-        .validate_ref(callee_proto_ref)
-        .map_err(invalid_proto_error)?;
-    // SAFETY: validated above; destructive sweep is disabled throughout VM
-    // execution.
-    let callee_proto = unsafe { callee_proto_ptr.as_ref() };
 
     let new_base = func_pos + 1;
-    let varargs = prepare_lua_varargs(l, gc, callee_proto, new_base, nargs as i32);
+    let (varargs, max_stack_size) =
+        prepare_lua_varargs(l, gc, callee_proto_ref, new_base, nargs as i32)?;
     let ci = l.push_call_info();
     ci.func = func_pos;
     ci.base = new_base;
-    ci.top = new_base + callee_proto.max_stack_size() as usize;
+    ci.top = new_base + max_stack_size;
     ci.nresults = wanted_results.map_or(LUA_MULTRET, |n| n as i32);
     ci.nargs = nargs as i32;
     ci.varargs = varargs;
@@ -1645,6 +2286,22 @@ pub fn start_lua_call_at_stack(
     ci.tailcalls = 0;
 
     Ok(())
+}
+
+pub(crate) fn dispatch_started_lua_call_hook(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+) -> Result<Option<NativeRequestId>, RuntimeError> {
+    let proto = l.current_call_info().proto.ok_or_else(|| {
+        RuntimeError::new("started Lua call lost its Proto before debug-hook dispatch")
+    })?;
+    publish_debug_hook_event(
+        l,
+        gc,
+        "call",
+        None,
+        DebugHookContinuation::LuaCall { proto },
+    )
 }
 
 pub(crate) fn start_finalizer_callback(
@@ -1679,6 +2336,9 @@ pub(crate) fn start_finalizer_callback(
         Some(callable) => call_native_function(l, gc, func_pos, 1, Some(0), callable),
         None => {
             start_lua_call_at_stack(l, gc, func_pos, 1, Some(0))?;
+            if let Some(request_id) = dispatch_started_lua_call_hook(l, gc)? {
+                return Ok(VmExit::NativeRequest(request_id));
+            }
             resume_finalizer_callback(l, gc, stop_ci)
         }
     }
@@ -1696,7 +2356,7 @@ pub(crate) fn resume_finalizer_callback(
         let proto = l
             .current_call_info()
             .proto
-            .or_else(|| current_lua_function(l).and_then(Function::proto))
+            .or_else(|| current_lua_proto(l, gc))
             .ok_or_else(|| RuntimeError::new("finalizer frame has no Lua proto"))?;
         // The callback may be resuming after a nested Lua return or a sealed
         // Runtime-native request. Reuse the VM's saved-PC continuation path
@@ -1730,17 +2390,18 @@ pub(crate) fn abort_finalizer_callback(
     Ok(())
 }
 
-pub(crate) fn start_protected_call_target(
+pub(crate) fn start_runtime_callback_target(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     function: Value,
     args: &[Value],
     stop_ci: usize,
     call_pos: usize,
+    wanted_results: Option<usize>,
 ) -> Result<VmExit, RuntimeError> {
     if l.current_ci != stop_ci {
         return Err(RuntimeError::new(
-            "VM: protected helper started at an unexpected frame depth",
+            "VM: Runtime callback started at an unexpected frame depth",
         ));
     }
     l.status = ThreadStatus::Ok;
@@ -1762,20 +2423,18 @@ pub(crate) fn start_protected_call_target(
             value_type_name(&function)
         )));
     };
-    // SAFETY: the function is rooted by the protected activation and has been
-    // copied into the active stack before it is inspected.
-    let Some(function) = (unsafe { function_ref.as_ref() }) else {
-        return Err(RuntimeError::new("attempt to call an invalid function"));
-    };
-    if let Some(callable) = native_callable(function) {
-        return call_native_function(l, gc, call_pos, args.len(), None, callable);
+    if let Some(callable) = inspect_function(gc, function_ref)?.1 {
+        return call_native_function(l, gc, call_pos, args.len(), wanted_results, callable);
     }
 
-    start_lua_call_at_stack(l, gc, call_pos, args.len(), None)?;
-    resume_protected_call(l, gc, stop_ci)
+    start_lua_call_at_stack(l, gc, call_pos, args.len(), wanted_results)?;
+    if let Some(request_id) = dispatch_started_lua_call_hook(l, gc)? {
+        return Ok(VmExit::NativeRequest(request_id));
+    }
+    resume_runtime_callback(l, gc, stop_ci)
 }
 
-pub(crate) fn resume_protected_call(
+pub(crate) fn resume_runtime_callback(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     stop_ci: usize,
@@ -1786,14 +2445,14 @@ pub(crate) fn resume_protected_call(
         }
         if l.current_ci < stop_ci {
             return Err(RuntimeError::new(
-                "VM: protected helper resumed below its caller boundary",
+                "VM: Runtime callback resumed below its caller boundary",
             ));
         }
         let proto = l
             .current_call_info()
             .proto
-            .or_else(|| current_lua_function(l).and_then(Function::proto))
-            .ok_or_else(|| RuntimeError::new("protected helper frame has no Lua proto"))?;
+            .or_else(|| current_lua_proto(l, gc))
+            .ok_or_else(|| RuntimeError::new("Runtime callback frame has no Lua proto"))?;
         l.status = ThreadStatus::Yield;
         match execute_proto(l, proto, gc)? {
             VmExit::Complete(ExecResult::Returned) => {}
@@ -1807,7 +2466,7 @@ pub(crate) fn resume_protected_call(
     }
 }
 
-pub(crate) fn finish_protected_call_turn(
+pub(crate) fn finish_runtime_callback_turn(
     l: &mut LuaState,
     stop_ci: usize,
     call_pos: usize,
@@ -1815,12 +2474,12 @@ pub(crate) fn finish_protected_call_turn(
 ) -> Result<Vec<Value>, RuntimeError> {
     if l.current_ci != stop_ci {
         return Err(RuntimeError::new(
-            "VM: protected helper completed above its caller boundary",
+            "VM: Runtime callback completed above its caller boundary",
         ));
     }
     if l.top < call_pos {
         return Err(RuntimeError::new(
-            "VM: protected helper result window moved below its call slot",
+            "VM: Runtime callback result window moved below its call slot",
         ));
     }
     let results = collect_call_results(l, call_pos);
@@ -1828,7 +2487,37 @@ pub(crate) fn finish_protected_call_turn(
     Ok(results)
 }
 
-pub(crate) fn abort_protected_call_turn(
+/// Finish a protected target while matching the fixed C++ pcall scratch-window
+/// cleanup. Generic Runtime callbacks retain their inactive register window;
+/// clearing it there can erase caller globals/locals still owned by a wider CI.
+pub(crate) fn finish_protected_callback_turn(
+    l: &mut LuaState,
+    stop_ci: usize,
+    call_pos: usize,
+    saved_top: usize,
+) -> Result<Vec<Value>, RuntimeError> {
+    if l.current_ci != stop_ci {
+        return Err(RuntimeError::new(
+            "VM: protected callback completed above its caller boundary",
+        ));
+    }
+    if l.top < call_pos {
+        return Err(RuntimeError::new(
+            "VM: protected callback result window moved below its call slot",
+        ));
+    }
+    let results = collect_call_results(l, call_pos);
+    let clear_end = l.top.min(l.stack.size());
+    for slot in saved_top.min(clear_end)..clear_end {
+        if let Some(value) = l.stack.at_mut(slot) {
+            *value = Value::Nil;
+        }
+    }
+    l.top = saved_top;
+    Ok(results)
+}
+
+pub(crate) fn abort_runtime_callback_turn(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     stop_ci: usize,
@@ -1852,18 +2541,12 @@ pub fn resume_lua_thread(
         let proto_ref = l
             .current_call_info()
             .proto
-            .or_else(|| current_lua_function(l).and_then(|function| function.proto()))
+            .or_else(|| current_lua_proto(l, gc))
             .ok_or_else(|| RuntimeError::new("coroutine frame has no Lua proto"))?;
         gc.validate_ref(proto_ref).map_err(invalid_proto_error)?;
 
         l.status = ThreadStatus::Yield;
-        let result = match execute_proto(l, proto_ref, gc) {
-            Ok(result) => result,
-            Err(error) => {
-                unwind_lua_frames_to(l, gc, 0)?;
-                return Err(error);
-            }
-        };
+        let result = execute_proto(l, proto_ref, gc)?;
         match result {
             VmExit::Complete(ExecResult::Yielded) => {
                 return Ok(VmExit::Complete(ExecResult::Yielded));
@@ -1895,12 +2578,8 @@ fn call_value_at_stack(
         )));
     };
 
-    // SAFETY: function value is on the active Lua stack and GC is not running.
-    let Some(func_obj) = (unsafe { func_ref.as_ref() }) else {
-        return Err(RuntimeError::new("attempt to call an invalid function"));
-    };
-
-    if let Some(callable) = native_callable(func_obj) {
+    let (callee_proto, callable) = inspect_function(gc, func_ref)?;
+    if let Some(callable) = callable {
         match call_native_function(l, gc, func_pos, nargs, wanted_results, callable)? {
             VmExit::Complete(ExecResult::Returned) => {}
             VmExit::Complete(ExecResult::Yielded) => {
@@ -1928,23 +2607,18 @@ fn call_value_at_stack(
         return Ok(());
     }
 
-    let Some(callee_proto_ref) = func_obj.proto() else {
+    let Some(callee_proto_ref) = callee_proto else {
         return Err(RuntimeError::new("Lua function has no proto"));
     };
-    let callee_proto_ptr = gc
-        .validate_ref(callee_proto_ref)
-        .map_err(invalid_proto_error)?;
-    // SAFETY: validated above; destructive sweep is disabled throughout VM
-    // execution.
-    let callee_proto = unsafe { callee_proto_ptr.as_ref() };
 
     let saved_ci = l.current_ci;
     let new_base = func_pos + 1;
-    let varargs = prepare_lua_varargs(l, gc, callee_proto, new_base, nargs as i32);
+    let (varargs, max_stack_size) =
+        prepare_lua_varargs(l, gc, callee_proto_ref, new_base, nargs as i32)?;
     let ci = l.push_call_info();
     ci.func = func_pos;
     ci.base = new_base;
-    ci.top = new_base + callee_proto.max_stack_size() as usize;
+    ci.top = new_base + max_stack_size;
     ci.nresults = wanted_results.map_or(LUA_MULTRET, |n| n as i32);
     ci.nargs = nargs as i32;
     ci.varargs = varargs;
@@ -1978,7 +2652,9 @@ fn call_value_at_stack(
             ));
         }
         Err(e) => {
-            unwind_lua_frames_to(l, gc, saved_ci)?;
+            if l.current_thread.is_none() {
+                unwind_lua_frames_to(l, gc, saved_ci)?;
+            }
             return Err(e);
         }
     }
@@ -1996,18 +2672,17 @@ fn collect_call_results(l: &LuaState, call_pos: usize) -> Vec<Value> {
         .collect()
 }
 
-fn c_function_display_name(l: &LuaState, func_pos: usize) -> String {
+fn c_function_display_name(l: &LuaState, gc: &GarbageCollector, func_pos: usize) -> String {
     let Some(Value::Function(func_ref)) = l.stack.at(func_pos).cloned() else {
         return "<unknown>".to_string();
     };
     let Some(global_ref) = l.global_table else {
         return format!("function: {:p}", func_ref.as_ptr());
     };
-    // SAFETY: global table is rooted for the duration of VM execution.
-    let Some(global) = (unsafe { global_ref.as_ref() }) else {
-        return format!("function: {:p}", func_ref.as_ptr());
-    };
-    find_function_name_in_table(l, global, func_ref).unwrap_or_else(|| {
+    let display_name = gc.with_ref(global_ref, |global| {
+        if let Some(name) = find_function_name_in_table(gc, global, func_ref) {
+            return Some(name);
+        }
         for (key, value) in global.hash_entries() {
             let Value::String(lib_name_ref) = key else {
                 continue;
@@ -2015,26 +2690,32 @@ fn c_function_display_name(l: &LuaState, func_pos: usize) -> String {
             let Value::Table(table_ref) = value else {
                 continue;
             };
-            // SAFETY: library tables are reachable from the global table.
-            let Some(table) = (unsafe { table_ref.as_ref() }) else {
-                continue;
-            };
-            if let Some(name) = find_function_name_in_table(l, table, func_ref) {
-                let lib_name = l
+            let name = gc
+                .with_ref(*table_ref, |table| {
+                    find_function_name_in_table(gc, table, func_ref)
+                })
+                .ok()
+                .flatten();
+            if let Some(name) = name {
+                let lib_name = gc
                     .with_string_bytes(*lib_name_ref, |bytes| {
                         String::from_utf8_lossy(bytes).into_owned()
                     })
                     .ok()
                     .unwrap_or_default();
-                return format!("{lib_name}.{name}");
+                return Some(format!("{lib_name}.{name}"));
             }
         }
-        format!("function: {:p}", func_ref.as_ptr())
-    })
+        None
+    });
+    display_name
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| format!("function: {:p}", func_ref.as_ptr()))
 }
 
 fn find_function_name_in_table(
-    l: &LuaState,
+    gc: &GarbageCollector,
     table: &Table,
     func_ref: GcRef<Function>,
 ) -> Option<String> {
@@ -2042,7 +2723,7 @@ fn find_function_name_in_table(
         if let (Value::String(name_ref), Value::Function(value_ref)) = (key, value)
             && *value_ref == func_ref
         {
-            return l
+            return gc
                 .with_string_bytes(*name_ref, |bytes| {
                     String::from_utf8_lossy(bytes).into_owned()
                 })
@@ -2068,30 +2749,31 @@ fn value_type_name(value: &Value) -> &'static str {
 
 fn runtime_error_at(
     gc: &GarbageCollector,
-    proto: &Proto,
+    proto: GcRef<Proto>,
     pc: usize,
     message: impl Into<String>,
 ) -> RuntimeError {
-    let source = proto
-        .source()
+    let (source_ref, line) = gc
+        .with_ref(proto, |proto| (proto.source(), proto.line(pc)))
+        .unwrap_or((None, 0));
+    let source = source_ref
         .and_then(|source_ref| {
-            gc.with_string_bytes(source_ref, |bytes| {
-                String::from_utf8_lossy(bytes).into_owned()
-            })
-            .ok()
+            gc.with_string_bytes(source_ref, chunk_name_for_diagnostic)
+                .ok()
         })
         .unwrap_or_else(|| "?".to_string());
-    let line = proto.line(pc);
     RuntimeError::new(format!("{}:{}: {}", source, line, message.into()))
 }
 
 fn stack_overflow_error(
     l: &LuaState,
     gc: &GarbageCollector,
-    caller_proto: &Proto,
+    caller_proto: GcRef<Proto>,
     caller_pc: usize,
 ) -> RuntimeError {
-    let recursive_line = caller_proto.line(caller_pc);
+    let recursive_line = gc
+        .with_ref(caller_proto, |proto| proto.line(caller_pc))
+        .unwrap_or(0);
     let mut message = format!("?:{}: stack overflow", recursive_line);
     for _ in 0..20 {
         message.push_str(&format!("\n?:{}: in function 'y'", recursive_line));
@@ -2099,8 +2781,7 @@ fn stack_overflow_error(
     if let Some(line) = first_non_recursive_caller_line(l, gc) {
         message.push_str(&format!("\n?:{}: in function 'g'", line));
     } else {
-        let line = caller_proto.line(caller_pc);
-        message.push_str(&format!("\n?:{}: in function", line));
+        message.push_str(&format!("\n?:{}: in function", recursive_line));
     }
     RuntimeError::new(message)
 }
@@ -2142,23 +2823,25 @@ fn should_error_newindex(l: &LuaState, gc: &GarbageCollector, value: &Value) -> 
 
 fn index_error_message(
     gc: &GarbageCollector,
-    proto: &Proto,
+    proto: GcRef<Proto>,
     pc: usize,
     reg: usize,
-    constants: &[Value],
     value: &Value,
 ) -> String {
     let type_desc = value_type_name(value);
-    describe_register_for_index(gc, proto, pc, reg, constants, 8)
-        .map(|name| format!("attempt to index {name} (a {type_desc} value)"))
-        .unwrap_or_else(|| format!("attempt to index a {type_desc} value"))
+    gc.with_ref(proto, |proto| {
+        describe_register_for_index(gc, proto, pc, reg, proto.constants(), 8)
+    })
+    .ok()
+    .flatten()
+    .map(|name| format!("attempt to index {name} (a {type_desc} value)"))
+    .unwrap_or_else(|| format!("attempt to index a {type_desc} value"))
 }
 
 fn arith_error_message(
     gc: &GarbageCollector,
-    proto: &Proto,
+    proto: GcRef<Proto>,
     pc: usize,
-    constants: &[Value],
     lhs: (i32, &Value),
     rhs: (i32, &Value),
 ) -> String {
@@ -2167,34 +2850,53 @@ fn arith_error_message(
     } else {
         rhs
     };
-    operand_error_message(
-        gc,
-        proto,
-        pc,
-        bad_rk,
-        constants,
-        bad_value,
-        "attempt to perform arithmetic on",
-    )
+    gc.with_ref(proto, |proto| {
+        operand_error_message(
+            gc,
+            proto,
+            pc,
+            bad_rk,
+            proto.constants(),
+            bad_value,
+            "attempt to perform arithmetic on",
+        )
+    })
+    .unwrap_or_else(|_| "attempt to perform arithmetic on a non-number value".to_string())
 }
 
 fn unm_error_message(
     gc: &GarbageCollector,
-    proto: &Proto,
+    proto: GcRef<Proto>,
     pc: usize,
     rk: usize,
-    constants: &[Value],
     value: &Value,
 ) -> String {
-    operand_error_message(
-        gc,
-        proto,
-        pc,
-        rk as i32,
-        constants,
-        value,
-        "attempt to perform arithmetic on",
-    )
+    gc.with_ref(proto, |proto| {
+        operand_error_message(
+            gc,
+            proto,
+            pc,
+            rk as i32,
+            proto.constants(),
+            value,
+            "attempt to perform arithmetic on",
+        )
+    })
+    .unwrap_or_else(|_| "attempt to perform arithmetic on a non-number value".to_string())
+}
+
+fn describe_register_at(
+    gc: &GarbageCollector,
+    proto: GcRef<Proto>,
+    pc: usize,
+    reg: usize,
+    depth: usize,
+) -> Option<String> {
+    gc.with_ref(proto, |proto| {
+        describe_register(gc, proto, pc, reg, proto.constants(), depth)
+    })
+    .ok()
+    .flatten()
 }
 
 fn operand_error_message(
@@ -2458,24 +3160,41 @@ fn fill_missing_fixed_params(l: &mut LuaState, base: usize, nargs: i32, fixed_pa
 fn prepare_lua_varargs(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    proto: &Proto,
+    proto: GcRef<Proto>,
     base: usize,
     nargs: i32,
-) -> Vec<Value> {
-    let fixed_params = proto.num_params() as usize;
-    let varargs = if proto.is_vararg() {
+) -> Result<(Vec<Value>, usize), RuntimeError> {
+    let (fixed_params, is_vararg, vararg_flags, max_stack_size) = gc
+        .with_ref(proto, |proto| {
+            (
+                proto.num_params() as usize,
+                proto.is_vararg(),
+                proto.vararg_flags(),
+                proto.max_stack_size() as usize,
+            )
+        })
+        .map_err(invalid_proto_error)?;
+    let varargs = if is_vararg {
         collect_varargs(l, base, nargs, fixed_params)
     } else {
         Vec::new()
     };
 
     fill_missing_fixed_params(l, base, nargs, fixed_params);
+    if max_stack_size > 0 {
+        ensure_stack_slot(l, base + max_stack_size - 1);
+    }
+    for slot in fixed_params..max_stack_size {
+        if let Some(value) = l.stack.at_mut(base + slot) {
+            *value = Value::Nil;
+        }
+    }
 
-    if proto.vararg_flags() & VARARG_NEEDSARG != 0 {
+    if vararg_flags & VARARG_NEEDSARG != 0 {
         install_arg_table(l, gc, base + fixed_params, &varargs);
     }
 
-    varargs
+    Ok((varargs, max_stack_size))
 }
 
 fn install_arg_table(l: &mut LuaState, gc: &mut GarbageCollector, slot: usize, varargs: &[Value]) {
@@ -2513,20 +3232,21 @@ enum NativeCallable {
     Runtime(RuntimeNativeFunction),
 }
 
-#[derive(Clone, Copy)]
-struct NativeCallFrame {
-    func_pos: usize,
-    nargs: usize,
-    wanted_results: Option<usize>,
-    saved_ci: usize,
-    saved_top: usize,
-}
-
 fn native_callable(function: &Function) -> Option<NativeCallable> {
     function
         .runtime_native_function()
         .map(NativeCallable::Runtime)
         .or_else(|| function.c_function().map(NativeCallable::C))
+}
+
+fn inspect_function(
+    gc: &GarbageCollector,
+    function: GcRef<Function>,
+) -> Result<(Option<GcRef<Proto>>, Option<NativeCallable>), RuntimeError> {
+    gc.with_ref(function, |function| {
+        (function.proto(), native_callable(function))
+    })
+    .map_err(|error| RuntimeError::new(format!("VM: invalid Function: {error}")))
 }
 
 fn call_native_function(
@@ -2541,12 +3261,15 @@ fn call_native_function(
     let saved_top = l.top;
     let caller_proto = l.current_call_info().proto;
     let caller_pc = l.current_call_info().savedpc;
-    let frame = NativeCallFrame {
+    let frame = DebugHookNativeCall {
         func_pos,
         nargs,
         wanted_results,
         saved_ci,
         saved_top,
+        caller_proto,
+        caller_pc,
+        continuation: DeferredVmContinuation::Call,
     };
     let ci_top = {
         let ci = l.push_call_info();
@@ -2564,20 +3287,90 @@ fn call_native_function(
     if l.stack.size() < ci_top {
         l.stack.set_top(ci_top);
     }
-    l.top = func_pos + 1 + nargs;
+    let argument_top = func_pos + 1 + nargs;
+    if matches!(callable, NativeCallable::C(_)) {
+        // The fixed C++ C frame initializes its unused register window. This
+        // is observable in full-register snapshots even though it lies above
+        // the callback's logical argument top.
+        record_trace_nil_range(l, argument_top, ci_top);
+    }
+    l.top = argument_top;
 
-    if let Err(e) = fire_debug_hook(l, gc, "call", None) {
-        unwind_lua_frames_to(l, gc, saved_ci)?;
-        l.top = saved_top;
-        return Err(e);
+    match publish_debug_hook_event(
+        l,
+        gc,
+        "call",
+        None,
+        DebugHookContinuation::NativeCall {
+            frame: frame.clone(),
+        },
+    ) {
+        Ok(Some(request_id)) => return Ok(VmExit::NativeRequest(request_id)),
+        Ok(None) => {}
+        Err(error) => {
+            unwind_lua_frames_to(l, gc, saved_ci)?;
+            l.top = saved_top;
+            return Err(error);
+        }
     }
 
+    invoke_native_call_after_debug_hook(l, gc, frame, callable)
+}
+
+pub(crate) fn resume_native_call_after_debug_hook(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    frame: DebugHookNativeCall,
+) -> Result<VmExit, RuntimeError> {
+    if l.current_ci != frame.saved_ci + 1 {
+        return Err(RuntimeError::new(
+            "debug-hook native-call continuation changed frame depth",
+        ));
+    }
+    let function = l.stack.at(frame.func_pos).cloned().unwrap_or(Value::Nil);
+    let Value::Function(function_ref) = function else {
+        return Err(RuntimeError::new(
+            "debug-hook native-call continuation lost its function",
+        ));
+    };
+    let callable = inspect_function(gc, function_ref)?.1.ok_or_else(|| {
+        RuntimeError::new("debug-hook native-call continuation is no longer native")
+    })?;
+    invoke_native_call_after_debug_hook(l, gc, frame, callable)
+}
+
+fn invoke_native_call_after_debug_hook(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    frame: DebugHookNativeCall,
+    callable: NativeCallable,
+) -> Result<VmExit, RuntimeError> {
+    let DebugHookNativeCall {
+        func_pos,
+        nargs,
+        wanted_results,
+        saved_ci,
+        saved_top,
+        caller_proto,
+        caller_pc,
+        continuation,
+    } = frame.clone();
     let nret = match callable {
         NativeCallable::C(cfunc) => {
-            let l_ptr = l as *mut LuaState as *mut std::ffi::c_void;
-            // SAFETY: l_ptr points to the currently executing LuaState and the
+            let state = NonNull::from(&mut *l);
+            let collector = NonNull::from(&mut *gc);
+            let strings =
+                NonNull::new(l.active_string_pool_ptr().ok_or_else(|| {
+                    RuntimeError::new("native callback has no active StringPool")
+                })?)
+                .expect("active StringPool pointer is non-null");
+            // SAFETY: this nested scope is derived from the currently active
+            // state/collector reborrows. It suspends the outer collector borrow
+            // while the C callback uses LuaState's dynamic scoped services.
+            let _callback_scope = unsafe { enter_vm_context(state, collector, strings) };
+            // SAFETY: state points to the currently executing LuaState and the
             // ordinary C ABI owns no Runtime state-switch capability.
-            unsafe { cfunc(l_ptr) }
+            unsafe { cfunc(state.as_ptr().cast()) }
         }
         NativeCallable::Runtime(operation) => invoke_runtime_native(l, gc, operation),
     };
@@ -2592,7 +3385,7 @@ fn call_native_function(
             saved_top,
             caller_proto,
             caller_pc,
-            continuation: DeferredVmContinuation::Call,
+            continuation,
             snapshot: crate::native::StateContinuationSnapshot::capture(l),
         };
         if !l.seal_native_request(request_id, deferred) {
@@ -2610,6 +3403,10 @@ fn call_native_function(
         l.yield_wanted_results = wanted_results;
         l.pop_call_info();
         l.top = func_pos;
+        flush_instruction_diff(l, gc);
+        if let (Some(proto), Some(pc)) = (caller_proto, caller_pc) {
+            emit_coroutine_yield_trace(l, gc, proto, pc);
+        }
         return Ok(VmExit::Complete(ExecResult::Yielded));
     }
 
@@ -2619,19 +3416,15 @@ fn call_native_function(
 fn finish_native_call(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    frame: NativeCallFrame,
+    frame: DebugHookNativeCall,
     nret: i32,
 ) -> Result<VmExit, RuntimeError> {
-    let NativeCallFrame {
-        func_pos,
-        nargs,
-        wanted_results,
-        saved_ci,
-        saved_top,
-    } = frame;
+    let func_pos = frame.func_pos;
+    let saved_ci = frame.saved_ci;
+    let saved_top = frame.saved_top;
     if nret < 0 {
-        let initial_top = func_pos + 1 + nargs;
-        let error_value = if l.top > initial_top {
+        let native_base = l.current_call_info().base;
+        let error_value = if l.top > native_base {
             l.top
                 .checked_sub(1)
                 .and_then(|idx| l.stack.at(idx))
@@ -2639,7 +3432,7 @@ fn finish_native_call(
         } else {
             None
         };
-        let display_name = c_function_display_name(l, func_pos);
+        let display_name = c_function_display_name(l, gc, func_pos);
         unwind_lua_frames_to(l, gc, saved_ci)?;
         l.top = saved_top;
         return Err(error_value
@@ -2649,14 +3442,55 @@ fn finish_native_call(
             }));
     }
 
-    let nret_count = nret as usize;
+    match publish_debug_hook_event(
+        l,
+        gc,
+        "return",
+        None,
+        DebugHookContinuation::NativeReturn {
+            frame: frame.clone(),
+            result_count: nret,
+        },
+    ) {
+        Ok(Some(request_id)) => return Ok(VmExit::NativeRequest(request_id)),
+        Ok(None) => {}
+        Err(error) => {
+            unwind_lua_frames_to(l, gc, saved_ci)?;
+            l.top = saved_top;
+            return Err(error);
+        }
+    }
+
+    finish_native_call_after_debug_hook(l, gc, frame, nret)
+}
+
+pub(crate) fn finish_native_call_after_debug_hook(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    frame: DebugHookNativeCall,
+    nret: i32,
+) -> Result<VmExit, RuntimeError> {
+    let DebugHookNativeCall {
+        func_pos,
+        nargs: _,
+        wanted_results,
+        saved_ci,
+        saved_top: _,
+        caller_proto: _,
+        caller_pc,
+        continuation,
+    } = frame;
+    if l.current_ci != saved_ci + 1 || l.current_call_info().func != func_pos {
+        return Err(RuntimeError::new(
+            "debug-hook native-return continuation changed its call frame",
+        ));
+    }
+    let nret_count = usize::try_from(nret).map_err(|_| {
+        RuntimeError::new("debug-hook native-return continuation has a negative result count")
+    })?;
+    let old_top = l.top;
     let first_result = l.top.saturating_sub(nret_count);
     let wanted_count = wanted_results.unwrap_or(nret_count);
-    if let Err(error) = fire_debug_hook(l, gc, "return", None) {
-        unwind_lua_frames_to(l, gc, saved_ci)?;
-        l.top = saved_top;
-        return Err(error);
-    }
     if wanted_count > 0 {
         ensure_stack_slot(l, func_pos + wanted_count - 1);
     }
@@ -2670,8 +3504,18 @@ fn finish_native_call(
             *dst = src;
         }
     }
+    let new_top = func_pos + wanted_count;
+    record_trace_nil_range(l, new_top, old_top);
     l.pop_call_info();
-    l.top = func_pos + wanted_count;
+    l.top = new_top;
+    if matches!(continuation, DeferredVmContinuation::TailCall) {
+        // The pinned C++ TAILCALL handler closes the caller's Upvalues before
+        // invoking any target but continues to the compiler-emitted RETURN
+        // after a native target completes. Preserve that frame/PC here.
+        close_state_upvalues(l, gc, l.current_call_info().base)?;
+    } else {
+        apply_vm_continuation(l, gc, &continuation, saved_ci, caller_pc)?;
+    }
     Ok(VmExit::Complete(ExecResult::Returned))
 }
 
@@ -2681,7 +3525,7 @@ pub(crate) fn finish_deferred_native_call(
     deferred: &DeferredNativeCall,
     envelope: ResumeEnvelope,
     response: ResumeResponse,
-) -> Result<(), RuntimeError> {
+) -> Result<VmExit, RuntimeError> {
     validate_deferred_native_call(l, deferred)?;
 
     l.top = deferred.func_pos + 1 + deferred.nargs;
@@ -2740,25 +3584,7 @@ pub(crate) fn finish_deferred_native_call(
         }
     };
 
-    let frame = NativeCallFrame {
-        func_pos: deferred.func_pos,
-        nargs: deferred.nargs,
-        wanted_results: deferred.wanted_results,
-        saved_ci: deferred.saved_ci,
-        saved_top: deferred.saved_top,
-    };
-    match finish_native_call(l, gc, frame, nret)? {
-        VmExit::Complete(ExecResult::Returned) => {
-            apply_deferred_vm_continuation(l, deferred)?;
-            Ok(())
-        }
-        VmExit::Complete(ExecResult::Yielded)
-        | VmExit::NativeRequest(_)
-        | VmExit::UpvalueAccess(_)
-        | VmExit::AutomaticGc => Err(RuntimeError::new(
-            "VM: deferred native completion produced a second suspension",
-        )),
-    }
+    finish_native_call(l, gc, native_call_frame_from_deferred(deferred), nret)
 }
 
 pub(crate) fn finish_deferred_native_values(
@@ -2766,32 +3592,45 @@ pub(crate) fn finish_deferred_native_values(
     gc: &mut GarbageCollector,
     deferred: &DeferredNativeCall,
     values: Vec<Value>,
-) -> Result<(), RuntimeError> {
+) -> Result<VmExit, RuntimeError> {
     validate_deferred_native_call(l, deferred)?;
     l.top = deferred.func_pos + 1 + deferred.nargs;
     let count = values.len();
     for value in values {
         l.push_value(value);
     }
-    let frame = NativeCallFrame {
-        func_pos: deferred.func_pos,
-        nargs: deferred.nargs,
-        wanted_results: deferred.wanted_results,
-        saved_ci: deferred.saved_ci,
-        saved_top: deferred.saved_top,
-    };
-    match finish_native_call(l, gc, frame, count as i32)? {
-        VmExit::Complete(ExecResult::Returned) => {
-            apply_deferred_vm_continuation(l, deferred)?;
-            Ok(())
-        }
-        VmExit::Complete(ExecResult::Yielded)
-        | VmExit::NativeRequest(_)
-        | VmExit::UpvalueAccess(_)
-        | VmExit::AutomaticGc => Err(RuntimeError::new(
-            "VM: raw deferred completion produced a second suspension",
-        )),
+    finish_native_call(
+        l,
+        gc,
+        native_call_frame_from_deferred(deferred),
+        count as i32,
+    )
+}
+
+/// Finish pcall/xpcall values in the native frame's result base.
+///
+/// Unlike an ordinary deferred native operation, the fixed C++ protected
+/// helper executes its target in place and returns its status/value tuple from
+/// the first native-frame slot. Preserving that staging point also preserves
+/// the oracle's physical scratch-window cleanup and GC roots.
+pub(crate) fn finish_deferred_protected_values(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+    values: Vec<Value>,
+) -> Result<VmExit, RuntimeError> {
+    validate_deferred_native_call(l, deferred)?;
+    l.top = deferred.func_pos + 1;
+    let count = values.len();
+    for value in values {
+        l.push_value(value);
     }
+    finish_native_call(
+        l,
+        gc,
+        native_call_frame_from_deferred(deferred),
+        count as i32,
+    )
 }
 
 pub(crate) fn finish_deferred_runtime_result(
@@ -2800,7 +3639,7 @@ pub(crate) fn finish_deferred_runtime_result(
     deferred: &DeferredNativeCall,
     protected: bool,
     response: Result<Vec<Value>, Value>,
-) -> Result<(), RuntimeError> {
+) -> Result<VmExit, RuntimeError> {
     validate_deferred_native_call(l, deferred)?;
     l.top = deferred.func_pos + 1 + deferred.nargs;
     let nret = match (protected, response) {
@@ -2829,24 +3668,100 @@ pub(crate) fn finish_deferred_runtime_result(
             2
         }
     };
-    let frame = NativeCallFrame {
+    finish_native_call(l, gc, native_call_frame_from_deferred(deferred), nret)
+}
+
+pub(crate) fn finish_deferred_load_source(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+    source: &[u8],
+    chunk_name: &[u8],
+) -> Result<VmExit, RuntimeError> {
+    validate_deferred_native_call(l, deferred)?;
+    l.top = deferred.func_pos + 1 + deferred.nargs;
+    match compile_chunk_function(l, gc, source, chunk_name) {
+        Ok(_) => finish_deferred_native_stack_results(l, gc, deferred, 1),
+        Err(message) => finish_validated_deferred_load_error(l, gc, deferred, &message),
+    }
+}
+
+pub(crate) fn finish_deferred_load_error_message(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+    message: &str,
+) -> Result<VmExit, RuntimeError> {
+    validate_deferred_native_call(l, deferred)?;
+    l.top = deferred.func_pos + 1 + deferred.nargs;
+    finish_validated_deferred_load_error(l, gc, deferred, message)
+}
+
+pub(crate) fn finish_deferred_gsub_result(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+    output: &[u8],
+    count: usize,
+) -> Result<VmExit, RuntimeError> {
+    validate_deferred_native_call(l, deferred)?;
+    l.top = deferred.func_pos + 1 + deferred.nargs;
+    gc.with_publication(|transaction| {
+        let output = rooted_vm_bytes(l, transaction, output)?;
+        // SAFETY: the result string is installed on the retained native frame
+        // before its temporary publication root is released.
+        unsafe {
+            transaction.publish_string_value(output, |output| {
+                l.push_value(output);
+            })
+        }
+    })
+    .map_err(|error| RuntimeError::new(format!("VM: invalid string.gsub result: {error}")))?;
+    l.push_value(Value::Number(count as f64));
+    finish_deferred_native_stack_results(l, gc, deferred, 2)
+}
+
+fn finish_validated_deferred_load_error(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+    message: &str,
+) -> Result<VmExit, RuntimeError> {
+    l.push_value(Value::Nil);
+    gc.with_publication(|transaction| {
+        let message = rooted_vm_bytes(l, transaction, message.as_bytes())?;
+        // SAFETY: the message is installed on the active native frame before
+        // the publication root is released.
+        unsafe {
+            transaction.publish_string_value(message, |message| {
+                l.push_value(message);
+            })
+        }
+    })
+    .map_err(|error| RuntimeError::new(format!("VM: invalid load error result: {error}")))?;
+    finish_deferred_native_stack_results(l, gc, deferred, 2)
+}
+
+fn finish_deferred_native_stack_results(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    deferred: &DeferredNativeCall,
+    result_count: i32,
+) -> Result<VmExit, RuntimeError> {
+    let frame = native_call_frame_from_deferred(deferred);
+    finish_native_call(l, gc, frame, result_count)
+}
+
+fn native_call_frame_from_deferred(deferred: &DeferredNativeCall) -> DebugHookNativeCall {
+    DebugHookNativeCall {
         func_pos: deferred.func_pos,
         nargs: deferred.nargs,
         wanted_results: deferred.wanted_results,
         saved_ci: deferred.saved_ci,
         saved_top: deferred.saved_top,
-    };
-    match finish_native_call(l, gc, frame, nret)? {
-        VmExit::Complete(ExecResult::Returned) => {
-            apply_deferred_vm_continuation(l, deferred)?;
-            Ok(())
-        }
-        VmExit::Complete(ExecResult::Yielded)
-        | VmExit::NativeRequest(_)
-        | VmExit::UpvalueAccess(_)
-        | VmExit::AutomaticGc => Err(RuntimeError::new(
-            "VM: deferred Runtime-native completion produced a second suspension",
-        )),
+        caller_proto: deferred.caller_proto,
+        caller_pc: deferred.caller_pc,
+        continuation: deferred.continuation.clone(),
     }
 }
 
@@ -2898,29 +3813,598 @@ fn validate_deferred_native_call(
     Ok(())
 }
 
-fn apply_deferred_vm_continuation(
+fn apply_vm_continuation(
     l: &mut LuaState,
-    deferred: &DeferredNativeCall,
+    _gc: &mut GarbageCollector,
+    continuation: &DeferredVmContinuation,
+    saved_ci: usize,
+    caller_pc: Option<usize>,
 ) -> Result<(), RuntimeError> {
-    match deferred.continuation {
+    match continuation {
         DeferredVmContinuation::Call => Ok(()),
         DeferredVmContinuation::GenericFor { base, register } => {
             let first_result = l
                 .stack
-                .at(base + register + 3)
+                .at(*base + *register + 3)
                 .cloned()
                 .unwrap_or(Value::Nil);
             if first_result.is_nil() {
-                let caller = l.call_stack.get_mut(deferred.saved_ci).ok_or_else(|| {
+                let caller = l.call_stack.get_mut(saved_ci).ok_or_else(|| {
                     RuntimeError::new("VM: generic-for continuation lost caller frame")
                 })?;
-                caller.savedpc = deferred.caller_pc.and_then(|pc| pc.checked_add(1));
-            } else if let Some(destination) = l.stack.at_mut(base + register + 2) {
+                caller.savedpc = caller_pc.and_then(|pc| pc.checked_add(1));
+            } else if let Some(destination) = l.stack.at_mut(*base + *register + 2) {
                 *destination = first_result;
             }
             Ok(())
         }
+        DeferredVmContinuation::TailCall => Ok(()),
     }
+}
+
+/// Next externally visible step of the Runtime-owned `table.sort` state machine.
+#[derive(Debug)]
+pub(crate) enum TableSortAdvance {
+    Callback { function: Value, args: Vec<Value> },
+    Complete,
+    Error(String),
+}
+
+/// Next externally visible step of a Runtime-owned `table.foreach[i]` traversal.
+#[derive(Debug)]
+pub(crate) enum TableForeachAdvance {
+    Callback { function: Value, args: Vec<Value> },
+    Complete,
+}
+
+pub(crate) fn advance_table_foreach_state(
+    gc: &GarbageCollector,
+    state: &mut TableForeachState,
+) -> Result<TableForeachAdvance, RuntimeError> {
+    let args = match state.cursor.clone() {
+        TableForeachCursor::Pairs { key } => {
+            let next = gc
+                .with_ref(state.table, |table| table.next(&key))
+                .map_err(|error| {
+                    RuntimeError::new(format!("invalid table.foreach target: {error}"))
+                })?;
+            let Some((next_key, value)) = next else {
+                return Ok(TableForeachAdvance::Complete);
+            };
+            state.cursor = TableForeachCursor::Pairs {
+                key: next_key.clone(),
+            };
+            vec![next_key, value]
+        }
+        TableForeachCursor::Indices { next, limit } => {
+            if next > limit {
+                return Ok(TableForeachAdvance::Complete);
+            }
+            let value = gc
+                .with_ref(state.table, |table| table.get(&Value::Number(next as f64)))
+                .map_err(|error| {
+                    RuntimeError::new(format!("invalid table.foreachi target: {error}"))
+                })?;
+            state.cursor = TableForeachCursor::Indices {
+                next: next.saturating_add(1),
+                limit,
+            };
+            vec![Value::Number(next as f64), value]
+        }
+    };
+    Ok(TableForeachAdvance::Callback {
+        function: state.callback.clone(),
+        args,
+    })
+}
+
+/// Apply one successful `require` loader result to `package.loaded` and return
+/// the exact value observed after the loader's own table writes.
+pub(crate) fn finish_package_require_callback(
+    gc: &mut GarbageCollector,
+    loaded: GcRef<Table>,
+    module_key: &Value,
+    values: Vec<Value>,
+) -> Result<Vec<Value>, RuntimeError> {
+    if let Some(result) = values.into_iter().next()
+        && !result.is_nil()
+    {
+        set_package_loaded_value(gc, loaded, module_key, &result)?;
+    }
+
+    let mut loaded_value = gc
+        .with_ref(loaded, |table| table.get(module_key))
+        .map_err(|error| RuntimeError::new(format!("invalid package.loaded table: {error}")))?;
+    if loaded_value.is_nil() {
+        loaded_value = Value::Boolean(true);
+        set_package_loaded_value(gc, loaded, module_key, &loaded_value)?;
+    }
+    Ok(vec![loaded_value])
+}
+
+fn set_package_loaded_value(
+    gc: &mut GarbageCollector,
+    loaded: GcRef<Table>,
+    module_key: &Value,
+    value: &Value,
+) -> Result<(), RuntimeError> {
+    gc.with_mut(loaded, |table| table.set(module_key, value))
+        .map_err(|error| RuntimeError::new(format!("invalid package.loaded table: {error}")))?;
+    gc.write_barrier_value(loaded, module_key);
+    gc.write_barrier_value(loaded, value);
+    Ok(())
+}
+
+/// Next externally visible step of a Runtime-owned `string.gsub` callback loop.
+#[derive(Debug)]
+pub(crate) enum GsubAdvance {
+    Callback { function: Value, args: Vec<Value> },
+    Complete,
+    Error(String),
+}
+
+pub(crate) fn advance_gsub_state(
+    gc: &GarbageCollector,
+    state: &mut GsubState,
+    callback_result: Option<Value>,
+) -> Result<GsubAdvance, RuntimeError> {
+    if let Some(value) = callback_result {
+        let step = state.steps.get(state.next).ok_or_else(|| {
+            RuntimeError::new("string.gsub callback result lost its current match")
+        })?;
+        match gsub_replacement_bytes(gc, &step.matched, &value) {
+            Ok(bytes) => state.output.extend_from_slice(&bytes),
+            Err(message) => return Ok(GsubAdvance::Error(message)),
+        }
+        state.next = state.next.saturating_add(1);
+    }
+
+    loop {
+        let Some(step) = state.steps.get(state.next).cloned() else {
+            if !state.completed {
+                state.output.extend_from_slice(&state.suffix);
+                state.completed = true;
+            }
+            return Ok(GsubAdvance::Complete);
+        };
+        state.output.extend_from_slice(&step.prefix);
+
+        match &state.replacement {
+            GsubReplacement::Function(function) => {
+                return Ok(GsubAdvance::Callback {
+                    function: function.clone(),
+                    args: step.arguments,
+                });
+            }
+            GsubReplacement::Table { table, index_key } => {
+                match resolve_gsub_table_replacement(gc, *table, index_key, &step.table_key)? {
+                    GsubTableReplacement::Value(value) => {
+                        match gsub_replacement_bytes(gc, &step.matched, &value) {
+                            Ok(bytes) => state.output.extend_from_slice(&bytes),
+                            Err(message) => return Ok(GsubAdvance::Error(message)),
+                        }
+                        state.next = state.next.saturating_add(1);
+                    }
+                    GsubTableReplacement::Callback { function, args } => {
+                        return Ok(GsubAdvance::Callback { function, args });
+                    }
+                    GsubTableReplacement::ChainTooLong => {
+                        return Ok(GsubAdvance::Error("'__index' chain too long".to_string()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum GsubTableReplacement {
+    Value(Value),
+    Callback { function: Value, args: Vec<Value> },
+    ChainTooLong,
+}
+
+fn resolve_gsub_table_replacement(
+    gc: &GarbageCollector,
+    table: GcRef<Table>,
+    index_key: &Value,
+    key: &Value,
+) -> Result<GsubTableReplacement, RuntimeError> {
+    let mut current = table;
+    for _ in 0..100 {
+        let raw_value = gc
+            .with_ref(current, |table| table.get(key))
+            .map_err(|error| {
+                RuntimeError::new(format!("invalid gsub replacement table: {error}"))
+            })?;
+        if !raw_value.is_nil() {
+            return Ok(GsubTableReplacement::Value(raw_value));
+        }
+
+        let metatable = gc.with_ref(current, Table::metatable).map_err(|error| {
+            RuntimeError::new(format!("invalid gsub replacement table: {error}"))
+        })?;
+        let Some(metatable) = metatable else {
+            return Ok(GsubTableReplacement::Value(Value::Nil));
+        };
+        let index = gc
+            .with_ref(metatable, |table| table.get(index_key))
+            .map_err(|error| {
+                RuntimeError::new(format!("invalid gsub replacement metatable: {error}"))
+            })?;
+        match index {
+            Value::Table(next) => current = next,
+            function @ Value::Function(_) => {
+                return Ok(GsubTableReplacement::Callback {
+                    function,
+                    args: vec![Value::Table(current), key.clone()],
+                });
+            }
+            _ => return Ok(GsubTableReplacement::Value(Value::Nil)),
+        }
+    }
+    Ok(GsubTableReplacement::ChainTooLong)
+}
+
+fn gsub_replacement_bytes(
+    gc: &GarbageCollector,
+    matched: &[u8],
+    value: &Value,
+) -> Result<Vec<u8>, String> {
+    match value {
+        Value::Nil | Value::Boolean(false) => Ok(matched.to_vec()),
+        Value::String(string) => gc
+            .with_string_bytes(*string, <[u8]>::to_vec)
+            .map_err(|error| format!("invalid gsub replacement string: {error}")),
+        Value::Number(number) => Ok(lua_number_bytes(*number)),
+        _ => Err("invalid replacement value (a string expected)".to_string()),
+    }
+}
+
+fn lua_number_bytes(number: f64) -> Vec<u8> {
+    if number.fract() == 0.0 && number.is_finite() {
+        format!("{number:.0}").into_bytes()
+    } else {
+        number.to_string().into_bytes()
+    }
+}
+
+enum DefaultTableSortComparison {
+    Ready(bool),
+    Callback(Value),
+    Error(String),
+}
+
+/// Apply at most one completed comparator result, then run synchronous merge
+/// work until another Lua callback, completion, or error boundary is reached.
+pub(crate) fn advance_table_sort_state(
+    gc: &mut GarbageCollector,
+    state: &mut TableSortState,
+    callback_result: Option<bool>,
+) -> Result<TableSortAdvance, RuntimeError> {
+    match (state.pending.take(), callback_result) {
+        (Some(TableSortPending::ValidatePrimary), Some(result)) => {
+            let TableSortStage::ValidateComparator { index } = state.stage.clone() else {
+                return Err(RuntimeError::new(
+                    "table.sort validation callback lost its stage",
+                ));
+            };
+            if result {
+                let comparator = state.comparator.clone().ok_or_else(|| {
+                    RuntimeError::new("table.sort validation lost its comparator")
+                })?;
+                let value = state.values.get(index).cloned().ok_or_else(|| {
+                    RuntimeError::new("table.sort validation index moved out of range")
+                })?;
+                state.pending = Some(TableSortPending::ValidateReverse);
+                return Ok(TableSortAdvance::Callback {
+                    function: comparator,
+                    args: vec![value.clone(), value],
+                });
+            }
+            state.stage = TableSortStage::ValidateComparator { index: index + 1 };
+        }
+        (Some(TableSortPending::ValidateReverse), Some(_)) => {
+            return Ok(TableSortAdvance::Error(
+                "invalid order function for sorting".to_string(),
+            ));
+        }
+        (Some(TableSortPending::MergePrimary { custom }), Some(result)) => {
+            if result && custom {
+                let comparator = state.comparator.clone().ok_or_else(|| {
+                    RuntimeError::new("table.sort reverse check lost its comparator")
+                })?;
+                let (first, second) = table_sort_merge_indices(state)?;
+                let first_value = state.values.get(first).cloned().ok_or_else(|| {
+                    RuntimeError::new("table.sort first merge index moved out of range")
+                })?;
+                let second_value = state.values.get(second).cloned().ok_or_else(|| {
+                    RuntimeError::new("table.sort second merge index moved out of range")
+                })?;
+                state.pending = Some(TableSortPending::MergeReverse);
+                return Ok(TableSortAdvance::Callback {
+                    function: comparator,
+                    args: vec![first_value, second_value],
+                });
+            }
+            table_sort_take_merge_value(state, result)?;
+        }
+        (Some(TableSortPending::MergeReverse), Some(result)) => {
+            if result {
+                return Ok(TableSortAdvance::Error(
+                    "invalid order function for sorting".to_string(),
+                ));
+            }
+            table_sort_take_merge_value(state, true)?;
+        }
+        (None, None) => {}
+        (Some(_), None) => {
+            return Err(RuntimeError::new(
+                "table.sort continuation resumed without a comparator result",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(RuntimeError::new(
+                "table.sort received an unexpected comparator result",
+            ));
+        }
+    }
+
+    loop {
+        match state.stage.clone() {
+            TableSortStage::ValidateComparator { index } => {
+                if state.comparator.is_none() || index >= state.values.len() {
+                    state.stage = if state.values.len() < 2 {
+                        TableSortStage::Complete
+                    } else {
+                        table_sort_merge_stage(state.values.len(), 1, 0)
+                    };
+                    continue;
+                }
+                let comparator = state
+                    .comparator
+                    .clone()
+                    .expect("checked comparator presence above");
+                let value = state.values[index].clone();
+                state.pending = Some(TableSortPending::ValidatePrimary);
+                return Ok(TableSortAdvance::Callback {
+                    function: comparator,
+                    args: vec![value.clone(), value],
+                });
+            }
+            TableSortStage::Merge {
+                width,
+                left,
+                middle,
+                right,
+                first,
+                second,
+                output,
+            } => {
+                if first < middle && second < right {
+                    let lhs = state.values[second].clone();
+                    let rhs = state.values[first].clone();
+                    if let Some(comparator) = state.comparator.clone() {
+                        state.pending = Some(TableSortPending::MergePrimary { custom: true });
+                        return Ok(TableSortAdvance::Callback {
+                            function: comparator,
+                            args: vec![lhs, rhs],
+                        });
+                    }
+                    match default_table_sort_comparison(gc, state, &lhs, &rhs) {
+                        DefaultTableSortComparison::Ready(result) => {
+                            table_sort_take_merge_value(state, result)?;
+                        }
+                        DefaultTableSortComparison::Callback(function) => {
+                            state.pending = Some(TableSortPending::MergePrimary { custom: false });
+                            return Ok(TableSortAdvance::Callback {
+                                function,
+                                args: vec![lhs, rhs],
+                            });
+                        }
+                        DefaultTableSortComparison::Error(message) => {
+                            return Ok(TableSortAdvance::Error(message));
+                        }
+                    }
+                    continue;
+                }
+
+                if first < middle {
+                    state.scratch[output] = state.values[first].clone();
+                    state.stage = TableSortStage::Merge {
+                        width,
+                        left,
+                        middle,
+                        right,
+                        first: first + 1,
+                        second,
+                        output: output + 1,
+                    };
+                    continue;
+                }
+                if second < right {
+                    state.scratch[output] = state.values[second].clone();
+                    state.stage = TableSortStage::Merge {
+                        width,
+                        left,
+                        middle,
+                        right,
+                        first,
+                        second: second + 1,
+                        output: output + 1,
+                    };
+                    continue;
+                }
+
+                let span = width.saturating_mul(2);
+                let next_left = left.saturating_add(span);
+                if next_left < state.values.len() {
+                    state.stage = table_sort_merge_stage(state.values.len(), width, next_left);
+                    continue;
+                }
+
+                std::mem::swap(&mut state.values, &mut state.scratch);
+                let next_width = if width > state.values.len() / 2 {
+                    state.values.len()
+                } else {
+                    width.saturating_mul(2)
+                };
+                state.stage = if next_width >= state.values.len() {
+                    TableSortStage::Complete
+                } else {
+                    table_sort_merge_stage(state.values.len(), next_width, 0)
+                };
+            }
+            TableSortStage::Complete => return Ok(TableSortAdvance::Complete),
+        }
+    }
+}
+
+fn table_sort_merge_stage(size: usize, width: usize, left: usize) -> TableSortStage {
+    let middle = left.saturating_add(width).min(size);
+    let right = left.saturating_add(width.saturating_mul(2)).min(size);
+    TableSortStage::Merge {
+        width,
+        left,
+        middle,
+        right,
+        first: left,
+        second: middle,
+        output: left,
+    }
+}
+
+fn table_sort_merge_indices(state: &TableSortState) -> Result<(usize, usize), RuntimeError> {
+    match state.stage {
+        TableSortStage::Merge { first, second, .. } => Ok((first, second)),
+        _ => Err(RuntimeError::new(
+            "table.sort comparator callback lost its merge stage",
+        )),
+    }
+}
+
+fn table_sort_take_merge_value(
+    state: &mut TableSortState,
+    take_second: bool,
+) -> Result<(), RuntimeError> {
+    let TableSortStage::Merge {
+        width,
+        left,
+        middle,
+        right,
+        mut first,
+        mut second,
+        output,
+    } = state.stage.clone()
+    else {
+        return Err(RuntimeError::new(
+            "table.sort comparator result lost its merge stage",
+        ));
+    };
+    let source = if take_second {
+        let source = second;
+        second += 1;
+        source
+    } else {
+        let source = first;
+        first += 1;
+        source
+    };
+    state.scratch[output] = state.values.get(source).cloned().ok_or_else(|| {
+        RuntimeError::new("table.sort comparator selected an out-of-range merge value")
+    })?;
+    state.stage = TableSortStage::Merge {
+        width,
+        left,
+        middle,
+        right,
+        first,
+        second,
+        output: output + 1,
+    };
+    Ok(())
+}
+
+fn default_table_sort_comparison(
+    gc: &GarbageCollector,
+    state: &TableSortState,
+    lhs: &Value,
+    rhs: &Value,
+) -> DefaultTableSortComparison {
+    match (lhs, rhs) {
+        (Value::Number(lhs), Value::Number(rhs)) => DefaultTableSortComparison::Ready(lhs < rhs),
+        (Value::String(lhs), Value::String(rhs)) => match gc
+            .with_string_bytes(*lhs, |lhs| {
+                gc.with_string_bytes(*rhs, |rhs| compare_lua_string_bytes(lhs, rhs))
+            })
+            .and_then(|ordering| ordering)
+        {
+            Ok(ordering) => DefaultTableSortComparison::Ready(ordering == Ordering::Less),
+            Err(error) => DefaultTableSortComparison::Error(format!(
+                "invalid string comparison in table.sort: {error}"
+            )),
+        },
+        _ => match common_table_sort_metamethod(gc, state, lhs, rhs) {
+            Some(function) => DefaultTableSortComparison::Callback(function),
+            None => DefaultTableSortComparison::Error(
+                "attempt to compare values in table.sort".to_string(),
+            ),
+        },
+    }
+}
+
+fn common_table_sort_metamethod(
+    gc: &GarbageCollector,
+    state: &TableSortState,
+    lhs: &Value,
+    rhs: &Value,
+) -> Option<Value> {
+    let key = state.less_key?;
+    let lookup = |value: &Value| {
+        let metatable = table_sort_value_metatable(gc, state, value)?;
+        gc.with_ref(metatable, |table| table.get(&Value::String(key)))
+            .ok()
+            .filter(|value| !value.is_nil())
+    };
+    match (lookup(lhs), lookup(rhs)) {
+        (Some(lhs), Some(rhs)) if values_equal(&lhs, &rhs) => Some(lhs),
+        _ => None,
+    }
+}
+
+fn table_sort_value_metatable(
+    gc: &GarbageCollector,
+    state: &TableSortState,
+    value: &Value,
+) -> Option<GcRef<Table>> {
+    match value {
+        Value::Table(table) => gc.with_ref(*table, Table::metatable).ok().flatten(),
+        Value::Userdata(userdata) => gc
+            .with_ref(*userdata, |userdata| userdata.metatable())
+            .ok()
+            .flatten(),
+        Value::Nil => state.nil_metatable,
+        Value::Boolean(_) => state.boolean_metatable,
+        Value::Number(_) => state.number_metatable,
+        _ => None,
+    }
+}
+
+/// Commit a successfully sorted working copy atomically with respect to Lua
+/// callback errors, then shade every newly published collectable edge.
+pub(crate) fn commit_table_sort(
+    gc: &mut GarbageCollector,
+    state: &TableSortState,
+) -> Result<(), RuntimeError> {
+    gc.with_mut(state.table, |table| {
+        for (index, value) in state.values.iter().enumerate() {
+            table.set(&Value::Number((index + 1) as f64), value);
+        }
+    })
+    .map_err(|error| RuntimeError::new(format!("invalid table.sort target: {error}")))?;
+    for value in &state.values {
+        gc.write_barrier_value(state.table, value);
+    }
+    Ok(())
 }
 
 fn invoke_runtime_native(
@@ -2944,6 +4428,24 @@ fn invoke_runtime_native(
         RuntimeNativeFunction::ProtectedXCall => {
             return invoke_protected_call_runtime_native(l, gc, ProtectedCallKind::XPCall);
         }
+        RuntimeNativeFunction::ToString => {
+            return invoke_tostring_runtime_native(l, gc);
+        }
+        RuntimeNativeFunction::Load => {
+            return invoke_load_runtime_native(l, gc);
+        }
+        RuntimeNativeFunction::TableSort => {
+            return invoke_table_sort_runtime_native(l, gc);
+        }
+        RuntimeNativeFunction::DoFile => {
+            return invoke_dofile_runtime_native(l, gc);
+        }
+        RuntimeNativeFunction::TableForeach => {
+            return invoke_table_foreach_runtime_native(l, gc, false);
+        }
+        RuntimeNativeFunction::TableForeachi => {
+            return invoke_table_foreach_runtime_native(l, gc, true);
+        }
         RuntimeNativeFunction::CoroutineResume | RuntimeNativeFunction::CoroutineWrapRunner => {}
     }
 
@@ -2960,7 +4462,7 @@ fn invoke_runtime_native(
             (thread_ref, native_args_from(l, 2), ResumeEnvelope::Resume)
         }
         RuntimeNativeFunction::CoroutineWrapRunner => {
-            let Some(Value::Thread(thread_ref)) = current_native_upvalue(l, 0) else {
+            let Some(Value::Thread(thread_ref)) = current_native_upvalue(l, gc, 0) else {
                 return publish_runtime_native_error(
                     l,
                     gc,
@@ -2974,7 +4476,13 @@ fn invoke_runtime_native(
         | RuntimeNativeFunction::DebugGetUpvalue
         | RuntimeNativeFunction::DebugSetUpvalue
         | RuntimeNativeFunction::ProtectedCall
-        | RuntimeNativeFunction::ProtectedXCall => unreachable!("handled above"),
+        | RuntimeNativeFunction::ProtectedXCall
+        | RuntimeNativeFunction::ToString
+        | RuntimeNativeFunction::Load
+        | RuntimeNativeFunction::TableSort
+        | RuntimeNativeFunction::DoFile
+        | RuntimeNativeFunction::TableForeach
+        | RuntimeNativeFunction::TableForeachi => unreachable!("handled above"),
     };
 
     let (status, target) = match gc.with_ref(thread_ref, |thread: &Thread| {
@@ -3054,6 +4562,474 @@ fn invoke_protected_call_runtime_native(
                 }
             };
             publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message)
+        }
+    }
+}
+
+fn invoke_tostring_runtime_native(l: &mut LuaState, gc: &mut GarbageCollector) -> i32 {
+    if l.get_top() < 1 {
+        return publish_runtime_native_error(
+            l,
+            gc,
+            ResumeEnvelope::Wrap,
+            b"bad argument #1 to 'tostring' (value expected)",
+        );
+    }
+
+    let value = l.at(1).cloned().unwrap_or(Value::Nil);
+    if matches!(value, Value::String(_)) {
+        l.push_value(value);
+        return 1;
+    }
+
+    if let Some(metatable) = value_metatable(l, gc, &value)
+        && let Some(metamethod) = lookup_metamethod(l, gc, metatable, "__tostring")
+        && matches!(metamethod, Value::Function(_))
+    {
+        return match l.publish_callback_helper_request(
+            CallbackHelperKind::ToString,
+            metamethod,
+            vec![value],
+        ) {
+            Ok(_) => 0,
+            Err(error) => {
+                let message = match error {
+                    NativeRequestPublishError::ScopeUnavailable => {
+                        b"runtime-native dispatcher unavailable".as_slice()
+                    }
+                    NativeRequestPublishError::MailboxOccupied => {
+                        b"runtime-native mailbox already occupied".as_slice()
+                    }
+                    NativeRequestPublishError::IdExhausted => {
+                        b"runtime-native request id exhausted".as_slice()
+                    }
+                };
+                publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message)
+            }
+        };
+    }
+
+    let rendered = value_to_string(gc, &value);
+    gc.with_publication(|transaction| {
+        let string = rooted_vm_bytes(l, transaction, rendered.as_bytes())
+            .expect("tostring requires the active Runtime StringPool");
+        // SAFETY: the new string is installed on the active native frame before
+        // the publication root is released.
+        unsafe {
+            transaction.publish_string_value(string, |string| {
+                l.push_value(string);
+                1
+            })
+        }
+        .expect("tostring result remains collector-registered")
+    })
+}
+
+fn invoke_load_runtime_native(l: &mut LuaState, gc: &mut GarbageCollector) -> i32 {
+    let reader = l.at(1).cloned().unwrap_or(Value::Nil);
+    let chunk_name = l
+        .at(2)
+        .and_then(|value| match value {
+            Value::String(name) => gc.with_string_bytes(*name, <[u8]>::to_vec).ok(),
+            _ => None,
+        })
+        .unwrap_or_else(|| b"=(load)".to_vec());
+
+    match reader {
+        Value::String(source) => {
+            let Ok(source) = gc.with_string_bytes(source, <[u8]>::to_vec) else {
+                return publish_load_error(l, gc, "invalid source string");
+            };
+            match compile_chunk_function(l, gc, &source, &chunk_name) {
+                Ok(_) => 1,
+                Err(message) => publish_load_error(l, gc, &message),
+            }
+        }
+        Value::Function(_) => match l.publish_callback_helper_request(
+            CallbackHelperKind::LoadReader {
+                chunk_name,
+                source: Vec::new(),
+                terminal_error: None,
+            },
+            reader,
+            Vec::new(),
+        ) {
+            Ok(_) => 0,
+            Err(error) => {
+                let message = match error {
+                    NativeRequestPublishError::ScopeUnavailable => {
+                        "runtime-native dispatcher unavailable"
+                    }
+                    NativeRequestPublishError::MailboxOccupied => {
+                        "runtime-native mailbox already occupied"
+                    }
+                    NativeRequestPublishError::IdExhausted => "runtime-native request id exhausted",
+                };
+                publish_load_error(l, gc, message)
+            }
+        },
+        _ => publish_load_error(l, gc, "bad argument #1 to 'load' (function expected)"),
+    }
+}
+
+/// Publish one `require` loader callback while retaining its exact
+/// `package.loaded` destination for Runtime-owned completion.
+pub fn request_package_require_callback(
+    l: &mut LuaState,
+    loader: Value,
+    module_key: Value,
+    loaded: GcRef<Table>,
+) -> Result<(), RuntimeError> {
+    let args = vec![module_key.clone()];
+    l.publish_callback_helper_request(
+        CallbackHelperKind::PackageRequire { loaded, module_key },
+        loader,
+        args,
+    )
+    .map(|_| ())
+    .map_err(native_request_runtime_error)
+}
+
+/// Publish the first ordered `module` option callback. Runtime retains the
+/// remaining options and advances them only after each preceding callback
+/// succeeds.
+pub fn request_package_module_option_callbacks(
+    l: &mut LuaState,
+    module: GcRef<Table>,
+    options: Vec<Value>,
+) -> Result<(), RuntimeError> {
+    let Some(function) = options.first().cloned() else {
+        return Ok(());
+    };
+    if !matches!(function, Value::Function(_)) {
+        return Err(RuntimeError::new("module option must be a function"));
+    }
+    l.publish_callback_helper_request(
+        CallbackHelperKind::PackageModuleOptions {
+            state: Box::new(PackageModuleOptionsState {
+                module,
+                options,
+                next: 1,
+            }),
+            terminal_error: None,
+        },
+        function,
+        vec![Value::Table(module)],
+    )
+    .map(|_| ())
+    .map_err(native_request_runtime_error)
+}
+
+/// Prepare and, when needed, publish callback-capable `string.gsub` work.
+/// Raw table replacements may complete synchronously; the first Lua callback
+/// transfers the remaining state to the Runtime scheduler.
+pub fn request_gsub_callback_helper(
+    l: &mut LuaState,
+    gc: &GarbageCollector,
+    replacement: GsubCallbackReplacement,
+    steps: Vec<GsubCallbackStep>,
+    suffix: Vec<u8>,
+) -> Result<GsubCallbackRequestOutcome, RuntimeError> {
+    let replacement = match replacement {
+        GsubCallbackReplacement::Function(function) => GsubReplacement::Function(function),
+        GsubCallbackReplacement::Table { table, index_key } => {
+            GsubReplacement::Table { table, index_key }
+        }
+    };
+    let steps = steps
+        .into_iter()
+        .map(|step| GsubStep {
+            prefix: step.prefix,
+            matched: step.matched,
+            arguments: step.arguments,
+            table_key: step.table_key,
+        })
+        .collect();
+    let mut state = GsubState {
+        replacement,
+        steps,
+        next: 0,
+        output: Vec::new(),
+        suffix,
+        completed: false,
+    };
+    match advance_gsub_state(gc, &mut state, None)? {
+        GsubAdvance::Callback { function, args } => {
+            l.publish_callback_helper_request(
+                CallbackHelperKind::Gsub {
+                    state: Box::new(state),
+                    terminal_error: None,
+                },
+                function,
+                args,
+            )
+            .map_err(native_request_runtime_error)?;
+            Ok(GsubCallbackRequestOutcome::Suspended)
+        }
+        GsubAdvance::Complete => Ok(GsubCallbackRequestOutcome::Complete {
+            output: state.output,
+            count: state.next,
+        }),
+        GsubAdvance::Error(message) => Err(RuntimeError::new(message)),
+    }
+}
+
+fn invoke_dofile_runtime_native(l: &mut LuaState, gc: &mut GarbageCollector) -> i32 {
+    let filename = match l.at(1) {
+        Some(Value::String(filename)) => gc
+            .with_string_bytes(*filename, |bytes| {
+                std::str::from_utf8(bytes).ok().map(str::to_owned)
+            })
+            .ok()
+            .flatten(),
+        _ => None,
+    };
+    let Some(filename) = filename else {
+        return publish_runtime_native_error(
+            l,
+            gc,
+            ResumeEnvelope::Wrap,
+            b"bad argument #1 to 'dofile' (string expected)",
+        );
+    };
+    let source = match std::fs::read(&filename) {
+        Ok(source) => source,
+        Err(error) => {
+            let message = format!("cannot open {filename}: {error}");
+            return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message.as_bytes());
+        }
+    };
+    let chunk_name = format!("@{filename}");
+    let function = match compile_chunk_function(l, gc, &source, chunk_name.as_bytes()) {
+        Ok(function) => Value::Function(function),
+        Err(message) => {
+            return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message.as_bytes());
+        }
+    };
+    match l.publish_callback_helper_request(
+        CallbackHelperKind::DoFile,
+        function.clone(),
+        Vec::new(),
+    ) {
+        Ok(_) => 0,
+        Err(error) => {
+            let _ = l.pop();
+            let message = native_request_publication_error(error);
+            publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message)
+        }
+    }
+}
+
+fn invoke_table_foreach_runtime_native(
+    l: &mut LuaState,
+    gc: &mut GarbageCollector,
+    indexed: bool,
+) -> i32 {
+    let helper_name = if indexed {
+        "table.foreachi"
+    } else {
+        "table.foreach"
+    };
+    let Value::Table(table) = l.at(1).cloned().unwrap_or(Value::Nil) else {
+        let message = format!("bad argument #1 to '{helper_name}' (table expected)");
+        return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message.as_bytes());
+    };
+    let callback = match l.at(2).cloned().unwrap_or(Value::Nil) {
+        value @ Value::Function(_) => value,
+        _ => {
+            let message = format!("bad argument #2 to '{helper_name}' (function expected)");
+            return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message.as_bytes());
+        }
+    };
+    let cursor = if indexed {
+        let n_key = interned_name_ref(l, gc, b"n");
+        let limit = match gc.with_ref(table, |table| {
+            n_key
+                .and_then(|key| match table.get(&Value::String(key)) {
+                    Value::Number(value) if value >= 0.0 => Some(value as usize),
+                    _ => None,
+                })
+                .unwrap_or_else(|| table.length())
+        }) {
+            Ok(limit) => limit,
+            Err(error) => {
+                let message = format!("invalid {helper_name} target: {error}");
+                return publish_runtime_native_error(
+                    l,
+                    gc,
+                    ResumeEnvelope::Wrap,
+                    message.as_bytes(),
+                );
+            }
+        };
+        TableForeachCursor::Indices { next: 1, limit }
+    } else {
+        TableForeachCursor::Pairs { key: Value::Nil }
+    };
+    let mut state = TableForeachState {
+        table,
+        callback,
+        cursor,
+    };
+    match advance_table_foreach_state(gc, &mut state) {
+        Ok(TableForeachAdvance::Complete) => {
+            l.push_value(Value::Nil);
+            1
+        }
+        Ok(TableForeachAdvance::Callback { function, args }) => {
+            match l.publish_callback_helper_request(
+                CallbackHelperKind::TableForeach {
+                    state: Box::new(state),
+                },
+                function,
+                args,
+            ) {
+                Ok(_) => 0,
+                Err(error) => publish_runtime_native_error(
+                    l,
+                    gc,
+                    ResumeEnvelope::Wrap,
+                    native_request_publication_error(error),
+                ),
+            }
+        }
+        Err(error) => {
+            publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, error.message.as_bytes())
+        }
+    }
+}
+
+fn publish_load_error(l: &mut LuaState, gc: &mut GarbageCollector, message: &str) -> i32 {
+    l.push_value(Value::Nil);
+    gc.with_publication(|transaction| {
+        let message = rooted_vm_bytes(l, transaction, message.as_bytes())
+            .expect("load errors require the active Runtime StringPool");
+        // SAFETY: the error is installed in the active native frame before its
+        // publication root is released.
+        unsafe {
+            transaction.publish_string_value(message, |message| {
+                l.push_value(message);
+                2
+            })
+        }
+        .expect("load error remains collector-registered")
+    })
+}
+
+fn invoke_table_sort_runtime_native(l: &mut LuaState, gc: &mut GarbageCollector) -> i32 {
+    if l.get_top() < 1 {
+        return publish_runtime_native_error(
+            l,
+            gc,
+            ResumeEnvelope::Wrap,
+            b"table.sort: missing table argument",
+        );
+    }
+    let Value::Table(table) = l.at(1).cloned().unwrap_or(Value::Nil) else {
+        return publish_runtime_native_error(
+            l,
+            gc,
+            ResumeEnvelope::Wrap,
+            b"bad argument #1 to 'table.sort' (table expected)",
+        );
+    };
+    let comparator = if l.get_top() >= 2 {
+        match l.at(2).cloned().unwrap_or(Value::Nil) {
+            value @ Value::Function(_) => Some(value),
+            _ => {
+                return publish_runtime_native_error(
+                    l,
+                    gc,
+                    ResumeEnvelope::Wrap,
+                    b"bad argument #2 to 'table.sort' (function expected)",
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let len = match gc.with_ref(table, Table::length) {
+        Ok(len) => len,
+        Err(error) => {
+            let message = format!("invalid table.sort target: {error}");
+            return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message.as_bytes());
+        }
+    };
+    let mut values = Vec::new();
+    let mut scratch = Vec::new();
+    if values.try_reserve_exact(len).is_err() || scratch.try_reserve_exact(len).is_err() {
+        return publish_runtime_native_error(
+            l,
+            gc,
+            ResumeEnvelope::Wrap,
+            b"not enough memory while preparing table.sort",
+        );
+    }
+    for index in 1..=len {
+        let value = match gc.with_ref(table, |table| table.get(&Value::Number(index as f64))) {
+            Ok(value) => value,
+            Err(error) => {
+                let message = format!("invalid table.sort target: {error}");
+                return publish_runtime_native_error(
+                    l,
+                    gc,
+                    ResumeEnvelope::Wrap,
+                    message.as_bytes(),
+                );
+            }
+        };
+        values.push(value);
+        scratch.push(Value::Nil);
+    }
+
+    let mut state = TableSortState {
+        table,
+        comparator,
+        less_key: interned_name_ref(l, gc, b"__lt"),
+        nil_metatable: l.nil_metatable,
+        boolean_metatable: l.boolean_metatable,
+        number_metatable: l.number_metatable,
+        values,
+        scratch,
+        stage: TableSortStage::ValidateComparator { index: 0 },
+        pending: None,
+    };
+    match advance_table_sort_state(gc, &mut state, None) {
+        Ok(TableSortAdvance::Complete) => match commit_table_sort(gc, &state) {
+            Ok(()) => 0,
+            Err(error) => {
+                publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, error.message.as_bytes())
+            }
+        },
+        Ok(TableSortAdvance::Error(message)) | Err(RuntimeError { message, .. }) => {
+            publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message.as_bytes())
+        }
+        Ok(TableSortAdvance::Callback { function, args }) => {
+            match l.publish_callback_helper_request(
+                CallbackHelperKind::TableSort {
+                    state: Box::new(state),
+                    terminal_error: None,
+                },
+                function,
+                args,
+            ) {
+                Ok(_) => 0,
+                Err(error) => {
+                    let message = match error {
+                        NativeRequestPublishError::ScopeUnavailable => {
+                            b"runtime-native dispatcher unavailable".as_slice()
+                        }
+                        NativeRequestPublishError::MailboxOccupied => {
+                            b"runtime-native mailbox already occupied".as_slice()
+                        }
+                        NativeRequestPublishError::IdExhausted => {
+                            b"runtime-native request id exhausted".as_slice()
+                        }
+                    };
+                    publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message)
+                }
+            }
         }
     }
 }
@@ -3203,7 +5179,7 @@ fn invoke_debug_upvalue_runtime_native(
 
 fn invoke_collectgarbage_runtime_native(l: &mut LuaState, gc: &mut GarbageCollector) -> i32 {
     let option = match l.at(1) {
-        Some(Value::String(value)) => l.copy_string_bytes(*value).ok(),
+        Some(Value::String(value)) => gc.with_string_bytes(*value, <[u8]>::to_vec).ok(),
         _ => None,
     };
     match option.as_deref().unwrap_or(b"collect") {
@@ -3213,7 +5189,7 @@ fn invoke_collectgarbage_runtime_native(l: &mut LuaState, gc: &mut GarbageCollec
         }
         b"collect" => publish_full_collection_request(l, gc, FullCollectionResult::Collect),
         b"step" => {
-            let size = match collect_garbage_control_argument(l) {
+            let size = match collect_garbage_control_argument(l, gc) {
                 Ok(size) => size,
                 Err(message) => {
                     return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message);
@@ -3232,7 +5208,7 @@ fn invoke_collectgarbage_runtime_native(l: &mut LuaState, gc: &mut GarbageCollec
             1
         }
         b"setpause" => {
-            let value = match collect_garbage_control_argument(l) {
+            let value = match collect_garbage_control_argument(l, gc) {
                 Ok(value) => value,
                 Err(message) => {
                     return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message);
@@ -3242,7 +5218,7 @@ fn invoke_collectgarbage_runtime_native(l: &mut LuaState, gc: &mut GarbageCollec
             1
         }
         b"setstepmul" => {
-            let value = match collect_garbage_control_argument(l) {
+            let value = match collect_garbage_control_argument(l, gc) {
                 Ok(value) => value,
                 Err(message) => {
                     return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message);
@@ -3284,12 +5260,15 @@ fn publish_full_collection_request(
     }
 }
 
-fn collect_garbage_control_argument(l: &LuaState) -> Result<i32, &'static [u8]> {
+fn collect_garbage_control_argument(
+    l: &LuaState,
+    gc: &GarbageCollector,
+) -> Result<i32, &'static [u8]> {
     let value = match l.at(2) {
         None | Some(Value::Nil) => return Ok(0),
         Some(Value::Number(value)) => *value,
-        Some(Value::String(value)) => l
-            .copy_string_bytes(*value)
+        Some(Value::String(value)) => gc
+            .with_string_bytes(*value, <[u8]>::to_vec)
             .ok()
             .and_then(|bytes| parse_lua_number_bytes(&bytes))
             .ok_or(b"bad argument #2 to 'collectgarbage' (number expected)".as_slice())?,
@@ -3346,6 +5325,18 @@ fn publish_runtime_native_error(
     })
 }
 
+fn native_request_publication_error(error: NativeRequestPublishError) -> &'static [u8] {
+    match error {
+        NativeRequestPublishError::ScopeUnavailable => b"runtime-native dispatcher unavailable",
+        NativeRequestPublishError::MailboxOccupied => b"runtime-native mailbox already occupied",
+        NativeRequestPublishError::IdExhausted => b"runtime-native request id exhausted",
+    }
+}
+
+fn native_request_runtime_error(error: NativeRequestPublishError) -> RuntimeError {
+    RuntimeError::new(String::from_utf8_lossy(native_request_publication_error(error)).into_owned())
+}
+
 fn native_args_from(l: &LuaState, first: i32) -> Vec<Value> {
     let top = l.get_top();
     if top < first {
@@ -3356,27 +5347,58 @@ fn native_args_from(l: &LuaState, first: i32) -> Vec<Value> {
         .collect()
 }
 
-fn current_native_upvalue(l: &LuaState, index: usize) -> Option<Value> {
+fn current_native_upvalue(l: &LuaState, gc: &GarbageCollector, index: usize) -> Option<Value> {
     let func_idx = l.current_call_info().func;
     let Value::Function(func_ref) = l.stack.at(func_idx).cloned()? else {
         return None;
     };
-    // SAFETY: the current native frame's function slot keeps the closure live.
-    let function = unsafe { func_ref.as_ref() }?;
-    let upvalue_ref = function.upvalue(index)?;
-    // SAFETY: the closure owns this upvalue and destructive sweep is disabled.
-    let upvalue = unsafe { upvalue_ref.as_ref() }?;
-    Some(upvalue.get_closed_value().clone())
+    let upvalue_ref = gc
+        .with_ref(func_ref, |function| function.upvalue(index))
+        .ok()
+        .flatten()?;
+    gc.with_ref(upvalue_ref, |upvalue| upvalue.get_closed_value().clone())
+        .ok()
+}
+
+fn proto_instruction(
+    gc: &GarbageCollector,
+    proto: GcRef<Proto>,
+    pc: usize,
+) -> Result<Option<lua_core::proto::Instruction>, RuntimeError> {
+    gc.with_ref(proto, |proto| proto.code().get(pc).copied())
+        .map_err(invalid_proto_error)
+}
+
+fn proto_constant(
+    gc: &GarbageCollector,
+    proto: GcRef<Proto>,
+    index: usize,
+) -> Result<Value, RuntimeError> {
+    gc.with_ref(proto, |proto| {
+        proto.constants().get(index).cloned().unwrap_or(Value::Nil)
+    })
+    .map_err(invalid_proto_error)
+}
+
+fn proto_max_stack_size(gc: &GarbageCollector, proto: GcRef<Proto>) -> Result<usize, RuntimeError> {
+    gc.with_ref(proto, |proto| proto.max_stack_size() as usize)
+        .map_err(invalid_proto_error)
 }
 
 /// 获取 RK 操作数——寄存器或常量
-fn get_rk(l: &LuaState, base: usize, rk: i32, constants: &[Value]) -> Value {
+fn get_rk(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    proto: GcRef<Proto>,
+    base: usize,
+    rk: i32,
+) -> Result<Value, RuntimeError> {
     if opcode::is_k(rk) {
         let idx = opcode::index_k(rk) as usize;
-        constants.get(idx).cloned().unwrap_or(Value::Nil)
+        proto_constant(gc, proto, idx)
     } else {
         let reg = rk as usize;
-        l.stack.at(base + reg).cloned().unwrap_or(Value::Nil)
+        Ok(l.stack.at(base + reg).cloned().unwrap_or(Value::Nil))
     }
 }
 
@@ -3395,8 +5417,7 @@ fn get_upvalue(
     gc: &GarbageCollector,
     upvalue_idx: usize,
 ) -> Result<UpvalueRead, RuntimeError> {
-    let uv_ref = current_lua_function(l)
-        .and_then(|function| function.upvalue(upvalue_idx))
+    let uv_ref = current_lua_upvalue(l, gc, upvalue_idx)
         .ok_or_else(|| RuntimeError::new("VM: GETUPVAL invalid upvalue index"))?;
 
     let (location, closed) = gc
@@ -3439,8 +5460,7 @@ fn set_upvalue(
     upvalue_idx: usize,
     val: &Value,
 ) -> Result<Option<(GcRef<Upvalue>, lua_core::state_handle::StateHandle, usize)>, RuntimeError> {
-    let uv_ref = current_lua_function(l)
-        .and_then(|function| function.upvalue(upvalue_idx))
+    let uv_ref = current_lua_upvalue(l, gc, upvalue_idx)
         .ok_or_else(|| RuntimeError::new("VM: SETUPVAL invalid upvalue index"))?;
 
     let location = gc
@@ -3468,7 +5488,7 @@ fn set_upvalue(
     }
 }
 
-fn current_lua_function(l: &LuaState) -> Option<&Function> {
+fn current_lua_function_ref(l: &LuaState) -> Option<GcRef<Function>> {
     if l.current_ci == 0 {
         return None;
     }
@@ -3478,17 +5498,35 @@ fn current_lua_function(l: &LuaState) -> Option<&Function> {
     }
     let func_idx = ci.func;
     match l.stack.at(func_idx) {
-        Some(Value::Function(func_ref)) => {
-            // SAFETY: the current call frame's function slot keeps the closure live.
-            unsafe { func_ref.as_ref() }
-        }
+        Some(Value::Function(func_ref)) => Some(*func_ref),
         _ => None,
     }
 }
 
-fn current_env(l: &LuaState) -> Option<GcRef<Table>> {
-    match current_lua_function(l) {
-        Some(function) => function.env().or(l.global_table),
+fn current_lua_proto(l: &LuaState, gc: &GarbageCollector) -> Option<GcRef<Proto>> {
+    current_lua_function_ref(l)
+        .and_then(|function| gc.with_ref(function, Function::proto).ok().flatten())
+}
+
+fn current_lua_upvalue(
+    l: &LuaState,
+    gc: &GarbageCollector,
+    index: usize,
+) -> Option<GcRef<Upvalue>> {
+    current_lua_function_ref(l).and_then(|function| {
+        gc.with_ref(function, |function| function.upvalue(index))
+            .ok()
+            .flatten()
+    })
+}
+
+fn current_env(l: &LuaState, gc: &GarbageCollector) -> Option<GcRef<Table>> {
+    match current_lua_function_ref(l) {
+        Some(function) => gc
+            .with_ref(function, Function::env)
+            .ok()
+            .flatten()
+            .or(l.global_table),
         None => l.chunk_env.or(l.thread_env).or(l.global_table),
     }
 }
@@ -3497,24 +5535,29 @@ fn current_env(l: &LuaState) -> Option<GcRef<Table>> {
 fn get_global_into(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    stack_limit: usize,
     name: &Value,
     destination: usize,
-) -> Result<(), RuntimeError> {
-    if let Some(env_table) = current_env(l) {
+    proto: GcRef<Proto>,
+    pc: usize,
+) -> Result<VmMetamethodOutcome<()>, RuntimeError> {
+    if let Some(env_table) = current_env(l, gc) {
         get_table_into(
             l,
             gc,
-            stack_limit,
             &Value::Table(env_table),
             name,
             destination,
+            VmMetamethodContinuation::StoreResult {
+                proto,
+                pc,
+                destination,
+            },
         )
     } else {
         if let Some(slot) = l.stack.at_mut(destination) {
             *slot = Value::Nil;
         }
-        Ok(())
+        Ok(VmMetamethodOutcome::Ready(()))
     }
 }
 
@@ -3522,64 +5565,68 @@ fn get_global_into(
 fn set_global(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    stack_limit: usize,
     name: &Value,
     val: &Value,
-) -> Result<(), RuntimeError> {
-    if let Some(env_table) = current_env(l) {
-        set_table_value(l, gc, stack_limit, &Value::Table(env_table), name, val)?;
+    proto: GcRef<Proto>,
+    pc: usize,
+) -> Result<VmMetamethodOutcome<()>, RuntimeError> {
+    if let Some(env_table) = current_env(l, gc) {
+        return set_table_value(
+            l,
+            gc,
+            &Value::Table(env_table),
+            name,
+            val,
+            VmMetamethodContinuation::CompleteSet { proto, pc },
+        );
     }
-    Ok(())
+    Ok(VmMetamethodOutcome::Ready(()))
 }
 
 /// 表取值（含元方法回退）
 fn get_table_into(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    stack_limit: usize,
     table: &Value,
     key: &Value,
     destination: usize,
-) -> Result<(), RuntimeError> {
+    continuation: VmMetamethodContinuation,
+) -> Result<VmMetamethodOutcome<()>, RuntimeError> {
     let mut current = table.clone();
     for _ in 0..100 {
         match &current {
             Value::Table(t) => {
-                // SAFETY: the table ref is reachable from the Lua stack, constants,
-                // or another reachable table while this VM instruction is executing.
-                let Some(table_obj) = (unsafe { t.as_ref() }) else {
-                    if let Some(slot) = l.stack.at_mut(destination) {
-                        *slot = Value::Nil;
-                    }
-                    return Ok(());
-                };
-                let result = table_obj.get(key);
-                if !result.is_nil() {
-                    if let Some(slot) = l.stack.at_mut(destination) {
-                        *slot = result;
-                    }
-                    return Ok(());
-                }
-
-                let Some(index_metamethod) = table_obj
-                    .metatable()
-                    .and_then(|mt| lookup_metamethod(l, gc, mt, "__index"))
+                let Ok((result, metatable)) =
+                    gc.with_ref(*t, |table| (table.get(key), table.metatable()))
                 else {
                     if let Some(slot) = l.stack.at_mut(destination) {
                         *slot = Value::Nil;
                     }
-                    return Ok(());
+                    return Ok(VmMetamethodOutcome::Ready(()));
+                };
+                if !result.is_nil() {
+                    if let Some(slot) = l.stack.at_mut(destination) {
+                        *slot = result;
+                    }
+                    return Ok(VmMetamethodOutcome::Ready(()));
+                }
+
+                let Some(index_metamethod) =
+                    metatable.and_then(|mt| lookup_metamethod(l, gc, mt, "__index"))
+                else {
+                    if let Some(slot) = l.stack.at_mut(destination) {
+                        *slot = Value::Nil;
+                    }
+                    return Ok(VmMetamethodOutcome::Ready(()));
                 };
 
                 match index_metamethod {
                     Value::Function(_) => {
                         return call_metamethod_into(
                             l,
-                            gc,
-                            stack_limit,
                             index_metamethod,
-                            &[current.clone(), key.clone()],
-                            destination,
+                            vec![current.clone(), key.clone()],
+                            continuation,
                         );
                     }
                     Value::Table(_) => current = index_metamethod,
@@ -3587,7 +5634,7 @@ fn get_table_into(
                         if let Some(slot) = l.stack.at_mut(destination) {
                             *slot = Value::Nil;
                         }
-                        return Ok(());
+                        return Ok(VmMetamethodOutcome::Ready(()));
                     }
                 }
             }
@@ -3596,7 +5643,7 @@ fn get_table_into(
                 if let Some(slot) = l.stack.at_mut(destination) {
                     *slot = result;
                 }
-                return Ok(());
+                return Ok(VmMetamethodOutcome::Ready(()));
             }
             _ => {
                 let Some(index_metamethod) = value_metatable(l, gc, &current)
@@ -3605,17 +5652,15 @@ fn get_table_into(
                     if let Some(slot) = l.stack.at_mut(destination) {
                         *slot = Value::Nil;
                     }
-                    return Ok(());
+                    return Ok(VmMetamethodOutcome::Ready(()));
                 };
                 match index_metamethod {
                     Value::Function(_) => {
                         return call_metamethod_into(
                             l,
-                            gc,
-                            stack_limit,
                             index_metamethod,
-                            &[current.clone(), key.clone()],
-                            destination,
+                            vec![current.clone(), key.clone()],
+                            continuation,
                         );
                     }
                     Value::Table(_) => current = index_metamethod,
@@ -3623,7 +5668,7 @@ fn get_table_into(
                         if let Some(slot) = l.stack.at_mut(destination) {
                             *slot = Value::Nil;
                         }
-                        return Ok(());
+                        return Ok(VmMetamethodOutcome::Ready(()));
                     }
                 }
             }
@@ -3655,11 +5700,11 @@ fn get_string_library_member(l: &LuaState, gc: &GarbageCollector, key: &Value) -
 fn set_table_value(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    stack_limit: usize,
     table: &Value,
     key: &Value,
     value: &Value,
-) -> Result<(), RuntimeError> {
+    continuation: VmMetamethodContinuation,
+) -> Result<VmMetamethodOutcome<()>, RuntimeError> {
     let mut current = table.clone();
     for _ in 0..100 {
         match &current {
@@ -3673,31 +5718,23 @@ fn set_table_value(
                     return Err(RuntimeError::new("table index is NaN"));
                 }
 
-                // SAFETY: the table is reachable and GC does not run during this VM
-                // instruction. We only take a shared view to test raw presence.
-                let has_raw_key = unsafe { t.as_ref() }.is_some_and(|table| table.has(key));
+                let (has_raw_key, metatable) = gc
+                    .with_ref(*t, |table| (table.has(key), table.metatable()))
+                    .map_err(|error| {
+                        RuntimeError::new(format!("VM: invalid table mutation: {error}"))
+                    })?;
                 if !has_raw_key {
-                    // SAFETY: same reachability reasoning as above.
-                    if let Some(table_obj) = unsafe { t.as_ref() }
-                        && let Some(newindex_metamethod) = table_obj
-                            .metatable()
-                            .and_then(|mt| lookup_metamethod(l, gc, mt, "__newindex"))
+                    if let Some(newindex_metamethod) =
+                        metatable.and_then(|mt| lookup_metamethod(l, gc, mt, "__newindex"))
                     {
                         match newindex_metamethod {
                             Value::Function(_) => {
-                                let saved_top = l.top;
-                                l.top = l.top.max(stack_limit);
-                                let call_result = call_value_with_results(
+                                return call_metamethod_into(
                                     l,
-                                    gc,
                                     newindex_metamethod,
-                                    &[current, key.clone(), value.clone()],
-                                    Some(0),
-                                    |_, _, _| (),
+                                    vec![current, key.clone(), value.clone()],
+                                    continuation,
                                 );
-                                l.top = saved_top;
-                                call_result?;
-                                return Ok(());
                             }
                             Value::Table(_) => {
                                 current = newindex_metamethod;
@@ -3712,7 +5749,7 @@ fn set_table_value(
                     .map_err(|error| {
                         RuntimeError::new(format!("VM: invalid table mutation: {error}"))
                     })?;
-                return Ok(());
+                return Ok(VmMetamethodOutcome::Ready(()));
             }
             _ => {
                 if let Some(newindex_metamethod) = value_metatable(l, gc, &current)
@@ -3720,19 +5757,12 @@ fn set_table_value(
                 {
                     match newindex_metamethod {
                         Value::Function(_) => {
-                            let saved_top = l.top;
-                            l.top = l.top.max(stack_limit);
-                            let call_result = call_value_with_results(
+                            return call_metamethod_into(
                                 l,
-                                gc,
                                 newindex_metamethod,
-                                &[current, key.clone(), value.clone()],
-                                Some(0),
-                                |_, _, _| (),
+                                vec![current, key.clone(), value.clone()],
+                                continuation,
                             );
-                            l.top = saved_top;
-                            call_result?;
-                            return Ok(());
                         }
                         Value::Table(_) => {
                             current = newindex_metamethod;
@@ -3755,12 +5785,12 @@ fn set_table_value(
 fn exec_arith_into(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    stack_limit: usize,
     op: OpCode,
     lhs: &Value,
     rhs: &Value,
     destination: usize,
-) -> Result<(), RuntimeError> {
+    continuation: VmMetamethodContinuation,
+) -> Result<VmMetamethodOutcome<()>, RuntimeError> {
     let metamethod_name = match op {
         OpCode::ADD => "__add",
         OpCode::SUB => "__sub",
@@ -3794,18 +5824,11 @@ fn exec_arith_into(
         if let Some(slot) = l.stack.at_mut(destination) {
             *slot = Value::Number(result);
         }
-        return Ok(());
+        return Ok(VmMetamethodOutcome::Ready(()));
     }
 
     if let Some(metamethod) = find_metamethod(l, gc, lhs, rhs, metamethod_name) {
-        call_metamethod_into(
-            l,
-            gc,
-            stack_limit,
-            metamethod,
-            &[lhs.clone(), rhs.clone()],
-            destination,
-        )
+        call_metamethod_into(l, metamethod, vec![lhs.clone(), rhs.clone()], continuation)
     } else {
         Err(RuntimeError::new(
             "attempt to perform arithmetic on a non-number value",
@@ -3817,25 +5840,18 @@ fn exec_arith_into(
 fn exec_unm_into(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    stack_limit: usize,
     val: &Value,
     destination: usize,
-) -> Result<(), RuntimeError> {
+    continuation: VmMetamethodContinuation,
+) -> Result<VmMetamethodOutcome<()>, RuntimeError> {
     if let Some(n) = to_arith_number(gc, val) {
         if let Some(slot) = l.stack.at_mut(destination) {
             *slot = Value::Number(-n);
         }
-        return Ok(());
+        return Ok(VmMetamethodOutcome::Ready(()));
     }
     if let Some(metamethod) = find_metamethod(l, gc, val, val, "__unm") {
-        call_metamethod_into(
-            l,
-            gc,
-            stack_limit,
-            metamethod,
-            &[val.clone(), val.clone()],
-            destination,
-        )
+        call_metamethod_into(l, metamethod, vec![val.clone(), val.clone()], continuation)
     } else {
         Err(RuntimeError::new(
             "attempt to perform arithmetic on a non-number value",
@@ -3846,11 +5862,11 @@ fn exec_unm_into(
 fn exec_concat_into(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    stack_limit: usize,
     lhs: &Value,
     rhs: &Value,
     destination: usize,
-) -> Result<(), RuntimeError> {
+    continuation: VmMetamethodContinuation,
+) -> Result<VmMetamethodOutcome<()>, RuntimeError> {
     if let (Some(left), Some(right)) = (to_concat_bytes(gc, lhs), to_concat_bytes(gc, rhs)) {
         let len = left
             .len()
@@ -3863,35 +5879,28 @@ fn exec_concat_into(
         bytes.extend_from_slice(&left);
         bytes.extend_from_slice(&right);
         let pool = l.active_string_pool_ptr();
-        return gc
-            .with_publication(|transaction| {
-                let pool = pool.ok_or(GcRefValidationError::StringPoolUnavailable)?;
-                // SAFETY: the Runtime owns the pool and VM execution has
-                // exclusive access to it for this state turn.
-                let string = transaction.intern_bytes(unsafe { &mut *pool }, &bytes)?;
-                // SAFETY: the callback installs the result in the destination
-                // VM register before releasing its temporary root.
-                unsafe {
-                    transaction.publish_string_value(string, |value| {
-                        if let Some(slot) = l.stack.at_mut(destination) {
-                            *slot = value;
-                        }
-                    })
-                }
-            })
-            .map_err(|error| {
-                RuntimeError::new(format!("VM: could not publish concat string: {error}"))
-            });
+        gc.with_publication(|transaction| {
+            let pool = pool.ok_or(GcRefValidationError::StringPoolUnavailable)?;
+            // SAFETY: the Runtime owns the pool and VM execution has
+            // exclusive access to it for this state turn.
+            let string = transaction.intern_bytes(unsafe { &mut *pool }, &bytes)?;
+            // SAFETY: the callback installs the result in the destination
+            // VM register before releasing its temporary root.
+            unsafe {
+                transaction.publish_string_value(string, |value| {
+                    if let Some(slot) = l.stack.at_mut(destination) {
+                        *slot = value;
+                    }
+                })
+            }
+        })
+        .map_err(|error| {
+            RuntimeError::new(format!("VM: could not publish concat string: {error}"))
+        })?;
+        return Ok(VmMetamethodOutcome::Ready(()));
     }
     if let Some(metamethod) = find_metamethod(l, gc, lhs, rhs, "__concat") {
-        call_metamethod_into(
-            l,
-            gc,
-            stack_limit,
-            metamethod,
-            &[lhs.clone(), rhs.clone()],
-            destination,
-        )
+        call_metamethod_into(l, metamethod, vec![lhs.clone(), rhs.clone()], continuation)
     } else {
         Err(RuntimeError::new(
             "attempt to concatenate a non-string value",
@@ -3899,16 +5908,38 @@ fn exec_concat_into(
     }
 }
 
-/// 取长度
-fn exec_len(gc: &GarbageCollector, val: &Value) -> Value {
-    match val {
-        Value::String(s) => gc
-            .with_ref(*s, |string| Value::Number(string.len() as f64))
-            .unwrap_or(Value::Number(0.0)),
-        Value::Table(t) => gc
-            .with_ref(*t, |table| Value::Number(table.length() as f64))
-            .unwrap_or(Value::Number(0.0)),
-        _ => Value::Number(0.0),
+/// 取长度（字符串和表走原始长度，其他值回退到 `__len`）。
+fn exec_len_into(
+    l: &mut LuaState,
+    gc: &GarbageCollector,
+    val: &Value,
+    destination: usize,
+    continuation: VmMetamethodContinuation,
+) -> Result<VmMetamethodOutcome<()>, RuntimeError> {
+    let raw_length = match val {
+        Value::String(string) => Some(
+            gc.with_ref(*string, |string| Value::Number(string.len() as f64))
+                .map_err(|error| RuntimeError::new(format!("invalid string length: {error}")))?,
+        ),
+        Value::Table(table) => Some(
+            gc.with_ref(*table, |table| Value::Number(table.length() as f64))
+                .map_err(|error| RuntimeError::new(format!("invalid table length: {error}")))?,
+        ),
+        _ => None,
+    };
+    if let Some(length) = raw_length {
+        if let Some(slot) = l.stack.at_mut(destination) {
+            *slot = length;
+        }
+        return Ok(VmMetamethodOutcome::Ready(()));
+    }
+    if let Some(metamethod) = find_metamethod(l, gc, val, val, "__len") {
+        call_metamethod_into(l, metamethod, vec![val.clone(), val.clone()], continuation)
+    } else {
+        Err(RuntimeError::new(format!(
+            "attempt to get length of a {} value",
+            value_type_name(val)
+        )))
     }
 }
 
@@ -3916,22 +5947,22 @@ fn exec_len(gc: &GarbageCollector, val: &Value) -> Value {
 fn exec_lt(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    stack_limit: usize,
     lhs: &Value,
     rhs: &Value,
-) -> Result<bool, RuntimeError> {
+    continuation: VmMetamethodContinuation,
+) -> Result<VmMetamethodOutcome<bool>, RuntimeError> {
     match (lhs, rhs) {
-        (Value::Number(a), Value::Number(b)) => Ok(a < b),
+        (Value::Number(a), Value::Number(b)) => Ok(VmMetamethodOutcome::Ready(a < b)),
         (Value::String(a_ref), Value::String(b_ref)) => gc
             .with_string_bytes(*a_ref, |left| {
                 gc.with_string_bytes(*b_ref, |right| compare_lua_string_bytes(left, right))
             })
             .and_then(|ordering| ordering)
-            .map(|ordering| ordering == Ordering::Less)
+            .map(|ordering| VmMetamethodOutcome::Ready(ordering == Ordering::Less))
             .map_err(|error| RuntimeError::new(format!("invalid string comparison: {error}"))),
         _ => {
             if let Some(metamethod) = find_common_metamethod(l, gc, lhs, rhs, "__lt") {
-                call_metamethod_bool(l, gc, stack_limit, metamethod, lhs, rhs)
+                call_metamethod_bool(l, metamethod, vec![lhs.clone(), rhs.clone()], continuation)
             } else {
                 Err(RuntimeError::new(
                     "attempt to compare non-comparable values",
@@ -3945,26 +5976,53 @@ fn exec_lt(
 fn exec_le(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    stack_limit: usize,
     lhs: &Value,
     rhs: &Value,
-) -> Result<bool, RuntimeError> {
+    continuation: VmMetamethodContinuation,
+) -> Result<VmMetamethodOutcome<bool>, RuntimeError> {
     match (lhs, rhs) {
-        (Value::Number(a), Value::Number(b)) => Ok(a <= b),
+        (Value::Number(a), Value::Number(b)) => Ok(VmMetamethodOutcome::Ready(a <= b)),
         (Value::String(a_ref), Value::String(b_ref)) => gc
             .with_string_bytes(*a_ref, |left| {
                 gc.with_string_bytes(*b_ref, |right| compare_lua_string_bytes(left, right))
             })
             .and_then(|ordering| ordering)
-            .map(|ordering| ordering != Ordering::Greater)
+            .map(|ordering| VmMetamethodOutcome::Ready(ordering != Ordering::Greater))
             .map_err(|error| RuntimeError::new(format!("invalid string comparison: {error}"))),
         _ => {
             if let Some(metamethod) = find_common_metamethod(l, gc, lhs, rhs, "__le") {
-                return call_metamethod_bool(l, gc, stack_limit, metamethod, lhs, rhs);
+                return call_metamethod_bool(
+                    l,
+                    metamethod,
+                    vec![lhs.clone(), rhs.clone()],
+                    continuation,
+                );
             }
             if let Some(metamethod) = find_common_metamethod(l, gc, lhs, rhs, "__lt") {
-                return call_metamethod_bool(l, gc, stack_limit, metamethod, rhs, lhs)
-                    .map(|result| !result);
+                let continuation = match continuation {
+                    VmMetamethodContinuation::Compare {
+                        proto,
+                        pc,
+                        expected,
+                        ..
+                    } => VmMetamethodContinuation::Compare {
+                        proto,
+                        pc,
+                        expected,
+                        invert_result: true,
+                    },
+                    _ => {
+                        return Err(RuntimeError::new(
+                            "VM: <= fallback lost its comparison continuation",
+                        ));
+                    }
+                };
+                return call_metamethod_bool(
+                    l,
+                    metamethod,
+                    vec![rhs.clone(), lhs.clone()],
+                    continuation,
+                );
             }
             Err(RuntimeError::new(
                 "attempt to compare non-comparable values",
@@ -4018,70 +6076,44 @@ pub fn compare_lua_string_bytes(mut left: &[u8], mut right: &[u8]) -> Ordering {
 
 fn call_metamethod_bool(
     l: &mut LuaState,
-    gc: &mut GarbageCollector,
-    stack_limit: usize,
     metamethod: Value,
-    lhs: &Value,
-    rhs: &Value,
-) -> Result<bool, RuntimeError> {
-    let saved_top = l.top;
-    l.top = l.top.max(stack_limit);
-    let mut comparison = false;
-    let result = call_value_with_results(
-        l,
-        gc,
-        metamethod,
-        &[lhs.clone(), rhs.clone()],
-        Some(1),
-        |_, _, results| {
-            comparison = results.first().is_some_and(|value| !value.is_false());
-        },
-    );
-    l.top = saved_top;
-    result?;
-    Ok(comparison)
+    args: Vec<Value>,
+    continuation: VmMetamethodContinuation,
+) -> Result<VmMetamethodOutcome<bool>, RuntimeError> {
+    let request_id = publish_vm_metamethod_call(l, metamethod, args, continuation)?;
+    Ok(VmMetamethodOutcome::Suspended(request_id))
 }
 
 fn call_metamethod_into(
     l: &mut LuaState,
-    gc: &mut GarbageCollector,
-    stack_limit: usize,
     metamethod: Value,
-    args: &[Value],
-    destination: usize,
-) -> Result<(), RuntimeError> {
-    let saved_top = l.top;
-    l.top = l.top.max(stack_limit);
-    let result = call_value_with_results(l, gc, metamethod, args, Some(1), |l, _, results| {
-        let value = results.first().cloned().unwrap_or(Value::Nil);
-        if let Some(slot) = l.stack.at_mut(destination) {
-            *slot = value;
-        }
-    });
-    l.top = saved_top;
-    result
+    args: Vec<Value>,
+    continuation: VmMetamethodContinuation,
+) -> Result<VmMetamethodOutcome<()>, RuntimeError> {
+    let request_id = publish_vm_metamethod_call(l, metamethod, args, continuation)?;
+    Ok(VmMetamethodOutcome::Suspended(request_id))
 }
 
 fn exec_eq(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
-    stack_limit: usize,
     lhs: &Value,
     rhs: &Value,
-) -> Result<bool, RuntimeError> {
+    continuation: VmMetamethodContinuation,
+) -> Result<VmMetamethodOutcome<bool>, RuntimeError> {
     if values_equal(lhs, rhs) {
-        return Ok(true);
+        return Ok(VmMetamethodOutcome::Ready(true));
     }
     if std::mem::discriminant(lhs) != std::mem::discriminant(rhs) {
-        return Ok(false);
+        return Ok(VmMetamethodOutcome::Ready(false));
     }
     if !matches!(lhs, Value::Table(_) | Value::Userdata(_)) {
-        return Ok(false);
+        return Ok(VmMetamethodOutcome::Ready(false));
     }
     if let Some(metamethod) = find_common_metamethod(l, gc, lhs, rhs, "__eq") {
-        call_metamethod_bool(l, gc, stack_limit, metamethod, lhs, rhs)
+        call_metamethod_bool(l, metamethod, vec![lhs.clone(), rhs.clone()], continuation)
     } else {
-        Ok(false)
+        Ok(VmMetamethodOutcome::Ready(false))
     }
 }
 
@@ -4340,17 +6372,31 @@ mod byte_string_tests {
         let right = byte_value(&mut gc, &mut pool, &[0xfe, 0xc3, 0x00]);
         let expected = [0x00, 0x80, 0xff, 0xfe, 0xc3, 0x00];
 
-        crate::state::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, pool| {
-            ensure_stack_slot(state, 0);
-            exec_concat_into(state, gc, 0, &left, &right, 0).expect("byte concat succeeds");
-            let result = state.stack.at(0).cloned().unwrap_or(Value::Nil);
-            let Value::String(result_ref) = result else {
-                panic!("concat must return a Lua string");
-            };
-            gc.with_string_bytes(result_ref, |bytes| assert_eq!(bytes, expected))
-                .expect("non-null string");
-            assert_eq!(pool.find_bytes(&expected), Some(result_ref));
-        });
+        let result_ref =
+            crate::state::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
+                ensure_stack_slot(state, 0);
+                let outcome = exec_concat_into(
+                    state,
+                    gc,
+                    &left,
+                    &right,
+                    0,
+                    VmMetamethodContinuation::CompleteSet {
+                        proto: GcRef::null(),
+                        pc: 0,
+                    },
+                )
+                .expect("byte concat succeeds");
+                assert!(matches!(outcome, VmMetamethodOutcome::Ready(())));
+                let result = state.stack.at(0).cloned().unwrap_or(Value::Nil);
+                let Value::String(result_ref) = result else {
+                    panic!("concat must return a Lua string");
+                };
+                gc.with_string_bytes(result_ref, |bytes| assert_eq!(bytes, expected))
+                    .expect("non-null string");
+                result_ref
+            });
+        assert_eq!(pool.find_bytes(&expected), Some(result_ref));
     }
 
     #[test]
@@ -4361,7 +6407,17 @@ mod byte_string_tests {
         let same = byte_value(&mut gc, &mut pool, b"a\0b");
         let different_tail = byte_value(&mut gc, &mut pool, b"a\0c");
 
-        assert_eq!(exec_len(&gc, &first), Value::Number(3.0));
+        assert_eq!(
+            gc.with_ref(
+                match &first {
+                    Value::String(string) => *string,
+                    _ => unreachable!("fixture is a string"),
+                },
+                |string| Value::Number(string.len() as f64),
+            )
+            .expect("string remains live"),
+            Value::Number(3.0),
+        );
         assert!(values_equal(&first, &same));
         assert!(!values_equal(&first, &different_tail));
     }
@@ -4381,9 +6437,19 @@ mod byte_string_tests {
         let mut state = LuaState::new();
         let left = byte_value(&mut gc, &mut pool, b"a\0b");
         let right = byte_value(&mut gc, &mut pool, b"a\0c");
-        crate::state::with_vm_context_parts(&mut state, &mut gc, &mut pool, |state, gc, _| {
-            assert!(exec_lt(state, gc, 0, &left, &right).expect("strings compare"));
-            assert!(exec_le(state, gc, 0, &left, &right).expect("strings compare"));
+        crate::state::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
+            let continuation = VmMetamethodContinuation::CompleteSet {
+                proto: GcRef::null(),
+                pc: 0,
+            };
+            assert!(matches!(
+                exec_lt(state, gc, &left, &right, continuation.clone()).expect("strings compare"),
+                VmMetamethodOutcome::Ready(true)
+            ));
+            assert!(matches!(
+                exec_le(state, gc, &left, &right, continuation).expect("strings compare"),
+                VmMetamethodOutcome::Ready(true)
+            ));
         });
     }
 
@@ -4407,37 +6473,31 @@ mod byte_string_tests {
         let function = gc.create(Function::new_c(return_fresh_string));
         let mut state = LuaState::new();
 
-        crate::state::with_vm_context_parts(
-            &mut state,
-            &mut gc,
-            &mut string_pool,
-            |state, gc, _| {
-                call_value_with_results(
-                    state,
-                    gc,
-                    Value::Function(function),
-                    &[],
-                    Some(1),
-                    |state, gc, results| {
-                        assert_eq!(state.top, 0);
-                        assert_eq!(gc.temporary_root_count(), 1);
-                        let report = gc.begin_mark_only();
-                        assert_eq!(report.temporary_seeded, 1);
-                        state.push_value(results[0].clone());
-                    },
-                )
-                .expect("fresh result publishes to the restored caller stack");
+        crate::state::with_vm_context_gc(&mut state, &mut gc, &mut string_pool, |state, gc| {
+            call_value_with_results(
+                state,
+                gc,
+                Value::Function(function),
+                &[],
+                Some(1),
+                |state, gc, results| {
+                    assert_eq!(state.top, 0);
+                    assert_eq!(gc.temporary_root_count(), 1);
+                    let report = gc.begin_mark_only();
+                    assert_eq!(report.temporary_seeded, 1);
+                    state.push_value(results[0].clone());
+                },
+            )
+            .expect("fresh result publishes to the restored caller stack");
 
-                assert_eq!(gc.temporary_root_count(), 0);
-                assert!(matches!(state.stack.at(0), Some(Value::String(_))));
-            },
-        );
+            assert_eq!(gc.temporary_root_count(), 0);
+            assert!(matches!(state.stack.at(0), Some(Value::String(_))));
+        });
     }
 }
 
 #[cfg(test)]
 mod proto_handle_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use lua_compiler::codegen::CodeGenerator;
     use lua_compiler::parser::Parser;
@@ -4445,10 +6505,7 @@ mod proto_handle_tests {
 
     use super::*;
 
-    static LINE_HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    unsafe extern "C" fn counting_line_hook(_: *mut std::ffi::c_void) -> i32 {
-        LINE_HOOK_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
+    unsafe extern "C" fn test_noop_c_function(_: *mut std::ffi::c_void) -> i32 {
         0
     }
 
@@ -4495,11 +6552,11 @@ mod proto_handle_tests {
             &mut string_pool,
             "local function f(...) return 42 end return f(1, 2)",
         );
-        crate::state::with_vm_context_parts(
+        crate::state::with_vm_context_gc(
             &mut returned,
             &mut gc,
             &mut string_pool,
-            |returned, gc, _| {
+            |returned, gc| {
                 assert!(matches!(
                     execute_proto(returned, return_proto, gc),
                     Ok(VmExit::Complete(ExecResult::Returned))
@@ -4522,15 +6579,10 @@ mod proto_handle_tests {
             &mut string_pool,
             "local function f(...) return nil + 1 end return f(1, 2)",
         );
-        crate::state::with_vm_context_parts(
-            &mut errored,
-            &mut gc,
-            &mut string_pool,
-            |errored, gc, _| {
-                execute_proto(errored, error_proto, gc)
-                    .expect_err("nested arithmetic error must propagate");
-            },
-        );
+        crate::state::with_vm_context_gc(&mut errored, &mut gc, &mut string_pool, |errored, gc| {
+            execute_proto(errored, error_proto, gc)
+                .expect_err("nested arithmetic error must propagate");
+        });
         assert_eq!(errored.current_ci, 0);
         assert!(
             errored
@@ -4542,7 +6594,6 @@ mod proto_handle_tests {
 
     #[test]
     fn debug_line_skip_is_one_shot_and_matches_full_object_identity() {
-        LINE_HOOK_CALLS.store(0, AtomicOrdering::SeqCst);
         let mut gc = GarbageCollector::new();
         let mut string_pool = StringPool::new();
         let mut first = Proto::new();
@@ -4553,33 +6604,46 @@ mod proto_handle_tests {
         let second = gc.create(second);
         assert_ne!(first.object_id(), second.object_id());
 
-        let hook = gc.create(Function::new_c(counting_line_hook));
+        let hook = gc.create(Function::new_c(test_noop_c_function));
         let mut state = LuaState::new();
         state.debug_hook = Some(Value::Function(hook));
         state.debug_hook_mask = "l".to_string();
         state.debug_hook_skip_proto = Some(first);
         state.debug_hook_skip_line = 17;
 
-        crate::state::with_vm_context_parts(
-            &mut state,
-            &mut gc,
-            &mut string_pool,
-            |state, gc, _| {
-                run_debug_instruction_hooks(state, gc, second, 0, OpCode::MOVE)
-                    .expect("different Proto identity runs the hook");
-                assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 1);
-                assert_eq!(state.debug_hook_skip_proto, Some(first));
+        crate::state::with_vm_context_gc(&mut state, &mut gc, &mut string_pool, |state, gc| {
+            let different = state
+                .with_native_request_scope(|state| {
+                    let request_id = run_debug_instruction_hooks(state, gc, second, 0)?;
+                    let request_id = request_id.expect("different Proto publishes the hook");
+                    assert!(state.take_native_request(request_id).is_some());
+                    state.debug_hook_active = false;
+                    Ok::<_, RuntimeError>(())
+                })
+                .expect("native request scope opens");
+            different.expect("different Proto identity runs the hook");
+            assert_eq!(state.debug_hook_skip_proto, Some(first));
 
-                run_debug_instruction_hooks(state, gc, first, 0, OpCode::MOVE)
-                    .expect("matching Proto consumes the skip");
-                assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 1);
-                assert_eq!(state.debug_hook_skip_proto, None);
-                assert_eq!(state.debug_hook_skip_line, -1);
+            let matching = state
+                .with_native_request_scope(|state| {
+                    assert!(run_debug_instruction_hooks(state, gc, first, 0)?.is_none());
+                    Ok::<_, RuntimeError>(())
+                })
+                .expect("native request scope opens");
+            matching.expect("matching Proto consumes the skip");
+            assert_eq!(state.debug_hook_skip_proto, None);
+            assert_eq!(state.debug_hook_skip_line, -1);
 
-                run_debug_instruction_hooks(state, gc, first, 0, OpCode::MOVE)
-                    .expect("consumed skip no longer suppresses the line");
-                assert_eq!(LINE_HOOK_CALLS.load(AtomicOrdering::SeqCst), 2);
-            },
-        );
+            let consumed = state
+                .with_native_request_scope(|state| {
+                    let request_id = run_debug_instruction_hooks(state, gc, first, 0)?;
+                    let request_id = request_id.expect("consumed skip publishes the hook");
+                    assert!(state.take_native_request(request_id).is_some());
+                    state.debug_hook_active = false;
+                    Ok::<_, RuntimeError>(())
+                })
+                .expect("native request scope opens");
+            consumed.expect("consumed skip no longer suppresses the line");
+        });
     }
 }

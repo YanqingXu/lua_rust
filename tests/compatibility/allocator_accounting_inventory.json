@@ -3,7 +3,7 @@
   "description": "Fail-closed inventory for M1.13 managed allocator accounting, allocation-triggered collection, deterministic allocation failure, and unsafe durability evidence.",
   "contract": {
     "metric": "managed_payload_bytes",
-    "excludes": "host allocator metadata and unrelated Rust service bookkeeping",
+    "excludes": "host allocator metadata and unrelated host service bookkeeping",
     "automatic_entry": "Runtime scheduler instruction boundary",
     "automatic_cycle_policy": "run one complete incremental cycle at the safe point; explicit step cycles remain caller-owned"
   },
@@ -31,6 +31,12 @@
       "status": "implemented",
       "path": "crates/lua_vm/src/runtime.rs",
       "anchors": ["accounted_bytes", "update_state_allocation", "reconcile_allocation_account"]
+    },
+    {
+      "family": "RUNTIME_RESOURCE_REGISTRY",
+      "status": "implemented",
+      "path": "crates/lua_vm/src/runtime.rs",
+      "anchors": ["AllocationSite::RuntimeResourceRegistry", "reserve_runtime_resources", "resource_registry_allocation_failure_is_transactional_and_retryable", "runtime_resource_drain_errors"]
     },
     {
       "family": "SHUTDOWN_ZERO",
