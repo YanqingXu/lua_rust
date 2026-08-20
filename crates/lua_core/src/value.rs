@@ -16,6 +16,7 @@ use crate::types::{Function, LuaInteger, LuaNumber, Table, Thread, Userdata, Val
 // Value 枚举定义
 // =====================================================================
 
+// ANCHOR: lua_value
 /// Lua 5.1 值类型
 ///
 /// 在 64 位系统上，此 enum 大小约 16 字节。
@@ -42,8 +43,10 @@ pub enum Value {
     /// Lua 线程/协程（受 GC 管理）— discriminant 8
     Thread(GcRef<Thread>),
 }
+// ANCHOR_END: lua_value
 
 impl Value {
+    // ANCHOR: lua_value_type
     /// 获取值的类型标签
     #[inline]
     pub fn value_type(&self) -> ValueType {
@@ -59,6 +62,7 @@ impl Value {
             Value::Thread(_) => ValueType::Thread,
         }
     }
+    // ANCHOR_END: lua_value_type
 
     // ── 类型判断方法 ──────────────────────────────────────────
 

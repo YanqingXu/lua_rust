@@ -9,6 +9,7 @@ use lua_core::byte_string::ByteString;
 // TokenType 枚举
 // =====================================================================
 
+// ANCHOR: lua_token_type
 /// Lua 词法标记类型
 ///
 /// 关键词从 257 开始以区分 ASCII 单字符标记（0-255 范围）。
@@ -108,6 +109,7 @@ pub enum TokenType {
     /// 词法错误
     Error = 288,
 }
+// ANCHOR_END: lua_token_type
 
 impl TokenType {
     /// 检查是否为关键词

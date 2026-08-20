@@ -1,0 +1,282 @@
+:root {
+  --lr-ink: #17211b;
+  --lr-muted: #58665e;
+  --lr-paper: #fbfaf4;
+  --lr-panel: #f2efe5;
+  --lr-line: #d9d5c7;
+  --lr-green: #1f6b4f;
+  --lr-green-dark: #164a38;
+  --lr-rust: #c5522d;
+  --lr-gold: #e2a53a;
+}
+
+html.light,
+html.rust {
+  --bg: var(--lr-paper);
+  --fg: var(--lr-ink);
+  --sidebar-bg: #f1eee4;
+  --sidebar-fg: #334239;
+  --sidebar-active: var(--lr-rust);
+  --links: var(--lr-green);
+  --quote-bg: #eef4ed;
+  --quote-border: var(--lr-green);
+  --table-border-color: var(--lr-line);
+  --table-header-bg: #e8e3d6;
+  --table-alternate-bg: #f5f2ea;
+}
+
+body {
+  font-family: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  letter-spacing: 0.005em;
+}
+
+.content main {
+  max-width: 860px;
+}
+
+.content main h1,
+.content main h2,
+.content main h3 {
+  letter-spacing: -0.025em;
+}
+
+.content main h1 {
+  font-size: clamp(2.1rem, 5vw, 3.25rem);
+  line-height: 1.08;
+  margin-bottom: 0.7rem;
+}
+
+.content main h2 {
+  margin-top: 2.8rem;
+}
+
+.content main p,
+.content main li {
+  line-height: 1.82;
+}
+
+.content main code {
+  border-radius: 5px;
+}
+
+.hero {
+  position: relative;
+  overflow: hidden;
+  margin: 0 0 2.5rem;
+  padding: clamp(2rem, 6vw, 4.8rem);
+  border: 1px solid var(--lr-line);
+  border-radius: 26px;
+  color: #fffaf0;
+  background:
+    radial-gradient(circle at 86% 12%, rgba(226, 165, 58, 0.38), transparent 25%),
+    linear-gradient(135deg, #173d2f 0%, #1f6b4f 58%, #2f4e3e 100%);
+  box-shadow: 0 22px 60px rgba(23, 61, 47, 0.17);
+}
+
+.hero::after {
+  content: "{ }";
+  position: absolute;
+  right: -0.05em;
+  bottom: -0.28em;
+  color: rgba(255, 255, 255, 0.075);
+  font: 700 clamp(9rem, 28vw, 18rem)/1 ui-monospace, monospace;
+  pointer-events: none;
+}
+
+.hero h1 {
+  position: relative;
+  max-width: 700px;
+  margin: 0.3rem 0 1.25rem;
+  color: white;
+  font-size: clamp(2.5rem, 7vw, 4.7rem) !important;
+  line-height: 1.03 !important;
+}
+
+.hero .eyebrow {
+  margin: 0;
+  color: #f2c56c;
+  font: 700 0.78rem/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+  letter-spacing: 0.16em;
+}
+
+.hero-copy {
+  position: relative;
+  max-width: 680px;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 1.12rem;
+}
+
+.hero-actions {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  margin-top: 2rem;
+}
+
+.hero-actions a,
+.checkpoint a {
+  display: inline-block;
+  padding: 0.78rem 1.05rem;
+  border: 1px solid rgba(255, 255, 255, 0.38);
+  border-radius: 10px;
+  color: inherit;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.hero-actions a.primary {
+  border-color: #f1c467;
+  color: #173d2f;
+  background: #f1c467;
+}
+
+.learning-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.9rem;
+  margin: 1.5rem 0 2.5rem;
+}
+
+.learning-grid > div {
+  display: flex;
+  min-height: 92px;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 1.15rem;
+  border: 1px solid var(--lr-line);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--bg) 84%, var(--lr-green) 16%);
+}
+
+.learning-grid strong {
+  color: var(--links);
+}
+
+.learning-grid span {
+  color: var(--lr-muted);
+  line-height: 1.55;
+}
+
+.pipeline {
+  display: flex;
+  overflow-x: auto;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 1.5rem 0 2rem;
+  padding: 1.1rem;
+  border: 1px solid var(--lr-line);
+  border-radius: 14px;
+  background: var(--lr-panel);
+  white-space: nowrap;
+}
+
+.pipeline span {
+  padding: 0.48rem 0.7rem;
+  border-radius: 8px;
+  color: #fff;
+  background: var(--lr-green-dark);
+  font: 650 0.82rem/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.pipeline b {
+  color: var(--lr-rust);
+}
+
+.lesson-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 2.2rem;
+}
+
+.lesson-meta span {
+  padding: 0.35rem 0.65rem;
+  border: 1px solid var(--lr-line);
+  border-radius: 999px;
+  color: var(--lr-muted);
+  background: var(--lr-panel);
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.exercise,
+.checkpoint,
+.warning {
+  margin: 2rem 0;
+  padding: 1.15rem 1.3rem;
+  border: 1px solid var(--lr-line);
+  border-left: 5px solid var(--lr-green);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg) 80%, var(--lr-green) 20%);
+}
+
+.exercise {
+  border-left-color: var(--lr-rust);
+  background: color-mix(in srgb, var(--bg) 88%, var(--lr-rust) 12%);
+}
+
+.warning {
+  border-left-color: var(--lr-gold);
+  background: color-mix(in srgb, var(--bg) 84%, var(--lr-gold) 16%);
+}
+
+.exercise > strong,
+.checkpoint > strong,
+.warning > strong {
+  display: block;
+  margin-bottom: 0.35rem;
+  font-size: 1.05rem;
+}
+
+.exercise ol,
+.checkpoint p,
+.warning p {
+  margin-bottom: 0;
+}
+
+.checkpoint a {
+  margin-top: 0.7rem;
+  border-color: var(--lr-green);
+  color: white;
+  background: var(--lr-green);
+}
+
+blockquote {
+  border-radius: 0 10px 10px 0;
+}
+
+table {
+  display: table;
+  width: 100%;
+}
+
+@media (max-width: 700px) {
+  .learning-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .hero {
+    border-radius: 18px;
+  }
+
+  table {
+    display: block;
+    overflow-x: auto;
+  }
+}
+
+html.navy .learning-grid > div,
+html.ayu .learning-grid > div,
+html.coal .learning-grid > div,
+html.navy .exercise,
+html.navy .checkpoint,
+html.navy .warning,
+html.ayu .exercise,
+html.ayu .checkpoint,
+html.ayu .warning,
+html.coal .exercise,
+html.coal .checkpoint,
+html.coal .warning {
+  color: var(--fg);
+}

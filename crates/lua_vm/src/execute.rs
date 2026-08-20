@@ -363,6 +363,7 @@ fn execute_proto_inner(
         l.current_call_info_mut().top = stack_needed;
     }
 
+    // ANCHOR: lua_vm_dispatch
     // 主解释循环
     while let Some(inst) = proto_instruction(gc, active_proto_ref, pc)? {
         let op = opcode::get_opcode(inst);
@@ -417,6 +418,7 @@ fn execute_proto_inner(
                     }
                 }
             }
+            // ANCHOR_END: lua_vm_dispatch
 
             // ── 上值 / 全局 (3) ─────────────────────────────
             OpCode::GETUPVAL => {

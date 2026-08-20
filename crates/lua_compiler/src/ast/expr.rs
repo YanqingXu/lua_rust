@@ -220,6 +220,7 @@ pub struct ParenExpr {
 // =====================================================================
 // =====================================================================
 
+// ANCHOR: lua_expr_ast
 /// Lua 5.1 表达式枚举
 ///
 /// 包含全部 14 种表达式节点类型。
@@ -242,6 +243,7 @@ pub enum Expr {
     Function(FunctionExpr),
     Paren(ParenExpr),
 }
+// ANCHOR_END: lua_expr_ast
 
 /// 表达式节点数量（编译期常量，用于验证）
 pub const EXPR_NODE_COUNT: usize = 14;

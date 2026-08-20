@@ -56,6 +56,7 @@ fn lookup_keyword(ident: &str) -> Option<TokenType> {
 // Lexer 结构体
 // =====================================================================
 
+// ANCHOR: lua_lexer_state
 /// Lua 词法分析器
 ///
 /// 从 Lua 源代码字节中提取 Token 流。
@@ -92,9 +93,11 @@ impl<'source> Lexer<'source> {
             lookahead: None,
         }
     }
+    // ANCHOR_END: lua_lexer_state
 
     // ── 公共接口 ──────────────────────────────────────────────────
 
+    // ANCHOR: lua_lexer_lookahead
     /// 获取下一个 Token（消费）
     pub fn next_token(&mut self) -> Token {
         if let Some(tok) = self.lookahead.take() {
@@ -111,6 +114,7 @@ impl<'source> Lexer<'source> {
         }
         self.lookahead.clone().unwrap()
     }
+    // ANCHOR_END: lua_lexer_lookahead
 
     /// 检查是否到达源代码末尾
     #[inline]

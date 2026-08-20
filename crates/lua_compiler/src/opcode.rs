@@ -78,6 +78,7 @@ pub const LFIELDS_PER_FLUSH: i32 = 50;
 // 操作码枚举（38 个指令）
 // =====================================================================
 
+// ANCHOR: lua_opcodes
 /// Lua 5.1 虚拟机操作码（38 个指令）
 ///
 /// discriminant 值固定为 Lua 5.1 的 38 条 opcode 编号（0..37）。
@@ -187,6 +188,7 @@ pub enum OpCode {
     /// R(A), R(A+1), ..., R(A+B-1) = vararg
     VARARG = 37,
 }
+// ANCHOR_END: lua_opcodes
 
 /// 操作码数量
 pub const NUM_OPCODES: i32 = 38;

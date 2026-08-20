@@ -11,6 +11,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::str::Utf8Error;
 
+// ANCHOR: lua_byte_string
 /// An immutable Lua byte string with a stable, trailing-NUL-terminated buffer.
 ///
 /// The trailing NUL is storage metadata, not part of the logical value. An
@@ -85,6 +86,7 @@ impl ByteString {
     pub fn to_utf8(&self) -> Result<&str, Utf8Error> {
         std::str::from_utf8(self.as_bytes())
     }
+    // ANCHOR_END: lua_byte_string
 
     /// Converts the logical bytes for human-facing display, replacing invalid
     /// UTF-8 sequences with the Unicode replacement character.

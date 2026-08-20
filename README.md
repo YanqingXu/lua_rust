@@ -223,6 +223,7 @@ artifact 上传和 workflow 环境本身。
 
 | 文档 | 说明 |
 |---|---|
+| [在线教程源码](book/src/PREFACE.md) | 《从 Lua 解释器开始学习 Rust》：沿 Value、Table、Lexer、AST、Bytecode 与 VM 阅读真实实现。 |
 | [执行计划](plan.md) | 从 M0 验证基线到 M5 发布治理的依赖顺序和验收门。 |
 | [M0 收口报告](docs/rust_migration/m0_report.md) | 本地门禁结果、fixture/differential/parity 证据、3 项债务与 CI 边界。 |
 | [ByteString RFC](docs/rust_migration/byte_string_rfc.md) | M1 字节表示、pointer+length、hash 与迁移边界决策。 |
@@ -235,6 +236,16 @@ artifact 上传和 workflow 环境本身。
 | [兼容偏差日志](docs/rust_migration/deviation_log.md) | 固定 `NOTE-*`、oracle、测试/任务和处置状态。 |
 | [类型速查表](docs/rust_migration/type_mapping_table.md) | Rust 内部类型、模块和职责速查表。 |
 | [术语表](docs/glossary.md) | Lua 概念与项目术语说明。 |
+
+本地预览教程：
+
+```powershell
+cargo install mdbook --version 0.5.4 --locked
+mdbook serve book --open
+```
+
+推送 `book/` 或被教程引用的 `crates/` 代码后，GitHub Pages workflow 会自动
+构建并发布静态站点。
 
 ---
 

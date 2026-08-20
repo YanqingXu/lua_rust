@@ -27,6 +27,7 @@ const MAX_ARRAY_INDEX: i32 = 1_000_000;
 // Table 结构体
 // =====================================================================
 
+// ANCHOR: lua_table_layout
 /// Lua 表对象
 ///
 /// 实现 Lua 的表数据结构。GC 管理，支持数组部分（连续整数键）
@@ -63,6 +64,7 @@ pub struct Table {
     /// 每个位对应一个元方法类型，位为 1 表示该元方法不存在
     flags: u8,
 }
+// ANCHOR_END: lua_table_layout
 
 impl Table {
     /// 创建空表
@@ -99,6 +101,7 @@ impl Table {
     // 基本操作
     // =====================================================================
 
+    // ANCHOR: lua_table_get_set
     /// 获取键对应的值
     ///
     /// 查找策略：
@@ -164,6 +167,7 @@ impl Table {
         }
         self.hash.insert(hash_key, value.clone());
     }
+    // ANCHOR_END: lua_table_get_set
 
     /// 检查键是否存在且值不为 nil
     ///

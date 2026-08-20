@@ -10,6 +10,7 @@ const INITIAL_STACK_SIZE: usize = 64;
 /// 栈增长余量
 const STACK_GROW_MARGIN: usize = 32;
 
+// ANCHOR: lua_vm_stack
 /// Lua 值栈
 ///
 /// 管理 Lua 值的动态栈，支持 push/pop 操作和自动扩展。
@@ -69,6 +70,7 @@ impl Stack {
         self.top -= 1;
         Some(std::mem::replace(&mut self.values[self.top], Value::Nil))
     }
+    // ANCHOR_END: lua_vm_stack
 
     /// 返回栈顶值（不弹出）
     pub fn top_value(&self) -> Option<&Value> {

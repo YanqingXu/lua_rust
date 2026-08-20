@@ -1,0 +1,36 @@
+[book]
+title = "从 Lua 解释器开始学习 Rust"
+authors = ["YanqingXu"]
+description = "从值系统、编译器到寄存器虚拟机，循序渐进地用 Rust 实现 Lua 5.1"
+language = "zh-CN"
+src = "src"
+
+[rust]
+edition = "2024"
+
+[build]
+build-dir = "../target/mdbook"
+create-missing = false
+
+[output.html]
+site-url = "/lua_rust/"
+git-repository-url = "https://github.com/YanqingXu/lua_rust"
+edit-url-template = "https://github.com/YanqingXu/lua_rust/edit/main/book/{path}"
+default-theme = "rust"
+preferred-dark-theme = "navy"
+smart-punctuation = true
+additional-css = ["theme/custom.css"]
+
+[output.html.fold]
+enable = true
+level = 0
+
+[output.html.search]
+enable = true
+limit-results = 20
+use-boolean-and = true
+
+[output.html.playground]
+runnable = false
+copyable = true
+copy-js = true
