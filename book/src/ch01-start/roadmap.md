@@ -2,7 +2,7 @@
 
 <div class="lesson-meta"><span>预计 5 分钟</span><span>路线导览</span><span>无需前置知识</span></div>
 
-这是面向当前成熟实现的专题阅读地图。如果你是第一次实现解释器，请先沿 [版本主线](../versions/README.md) 从 v0.0 逐步前进；完成某个 checkpoint 后，再回到这里对照生产实现。
+这是面向当前成熟实现的专题阅读地图。如果你是第一次实现解释器，请先沿 [版本主线](../versions/index.html) 从 v0.0 逐步前进；完成某个 checkpoint 后，再回到这里对照生产实现。
 
 ## 主线地图
 

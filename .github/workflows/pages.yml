@@ -42,6 +42,9 @@ jobs:
       - name: Build book
         run: mdbook build book
 
+      - name: Check book links
+        run: node tools/check_book_links.mjs target/mdbook .
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 

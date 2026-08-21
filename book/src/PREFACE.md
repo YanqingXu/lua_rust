@@ -3,7 +3,7 @@
   <h1>从 Lua 解释器开始学习 Rust</h1>
   <p class="hero-copy">从最小 CLI 开始，通过 20 个可运行版本逐步实现 Value、Lexer、AST、Bytecode、VM、GC 与协程。</p>
   <div class="hero-actions">
-    <a class="primary" href="versions/README.html">进入版本主线</a>
+    <a class="primary" href="versions/index.html">进入版本主线</a>
     <a href="versions/v00-skeleton.html">运行第一个快照</a>
   </div>
 </div>
@@ -47,5 +47,5 @@
 <div class="checkpoint">
   <strong>准备好了吗？</strong>
   <p>先查看 20 个 checkpoint 的实施状态，再运行 v0.0。你会带着一个可观察、可测试的结果进入下一版。</p>
-  <a href="versions/README.html">开始学习 →</a>
+  <a href="versions/index.html">开始学习 →</a>
 </div>
