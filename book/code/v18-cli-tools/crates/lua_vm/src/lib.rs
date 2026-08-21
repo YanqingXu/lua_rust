@@ -3180,9 +3180,7 @@ impl Vm {
                     Command::new("sh").args(["-c", &command]).status()
                 };
                 match status {
-                    Ok(status) => Ok(vec![Value::Number(
-                        status.code().map_or(1, |code| code) as f64
-                    )]),
+                    Ok(status) => Ok(vec![Value::Number(status.code().unwrap_or(1) as f64)]),
                     Err(error) => Ok(vec![
                         Value::Nil,
                         Value::String(ByteString::new(error.to_string().as_bytes())),
