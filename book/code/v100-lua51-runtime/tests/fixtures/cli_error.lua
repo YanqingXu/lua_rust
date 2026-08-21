@@ -1,0 +1,1 @@
+error("manifest-failure")

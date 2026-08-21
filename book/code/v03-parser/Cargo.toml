@@ -1,0 +1,18 @@
+[package]
+name = "lua-step-v03"
+version = "0.3.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "lua_step_v03"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lua-step"
+path = "src/main.rs"
+
+[workspace]
+
+[lints.clippy]
+all = "warn"

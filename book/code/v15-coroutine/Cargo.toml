@@ -1,0 +1,22 @@
+[package]
+name = "lua_app"
+version = "0.15.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lua_compiler = { path = "crates/lua_compiler" }
+lua_core = { path = "crates/lua_core" }
+lua_vm = { path = "crates/lua_vm" }
+
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "crates/lua_core",
+    "crates/lua_compiler",
+    "crates/lua_vm",
+]
+
+[lints.clippy]
+all = "warn"

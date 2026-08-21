@@ -1,0 +1,22 @@
+schema = "lua-rust-lua51-oracles/v1"
+candidate_manifest = "Cargo.toml"
+
+[official]
+name = "Lua 5.1.5"
+source_url = "https://www.lua.org/ftp/lua-5.1.5.tar.gz"
+source_sha256 = "2640fc56a795f29d28ef15e13c34a47e223960b0240e8cb0a82d9b0738695333"
+tests_url = "https://www.lua.org/tests/lua5.1-tests.tar.gz"
+tests_sha256 = "49e4ca6561f82ea605908c5041ab5fad66ed9930fa0686675bd51b02767f18ad"
+
+[cpp]
+name = "lua_cpp"
+repository = "https://github.com/YanqingXu/lua.git"
+commit = "87c15e69ceb94eb74e28226ccbefb7e196635711"
+archive_url = "https://codeload.github.com/YanqingXu/lua/zip/87c15e69ceb94eb74e28226ccbefb7e196635711"
+archive_sha256 = "66c9506a07c4bab8b8e84d7858484e1456772bf605be2ae40003a22a8d1bbfb8"
+
+[policy]
+compare = ["stdout-bytes", "stderr-bytes", "exit-code", "declared-side-effects"]
+normalization = ["crlf-to-lf"]
+unlisted_difference = "fail"
+timeout_seconds = 10

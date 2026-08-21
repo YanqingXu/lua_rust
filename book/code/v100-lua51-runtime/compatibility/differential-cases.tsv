@@ -1,0 +1,6 @@
+id	script
+language-core	compatibility/fixtures/language-core.lua
+byte-strings	compatibility/fixtures/byte-strings.lua
+metatables	compatibility/fixtures/metatables.lua
+coroutines	compatibility/fixtures/coroutines.lua
+core-stdlib	compatibility/fixtures/core-stdlib.lua

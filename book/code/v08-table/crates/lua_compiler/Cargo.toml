@@ -1,0 +1,11 @@
+[package]
+name = "lua_compiler"
+version = "0.8.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lua_core = { path = "../lua_core" }
+
+[lints.clippy]
+all = "warn"

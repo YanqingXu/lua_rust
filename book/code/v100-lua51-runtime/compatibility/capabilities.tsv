@@ -1,0 +1,26 @@
+category	feature	status	evidence	deviation
+language	byte-oriented lexer and Lua 5.1 tokens	complete	crates/lua_compiler/src/lib.rs	-
+language	complete Lua 5.1 source grammar including call sugar	complete	tests/lua51_release.rs	-
+language	expressions truthiness short-circuit and coercion	complete	tests/pipeline.rs	-
+runtime	tables identity and nil deletion	complete	tests/pipeline.rs	-
+runtime	functions recursion multi-return vararg and tail calls	complete	tests/pipeline.rs	-
+runtime	closures shared open and closed upvalues	complete	tests/pipeline.rs	-
+runtime	metatables and language-visible metamethods	complete	tests/pipeline.rs	-
+runtime	full and incremental GC weak tables and finalizers	complete	tests/pipeline.rs	-
+runtime	coroutines resume yield status running and wrap	complete	tests/pipeline.rs	-
+stdlib	base library source loaders and protected calls	partial	tests/stdlib.rs	LUA51-D004
+stdlib	math library	partial	tests/stdlib.rs	LUA51-D010
+stdlib	byte-string library	partial	tests/stdlib.rs	LUA51-D005
+stdlib	table library	complete	tests/stdlib.rs	-
+stdlib	io and file library	partial	tests/host_stdlib.rs	LUA51-D006
+stdlib	os library	partial	tests/host_stdlib.rs	LUA51-D007
+stdlib	Lua file modules require preload path and cache	partial	tests/host_stdlib.rs	LUA51-D008
+stdlib	debug inspection library	partial	tests/host_stdlib.rs	LUA51-D009
+tooling	script stdin -e -l -i -- arg and exit codes	complete	tests/cli_contract.rs	-
+tooling	persistent multiline REPL	complete	tests/cli_contract.rs	-
+tooling	versioned bytecode JSON CFG opcode audit and VM trace	complete	crates/lua_bytecode/tests/tool_contract.rs	-
+distribution	official 38-opcode binary instruction encoding	excluded	crates/lua_bytecode/src/compatibility.rs	LUA51-D012
+distribution	Lua 5.1 binary chunks	excluded	compatibility/deviations.tsv	LUA51-D001
+embedding	Lua 5.1 C API and ABI	excluded	compatibility/deviations.tsv	LUA51-D002
+modules	dynamic native modules and package.loadlib	excluded	compatibility/deviations.tsv	LUA51-D003
+platform	lossless native argv and path encoding	partial	tests/cli_contract.rs	LUA51-D011

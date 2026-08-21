@@ -1,0 +1,4 @@
+# name|script|args|exit|stdout|stderr-substring
+success|cli_success.lua||0|manifest-ok\n|
+runtime-error|cli_error.lua||1||manifest-failure
+arguments|cli_args.lua|first,second|0|first\tsecond\ttrue\n|

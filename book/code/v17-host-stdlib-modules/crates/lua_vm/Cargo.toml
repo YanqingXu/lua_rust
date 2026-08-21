@@ -1,0 +1,13 @@
+[package]
+name = "lua_vm"
+version = "0.17.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lua_core = { path = "../lua_core" }
+lua_compiler = { path = "../lua_compiler" }
+lua_stdlib = { path = "../lua_stdlib" }
+
+[lints.clippy]
+all = "warn"

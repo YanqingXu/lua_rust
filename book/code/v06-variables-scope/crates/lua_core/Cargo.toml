@@ -1,0 +1,8 @@
+[package]
+name = "lua_core"
+version = "0.6.0"
+edition = "2021"
+publish = false
+
+[lints.clippy]
+all = "warn"

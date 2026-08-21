@@ -1,16 +1,16 @@
 <div class="hero">
   <p class="eyebrow">LEARNING RUST BY BUILDING LUA</p>
   <h1>从 Lua 解释器开始学习 Rust</h1>
-  <p class="hero-copy">不从语法清单开始，而是亲手拆开一个真实解释器：Value、Table、Lexer、AST、Bytecode 与寄存器 VM。</p>
+  <p class="hero-copy">从最小 CLI 开始，通过 20 个可运行版本逐步实现 Value、Lexer、AST、Bytecode、VM、GC 与协程。</p>
   <div class="hero-actions">
-    <a class="primary" href="ch01-start/roadmap.html">查看学习路线</a>
-    <a href="ch01-start/setup.html">运行第一个 Lua 程序</a>
+    <a class="primary" href="versions/README.html">进入版本主线</a>
+    <a href="versions/v00-skeleton.html">运行第一个快照</a>
   </div>
 </div>
 
 ## 这不是一本只读不写的书
 
-这本在线书与 [`lua_rust`](https://github.com/YanqingXu/lua_rust) 的真实代码放在同一个仓库里。你看到的关键实现通过 mdBook 的 `include` 机制直接来自 `crates/`，因此教程会跟着代码一起演进。
+这本在线书与 [`lua_rust`](https://github.com/YanqingXu/lua_rust) 的真实代码放在同一个仓库里。版本主线的独立快照位于 `book/code/`，关键实现通过 mdBook `include` 直接进入章节；“专题深入”则对照 `crates/` 中的当前成熟实现。
 
 每一章都会沿着同一条路径展开：
 
@@ -46,6 +46,6 @@
 
 <div class="checkpoint">
   <strong>准备好了吗？</strong>
-  <p>先用 3 分钟查看完整路线，再在本地运行一段 Lua。你会带着一个可观察的结果进入第一章。</p>
-  <a href="ch01-start/roadmap.html">开始学习 →</a>
+  <p>先查看 20 个 checkpoint 的实施状态，再运行 v0.0。你会带着一个可观察、可测试的结果进入下一版。</p>
+  <a href="versions/README.html">开始学习 →</a>
 </div>

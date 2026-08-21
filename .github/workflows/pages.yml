@@ -7,6 +7,7 @@ on:
       - master
     paths:
       - "book/**"
+      - "book_plan.md"
       - "crates/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -30,6 +31,10 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Test teaching snapshots
+        shell: pwsh
+        run: ./book/code/check.ps1
 
       - name: Install mdBook
         run: cargo install mdbook --version 0.5.4 --locked

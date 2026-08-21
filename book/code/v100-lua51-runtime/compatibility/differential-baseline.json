@@ -1,0 +1,20 @@
+{
+  "schema": "lua-rust-lua51-differential-baseline/v1",
+  "verified_at": "2026-08-21",
+  "official": {
+    "release": "Lua 5.1.5",
+    "source_sha256": "2640fc56a795f29d28ef15e13c34a47e223960b0240e8cb0a82d9b0738695333"
+  },
+  "cpp": {
+    "commit": "87c15e69ceb94eb74e28226ccbefb7e196635711",
+    "archive_sha256": "66c9506a07c4bab8b8e84d7858484e1456772bf605be2ae40003a22a8d1bbfb8"
+  },
+  "passed": true,
+  "cases": [
+    { "id": "language-core", "exit_code": 0, "stdout": "10\t60\tlua5.1\n", "stderr": "" },
+    { "id": "byte-strings", "exit_code": 0, "stdout": "3\t0\t65\t255\t65\n", "stderr": "" },
+    { "id": "metatables", "exit_code": 0, "stdout": "42\t42\n", "stderr": "" },
+    { "id": "coroutines", "exit_code": 0, "stdout": "true\t11\t12\ttrue\t42\tdead\n", "stderr": "" },
+    { "id": "core-stdlib", "exit_code": 0, "stdout": "9\t1:2:3\tLUA\n", "stderr": "" }
+  ]
+}
