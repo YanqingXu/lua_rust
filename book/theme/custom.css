@@ -6,7 +6,7 @@
   --lr-line: #d9d5c7;
   --lr-green: #1f6b4f;
   --lr-green-dark: #164a38;
-  --lr-rust: #c5522d;
+  --lr-rust: #a43f22;
   --lr-gold: #e2a53a;
 }
 
@@ -23,6 +23,17 @@ html.rust {
   --table-border-color: var(--lr-line);
   --table-header-bg: #e8e3d6;
   --table-alternate-bg: #f5f2ea;
+}
+
+html.navy,
+html.coal {
+  --links: #69b3e7;
+  --sidebar-active: #69b3e7;
+}
+
+html.coal {
+  --icons: #aab7c4;
+  --table-header-bg: #303538;
 }
 
 body {
@@ -114,8 +125,8 @@ body {
   margin-top: 2rem;
 }
 
-.hero-actions a,
-.checkpoint a {
+.content main .hero-actions a,
+.content main .checkpoint a {
   display: inline-block;
   padding: 0.78rem 1.05rem;
   border: 1px solid rgba(255, 255, 255, 0.38);
@@ -125,10 +136,38 @@ body {
   text-decoration: none;
 }
 
-.hero-actions a.primary {
+.content main .hero-actions a:link,
+.content main .hero-actions a:visited,
+.content main .hero-actions a:hover,
+.content main .hero-actions a:active {
+  color: #fffaf0;
+}
+
+.content main .hero-actions a.primary:link,
+.content main .hero-actions a.primary:visited,
+.content main .hero-actions a.primary:hover,
+.content main .hero-actions a.primary:active {
   border-color: #f1c467;
   color: #173d2f;
   background: #f1c467;
+}
+
+.content main .hero-actions a:hover,
+.content main .hero-actions a:active {
+  border-color: white;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.content main .hero-actions a.primary:hover,
+.content main .hero-actions a.primary:active {
+  border-color: #ffdc88;
+  background: #ffdc88;
+}
+
+.content main .hero-actions a:focus-visible,
+.content main .checkpoint a:focus-visible {
+  outline: 3px solid #f1c467;
+  outline-offset: 3px;
 }
 
 .learning-grid {
@@ -235,11 +274,20 @@ body {
   margin-bottom: 0;
 }
 
-.checkpoint a {
+.content main .checkpoint a:link,
+.content main .checkpoint a:visited,
+.content main .checkpoint a:hover,
+.content main .checkpoint a:active {
   margin-top: 0.7rem;
   border-color: var(--lr-green);
   color: white;
   background: var(--lr-green);
+}
+
+.content main .checkpoint a:hover,
+.content main .checkpoint a:active {
+  border-color: var(--lr-green-dark);
+  background: var(--lr-green-dark);
 }
 
 blockquote {
@@ -279,4 +327,30 @@ html.coal .exercise,
 html.coal .checkpoint,
 html.coal .warning {
   color: var(--fg);
+}
+
+html:is(.navy, .coal, .ayu) .learning-grid span {
+  color: var(--fg);
+}
+
+html:is(.navy, .coal) :is(
+  .hljs-variable,
+  .hljs-attribute,
+  .hljs-attr,
+  .hljs-tag,
+  .hljs-regexp,
+  .ruby .hljs-constant,
+  .xml .hljs-tag .hljs-title,
+  .xml .hljs-pi,
+  .xml .hljs-doctype,
+  .html .hljs-doctype,
+  .css .hljs-id,
+  .css .hljs-class,
+  .css .hljs-pseudo
+) {
+  color: #e18181;
+}
+
+html.ayu :is(.hljs-comment, .hljs-quote) {
+  color: #98a6b3;
 }
