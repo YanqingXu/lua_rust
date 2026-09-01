@@ -24,39 +24,46 @@ $ProjectRoot = Resolve-Path (Join-Path $ScriptDir "..")
 
 $RequiredTools = @(
     @{
-        Name    = "rustup"
-        Check   = { Get-Command rustup -ErrorAction Stop | Out-Null; rustup --version 2>&1 }
-        Install = { Write-Host "    Install via: winget install Rustlang.Rustup" -ForegroundColor Yellow }
+        Name      = "rustup"
+        Command   = "rustup"
+        Arguments = @("--version")
+        Install   = { Write-Host "    Install via: winget install Rustlang.Rustup" -ForegroundColor Yellow }
     },
     @{
-        Name    = "cargo"
-        Check   = { cargo --version 2>&1 }
-        Install = { Write-Host "    Included with rustup" -ForegroundColor Yellow }
+        Name      = "cargo"
+        Command   = "cargo"
+        Arguments = @("--version")
+        Install   = { Write-Host "    Included with rustup" -ForegroundColor Yellow }
     },
     @{
-        Name    = "rustc"
-        Check   = { rustc --version 2>&1 }
-        Install = { Write-Host "    Included with rustup" -ForegroundColor Yellow }
+        Name      = "rustc"
+        Command   = "rustc"
+        Arguments = @("--version")
+        Install   = { Write-Host "    Included with rustup" -ForegroundColor Yellow }
     },
     @{
-        Name    = "clippy"
-        Check   = { cargo clippy --version 2>&1 }
-        Install = { rustup component add clippy }
+        Name      = "clippy"
+        Command   = "cargo"
+        Arguments = @("clippy", "--version")
+        Install   = { rustup component add clippy }
     },
     @{
-        Name    = "rustfmt"
-        Check   = { rustfmt --version 2>&1 }
-        Install = { rustup component add rustfmt }
+        Name      = "rustfmt"
+        Command   = "rustfmt"
+        Arguments = @("--version")
+        Install   = { rustup component add rustfmt }
     },
     @{
-        Name    = "cargo-nextest"
-        Check   = { cargo nextest --version 2>&1 }
-        Install = { cargo install cargo-nextest }
+        Name      = "cargo-nextest"
+        Command   = "cargo"
+        Arguments = @("nextest", "--version")
+        Install   = { cargo install cargo-nextest }
     },
     @{
-        Name    = "cargo-audit"
-        Check   = { cargo audit --version 2>&1 }
-        Install = { cargo install cargo-audit }
+        Name      = "cargo-audit"
+        Command   = "cargo"
+        Arguments = @("audit", "--version")
+        Install   = { cargo install cargo-audit }
     }
 )
 
@@ -68,14 +75,22 @@ $AllOk = $true
 foreach ($tool in $RequiredTools) {
     $name = $tool.Name
     try {
-        # Windows PowerShell 5.1 parses `& $tool.Check` as invoking `$tool`
-        # with a member-looking argument. Store the script block first so the
-        # call operator receives the intended command on both powershell.exe
-        # and pwsh.
-        $check = $tool["Check"]
-        $output = @(& $check)
-        if ($LASTEXITCODE -ne 0) {
-            throw "$name exited with status $LASTEXITCODE"
+        $command = Get-Command $tool["Command"] -CommandType Application `
+            -ErrorAction Stop | Select-Object -First 1
+        $arguments = @($tool["Arguments"])
+        $oldPreference = $ErrorActionPreference
+        try {
+            # Windows PowerShell 5.1 promotes native stderr to an error record.
+            # Some successful version probes (notably rustup) write notices to
+            # stderr, so determine success from the native exit code instead.
+            $ErrorActionPreference = "Continue"
+            $output = @(& $command.Source @arguments 2>&1)
+            $exitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $oldPreference
+        }
+        if ($exitCode -ne 0) {
+            throw "$name exited with status $exitCode"
         }
         Write-Host "  [OK] $name" -ForegroundColor Green
         if ($Verbose) {
