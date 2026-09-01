@@ -2,7 +2,40 @@
 
 <div class="lesson-meta"><span>核心增量：可暂停、可恢复的独立执行状态</span><span>workspace</span><span>checkpoint v0.15</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>把隐含在 Rust 栈中的 continuation 显式拥有</strong>
+  <p>前置：v0.14 的 Runtime/GC、v0.10 的开放结果和 v0.11 的 upvalue。新知识：可暂停帧、
+  owner turn、状态迁移、yield signal 与 GC traced continuation。完成后你应能手推两次
+  resume 之间保存和恢复的全部状态。</p>
+</div>
+
 v0.14 的 VM 只有一条正在前进的执行链：函数要么返回，要么报错。本版增加一个核心能力：**函数可以在任意普通 Lua 调用深度暂停，把控制权和值交给恢复者，之后从原指令位置继续执行**。实现保存真实 VM 帧，不通过重跑源码伪造恢复，因此 yield 之前的赋值、IO 占位和 GC 副作用只发生一次。
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+画 A resume B、B 又 resume C 时三条线程的状态：C running，B normal，A running/等待调用返回。
+再让 C yield 两个值，标出值先回到 B 的 resume 调用点，而不是直接回到 A。最后列出暂停
+frame 必须保存的 pc、registers、varargs 和结果写回位置。
+
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. `CoroutineRef`：Heap 中可追踪的 thread 身份；
+2. `CoroutineState`：VM scheduler 拥有 status、入口和 suspended frames；
+3. `CoroutineStatus`：Suspended/Running/Normal/Dead 的合法迁移；
+4. yield signal：沿普通调用链向外传播，但在 resume 边界消费；
+5. `SuspendedFrame`：保存 function/frame_id/registers/varargs/next pc/result window；
+6. resume loop：从最内层恢复，返回值逐层写回 caller；
+7. thread heap roots：把暂停寄存器重新接入 GC 对象图；
+8. forbidden-depth guard：阻止跨不可延续回调边界 yield。
+
+暂停时 Rust 函数会返回，因此任何只存在于局部变量或宿主调用栈里的状态都会丢失。
+`SuspendedFrame` 不是缓存，而是 continuation 的唯一 owner；这也是恢复不能靠重新执行源码
+模拟的原因。
 
 ## 线程值与 owner turn
 
@@ -13,9 +46,16 @@ v0.14 的 VM 只有一条正在前进的执行链：函数要么返回，要么�
 - `current_coroutine` 是当前 owner turn；嵌套 `resume` 时父线程由 `Running` 临时变为 `Normal`；
 - 主线程没有伪造的 thread handle，因此 `coroutine.running()` 在主线程返回 nil。
 
-```rust
-{{#include ../../code/v15-coroutine/crates/lua_vm/src/lib.rs:coroutine_state}}
+状态迁移先按表验证，再读实现：
+
+```text
+create:  absent → Suspended
+resume:  Suspended → Running → Suspended(yield) | Dead(return/error)
+nested:  parent Running → Normal → Running
+invalid: Running/Normal/Dead --resume→ false, message (no bytecode executed)
 ```
+
+[查看完整 coroutine 状态定义](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v15-coroutine/crates/lua_vm/src/lib.rs)
 
 这种拆分避免把 Rust 调用栈当作长期存储。暂停后 Rust 函数已经返回，真正需要延续的内容必须显式拥有。
 
@@ -41,9 +81,9 @@ resume(args)
     └──保存新 inner frames + 尚未恢复的 outer frames
 ```
 
-```rust
-{{#include ../../code/v15-coroutine/crates/lua_vm/src/lib.rs:coroutine_resume}}
-```
+恢复算法按“最内层 frame 先继续，结果逐层向外写回”循环执行；再次 yield 时，把新内层帧
+与尚未恢复的外层帧重新组合成 suspension。
+[查看完整 resume/continuation 实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v15-coroutine/crates/lua_vm/src/lib.rs)
 
 这个过程也覆盖多返回和 tail-yield：开放结果原样传播，tail 位置恢复后直接成为函数返回值。
 
@@ -124,13 +164,34 @@ type=number value=1515
 - finalizer/userdata/GC 入口仍是教学 helper，不是最终标准库命名；
 - 没有 base、math、string、table 等核心标准库适配器。
 
+<a id="learning-exercises"></a>
 ## 章末练习
 
-1. 删除 Heap thread 的 register roots，在暂停帧中保存自引用 table，复现 GC 后的 stale handle。
-2. 为 `SuspendedFrame` 增加 debug call-info，让恢复后错误包含暂停前的完整 caller chain。
-3. 写三层 A → resume(B) → resume(C)，在每一层验证 running/normal 状态和返回值方向。
-4. 让 `__call` 元方法尝试 yield，再移除 boundary guard，解释为什么结果偏离 Lua 5.1。
-5. 用 `VecDeque` 替换当前教学用的帧头部移除，测量一千层恢复链的差异。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>画三层 A→resume(B)→resume(C)，在每次 yield/resume 后标注 running/normal/suspended
+  和返回值方向。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>为 SuspendedFrame 增加 debug call-info，让恢复后错误包含暂停前 caller chain；同时
+  保持正常 resume 的 frame 状态不变。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>删除 Heap thread 的 register roots，在暂停帧保存自引用 table 并触发 GC；复现 stale
+  handle 后恢复 traced roots，解释宿主 scheduler map 为什么不能自动算作 GC root。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
+## 完成检查点
+
+- 能列出 SuspendedFrame 的所有必需字段；
+- 能手推嵌套 resume 的 owner turn 与状态；
+- 能解释 yield 路径为什么不能 close open upvalue；
+- 能画出 coroutine handle → suspended roots → heap objects 的 GC edges。
 
 ## 与成熟实现和专题章节的对应
 

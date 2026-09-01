@@ -2,7 +2,39 @@
 
 <div class="lesson-meta"><span>核心增量：可暂停且可重入的回收状态机</span><span>workspace</span><span>checkpoint v0.14</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>把一次完整遍历拆成可暂停状态机</strong>
+  <p>前置：v0.13 的 roots/edges、mark/sweep 与 Heap owner。新知识：三色不变量、持久 gray
+  queue、write barrier、ephemeron 固定点、finalizer 重入。完成后你应能解释任意 mutation
+  怎样保持黑对象不遗漏白 child。</p>
+</div>
+
 v0.13 每次 `collect` 都会一次扫描整个对象图。正确性已经成立，但暂停时间随 heap 增长；mutator 若在扫描中修改黑对象，还会破坏“黑对象不指向白对象”的不变量。本版增加一个核心能力：**完整 GC 可以在多个 VM checkpoint 之间暂停和恢复，同时保持弱引用与 finalizer 的可验证语义**。
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+设 parent 已被扫描成 black，child 仍是 white，此时脚本执行 `parent.x=child`。若没有 barrier，
+gray queue 已不会重访 parent，child 将被错误 sweep。先画出错误路径，再选择修复：把 child
+染 gray，或把 parent 重新染 gray。本版采用前者。
+
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. `GcPhase`：Pause/Mark/Atomic/Sweep 的合法迁移；
+2. collector state：跨 step 保存 gray stack、sweep IDs、cursor 和统计；
+3. `step(budget, roots)`：消费有限 work unit；
+4. Heap mutation API：集中执行 insertion barrier；
+5. allocation checkpoint：指令写回后按 debt 推进 step；
+6. Atomic：ephemeron 固定点、weak 清理、finalizer 发现；
+7. VM finalizer drain：释放 Heap 借用后回调，允许重入；
+8. budget=1 与 full collect 对照测试：证明两种调度结果一致。
+
+先只掌握强引用和三色不变量，再读 weak/finalizer。后两者不是独立算法，而是在普通 mark
+无法直接决定生死时，把决定延迟到 Atomic 一致性边界。
 
 ## 四个阶段
 
@@ -19,9 +51,16 @@ Pause ──开始周期──> Mark ──gray 为空──> Atomic ──固�
 | `Atomic` | ephemeron 固定点、finalizer 发现、弱引用清理 | 否，作为一致性边界完成 |
 | `Sweep` | 按 object ID 列表删除 white record | 是 |
 
-```rust
-{{#include ../../code/v14-incremental-gc/crates/lua_core/src/lib.rs:incremental_step}}
+`step` 的核心控制流可以先压缩为：
+
+```text
+Pause:  seed roots, enter Mark
+Mark:   pop at most budget gray objects and trace edges
+Atomic: repeat ephemerons to fixed point; queue finalizers; clear weak entries
+Sweep:  delete at most budget white snapshot IDs; finish cycle
 ```
+
+[查看完整 incremental step](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/crates/lua_core/src/lib.rs)
 
 每一步都会重新播种当前 roots，但只把 white root 加入 gray stack。若反复把已经 black 的 root 压到 LIFO 顶部，预算为 1 时真正的 child 会永远饥饿；对应回归测试正是从这个边界产生的。
 
@@ -60,9 +99,9 @@ Weak value 可以在 Atomic 直接依据 mark bit 删除。Weak key 更微妙：
 key 已标记 → 标记 value → 传播新 edges → 再检查 ephemeron
 ```
 
-```rust
-{{#include ../../code/v14-incremental-gc/crates/lua_core/src/lib.rs:atomic_weak_finalizer}}
-```
+Atomic 反复执行“已标记 key → 标记 value → 传播 edges”，直到没有新对象被标记，再清理
+未标记弱边并生成 finalizer 事件。
+[查看完整 Atomic/weak/finalizer 实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/crates/lua_core/src/lib.rs)
 
 固定点完成后，weak key/value 中指向未标记 heap object 的 entry 被删除。Primitive key/value 不由 GC 管理，因此视为存活。数组部分在 weak-value 模式下把死亡元素改为 nil，再执行尾部收缩。
 
@@ -127,13 +166,34 @@ type=number value=714
 - 没有 coroutine，尚未证明 collector 与 yield/resume 的 owner turn；
 - 没有标准库、Lua 模块或 CLI 工具完善。
 
+<a id="learning-exercises"></a>
 ## 章末练习
 
-1. 删除 table value 写入的 barrier，复现 black parent 指向 white child 后的 stale handle。
-2. 把 gray stack 改成 queue，比较预算为 1 时的遍历顺序和最大容器大小。
-3. 构造两层 ephemeron：第一个 value 使第二个 key 可达，证明为什么 Atomic 必须迭代。
-4. 写一个 finalizer，在回调中创建新 userdata、触发 GC 并让兄弟 userdata resurrection，记录执行顺序。
-5. 把 allocation debt 从对象数改为估算字节，设计 threshold 随存活集大小调整的公式。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>构造两层 ephemeron，让第一个 value 使第二个 key 可达；逐轮写出 Atomic 新增的 mark，
+  说明为什么必须迭代到固定点。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>把 gray stack 改成 queue，记录 budget=1 的遍历顺序和最大容器大小；要求最终 GcStats
+  与 full collect 保持一致。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>删除 table value barrier，复现 black→white 边导致的 stale handle；在恢复 barrier 后
+  增加一条只覆盖该 mutation family 的回归测试。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
+## 完成检查点
+
+- 能写出四个 phase 的状态迁移和持久字段；
+- 能为每类 Heap mutation 判断是否需要 barrier；
+- 能解释 weak key/value 与 ephemeron 的差别；
+- 能说明 finalizer 为什么必须在释放 Heap 借用后执行。
 
 ## 与成熟实现和专题章节的对应
 

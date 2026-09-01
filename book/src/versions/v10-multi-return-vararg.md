@@ -2,7 +2,23 @@
 
 <div class="lesson-meta"><span>核心增量：可变长度结果</span><span>workspace</span><span>checkpoint v0.10</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>让调用结果的宽度成为运行时状态</strong>
+  <p>前置：v0.9 的 CALL、CallInfo 和寄存器窗口。新知识：开放/固定宽度、top 哨兵、
+  Vec/切片窗口、显式 FrameOutcome 与 trampoline。完成后你应能手推列表调整和尾调用换帧。</p>
+</div>
+
 v0.9 把函数调用压缩成了“若干参数进去、一个值出来”。这便于先看清调用帧，却不是 Lua 的真实协议。本版只推进一个核心概念：**值列表的宽度可以到运行时才确定**。多返回、vararg、尾调用和 generic for 都建立在这个概念之上。
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+设 `values()` 返回 `10,20,30`。先分别写出 `a,b=values()`、`a,b=values(),1`、
+`a,b=(values())` 和 `{1,values()}` 的结果宽度。判断时只问两个问题：调用是否位于列表
+末项，括号是否强制折叠。不要先看 CALL 的 B/C 编码。
 
 ## 本版完成后能做什么
 
@@ -26,6 +42,21 @@ end
 - generic for 消费 `(generator, state, control)` 三元组；
 - 教学内建 `next`、`pairs` 和 `ipairs` 提供第一组迭代器。
 
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. 列表 context：用 `Option<usize>` 表达固定宽度或开放宽度；
+2. expression-list codegen：只有末项能把开放结果传给外层；
+3. `CALL/RETURN/VARARG`：用数量加一和 0 哨兵编码宽度；
+4. frame `top`：记录当前开放窗口右边界，而不是寄存器容量；
+5. `FrameOutcome`：区分普通多值返回与 tail-call 请求；
+6. trampoline：替换当前 Proto/arguments，不增加 Rust 或 Lua frame；
+7. generic-for：把 generator/state/control 变成固定三元组；
+8. 展开矩阵测试：覆盖赋值、参数、return、括号和 constructor。
+
+先在纸上分别维护“寄存器容量”和“top”。容量是编译期上限；top 是本次执行的动态边界。
+把两者混为一谈会让开放 CALL 读到无关 nil，或者截断真实多返回值。
+
 ## 先建立值列表规则
 
 表达式本身没有永久的“多值类型”。它是否展开，由所在的列表上下文决定：
@@ -41,9 +72,16 @@ end
 
 编译器因此不把“表达式求值”简单建模为 `Expr -> Register`。在需要列表的地方，它还要传入结果宽度：固定数量用 `Some(n)`，开放数量用 `None`。
 
-```rust
-{{#include ../../code/v10-multi-return-vararg/crates/lua_compiler/src/lib.rs:result_protocol}}
+编译器只需把列表位置转换成明确的 wanted width：
+
+```text
+non-last expression → wanted = 1
+last expandable expression in fixed context → wanted = remaining slots
+last expandable expression in open context  → wanted = open
+parenthesized call → wanted = 1
 ```
+
+[查看完整结果宽度 Codegen](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v10-multi-return-vararg/crates/lua_compiler/src/lib.rs)
 
 ## CALL、RETURN、VARARG 的宽度
 
@@ -55,9 +93,10 @@ end
 
 这里的 `top` 不是“永远等于寄存器数组长度”。它是当前开放值窗口的右边界。末尾调用或 `VARARG` 写入开放结果后，下一个 `CALL`、`RETURN` 或 `SETLISTOPEN` 才会消费它。
 
-```rust
-{{#include ../../code/v10-multi-return-vararg/crates/lua_vm/src/lib.rs:variable_results}}
-```
+VM 对三条指令使用同一解释方式：非零操作数表示“数量加一”，0 表示读取或写入到 top。
+把这一规则写在纸上，再进入
+[完整 VM 结果窗口实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v10-multi-return-vararg/crates/lua_vm/src/lib.rs)，
+分别找到参数窗口、结果窗口和 top 更新位置。
 
 ## 为什么尾调用需要 trampoline
 
@@ -145,13 +184,34 @@ type=number value=1060
 
 一个更直观的替代方案，是让每条指令都在寄存器旁携带 `Vec<Value>`。它会简化首次实现，却把参数展开、table 末项和 return 都变成额外复制。本版采用寄存器窗口加 `top`，因为它能逐步映射到 Lua 5.1 的调用约定。另一个替代方案是用 Rust 递归执行 `TAILCALL`；5000 层验收会直接暴露它仍在消耗宿主栈。
 
+<a id="learning-exercises"></a>
 ## 章末练习
 
-1. 给 `execute_multi` 增加“函数没有显式 return 时返回空列表”的测试，并说明 `execute` 为什么仍显示 `nil`。
-2. 写出 `a, b, c = 1, (values())` 与 `a, b, c = 1, values()` 的对照测试。
-3. 实现一个纯 Lua 的倒序数组迭代器，并用两个循环变量消费它。
-4. 把尾递归次数从 5000 提高到 20000，分别观察 Debug/Release 的耗时；结果不应出现调用深度或 Rust 栈溢出。
-5. 修改 `pairs` 测试，使 table 含有 `false` key，证明 generic for 只能以 `nil` 而不是真值作为终止条件。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>对照 <code>a,b,c=1,(values())</code> 与 <code>a,b,c=1,values()</code>，逐项说明括号、
+  末项和 nil 补齐如何决定最终宽度。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>给 <code>execute_multi</code> 增加“无显式 return 返回空列表”的测试，并实现一个纯
+  Lua 倒序迭代器，用两个循环变量消费它。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>把尾递归提升到 20000 次并分别运行 Debug/Release；若出现深度错误，沿
+  <code>FrameOutcome::TailCall</code> 检查是否意外创建了普通调用帧。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
+## 完成检查点
+
+- 能判定任意表达式列表中哪些调用展开；
+- 能解码 CALL/RETURN/VARARG 的 0 哨兵并更新 top；
+- 能说明 trampoline 为什么同时避免 Lua frame 和 Rust stack 增长；
+- 能解释 generic for 为什么只以 nil 终止。
 
 ## 与成熟实现和专题章节的对应
 

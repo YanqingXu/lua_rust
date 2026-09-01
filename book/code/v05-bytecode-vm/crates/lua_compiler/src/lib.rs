@@ -117,6 +117,7 @@ impl Codegen {
     // ANCHOR: codegen
     fn expression(&mut self, expression: &Expr) -> Result<u8, CompileError> {
         match expression {
+            // ANCHOR: codegen_leaf_unary
             Expr::Literal(value, position) => {
                 let register = self.register(*position)?;
                 let constant = self.constant(value.clone(), *position)?;
@@ -149,6 +150,8 @@ impl Codegen {
                 );
                 Ok(register)
             }
+            // ANCHOR_END: codegen_leaf_unary
+            // ANCHOR: codegen_short_circuit
             Expr::Binary(left, BinaryOp::And, right, position)
             | Expr::Binary(left, BinaryOp::Or, right, position) => {
                 let left_register = self.expression(left)?;
@@ -169,6 +172,8 @@ impl Codegen {
                 self.patch_jump(jump, self.code.len(), *position)?;
                 Ok(left_register)
             }
+            // ANCHOR_END: codegen_short_circuit
+            // ANCHOR: codegen_eager_binary
             Expr::Binary(left, op, right, position) => {
                 let left_register = self.expression(left)?;
                 let right_register = self.expression(right)?;
@@ -198,7 +203,7 @@ impl Codegen {
                     position.line,
                 );
                 Ok(left_register)
-            }
+            } // ANCHOR_END: codegen_eager_binary
         }
     }
     // ANCHOR_END: codegen

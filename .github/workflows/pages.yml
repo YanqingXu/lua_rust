@@ -36,6 +36,10 @@ jobs:
         shell: pwsh
         run: ./book/code/check.ps1
 
+      - name: Check teaching structure
+        shell: pwsh
+        run: ./tools/check_book_teaching.ps1
+
       - name: Install mdBook
         run: cargo install mdbook --version 0.5.4 --locked
 

@@ -5,30 +5,49 @@
 # 版本主线
 
 - [从 0 到 Lua 5.1](versions/README.md)
-  - [v0.0 · 最小解释器骨架](versions/v00-skeleton.md)
-  - [v0.1 · Lua Value 与字面量](versions/v01-value.md)
-  - [v0.2 · Lexer 与 Token](versions/v02-lexer.md)
-  - [v0.3 · Parser 与最小 AST](versions/v03-parser.md)
-  - [v0.4 · 完整表达式语义](versions/v04-expressions.md)
-  - [v0.5 · Bytecode 与最小寄存器 VM](versions/v05-bytecode-vm.md)
-  - [v0.6 · 变量、赋值与作用域](versions/v06-variables-scope.md)
-  - [v0.7 · 控制流](versions/v07-control-flow.md)
-  - [v0.8 · Table](versions/v08-table.md)
-  - [v0.9 · 函数与调用帧](versions/v09-functions.md)
-  - [v0.10 · 多返回、vararg 与迭代器](versions/v10-multi-return-vararg.md)
-  - [v0.11 · Closure 与 Upvalue](versions/v11-closure-upvalue.md)
-  - [v0.12 · Metatable 与元方法](versions/v12-metatable.md)
-  - [v0.13 · Runtime 所有权与完整 GC](versions/v13-runtime-gc.md)
-  - [v0.14 · 增量 GC、弱表与 Finalizer](versions/v14-incremental-gc.md)
-  - [v0.15 · Coroutine](versions/v15-coroutine.md)
-  - [v0.16 · 核心标准库](versions/v16-core-stdlib.md)
-  - [v0.17 · 宿主标准库与 Lua 模块](versions/v17-host-stdlib-modules.md)
-  - [v0.18 · CLI、REPL 与字节码工具](versions/v18-cli-tools.md)
-  - [v1.0 · Lua 5.1 语言运行时兼容收口](versions/v100-lua51-runtime.md)
+
+## 第一阶 · 建立程序边界
+
+- [v0.0 · 最小解释器骨架](versions/v00-skeleton.md)
+
+## 第二阶 · 用 Rust 表示语言
+
+- [v0.1 · Lua Value 与字面量](versions/v01-value.md)
+- [v0.2 · Lexer 与 Token](versions/v02-lexer.md)
+- [v0.3 · Parser 与最小 AST](versions/v03-parser.md)
+- [v0.4 · 完整表达式语义](versions/v04-expressions.md)
+
+## 第三阶 · 编译到寄存器 VM
+
+- [v0.5 · Bytecode 与最小寄存器 VM](versions/v05-bytecode-vm.md)
+- [v0.6 · 变量、赋值与作用域](versions/v06-variables-scope.md)
+- [v0.7 · 控制流](versions/v07-control-flow.md)
+
+## 第四阶 · 构造动态运行时
+
+- [v0.8 · Table](versions/v08-table.md)
+- [v0.9 · 函数与调用帧](versions/v09-functions.md)
+- [v0.10 · 多返回、vararg 与迭代器](versions/v10-multi-return-vararg.md)
+- [v0.11 · Closure 与 Upvalue](versions/v11-closure-upvalue.md)
+- [v0.12 · Metatable 与元方法](versions/v12-metatable.md)
+
+## 第五阶 · 管理对象与执行生命期
+
+- [v0.13 · Runtime 所有权与完整 GC](versions/v13-runtime-gc.md)
+- [v0.14 · 增量 GC、弱表与 Finalizer](versions/v14-incremental-gc.md)
+- [v0.15 · Coroutine](versions/v15-coroutine.md)
+
+## 第六阶 · 标准库、工具与兼容证明
+
+- [v0.16 · 核心标准库](versions/v16-core-stdlib.md)
+- [v0.17 · 宿主标准库与 Lua 模块](versions/v17-host-stdlib-modules.md)
+- [v0.18 · CLI、REPL 与字节码工具](versions/v18-cli-tools.md)
+- [v1.0 · Lua 5.1 语言运行时兼容收口](versions/v100-lua51-runtime.md)
 
 # 专题深入
 
 - [学习路线](ch01-start/roadmap.md)
+- [Rust 学习阶梯](ch01-start/rust-ladder.md)
 - [搭建与运行成熟实现](ch01-start/setup.md)
 
 ## 运行时核心

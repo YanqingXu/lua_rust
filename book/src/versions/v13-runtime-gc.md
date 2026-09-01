@@ -2,7 +2,24 @@
 
 <div class="lesson-meta"><span>核心增量：可回收的对象图</span><span>workspace</span><span>checkpoint v0.13</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>从引用计数迁移到唯一 Heap owner</strong>
+  <p>前置：v0.12 的 Rc 对象图、closure/upvalue 与 metatable。新知识：typed handle、
+  PhantomData、arena、roots/edges、迭代 mark-sweep 与 stale/foreign 校验。完成后你应能
+  为一张对象图手工执行完整 GC。</p>
+</div>
+
 v0.12 的 table、closure 和 upvalue 都由 `Rc` 强引用。这个模型便于先讲清共享身份，却无法回收 `table.self = table`，closure 捕获自身也会形成环。本版只完成一个核心迁移：**Runtime 成为所有 heap 对象的唯一 owner，语言值只携带经过校验的非拥有 handle，并加入一次完整 mark/sweep 回收**。
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+画两张图：一张自引用 table 已离开 scope；另一张同样的 table 仍被 global 指向。分别从
+roots 开始涂色，前者必须在 sweep 删除，后者必须保留。再把 global 改成宿主持有的裸
+GcRef：非拥有 handle 不是 root，若不登记 registry，对象仍可被回收并使 handle stale。
 
 ## 本版完成后能做什么
 
@@ -18,6 +35,22 @@ return reclaimed >= 1 -- true
 
 同一机制也必须证明相反方向：只要从 stack、global、registry、closure/upvalue 或 metatable 可达，对象就不能被误回收。
 
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. `GcRef<T>`：heap_id/object_id 加类型标记，不拥有对象；
+2. `HeapRecord`：唯一拥有 Table/Closure/Upvalue 等 payload；
+3. handle lookup：依次验证 heap、object existence 和 kind；
+4. VM root collector：active frames、globals、registry、metatables、temporaries；
+5. object tracer：从 Table/Closure/Upvalue 枚举 edges；
+6. mark stack：只访问未标记对象并继续压入 children；
+7. sweep 与失败恢复：删除 white，或在错误时清空本轮 mark；
+8. shutdown：唯一 owner 一次性 drain 全部 record。
+
+本章第一次要求把 Rust owner 与语言可达性彻底分开：Heap 是 Rust owner；GcRef 只是逻辑
+身份；GC roots 决定 Lua 对象是否继续存在。引用计数把这三件事混在 strong count 中，
+因此无法表达任意环。
+
 ## GcRef 不拥有对象
 
 `GcRef<T>` 只保存两个整数和一个零大小类型标记：
@@ -29,9 +62,16 @@ GcRef<TableObject> { heap_id, object_id }
              └─ 防止把另一个 Runtime 的 handle 混入当前对象图
 ```
 
-```rust
-{{#include ../../code/v13-runtime-gc/crates/lua_core/src/lib.rs:table_storage}}
+访问句柄时始终遵守同一验证顺序：
+
+```text
+handle.heap_id != heap.id       → ForeignHandle
+records lacks handle.object_id  → StaleHandle
+record kind != GcRef<T> kind    → WrongKind
+otherwise                       → borrow payload through Heap
 ```
+
+[查看完整 GcRef/Heap 实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v13-runtime-gc/crates/lua_core/src/lib.rs)
 
 复制 `GcRef` 不增加引用计数，也不延长对象寿命。Heap arena 的 `HashMap<object_id, HeapRecord>` 才拥有 Table、Closure 和 Upvalue。每次访问先检查 heap ID、对象是否仍存在以及对象种类：foreign handle 返回 `ForeignHandle`，已经 sweep 的 ID 返回 `StaleHandle`，不会解引用悬空地址。
 
@@ -143,13 +183,34 @@ type=number value=142
 - `gc_collect` / `gc_live` 是教学接口，不是最终 `collectgarbage` 合同；
 - arena 以正确性和可读性优先，尚未实现页分配、压缩或性能基线。
 
+<a id="learning-exercises"></a>
 ## 章末练习
 
-1. 构造两个 table 相互引用的环，分别在 global 保留和删除 global 后运行完整 GC，比较 `GcStats`。
-2. 暂时删除 primitive metatable roots，写一个在回收后访问 number 方法的失败测试。
-3. 不清理 `CLOSE A` 后的寄存器，观察自环测试为何不再回收，再解释 upvalue 为什么必须先关闭。
-4. 用 `(object_id, generation)` 且允许 slot 复用重写 handle，列出防止 ABA 所需的检查。
-5. 设计一个 `HostRoot` RAII guard：构造时写 registry，Drop 时清 entry；说明它如何处理嵌套宿主调用。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>为允许 slot 复用的 <code>(object_id,generation)</code> handle 列出防止 ABA 所需的验证，
+  并与本版“ID 永不复用”比较。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>构造两个 table 的环，分别在 global 保留和删除后比较 GcStats；再设计 HostRoot RAII
+  guard，让构造/Drop 对称更新 registry。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>暂时删除 primitive metatable root 或 CLOSE 后的寄存器清理，运行定向测试；分别解释
+  一个造成误回收、另一个造成假存活的原因。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
+## 完成检查点
+
+- 能区分 owner、handle、root 和 edge；
+- 能列出完整 root inventory 并手推 mark/sweep；
+- 能说明 foreign、stale、wrong-kind 三类失败；
+- 能解释为什么 close upvalue 必须先于清空死亡寄存器。
 
 ## 与成熟实现和专题章节的对应
 

@@ -191,6 +191,7 @@ fn evaluate_eager_binary(
     position: Position,
 ) -> Result<Value, Error> {
     match op {
+        // ANCHOR: compare_operators
         BinaryOp::Equal | BinaryOp::NotEqual => {
             let equal = left == right;
             Ok(Value::Boolean(if op == BinaryOp::Equal {
@@ -219,6 +220,8 @@ fn evaluate_eager_binary(
             };
             Ok(Value::Boolean(result))
         }
+        // ANCHOR_END: compare_operators
+        // ANCHOR: concat_operator
         BinaryOp::Concat => {
             let left_type = left.type_name();
             let right_type = right.type_name();
@@ -231,6 +234,8 @@ fn evaluate_eager_binary(
             bytes.extend(right);
             Ok(Value::String(ByteString::new(bytes)))
         }
+        // ANCHOR_END: concat_operator
+        // ANCHOR: arithmetic_operators
         BinaryOp::Add
         | BinaryOp::Subtract
         | BinaryOp::Multiply
@@ -258,6 +263,7 @@ fn evaluate_eager_binary(
             };
             Ok(Value::Number(result))
         }
+        // ANCHOR_END: arithmetic_operators
         BinaryOp::And | BinaryOp::Or => unreachable!("short-circuit operators are handled first"),
     }
 }

@@ -44,6 +44,7 @@ impl Vm {
 
     // ANCHOR: dispatch
     pub fn execute(&self, proto: &Proto) -> Result<Value, VmError> {
+        // ANCHOR: dispatch_setup_fetch
         proto.validate_shape().map_err(|message| VmError {
             pc: 0,
             line: 0,
@@ -63,8 +64,10 @@ impl Vm {
                 .opcode()
                 .map_err(|raw| self.error(proto, pc, format!("invalid opcode {raw}")))?;
             let mut next_pc = pc + 1;
+            // ANCHOR_END: dispatch_setup_fetch
 
             match opcode {
+                // ANCHOR: dispatch_value_ops
                 Opcode::LoadK => {
                     let value = proto
                         .constants
@@ -120,6 +123,8 @@ impl Vm {
                     };
                     self.write(&mut registers, instruction.a(), result, proto, pc)?;
                 }
+                // ANCHOR_END: dispatch_value_ops
+                // ANCHOR: dispatch_control_ops
                 Opcode::JumpIfFalse | Opcode::JumpIfTrue => {
                     let condition = self
                         .read(&registers, u16::from(instruction.a()), proto, pc)?
@@ -159,7 +164,7 @@ impl Vm {
                     let right = self.read(&registers, instruction.c(), proto, pc)?.clone();
                     let result = self.binary(opcode, left, right, proto, pc)?;
                     self.write(&mut registers, instruction.a(), result, proto, pc)?;
-                }
+                } // ANCHOR_END: dispatch_control_ops
             }
             pc = next_pc;
         }

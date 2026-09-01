@@ -284,6 +284,47 @@ body {
   background: var(--lr-green);
 }
 
+.learning-loop {
+  display: flex;
+  overflow-x: auto;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 1.5rem 0 2rem;
+  padding: 1rem;
+  border: 1px solid var(--lr-line);
+  border-radius: 14px;
+  background: var(--lr-panel);
+  white-space: nowrap;
+}
+
+.learning-loop span {
+  padding: 0.48rem 0.7rem;
+  border-radius: 999px;
+  color: var(--fg);
+  background: color-mix(in srgb, var(--bg) 72%, var(--lr-gold) 28%);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.learning-loop b {
+  color: var(--lr-rust);
+}
+
+.task-card {
+  margin: 1rem 0 2rem;
+  padding: 1.15rem 1.3rem;
+  border: 1px solid var(--lr-line);
+  border-left: 5px solid var(--lr-gold);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg) 86%, var(--lr-gold) 14%);
+}
+
+.task-card > strong {
+  display: block;
+  margin-bottom: 0.4rem;
+  font-size: 1.05rem;
+}
+
 .content main .checkpoint a:hover,
 .content main .checkpoint a:active {
   border-color: var(--lr-green-dark);

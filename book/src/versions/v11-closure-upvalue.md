@@ -2,7 +2,24 @@
 
 <div class="lesson-meta"><span>核心增量：跨函数共享局部状态</span><span>workspace</span><span>checkpoint v0.11</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>把捕获的位置与当前位置的值分开</strong>
+  <p>前置：v0.10 的 frame、寄存器窗口和尾调用。新知识：词法 resolver、共享稳定 slot、
+  open/closed 状态、Rc&lt;RefCell&gt; 身份迁移。完成后你应能跟踪一个 local 从 stack 到
+  closed value 的全过程。</p>
+</div>
+
 v0.10 已有函数对象、多返回和尾调用，但嵌套函数遇到外层 local 时仍把名字当作 global。本版增加一个核心能力：**函数可以捕获定义位置可见的 local，并在原调用帧结束后继续访问它**。
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+画两个 closure 同时捕获 `current` 的对象图。第一次 closure 修改后，第二个必须看到新值，
+所以捕获时复制 Value 是错误答案。再画 block 退出后原寄存器被新 local 复用的情况：若
+upvalue 永远指向 slot，旧 closure 会被新 local 污染，因此退出时必须 close。
 
 ## 本版完成后能做什么
 
@@ -29,6 +46,21 @@ counter(3) -- 15
 - numeric/generic for 每轮关闭捕获的循环变量；
 - 同一 Proto 每次执行 `CLOSURE` 都产生身份不同的函数对象。
 
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. resolver：local → parent local → parent upvalue → global；
+2. `UpvalueDescriptor`：记录从 parent stack 还是 parent upvalue 绑定；
+3. `Closure`：组合共享 Proto、绑定后的 UpvalueRef 与独立身份；
+4. `StackSlot`：给活跃寄存器提供稳定共享地址；
+5. open-upvalue map：以 `(frame_id, register)` 去重兄弟捕获；
+6. `GETUPVAL/SETUPVAL/CLOSE`：读取、修改和迁移状态；
+7. block/break/for/return/tail-call 清理点：决定何时 close；
+8. 兄弟共享、寄存器复用、跨两层捕获测试：证明模型完整。
+
+阅读时始终区分三种身份：Proto 是代码模板；Closure 是一次运行时函数对象；UpvalueRef
+是可被多个 Closure 共享的变量单元。把其中任意两种合并，都会在身份或共享测试中失败。
+
 ## Proto 不是 Closure
 
 Proto 是不可变的函数模板：字节码、常量、参数和 upvalue 描述符。Closure 才是运行时对象，它组合一个 Proto 和一组已经绑定的 `UpvalueRef`。
@@ -42,17 +74,23 @@ Proto ──描述──> upvalue 0: parent stack R[2]
 
 因此两个 closure 可以共享 Proto，却必须拥有独立函数身份；它们也可以让某些 upvalue 指向同一个共享单元。
 
-```rust
-{{#include ../../code/v11-closure-upvalue/crates/lua_core/src/lib.rs:function_ref}}
+三个运行时对象的关系可以先写成类型草图：
+
+```text
+Closure { proto: Rc<Proto>, upvalues: Vec<UpvalueRef> }
+UpvalueRef → RefCell<Open(StackSlot) | Closed(Value)>
+FunctionRef → Rc<Closure>  // identity belongs here
 ```
+
+[查看 FunctionRef/UpvalueRef 完整实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v11-closure-upvalue/crates/lua_core/src/lib.rs)
 
 ## 编译器怎样解析跨函数名字
 
 每个 Codegen 有一个 `Resolver`：保存当前函数的块级 local、已经分配的 upvalue 描述符，以及父函数 resolver。
 
-```rust
-{{#include ../../code/v11-closure-upvalue/crates/lua_compiler/src/lib.rs:lexical_resolver}}
-```
+Resolver 的递归只返回两种捕获路径：父 frame 的寄存器，或父 closure 已有的 upvalue。
+中间函数即使不直接读取该名字，也必须把第二种路径保存在自己的 descriptor 中。
+[查看完整词法 resolver](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v11-closure-upvalue/crates/lua_compiler/src/lib.rs)
 
 名字解析顺序固定为：
 
@@ -137,13 +175,34 @@ type=number value=135123
 - 没有 coroutine，不能跨 yield 保存 open upvalue；
 - 内建迭代器仍是 v0.10 的临时 `NativeFunction` 枚举。
 
+<a id="learning-exercises"></a>
 ## 章末练习
 
-1. 实现两个 closure：一个递增、一个重置，证明它们共享同一 upvalue。
-2. 删除 for body 末尾的 `CLOSE`，观察三个 closure 的结果如何变化，再与 Lua 5.1.5 对照。
-3. 写一个三层嵌套函数，让最内层同时捕获父函数 local 和祖父函数 local，检查 descriptor 的 `in_stack` 差异。
-4. 在带捕获 local 的 `do` 块中 `break`，然后声明复用寄存器的新 local，补一个回归测试。
-5. 解释 `local f = function() return f end` 与 `local function f() return f end` 为什么可能捕获不同绑定。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>解释 <code>local f=function() return f end</code> 与
+  <code>local function f() return f end</code> 的声明顺序，以及 resolver 会捕获哪个绑定。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>实现“递增”和“重置”两个 closure 证明共享 upvalue；再写三层捕获测试，检查
+  descriptor 的 <code>in_stack</code> 差异。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>删除 for body 末尾的 CLOSE，观察三个 closure 是否共享最后一次循环 slot；用对象图
+  解释失败后恢复每轮关闭。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
+## 完成检查点
+
+- 能手推跨两层名字解析和 descriptor 链；
+- 能解释兄弟 closure 为什么共享 UpvalueRef 而不是复制 Value；
+- 能列出所有必须执行 CLOSE 的控制流出口；
+- 能说明 open → closed 后寄存器为什么可以安全复用。
 
 ## 与成熟实现和专题章节的对应
 

@@ -2,6 +2,21 @@
 
 <div class="lesson-meta"><span>Checkpoint 10 / 20</span><span>嵌套 Proto</span><span>CallInfo</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>让函数值创建独立执行帧</strong>
+  <p>前置：v0.8 的对象身份与寄存器 VM。新知识：Rc&lt;Proto&gt;、嵌套 Proto、调用窗口、
+  显式 CallInfo、递归深度与 traceback。完成后你应能手推一次 CALL 的 caller/callee 状态。</p>
+</div>
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+为 `factorial(3)` 画三层 Lua frame。每层分别记录参数 `n`、返回 pc 和局部寄存器；不要
+把它们画成同一组寄存器。再预测参数不足和参数过多时 callee 前 `num_params` 个 slot 的值。
+
 ## 本版本增量
 
 v0.8 只有顶层 Proto 和一个寄存器窗口。v0.9 的唯一核心增量是“函数是值，调用创建新帧”：函数声明、`local function`、函数表达式、参数、单返回、递归、方法声明与冒号调用。
@@ -12,6 +27,22 @@ function factorial(n)
     return n * factorial(n - 1)
 end
 ```
+
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. `Proto`：拥有不可变 code/constants/nested protos 与参数元数据；
+2. `FunctionRef`：运行时身份，当前只共享 `Rc<Proto>`；
+3. function AST/codegen：把函数体编译成 nested Proto；
+4. call codegen：先求 callee/args，再复制到连续窗口；
+5. `CALL A B C`：A 是函数和返回位置，B/C 描述参数；
+6. `CallInfo`：记录 callee frame 及 caller source/line；
+7. `VmError.traceback`：错误传播时复制 Lua 栈，而不是泄漏 Rust 栈细节；
+8. 递归深度测试：在宿主 stack overflow 前返回结构化错误。
+
+Function 和 Proto 分离是下一章 closure 的前提：同一段不可变代码可以创建多个运行时
+函数对象，而每个函数未来还会携带不同 upvalue。`Rc<Proto>` 只共享代码，不代表两个
+Function 身份相同。
 
 ## Function 与 Proto 不是同一概念
 
@@ -37,9 +68,18 @@ Codegen 先按 Lua 顺序求值 callee 和所有参数，再把它们复制到�
 
 每次调用拥有独立寄存器 Vec、pc 与 Proto。VM 的 `CallInfo` 额外记录 caller source/line 以及参数窗口的 base/top；运行时错误从最深帧向外传播时，会将当前 call stack 复制到 `VmError.traceback`。
 
-```rust
-{{#include ../../code/v09-functions/crates/lua_vm/src/lib.rs:call_frame}}
+不要从近 300 行 dispatch 中寻找调用协议，先按一次 CALL 的状态变化阅读：
+
+```text
+caller: evaluate callee and args into a contiguous window
+  ↓ CALL
+callee: allocate max_stack_size registers; copy num_params values
+  ↓ execute until RETURN or VmError
+caller: write result into CALL.A; restore caller pc
+error: append caller source/line to traceback while unwinding
 ```
+
+[查看完整 frame/dispatch 实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v09-functions/crates/lua_vm/src/lib.rs)
 
 教学 VM 在 Rust 调用栈上递归执行帧，但所有 Lua 帧信息都显式存在 `CallInfo`。为了不让恶意递归先耗尽宿主栈，默认深度限制为 32；超出限制返回带完整 Lua traceback 的错误，而不是 Rust stack overflow。
 
@@ -86,11 +126,35 @@ cargo test --manifest-path book/code/v09-functions/Cargo.toml --workspace
 - Rust 宿主函数和标准库；
 - 平坦化单 Vec 栈；当前每帧使用独立寄存器 Vec。
 
-## 练习与迁移
+<a id="learning-exercises"></a>
+## 章末练习
 
-1. 手工跟踪 `factorial(3)` 的三个 CallInfo，记录每帧的参数 slot。
-2. 调用二参数函数时只传一个值，证明第二个 slot 保持 nil。
-3. 把 receiver 求值写两次，观察单次求值测试如何报警。
-4. 构造三层函数的类型错误，从 traceback 中找出每个 caller 行号。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>手工跟踪 <code>factorial(3)</code> 的三个 CallInfo，记录参数 slot、pc、Proto 和返回值
+  怎样回到 caller 的 A 寄存器。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>为二参数函数只传一个值，断言第二个 slot 为 nil；再构造三层类型错误并锁定每个
+  traceback caller 行号。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>临时让冒号调用对 receiver 求值两次，运行单次求值测试，找出重复副作用发生在
+  Codegen 的哪一步，再恢复临时寄存器复用。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
+## 完成检查点
+
+- 能区分 AST function、Proto、FunctionRef 和 CallInfo；
+- 能画出 CALL 前后的两个寄存器窗口；
+- 能解释 Function 身份为什么不能直接等同于 Proto 指针；
+- 能说明 Lua traceback 与 Rust 调用栈的边界。
+
+## 从本版迁往 v0.10
 
 从 v0.8 迁移时新增 `FunctionRef/Value::Function`、nested Proto、`CLOSURE/CALL`、函数 AST、参数 local、CallInfo 与 traceback。v0.10 会将单结果 CALL/RETURN 升级为可变宽度协议，并引入 vararg、tail call 和 generic for。

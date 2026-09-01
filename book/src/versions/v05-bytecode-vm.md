@@ -2,6 +2,26 @@
 
 <div class="lesson-meta"><span>Checkpoint 6 / 20</span><span>4-crate workspace</span><span>32-bit 指令</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>把直接求值拆成编译与执行</strong>
+  <p>前置：v0.4 的 AST 和语义 oracle。新知识：workspace 依赖边界、位域编码、常量表、
+  寄存器分配、跳转回填和 dispatch 状态机。完成后你应能从 AST 手推 Proto，再逐条更新
+  pc 与寄存器。</p>
+</div>
+
+本版信息量较大，请按五个微课阅读：crate 边界 → 指令位域 → Proto → Codegen → VM。
+每完成一节就用反汇编结果验证，不要把四个 crate 当成一个大文件阅读。
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+对表达式 `40 + 2`，先画出你认为最少需要的常量、寄存器和指令。再运行
+`--dump-bytecode` 对照。重点不是猜中 opcode 名，而是回答：常量放在哪里、运算中间值
+放在哪里、最终结果由哪条指令交还调用者。
+
 ## 架构转折点
 
 v0.4 由 Rust 递归函数直接遍历 AST。v0.5 的唯一核心增量是把执行路径迁移为：
@@ -25,6 +45,22 @@ v0.0–v0.4 中，拆 crate 只会增加 Cargo 概念，却没有稳定的边界
 
 快照根目录同时是 `lua_app` package 和 workspace root，因此仍然保留统一的 `src/`、`tests/` 与 `examples/` 入口。
 
+依赖箭头只能指向更稳定的数据层：app 可以组合 compiler 和 VM；VM 可以消费 core 的
+Proto；core 不能反过来调用 app。这个规则避免 `Value` 为了打印错误而依赖 CLI，也让
+compiler 与 VM 能分别单测。crate 边界不是文件整理，而是编译器强制执行的架构合同。
+
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. `lua_core::Opcode/Instruction`：把操作和操作数编码为 `u32`；
+2. `lua_core::Proto`：拥有常量、代码、行号和最大寄存器数；
+3. `lua_compiler::compile`：Lexer → Parser → Codegen；
+4. `Codegen::expression/register/constant/emit`：把树变成线性指令；
+5. `patch_jump`：表达式编译完后回填短路目标；
+6. `Vm::execute`：维护 pc 和寄存器数组；
+7. `lua_app::execute`：只负责组装 compiler 与 VM 的错误边界；
+8. `tests/pipeline.rs`：证明 v0.4 语义在迁移后不变。
+
 ## 32 位指令格式
 
 指令沿用 Lua 5.1 容易对照的布局：6 位 opcode、8 位 A、9 位 B 和 9 位 C。ABx 模式将 B/C 合并为 18 位常量索引，AsBx 再使用偏移编码表示有符号跳转。
@@ -47,8 +83,22 @@ Rust 学习点包括位移、掩码、`#[repr(u8)]`、`TryFrom<u8>` 与显式范
 
 每个字面量申请一个寄存器并生成 `LOADK`。一元运算就地覆盖输入寄存器；二元运算读取 B/C 并把结果写回 A。v0.5 使用只增不减的简单分配器，优先让寄存器流可见；后续引入局部变量时再学习释放与复用。
 
+叶节点和一元节点先展示最小的“申请寄存器 → 发指令 → 返回结果位置”协议：
+
 ```rust
-{{#include ../../code/v05-bytecode-vm/crates/lua_compiler/src/lib.rs:codegen}}
+{{#include ../../code/v05-bytecode-vm/crates/lua_compiler/src/lib.rs:codegen_leaf_unary}}
+```
+
+短路表达式需要先发占位跳转，编译右侧后再回填：
+
+```rust
+{{#include ../../code/v05-bytecode-vm/crates/lua_compiler/src/lib.rs:codegen_short_circuit}}
+```
+
+普通二元节点则依次获得左右寄存器，并把结果覆盖到左寄存器：
+
+```rust
+{{#include ../../code/v05-bytecode-vm/crates/lua_compiler/src/lib.rs:codegen_eager_binary}}
 ```
 
 `and/or` 的右侧仍然会被编译，但运行时由 `JumpIfFalse`/`JumpIfTrue` 跳过。Codegen 先放入 offset 为 0 的占位指令，编译右侧后再回填目标。这是 v0.7 复杂控制流 patch list 的最小预演。
@@ -57,11 +107,35 @@ Rust 学习点包括位移、掩码、`#[repr(u8)]`、`TryFrom<u8>` 与显式范
 
 VM 将 `max_stack_size` 转成寄存器数组，用 program counter 顺序取指、解码、执行。所有寄存器、常量与跳转访问都经过边界检查；恶意或损坏的 `Proto` 返回 `VmError`，不会导致 Rust panic。
 
+先看 VM 如何验证 Proto、分配寄存器并安全取指：
+
 ```rust
-{{#include ../../code/v05-bytecode-vm/crates/lua_vm/src/lib.rs:dispatch}}
+{{#include ../../code/v05-bytecode-vm/crates/lua_vm/src/lib.rs:dispatch_setup_fetch}}
+```
+
+值操作只读写寄存器，控制操作还会改变 `next_pc` 或直接返回：
+
+```rust
+{{#include ../../code/v05-bytecode-vm/crates/lua_vm/src/lib.rs:dispatch_value_ops}}
+```
+
+```rust
+{{#include ../../code/v05-bytecode-vm/crates/lua_vm/src/lib.rs:dispatch_control_ops}}
 ```
 
 VM 也带有指令数上限。当前 Codegen 只生成前向跳转，但这个限制从一开始就建立了宿主可以终止异常字节码的边界。
+
+以 `40 + 2` 为例，可以按下面的状态表阅读 dispatch；实际寄存器编号以反汇编为准：
+
+| pc | 指令 | 执行前 | 执行后 |
+|---:|---|---|---|
+| 0 | `LOADK R0 K0` | `R0=nil` | `R0=40` |
+| 1 | `LOADK R1 K1` | `R1=nil` | `R1=2` |
+| 2 | `ADD R0 R0 R1` | `R0=40,R1=2` | `R0=42` |
+| 3 | `RETURN R0` | `R0=42` | 返回 `42` |
+
+`Proto` 不变、寄存器可变、pc 单调前进或被跳转改写，是本版 VM 的三个核心状态边界。
+所有索引访问仍返回 `Result`，损坏 Proto 只能产生 `VmError`，不能越界 panic。
 
 ## 运行与预期输出
 
@@ -103,11 +177,34 @@ cargo test --manifest-path book/code/v05-bytecode-vm/Cargo.toml --workspace
 - Lua 5.1 全部 38 个 opcode；当前只有表达式 VM 的最小集合；
 - binary chunk 读写、跨版本字节码 ABI 与优化寄存器分配。
 
-## 练习与迁移
+<a id="learning-exercises"></a>
+## 章末练习
 
-1. 手工跟踪示例在 pc 0–11 期间的寄存器变化，标出哪些指令被跳过。
-2. 将一条指令的常量索引改为越界值，确认 VM 返回带 pc/行号的错误。
-3. 增加 `true and 1 or 2` 的反汇编快照，计算两个跳转的 target。
-4. 实验性释放右子树寄存器，观察 `max_stack_size` 如何下降。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>手工跟踪示例在 pc 0–11 期间的寄存器变化，标出短路跳过的指令和跳转 target。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>给 <code>true and 1 or 2</code> 增加反汇编快照，并在期望文本中锁定两个跳转目标。
+  要求 v0.4 迁移而来的全部语义测试仍然通过。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>将一条指令的常量索引改成越界值，跟踪它在哪个边界返回带 pc/行号的 VmError，确认
+  测试进程没有 panic。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
+## 完成检查点
+
+- 能画出四个 crate 的依赖方向并解释为什么 core 位于底层；
+- 能从一棵二元 AST 手推常量表、寄存器和指令；
+- 能按 pc 逐条更新寄存器并指出所有越界检查；
+- 能说明 v0.4 测试如何证明“机制改变但语义未改变”。
+
+## 从本版迁往 v0.6
 
 从 v0.4 迁移时，删除 AST evaluator，新增 `Instruction/Opcode/Proto`、Codegen、反汇编器与 VM dispatch，并将单 crate 拆成四个责任边界。v0.6 将在此基础上新增 global/local、多重赋值、作用域栈与局部寄存器复用。成熟实现的对应阅读材料是 [Bytecode](../ch03-compiler/bytecode.md) 与 [寄存器 VM](../ch04-vm/register-vm.md)。

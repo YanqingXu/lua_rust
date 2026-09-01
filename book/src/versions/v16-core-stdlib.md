@@ -2,7 +2,39 @@
 
 <div class="lesson-meta"><span>核心增量：统一的 Rust builtin 合同</span><span>5-crate workspace</span><span>checkpoint v0.16</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>用 catalog 与 adapter 约束所有宿主函数</strong>
+  <p>前置：v0.15 的 VM、Heap、metatable 和 protected boundary。新知识：crate API、函数
+  catalog、typed argument decoder、统一 HostError、受保护回调。完成后你应能新增 builtin
+  而不复制参数与错误协议。</p>
+</div>
+
 v0.15 已经能调用 Rust 写成的函数，但注册、取参和错误文案散落在 VM 初始化与 dispatch 中。本版增加一个核心能力：**用独立 `lua_stdlib` crate 声明公开 API，并让所有 builtin 共享同一套参数 coercion、返回值和 Lua 错误协议**。随后在这个边界上实现 base、math、string、table 和 coroutine 五组核心库。
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+分别预测 math 函数收到 number、数字字符串、非数字 byte string 和缺失参数时的结果。
+错误必须包含一基 argument index，string 参数仍不能假设 UTF-8。再预测 `answer=42` 后
+`_G.answer`：两者必须访问同一 Heap table，而不是两个同步副本。
+
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. core `NativeFunction`：稳定、可哈希的 builtin 身份；
+2. stdlib `FunctionSpec/LibrarySpec`：唯一公开 catalog；
+3. `Args`：required/number/integer/bytes/table 等统一 decoder；
+4. `HostError`：保留参数位置与可读原因；
+5. VM adapter：提供受控 Heap/调用能力并转换错误分类；
+6. global environment：唯一 Heap table，同时安装 `_G` 自引用；
+7. protected callback：pcall/xpcall/sort comparator 共用禁止 yield 边界；
+8. 公开函数矩阵：同时验证存在性、成功值、coercion 和失败文本。
+
+crate 边界对应三种 owner：stdlib 拥有声明和纯参数规则；VM 拥有 Runtime/Heap 与执行状态；
+core 只拥有可跨层传递的数据类型。让 stdlib 直接依赖 VM 会形成循环并放大宿主权限。
 
 ## 为什么现在才拆 `lua_stdlib`
 
@@ -24,9 +56,9 @@ lua_core <── lua_stdlib
 
 每个 Rust builtin 仍是可复制、可哈希的 `NativeFunction`，但按 base/math/string/table 分类。函数值不捕获 Rust closure；身份稳定，能放入 Lua table key、比较并由 GC 当作 primitive 处理。
 
-```rust
-{{#include ../../code/v16-core-stdlib/crates/lua_core/src/lib.rs:stdlib_native_ids}}
-```
+catalog 的最小形状是 `LibrarySpec { name, functions: &[FunctionSpec] }`，每个 spec 只关联
+Lua 名字与稳定 `NativeFunction` ID。
+[查看完整 builtin ID 与 catalog](https://github.com/YanqingXu/lua_rust/tree/main/book/code/v16-core-stdlib/crates)
 
 `lua_stdlib` 的 `FunctionSpec` 和 `LibrarySpec` 是唯一公开目录。VM 遍历 catalog 创建 library table，安装 math 常量，并为 string primitive 建立 `__index = string` 的 type metatable。因此 `string.sub(value, ...)` 与 `value:sub(...)` 走同一函数对象。
 
@@ -49,9 +81,9 @@ v0.15 用 Rust `HashMap<ByteString, Value>` 保存 global。若只额外创建�
 
 Lua C 库的 `luaL_checknumber` 接受 number，也接受可转换的 string；string 函数通常也接受 number 并先转成字节文本。若每个 builtin 自己 match，很容易出现不同函数对同一输入做不同决定。
 
-```rust
-{{#include ../../code/v16-core-stdlib/crates/lua_stdlib/src/lib.rs:host_args}}
-```
+把 decoder 当成逐项收窄：先取得 `Option<&Value>`，再执行缺参、类型、coercion 和范围检查，
+最后返回 builtin 真正需要的 Rust 类型。
+[查看完整 Args/HostError 实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v16-core-stdlib/crates/lua_stdlib/src/lib.rs)
 
 `Args` 提供：
 
@@ -63,9 +95,9 @@ Lua C 库的 `luaL_checknumber` 接受 number，也接受可转换的 string；s
 
 `HostError` 在 VM 边界加上函数名并分类为 `VmErrorKind::Type`。Heap、metamethod 或 Lua callback 错误保持自己的分类；多返回仍用 `Vec<Value>` 走 v0.10 的开放结果协议。
 
-```rust
-{{#include ../../code/v16-core-stdlib/crates/lua_vm/src/lib.rs:stdlib_adapter}}
-```
+VM adapter 根据 ID 分派，但所有分支都接收同一 `Args`、返回 `Vec<Value>`，并在单一边界
+把 HostError 转成带函数名的 VmError。
+[查看完整 stdlib adapter](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v16-core-stdlib/crates/lua_vm/src/lib.rs)
 
 ## 本版公开的核心库
 
@@ -138,13 +170,34 @@ type=number value=1616
 - `table.sort` 是教学 insertion sort，不是生产排序性能；
 - io、os、package、debug 和 Lua 文件模块尚未实现。
 
+<a id="learning-exercises"></a>
 ## 章末练习
 
-1. 新增一个无 Heap 副作用的 math 函数，只修改 enum 与 catalog，观察编译器如何指出 dispatch 漏项。
-2. 让 `print` 统一调用 Lua `tostring` 而非快速 stringify，并为失败的 `__tostring` 写合同测试。
-3. 为 `string.format` 增加宽度和精度 parser，禁止把 byte string 整体转换成 UTF-8。
-4. 把 table insertion sort 换成稳定 merge sort，设计 comparator 报错时不破坏 table 的事务策略。
-5. 把 allocation accounting 改成估算 bytes，让 `collectgarbage("count")` 返回 KB。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>比较 catalog、Args 和 VM adapter 的职责，说明把 Heap 访问放进 lua_stdlib 会造成哪些
+  依赖和权限问题。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>增加一个无 Heap 副作用的 math 函数，只修改 ID、catalog 和穷尽 dispatch；为 number、
+  数字字符串、缺参和错误类型各写一条合同测试。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>让 print 通过 Lua tostring，再故意使 <code>__tostring</code> 返回错误类型；确认错误保持
+  Metamethod/Type 分类而未被 HostError 覆盖。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
+## 完成检查点
+
+- 能画出 core/stdlib/vm/app 的依赖方向；
+- 能沿 Args 解释一个参数的 coercion 和错误编号；
+- 能说明 `_G` 为什么必须是真正的 global table；
+- 能新增一个 builtin 并补齐公开合同矩阵。
 
 ## 与成熟实现和专题章节的对应
 

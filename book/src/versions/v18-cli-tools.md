@@ -2,7 +2,40 @@
 
 <div class="lesson-meta"><span>核心增量：可自动验收的用户界面与观察工具</span><span>6-crate workspace</span><span>checkpoint v0.18</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>把终端行为和观察工具变成稳定协议</strong>
+  <p>前置：v0.17 的共享 Session、loader 与宿主 I/O。新知识：Action enum、终端检测、
+  BufRead 状态、稳定 JSON/CFG、子进程 timeout。完成后你应能从真实进程测试证明
+  stdout/stderr/exit-code 和 REPL 状态合同。</p>
+</div>
+
 到 v0.17 为止，binary 只读取一个文件并总是打印 Rust 风格的最终 Value。这足以演示 VM，却不是 Lua CLI 合同，也无法稳定观察编译器和执行状态。本版增加一个核心能力：**把脚本、交互和诊断都变成有明确 stdout/stderr/exit-code 合同的工具，并用真实子进程测试守住它们**。
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+为 `lua_app -e "x=1" script.lua arg` 写出 action 顺序和 `_G.arg` 索引。再分别预测未知 option、
+脚本运行时错误、help 的 stdout/stderr/exit code。最后判断 REPL 每行新建 VM 会破坏哪些状态：
+global、package cache、registry、coroutine 和 GC 都会丢失。
+
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. CLI parser：argv → 有序 `Vec<Action>`；
+2. `Session`：唯一持有跨 action/script/REPL 的 VM；
+3. arg-table builder：以 script position 为零点计算负/正索引；
+4. result boundary：Lua output、diagnostic 和 usage 映射到不同 stream/code；
+5. REPL buffer：complete/incomplete/error 三类编译结果；
+6. bytecode JSON：稳定表示 bytes、非有限 number 和 nested Proto；
+7. CFG builder：leaders → basic blocks → edges；
+8. process runner：spawn、关闭 stdin、并行 drain、deadline、kill exact child。
+
+本章的 Rust 学习点不是“会用 Command”，而是把一次进程执行当成资源协议：stdin 必须及时
+关闭，stdout/stderr 必须都被 drain，timeout 后必须 kill 并 wait，才能避免测试自身死锁或
+遗留 child。
 
 ## CLI 是动作序列，不是一个脚本参数
 
@@ -94,9 +127,9 @@ Lua string constant 可能包含 NUL 或无效 UTF-8，所以 JSON 不把它伪�
 
 CFG builder 先找 basic-block leaders：入口、jump target、jump/return 后的下一条指令；再为每个 block 输出 DOT node 和 jump/next edge。
 
-```rust
-{{#include ../../code/v18-cli-tools/crates/lua_bytecode/src/lib.rs:bytecode_cfg}}
-```
+CFG 构建分两遍：第一遍收集入口、jump target、终止指令后继作为 leaders；第二遍切分 block
+并按 opcode 添加 jump/fallthrough edge。
+[查看完整 CFG builder](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/crates/lua_bytecode/src/lib.rs)
 
 Jump target 必须落在 code 范围并恰好对应 leader，否则返回 bytecode error。ForPrep/ForLoop 和条件跳转分别建模，不根据源码缩进猜控制流。
 
@@ -169,13 +202,34 @@ cargo test --manifest-path book/code/v18-cli-tools/Cargo.toml --workspace
 - Lua 5.1 binary chunk、C API 与 dynamic native module 仍分别属于 v1.1、v1.2、v1.3；
 - v0.16/v0.17 已登记的 pattern、标准库和 debug 差异仍需 v1.0 收口。
 
+<a id="learning-exercises"></a>
 ## 章末练习
 
-1. 为 REPL 增加历史 abstraction，但让非 TTY process tests 仍使用纯 BufRead backend。
-2. 给 JSON 顶层增加 schema version，并写 backward-compatibility golden test。
-3. 在 CFG node 中加入 source line 区间和常量摘要，保持 DOT escape 正确。
-4. 增加 trace filter（function/opcode/pc range），证明关闭 trace 时不分配 event。
-5. 把 manifest runner 抽成独立 binary，支持每 case 工作目录、环境变量和 fixture side-effect 声明。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>解释为什么函数单测不能证明 stdout/stderr/exit code、stdin EOF、文件副作用和 child
+  timeout 合同。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>为 REPL 增加 history abstraction，同时保留纯 BufRead backend；用非 TTY 进程测试证明
+  history 不改变 continuation prompt 和 EOF 行为。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>构造一个不退出 fixture，观察 runner 是否在 deadline 后 kill 并 wait exact child；确认
+  测试不会按进程名误杀，也不会遗留后台进程。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
+## 完成检查点
+
+- 能从 argv 手推 Action 顺序与 arg table；
+- 能区分 usage、compile/runtime 和正常退出合同；
+- 能解释 JSON、CFG 与 trace 各自回答的问题；
+- 能列出可靠子进程 runner 的完整生命周期。
 
 ## 与成熟实现和专题章节的对应
 

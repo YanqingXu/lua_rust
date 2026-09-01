@@ -246,6 +246,7 @@ impl Parser {
 
     // ANCHOR: pratt_parser
     fn expression(&mut self, minimum_binding_power: u8) -> Result<Expr, ParseError> {
+        // ANCHOR: pratt_prefix
         let token = self.advance().clone();
         let mut left = match token.kind {
             TokenKind::Nil => self.literal(Value::Nil, token.position),
@@ -295,7 +296,9 @@ impl Parser {
                 });
             }
         };
+        // ANCHOR_END: pratt_prefix
 
+        // ANCHOR: pratt_infix
         while let Some((op, left_power, right_power)) = infix_binding_power(&self.current().kind) {
             if left_power < minimum_binding_power {
                 break;
@@ -309,6 +312,7 @@ impl Parser {
                 position,
             };
         }
+        // ANCHOR_END: pratt_infix
         Ok(left)
     }
     // ANCHOR_END: pratt_parser

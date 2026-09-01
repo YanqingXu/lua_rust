@@ -2,7 +2,23 @@
 
 <div class="lesson-meta"><span>核心增量：动态语义分发</span><span>workspace</span><span>checkpoint v0.12</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>在 raw 快速路径之后调用动态后备行为</strong>
+  <p>前置：v0.11 的 closure、调用协议和对象身份。新知识：快/慢路径、handler 身份、
+  迭代链上限、错误分类与回调重入。完成后你应能从一个 opcode 手推 raw 操作和元方法调用。</p>
+</div>
+
 v0.11 已经能创建 closure、共享 upvalue 并执行完整的调用协议，但每种操作仍只认识 VM 内建类型。本版只增加一个核心能力：**值可以通过 metatable 为既有操作提供后备行为**。这把“对象系统”从语法特性变成了普通 table、函数和一套统一的事件协议。
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+先判断一次 `object[key]` 会在哪些条件下直接返回、在哪些条件下查 `__index`、何时把
+请求转交给另一个 table。再判断两个 table 各有源码相同但身份不同的 `__eq` closure
+时是否调用元方法：答案是否，因为比较要求共享同一 handler 身份。
 
 ## 本版完成后能做什么
 
@@ -43,13 +59,29 @@ return answer:double() + answer(10) -- 504
 
 `setmetatable`、`getmetatable`、`rawget`、`rawset` 和 `tostring` 也进入全局环境。`__metatable` 非 nil 时，公开读取会得到保护值，再次修改则产生 `Metamethod` 错误。
 
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. raw `Table::get/set`：只操作容器，绝不回调 Lua；
+2. `Value → metatable`：区分对象 metatable 与 primitive type metatable；
+3. `metamethod/first_metamethod/shared_metamethod`：按操作选择 handler；
+4. `call_event`：复用普通 Lua/native 调用和多返回协议；
+5. index/newindex/call 链：迭代转交并统一执行 64 层上限；
+6. arithmetic/comparison dispatch：先快速路径，再按左右与共享规则选择事件；
+7. `VmErrorKind`：把稳定机器分类与可读消息分开；
+8. raw、链循环、handler 身份测试：证明慢路径不会污染容器层。
+
+最重要的借用规则是：离开 `RefCell` 借用后才能调用 Lua handler。否则元方法再次访问同一
+table 会触发借用冲突。先复制所需句柄、结束 raw 借用、再进入 `&mut Vm` 慢路径，是动态
+语言回调与 Rust 内部可变性共存的关键模式。
+
 ## Raw 快速路径与元方法慢路径
 
 每个 table 新增一个可选 `TableRef`。`get`、`set` 仍然只做原始访问，不在核心容器里偷偷触发 Lua 代码；VM 的操作分发才负责查找元方法。
 
-```rust
-{{#include ../../code/v12-metatable/crates/lua_core/src/lib.rs:table_storage}}
-```
+容器层只增加 `Option<TableRef>` 的存取；它不解释事件名，也不持有 VM。这样 raw API 可以
+永远在不执行 Lua 的前提下完成。
+[查看完整 Table 容器实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v12-metatable/crates/lua_core/src/lib.rs)
 
 这个边界很重要：若 `TableRef::get` 本身递归执行 `__index`，实现 `rawget` 会变得困难，借用冲突也会和语言调用栈混在一起。本版采用两阶段模型：
 
@@ -58,9 +90,19 @@ return answer:double() + answer(10) -- 504
 3. 事件是函数就按普通调用协议执行，是 table 就继续索引/写入链；
 4. 没有事件时，table 读取返回 nil，其他非法操作返回 `Type` 错误。
 
-```rust
-{{#include ../../code/v12-metatable/crates/lua_vm/src/lib.rs:metamethod_dispatch}}
+慢路径按一个可终止循环建模：
+
+```text
+for depth in 0..64:
+    if raw fast path succeeds: return result
+    event = raw lookup of metamethod
+    if event is callable: invoke through normal CALL protocol
+    if event is proxy table: value = event; continue
+    otherwise: return Type/Metamethod error
+return Limit error
 ```
+
+[查看完整元方法分发实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v12-metatable/crates/lua_vm/src/lib.rs)
 
 `__index`、`__newindex` 和 `__call` 都可能把请求转交给另一个带 metatable 的值。为了让错误可预测，三类链统一限制为 64 层，循环或超长代理链返回 `VmErrorKind::Limit`，而不是耗尽 Rust 栈。
 
@@ -160,13 +202,34 @@ type=number value=8348
 - 没有 Lua 文件模块、REPL、binary chunk、C API 或动态 native module；
 - table `#` 的边界仍沿用教学数组长度，不代表 Lua 5.1 未定义边界的全部行为。
 
+<a id="learning-exercises"></a>
 ## 章末练习
 
-1. 用 `__index` 和 `__newindex` 实现一个把读写都记录到日志 table 的 proxy，并用 `rawget` 证明日志不会递归触发自身。
-2. 为二维向量实现 `__sub`、`__eq` 与 `__tostring`，再故意让左右 metatable 使用两个不同的 `__eq` closure，观察共享 handler 规则。
-3. 把元方法链上限从 64 改为 3，构造四层 `__index` 代理并检查 `VmErrorKind::Limit`。
-4. 删除 CALL 前的 `resolve_callable`，解释普通调用和 tail call 哪些测试会分别失败。
-5. 将 primitive metatable 存储从字符串 key 改为 `ValueKind` enum，比较两种表示在可扩展性和非法状态上的差异。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>比较字符串 type key 与 <code>ValueKind</code> enum 保存 primitive metatable 的非法状态、
+  扩展成本和匹配完整性。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>用 <code>__index/__newindex</code> 写日志 proxy，并以 rawget 证明日志不会递归；再给
+  二维向量实现共享 handler 的 <code>__eq</code>。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>把链上限改为 3，构造四层代理并断言 <code>VmErrorKind::Limit</code>；沿循环确认失败
+  发生在受控边界，而不是 Rust stack overflow。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
+## 完成检查点
+
+- 能画出 raw fast path → handler lookup → call_event 的完整路径；
+- 能说明比较为什么要求共享 handler 身份；
+- 能指出每次 Lua 回调前必须释放的 RefCell 借用；
+- 能区分 Type、Metamethod、Limit 与 Bytecode 错误。
 
 ## 与成熟实现和专题章节的对应
 

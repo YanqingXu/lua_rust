@@ -2,7 +2,39 @@
 
 <div class="lesson-meta"><span>核心增量：从“有实现”变为“有证据的发布合同”</span><span>6-crate workspace</span><span>checkpoint v1.0</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>让每个兼容结论都有可追溯证据</strong>
+  <p>前置：v0.18 的语言、CLI 和观察协议。新知识：闭世界矩阵、双向引用校验、schema
+  version、oracle provenance、差分子进程与 release gate。完成后你应能区分代表性通过、
+  partial deviation 和被明确排除的版本边界。</p>
+</div>
+
 v0.18 已经能运行脚本、模块和协程，也能观察 bytecode、CFG 与 trace。但功能数量不是兼容性证据：如果测试没有说明参照物、平台归一化规则和允许差异，“测试通过”仍可能只是与自己一致。本版完成三件事：**补齐核心源码语法缺口、冻结可观察协议、让每项兼容结论都能追溯到测试或偏差 ID**。
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+判断以下证据各能证明什么：一个 golden output、五个 official-oracle fixtures、38 项语义
+映射、完整官方测试套件。它们强度不同，不能互相冒充。再为 complete/partial/excluded
+各写一行能力矩阵，检查是否需要 test evidence、deviation ID 或 future-version boundary。
+
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. capabilities.tsv：闭世界列出功能、状态、证据和 deviation；
+2. deviations.tsv：为 partial 项登记范围、处置和目标版本；
+3. release tests：双向检查 capability↔deviation，不允许孤儿或假 complete；
+4. versioned JSON/trace envelope：冻结 consumer 可观察协议；
+5. Lua51Opcode audit：覆盖官方 ordinal，但明确不是 binary compatibility；
+6. oracles.toml：固定版本、commit、URL 与 hash；
+7. differential runner：三个真实进程、唯一归一化、timeout 与 lane 结果；
+8. release gate：本地质量门与可选外部 oracle 证据分层报告。
+
+本版阅读顺序从证据到实现：先问“这个结论由什么证明”，再进入 parser/opcode/tool 代码。
+测试存在并不自动成为证据；只有覆盖对象、参照物和允许归一化都明确时，才能支撑对应行。
 
 ## 先定义“完成”
 
@@ -172,14 +204,28 @@ Release gate 还要求相同测试在 `--release` 下通过、Clippy 零 warning
 
 后三组 v1.0 范围内差异分别由 `LUA51-D004`–`LUA51-D011` 登记；它们不是未声明通过项。
 
+<a id="learning-exercises"></a>
 ## 章末练习
 
-1. 给 capability parser 增加 evidence 文件内容哈希，检测文件存在但证据漂移的情况。
-2. 新增错误 fixture，设计只比较错误类别而不依赖绝对路径的 schema。
-3. 选择一个 composite opcode，从源码、bytecode 和 VM trace 三层证明语义。
-4. 实现 `string.match` 的最小 pattern VM，并拆分 `LUA51-D005`。
-5. 给 release gate 添加 benchmark baseline，避免把不同 CPU 的绝对时间当兼容门。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>选择一个 composite opcode，从源码行为、教学 bytecode 与 VM trace 三层描述证据，并
+  解释为什么仍不能读取官方 binary chunk。</p>
+</div>
 
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>给 capability evidence 增加内容 hash，检测文件存在但证据漂移；同时为错误 fixture
+  设计不依赖绝对路径的分类 schema。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>故意删除一条 deviation 反向引用或给 complete 项绑定 deviation，运行 release test，
+  沿失败信息验证闭世界检查能准确指出非法关系。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
 ## 完成检查点
 
 读者应能解释：为什么双 oracle 比单个 expected output 强；为什么“38 项语义映射”不等于“binary chunk 兼容”；为什么偏差注册表必须双向闭合；以及为何外部 oracle 缺失必须显示为 skipped 而不能假绿。

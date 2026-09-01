@@ -2,7 +2,40 @@
 
 <div class="lesson-meta"><span>核心增量：可失败、需清理的宿主资源</span><span>5-crate workspace</span><span>checkpoint v0.17</span></div>
 
+<a id="learning-task-card"></a>
+## 学习任务卡
+
+<div class="task-card">
+  <strong>让 Runtime 明确拥有宿主资源与加载事务</strong>
+  <p>前置：v0.16 的 catalog/adapter、v0.13 的 Heap owner。新知识：typed userdata、
+  Option&lt;File&gt; 状态、确定性 drain、loader cache/sentinel/rollback、平台失败协议。完成后
+  你应能追踪文件和 require 从创建到关闭或回滚的生命期。</p>
+</div>
+
 v0.16 的 math/string/table 函数主要处理内存中的 `Value`。文件、环境、时钟和模块加载不同：它们会接触平台状态，可能部分成功，且离开 Lua 作用域后仍需要关闭资源。本版增加一个核心能力：**让 Runtime 对宿主资源、加载缓存和调试视图拥有明确的生命周期与失败协议**。
+
+<a id="learning-predict"></a>
+## 先预测再运行
+
+为一个 file userdata 画两条边：Heap identity/metatable edge 和 VM map 中的 OS-handle owner
+edge。`file:close()` 后 userdata 仍存在，但 map value 变成 closed tombstone。再手推 require
+第一次失败：循环 sentinel 必须删除，否则修复文件后的第二次调用会错误命中缓存。
+
+<a id="learning-code-map"></a>
+## 代码阅读地图
+
+1. UserdataRef：Lua/GC 身份与 per-object metatable；
+2. VM file map：`UserdataRef → Option<File>`，唯一拥有 OS handle；
+3. close/prune/drop：显式关闭、GC 后清理、VM shutdown 三条 drain 路径；
+4. byte-oriented read/write：内容保持 bytes，路径另走平台 adapter；
+5. loader：复用当前 compiler/VM/global/registry；
+6. `package.loaded`：truthy cache、循环 sentinel、成功 commit、失败 rollback；
+7. path search：模板替换与候选诊断累积；
+8. debug views：只暴露真实存在的 Proto/upvalue/registry/call-info 数据。
+
+这里有两套不同的生命周期：Heap 决定 Lua userdata identity 是否可达；VM map 决定宿主 File
+何时关闭。它们通过 typed handle 关联，但不能互相替代。只删除 Heap record 而不 prune map
+会泄漏 OS handle，只关闭 File 而不保留 tombstone又无法实现 `io.type`。
 
 ## 文件不是普通 userdata 标签
 
@@ -17,9 +50,16 @@ Lua userdata ──identity──> Runtime file entry ──owns──> OS handl
 
 Heap userdata 新增独立 metatable edge，collector 会追踪它。共享 file metatable 的 `__index` 指回自身，安装 read/write/close/flush/seek；因此 `file:read()` 使用 v0.12 已实现的方法调用语义，不需要在 Parser 中添加特殊语法。
 
-```rust
-{{#include ../../code/v17-host-stdlib-modules/crates/lua_vm/src/lib.rs:host_file_resources}}
+资源状态机可以先写成：
+
+```text
+open:   map[id] = Some(File)
+close:  take Some(File); map[id] = None
+prune:  if Heap handle is stale, remove map entry
+drop:   clear map before Heap shutdown
 ```
+
+[查看完整宿主文件资源实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v17-host-stdlib-modules/crates/lua_vm/src/lib.rs)
 
 文件有三条关闭路径：
 
@@ -86,9 +126,9 @@ package.preload[name]? ──否──> path 模板替换 ? ──> 读文件并
 非 nil 结果写缓存；nil 保留/读取缓存    删除 sentinel，允许修复后重试
 ```
 
-```rust
-{{#include ../../code/v17-host-stdlib-modules/crates/lua_vm/src/lib.rs:lua_module_loader}}
-```
+require 是一个带回滚的事务：检查 cache → 定位 loader → 写循环 sentinel → 调 loader →
+提交非 nil 结果；任一步失败都删除本次 sentinel，保留未来重试能力。
+[查看完整 module loader](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v17-host-stdlib-modules/crates/lua_vm/src/lib.rs)
 
 模块名中的 `.` 转成 `/`，每个以分号分隔的 path template 都替换 `?`。测试包含 preload、同一模块只执行一次、A/B 循环依赖、缺失模块诊断，以及“第一次 loader 报错、修改文件后同一 VM 重试成功”。
 
@@ -156,13 +196,34 @@ type=number value=1717
 - Windows host path 当前要求 UTF-8，未覆盖任意宽字符路径；
 - v0.16 尚未实现的 Lua pattern 与完整 string.format 仍未补齐。
 
+<a id="learning-exercises"></a>
 ## 章末练习
 
-1. 给 file userdata 增加 `__gc` callback，与 VM sweep 后 prune 比较调用顺序和重入风险。
-2. 实现 file:lines iterator；明确 iterator 如何拥有 file handle、EOF 后何时自动关闭。
-3. 在 require 的 loader 执行前后制造 GC checkpoint，证明 package tables、loader function 和循环 sentinel 都是 roots。
-4. 给每个动态 chunk 写入 `@path` debug name，让 traceback 显示模块来源。
-5. 把 UTF-8 host path adapter 换成 Windows `OsString`/Unix raw bytes 的平台 trait，并设计跨平台测试。
+<div class="exercise understanding">
+  <strong>理解题</strong>
+  <p>分别列出 Lua error 与普通平台失败的返回形状，并解释 file userdata identity 与 OS
+  handle owner 为什么放在不同容器。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题</strong>
+  <p>实现 file:lines iterator，明确 iterator 对 file 的引用、EOF 自动关闭条件和显式关闭后
+  的错误；增加实际文件删除测试验证 handle 释放。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题</strong>
+  <p>临时删除 require 失败 rollback，制造“首次报错、修复后重试”测试；观察 sentinel 如何
+  伪装成成功 cache，再恢复事务回滚。</p>
+</div>
+
+<a id="learning-checkpoint"></a>
+## 完成检查点
+
+- 能画出 userdata、VM resource map 和 OS handle 的 owner 图；
+- 能解释三条资源 drain 路径；
+- 能手推 require cache/sentinel/commit/rollback；
+- 能区分 Lua error 与 `nil,message` 平台失败。
 
 ## 与成熟实现和专题章节的对应
 
