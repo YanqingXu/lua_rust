@@ -68,10 +68,18 @@ $AllOk = $true
 foreach ($tool in $RequiredTools) {
     $name = $tool.Name
     try {
-        $output = & $tool.Check
+        # Windows PowerShell 5.1 parses `& $tool.Check` as invoking `$tool`
+        # with a member-looking argument. Store the script block first so the
+        # call operator receives the intended command on both powershell.exe
+        # and pwsh.
+        $check = $tool["Check"]
+        $output = @(& $check)
+        if ($LASTEXITCODE -ne 0) {
+            throw "$name exited with status $LASTEXITCODE"
+        }
         Write-Host "  [OK] $name" -ForegroundColor Green
         if ($Verbose) {
-            Write-Host "       $output" -ForegroundColor Gray
+            Write-Host "       $($output -join "`n       ")" -ForegroundColor Gray
         }
     }
     catch {
@@ -80,7 +88,8 @@ foreach ($tool in $RequiredTools) {
         if ($InstallTools) {
             Write-Host "    Installing $name..." -ForegroundColor Yellow
             try {
-                & $tool.Install
+                $install = $tool["Install"]
+                & $install
                 Write-Host "    [OK] $name installed" -ForegroundColor Green
             }
             catch {

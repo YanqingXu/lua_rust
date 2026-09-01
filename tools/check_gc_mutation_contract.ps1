@@ -28,6 +28,24 @@ $knownStatuses = @("implemented", "construction_only", "atomic_rescan")
 $resolvedInventory = [System.IO.Path]::GetFullPath((Join-Path $Root $InventoryPath))
 $families = @()
 
+function Get-RootRelativePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $rootPrefix = $Root.TrimEnd([char[]]@('\', '/')) +
+        [System.IO.Path]::DirectorySeparatorChar
+    if (-not $fullPath.StartsWith(
+        $rootPrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Path is outside project root: $fullPath"
+    }
+    return $fullPath.Substring($rootPrefix.Length)
+}
+
 try {
     if (-not (Test-Path -LiteralPath $resolvedInventory -PathType Leaf)) {
         throw "Inventory file does not exist: $resolvedInventory"
@@ -159,7 +177,7 @@ try {
         "crates\lua_core\src\gc\weak.rs"
     )
     foreach ($file in $productionFiles) {
-        $relative = [System.IO.Path]::GetRelativePath($Root, $file.FullName)
+        $relative = Get-RootRelativePath -Path $file.FullName
         $lines = @(Get-Content -LiteralPath $file.FullName)
         for ($index = 0; $index -lt $lines.Count; $index++) {
             if ($lines[$index] -match '^\s*#\[cfg\(test\)\]') {

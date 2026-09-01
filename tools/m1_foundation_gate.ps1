@@ -265,31 +265,55 @@ function Assert-NoMatches {
     )
 
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    $oldPreference = $ErrorActionPreference
+    $foundMatches = [System.Collections.Generic.List[string]]::new()
     try {
-        $ErrorActionPreference = "Continue"
-        $arguments = @("-n", "--pcre2", $Pattern) + $Paths
-        $matches = @(& rg @arguments 2>&1)
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $oldPreference
-        $timer.Stop()
-    }
+        $regex = [regex]::new($Pattern)
+        foreach ($relativePath in $Paths) {
+            $absolutePath = Join-Path $Root $relativePath
+            if (Test-Path -LiteralPath $absolutePath -PathType Leaf) {
+                $files = @(Get-Item -LiteralPath $absolutePath)
+            } elseif (Test-Path -LiteralPath $absolutePath -PathType Container) {
+                $files = @(Get-ChildItem -LiteralPath $absolutePath -Recurse -File)
+            } else {
+                throw "Search path does not exist: $relativePath"
+            }
 
-    if ($exitCode -eq 1) {
-        Add-Step -Name $Name -Status "passed" -ExitCode 0 `
-            -DurationMs $timer.ElapsedMilliseconds
+            foreach ($file in $files) {
+                $lines = @(Get-Content -LiteralPath $file.FullName)
+                $displayPath = $file.FullName
+                if ($displayPath.StartsWith(
+                    $Root,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )) {
+                    $displayPath = $displayPath.Substring($Root.Length).TrimStart(
+                        [char[]]@('\', '/')
+                    )
+                }
+                for ($index = 0; $index -lt $lines.Count; $index++) {
+                    if ($regex.IsMatch($lines[$index])) {
+                        $foundMatches.Add(
+                            "${displayPath}:$($index + 1):$($lines[$index].Trim())"
+                        )
+                    }
+                }
+            }
+        }
+    } catch {
+        $timer.Stop()
+        Add-Step -Name $Name -Status "failed" -ExitCode 2 `
+            -DurationMs $timer.ElapsedMilliseconds -Detail $_.Exception.Message
         return
     }
-    if ($exitCode -eq 0) {
+    $timer.Stop()
+
+    if ($foundMatches.Count -ne 0) {
         Add-Step -Name $Name -Status "failed" -ExitCode 1 `
             -DurationMs $timer.ElapsedMilliseconds `
-            -Detail (@($matches | Select-Object -First 30) -join "`n")
+            -Detail (@($foundMatches | Select-Object -First 30) -join "`n")
         return
     }
-    Add-Step -Name $Name -Status "failed" -ExitCode $exitCode `
-        -DurationMs $timer.ElapsedMilliseconds `
-        -Detail "rg failed: $(@($matches | Select-Object -Last 20) -join "`n")"
+    Add-Step -Name $Name -Status "passed" -ExitCode 0 `
+        -DurationMs $timer.ElapsedMilliseconds
 }
 
 function Assert-NoProductionMatches {
