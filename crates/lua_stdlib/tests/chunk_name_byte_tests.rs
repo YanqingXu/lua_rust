@@ -9,8 +9,8 @@ fn load_and_loadstring_keep_lua_provided_chunk_name_bytes() {
     let mut runtime = Runtime::new();
     let proto = {
         let mut parts = runtime.parts_mut().expect("runtime parts are available");
-        let (state, gc, string_pool) = parts.split_mut();
-        open_all(state, gc);
+        parts.with_context_gc(open_all);
+        let (_, gc, string_pool) = parts.split_mut();
 
         let source = br#"
             local name = string.char(0, 128, 255)
@@ -36,14 +36,15 @@ fn load_and_loadstring_keep_lua_provided_chunk_name_bytes() {
         .execute_proto(proto)
         .expect("test source should execute through the Runtime dispatcher");
 
-    let mut parts = runtime.parts_mut().expect("runtime parts remain available");
-    let (state, _, _) = parts.split_mut();
+    let state = runtime
+        .main_state()
+        .expect("runtime main state remains available");
     let result = state.stack.at(0).cloned().unwrap_or(Value::Nil);
     let Value::String(result) = result else {
         panic!("expected a string result, got {result:?}");
     };
     assert_eq!(
-        state
+        runtime
             .copy_string_bytes(result)
             .expect("result string should be live"),
         [0x00, 0x80, 0xff]

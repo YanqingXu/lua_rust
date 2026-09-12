@@ -98,9 +98,6 @@ pub unsafe trait GcObject: Sized + sealed::Sealed {
     /// 返回 GC 对象头部的引用
     fn gc_header(&self) -> &GcObjectHeader;
 
-    /// 返回 GC 对象头部的可变引用（仅供 GC 内部使用）
-    fn gc_header_mut(&mut self) -> &mut GcObjectHeader;
-
     /// 标记该对象引用的所有其他 GC 对象
     ///
     /// 在 GC 标记阶段调用。实现者应遍历所有 GC 引用，

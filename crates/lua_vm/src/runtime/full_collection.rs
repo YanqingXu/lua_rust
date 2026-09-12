@@ -270,6 +270,10 @@ mod tests {
             let reachable = collector.create(Table::new());
             let unreachable = collector.create(Table::new());
             state.push_value(Value::Table(reachable));
+            // Model a caller register that remains live above logical top.
+            state.stack.set_top(8);
+            state.current_call_info_mut().top = 8;
+            *state.stack.at_mut(7).expect("caller register exists") = Value::Table(reachable);
             (reachable, unreachable)
         };
 
@@ -299,6 +303,26 @@ mod tests {
             assert!(collector.contains_registered(reachable));
             assert!(!collector.contains_registered(unreachable));
             state.set_top(0);
+            *state.stack.at_mut(0).expect("original stack root exists") = Value::Nil;
+            assert_eq!(state.top, 0);
+            assert_eq!(state.stack.at(7), Some(&Value::Table(reachable)));
+        }
+
+        let lowered = runtime
+            .collect_full_stw()
+            .expect("lowering logical top preserves live caller registers");
+        assert_eq!(lowered.collected_objects, 0);
+        {
+            let mut parts = runtime.parts_mut().expect("Runtime remains usable");
+            let (state, collector, _) = parts.split_mut();
+            assert!(collector.contains_registered(reachable));
+            assert_eq!(state.current_ci, 0);
+            // This fixture now retires its only active frame, not merely its
+            // logical result stack. Explicitly release every initialized root
+            // before restoring the empty CallInfo sentinel.
+            state.stack.as_mut_slice().fill(Value::Nil);
+            state.stack.clear();
+            state.current_call_info_mut().reset();
         }
 
         let second = runtime

@@ -20,6 +20,7 @@
 pub mod allocator;
 pub mod byte_string;
 pub mod light_userdata;
+pub mod number_format;
 pub mod state_handle;
 pub mod types;
 pub mod value;

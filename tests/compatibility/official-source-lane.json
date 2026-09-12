@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "profile": "official-lua51-source-without-testc",
+  "source_root": "tests/lua/official",
+  "source_provenance": "tests/compatibility/lua51-official-sources.json",
+  "scope": "Independent source execution; no all.lua dump/undump roundtrip, shared-state ordering, or final global cleanup. _soft is not enabled.",
+  "cases": [
+    {"file":"all.lua","role":"helper","reason":"Upstream orchestrator. This profile expands its source entries independently; its dump/undump wrapper, shared state, and final cleanup require a separate full-suite lane."},
+    {"file":"api.lua","role":"excluded","reason":"The entire file returns immediately without the upstream TestC T module. Stock Lua 5.1.5 and lua_rust do not provide that private C-test API."},
+    {"file":"attrib.lua","role":"run","reason":"Package loading, module environments, globals, assignment order; requires a writable libs directory.","expected_return":27,"partial_exclusions":["Native libs/lib1.so and libs/lib2.so are not in the vendored inventory; the upstream file reports and skips their load tests."]},
+    {"file":"big.lua","role":"excluded","reason":"Starts with a 32 MiB string concatenated 129 times, requiring a >4 GiB overflow attempt tied to upstream string-size limits, before coroutine yields b/a. Needs a separately budgeted overflow/coroutine lane; _soft does not skip this allocation."},
+    {"file":"calls.lua","role":"run","reason":"Lua/C calls, tail calls, readers, dump/undump, and upvalues.","expected_return_global":"deep"},
+    {"file":"checktable.lua","role":"helper","reason":"require helper defining stat; without TestC it installs a diagnostic fallback. It has no standalone assertion workload."},
+    {"file":"closure.lua","role":"run","reason":"Closures, environments, coroutines and debug API.","partial_exclusions":["The upstream if-not-T branch skips private C yield/hook tests."]},
+    {"file":"code.lua","role":"excluded","reason":"The entire file requires T.listcode and otherwise returns immediately. Existing bytecode parity tools cover separate opcode contracts; they are not execution of this file's assertions."},
+    {"file":"constructs.lua","role":"run","reason":"Expression precedence, branches, loops and generated source."},
+    {"file":"db.lua","role":"run","reason":"Debug source/line/frame/local/upvalue/hook contracts."},
+    {"file":"errors.lua","role":"run","reason":"Parser/runtime error messages and protected-call contracts."},
+    {"file":"events.lua","role":"run","reason":"Metamethods including newproxy and primitive type metatables.","expected_return":12},
+    {"file":"files.lua","role":"run","reason":"File handles, binary I/O, errno, pipes, date/time and locale; fresh working directory and redirected stdin.","partial_exclusions":["Upstream conditionally skips unavailable popen support; emitted skip messages are preserved."]},
+    {"file":"gc.lua","role":"run","reason":"Full GC workload, including 200000-node structures and finalizers; no _soft shortcut.","timeout_seconds":60},
+    {"file":"literals.lua","role":"run","reason":"Byte literals, long strings, lexer and numeric parsing.","partial_exclusions":["Upstream conditionally skips pt_BR/ptb decimal-locale tests when unavailable; emitted skip messages are preserved."]},
+    {"file":"locals.lua","role":"run","reason":"Local scopes, environments and lexical blocks.","expected_return":5,"partial_exclusions":["The optional querytab block cannot run without private GC/table instrumentation."]},
+    {"file":"main.lua","role":"run","reason":"CLI subprocess/argument/interactive/stdio contracts. Runs unchanged so host shell or stock-oracle failures remain visible."},
+    {"file":"math.lua","role":"run","reason":"Full math, numeric strings, NaN and random workload; requires checktable.lua and writable temporary files. _soft is unset."},
+    {"file":"nextvar.lua","role":"run","reason":"Tables, next, length and iteration.","partial_exclusions":["The if-T block tests private table sizing and int2fb and is unavailable without TestC."]},
+    {"file":"pm.lua","role":"run","reason":"String patterns, matching and replacements."},
+    {"file":"sort.lua","role":"run","reason":"Full 30000-element sort workload; _soft is unset.","timeout_seconds":60},
+    {"file":"strings.lua","role":"run","reason":"Byte strings, format, coercion and string operators."},
+    {"file":"vararg.lua","role":"run","reason":"Varargs, legacy arg table and multireturn."},
+    {"file":"verybig.lua","role":"run","reason":"Generates and executes a >64k program and 70001-field table; requires checktable.lua and writable files. _soft is unset.","expected_return":10,"timeout_seconds":60}
+  ]
+}

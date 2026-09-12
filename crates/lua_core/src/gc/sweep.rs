@@ -23,6 +23,9 @@ impl GarbageCollector {
     ///
     pub fn sweep(&mut self, string_pool: &mut StringPool) -> usize {
         string_pool.bind_or_assert_owner(self.heap_id());
+        // This traversal can free the incremental cursor or its predecessor.
+        // Retire those cursors before unlinking any node.
+        self.abort_incremental_cycle();
         let mut collected = 0;
         let mut prev: *mut GcObjectHeader = std::ptr::null_mut();
         let mut current = self.all_objects;

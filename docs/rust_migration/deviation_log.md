@@ -1,6 +1,6 @@
 ---
 status: living
-last_updated: 2026-07-30
+last_updated: 2026-09-12
 applies_to: Lua 5.1.5 compatibility, lua_cpp project extensions, and runtime safety
 oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 ---
@@ -10,6 +10,12 @@ oracle_cpp_commit: 87c15e69ceb94eb74e28226ccbefb7e196635711
 本日志登记 `lua_rust` 与双 oracle（官方 Lua 5.1.5 和固定提交的
 `lua_cpp`）之间已确认的差异、近似实现和缺失能力。模块存在或项目内测试通过，
 不代表差异已经关闭；只有对应 oracle 测试通过，或差异被明确批准，状态才能改变。
+
+2026-09-12 更新：最新提交基线为 `503bf99`，审计发现公开 Runtime/GC 边界的新问题，
+不能再将早期局部 Miri 通过解读为全部安全合同已闭合。当前修复、测试和开放风险统一见
+[审计整改状态](../audits/2026-09-12-remediation.md)。各 NOTE 内旧计数和日期对应历史切片；
+未提交的修复不标记 resolved。M3 的两种 binary chunk 格式及 C ABI 前置设计见
+[M3 合同设计](m3_contract_design.md)。
 
 ## 状态定义
 

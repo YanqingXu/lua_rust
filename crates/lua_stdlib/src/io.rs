@@ -353,18 +353,7 @@ fn table_get_string_with_gc(
     table_ref: GcRef<Table>,
     key: &str,
 ) -> Value {
-    let Some(pool) = l.active_string_pool_ptr() else {
-        return Value::Nil;
-    };
-    // SAFETY: StringPool is disjoint from the explicitly borrowed collector
-    // and remains active for this state turn.
-    let Some(key_ref) = (unsafe { &*pool }).find_bytes(key.as_bytes()) else {
-        return Value::Nil;
-    };
-    if gc.with_ref(key_ref, |_| ()).is_err() {
-        return Value::Nil;
-    }
-    gc.with_ref(table_ref, |table| table.get(&Value::String(key_ref)))
+    gc.with_ref(table_ref, |table| get_field_gc(l, gc, table, key))
         .unwrap_or(Value::Nil)
 }
 
@@ -422,6 +411,15 @@ fn with_file_state<R>(
         .ok()
         .flatten()?;
     state.with_gc_ref(metatable, access).ok()
+}
+
+fn with_file_state_gc<R>(
+    gc: &GarbageCollector,
+    file_ref: GcRef<Userdata>,
+    access: impl for<'state> FnOnce(&'state Table) -> R,
+) -> Option<R> {
+    let metatable = file_state_ref(gc, file_ref).ok().flatten()?;
+    gc.with_ref(metatable, access).ok()
 }
 
 fn prepare_open_file(path: &str, mode: &[u8]) -> std::io::Result<FileConstruction> {
@@ -1347,8 +1345,9 @@ fn close_file_handle(l: &mut LuaState, file_ref: GcRef<Userdata>) -> i32 {
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let Some(closed) = with_file_state(l, file_ref, |file| get_bool_field(l, file, "__closed"))
-    else {
+    let Some(closed) = with_file_state_gc(gc, file_ref, |file| {
+        get_bool_field_gc(l, gc, file, "__closed")
+    }) else {
         l.push_value(Value::Boolean(false));
         return 1;
     };
@@ -1393,8 +1392,9 @@ fn close_file_silent(
     gc: &mut GarbageCollector,
     file_ref: GcRef<Userdata>,
 ) -> Result<(), String> {
-    let Some(closed) = with_file_state(l, file_ref, |file| get_bool_field(l, file, "__closed"))
-    else {
+    let Some(closed) = with_file_state_gc(gc, file_ref, |file| {
+        get_bool_field_gc(l, gc, file, "__closed")
+    }) else {
         return Err("invalid file".to_string());
     };
     if closed {
@@ -1423,8 +1423,8 @@ fn drain_io_file_resource(
     let Some(file_ref) = gc.registered_ref_by_id::<Userdata>(object_id) else {
         return RuntimeResourceDrainOutcome::Stale;
     };
-    let Some(closed) = with_file_state(state, file_ref, |file| {
-        get_bool_field(state, file, "__closed")
+    let Some(closed) = with_file_state_gc(gc, file_ref, |file| {
+        get_bool_field_gc(state, gc, file, "__closed")
     }) else {
         return RuntimeResourceDrainOutcome::Failed;
     };
@@ -1811,14 +1811,14 @@ fn flush_file_to_disk(
     file_ref: GcRef<Userdata>,
 ) -> std::io::Result<()> {
     let Some((closed, writable, direct, path, mode, content)) =
-        with_file_state(l, file_ref, |file| {
+        with_file_state_gc(gc, file_ref, |file| {
             (
-                get_bool_field(l, file, "__closed"),
-                get_bool_field(l, file, "__writable"),
-                get_bool_field(l, file, "__direct"),
-                get_utf8_field(l, file, "__path"),
-                get_bytes_field(l, file, "__mode"),
-                get_bytes_field(l, file, "__content"),
+                get_bool_field_gc(l, gc, file, "__closed"),
+                get_bool_field_gc(l, gc, file, "__writable"),
+                get_bool_field_gc(l, gc, file, "__direct"),
+                get_bytes_field_gc(l, gc, file, "__path"),
+                get_bytes_field_gc(l, gc, file, "__mode"),
+                get_bytes_field_gc(l, gc, file, "__content"),
             )
         })
     else {
@@ -1827,7 +1827,7 @@ fn flush_file_to_disk(
     if closed || !writable {
         return Ok(());
     }
-    if file_is_pipe(l, file_ref) {
+    if with_file_data_gc(gc, file_ref, |data| data.pipe.is_some()).unwrap_or(false) {
         return with_file_data_mut(gc, file_ref, |data| {
             if let Some(input) = data.pipe.as_mut().and_then(|pipe| pipe.input.as_mut()) {
                 input.flush()?;
@@ -1836,7 +1836,7 @@ fn flush_file_to_disk(
         })
         .unwrap_or(Ok(()));
     }
-    if let Some(stream) = file_standard_stream(l, file_ref) {
+    if let Some(stream) = with_file_data_gc(gc, file_ref, |data| data.standard_stream).flatten() {
         return flush_standard_stream(stream);
     }
     if direct {
@@ -1848,9 +1848,15 @@ fn flush_file_to_disk(
         })
         .unwrap_or(Ok(()));
     }
-    let Some(path) = path? else {
+    if path.is_empty() {
         return Ok(());
-    };
+    }
+    let path = String::from_utf8(path).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file path must be valid UTF-8",
+        )
+    })?;
     let mut file = std::fs::File::create(path)?;
     if mode.contains(&b'b') {
         file.write_all(&content)
@@ -1985,8 +1991,7 @@ fn with_file_data<R>(
 ) -> Option<R> {
     state
         .with_gc_ref(file_ref, |userdata| {
-            // SAFETY: build_file constructs every IO userdata with IoFileData.
-            unsafe { userdata.data_as::<IoFileData>() }.map(access)
+            userdata.typed_ref::<IoFileData>().map(access)
         })
         .ok()
         .flatten()
@@ -1998,8 +2003,19 @@ fn with_file_data_mut<R>(
     access: impl for<'data> FnOnce(&'data mut IoFileData) -> R,
 ) -> Option<R> {
     gc.with_mut(file_ref, |userdata| {
-        // SAFETY: build_file constructs every IO userdata with IoFileData.
-        unsafe { userdata.data_as_mut::<IoFileData>() }.map(access)
+        userdata.typed_mut::<IoFileData>().map(access)
+    })
+    .ok()
+    .flatten()
+}
+
+fn with_file_data_gc<R>(
+    gc: &GarbageCollector,
+    file_ref: GcRef<Userdata>,
+    access: impl for<'data> FnOnce(&'data IoFileData) -> R,
+) -> Option<R> {
+    gc.with_ref(file_ref, |userdata| {
+        userdata.typed_ref::<IoFileData>().map(access)
     })
     .ok()
     .flatten()
@@ -2251,9 +2267,39 @@ fn get_field(l: &LuaState, table: &Table, name: &str) -> Value {
     table.get(&Value::String(key))
 }
 
+fn get_field_gc(l: &LuaState, gc: &GarbageCollector, table: &Table, name: &str) -> Value {
+    let Some(pool) = l.active_string_pool_ptr() else {
+        return Value::Nil;
+    };
+    // SAFETY: the StringPool is disjoint from the explicit collector borrow
+    // and is active for this state turn. Do not recover a second collector via
+    // LuaState::find_interned_string: resource draining disables that path.
+    let Some(key) = (unsafe { &*pool }).find_bytes(name.as_bytes()) else {
+        return Value::Nil;
+    };
+    if gc.with_ref(key, |_| ()).is_err() {
+        return Value::Nil;
+    }
+    table.get(&Value::String(key))
+}
+
 fn get_bytes_field(l: &LuaState, table: &Table, name: &str) -> Vec<u8> {
     match get_field(l, table, name) {
         Value::String(s) => l.copy_string_bytes(s).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn get_bytes_field_gc(
+    state: &LuaState,
+    gc: &GarbageCollector,
+    table: &Table,
+    name: &str,
+) -> Vec<u8> {
+    match get_field_gc(state, gc, table, name) {
+        Value::String(string) => gc
+            .with_string_bytes(string, <[u8]>::to_vec)
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -2283,6 +2329,10 @@ fn get_bool_field(l: &LuaState, table: &Table, name: &str) -> bool {
         Value::Boolean(value) => value,
         _ => false,
     }
+}
+
+fn get_bool_field_gc(l: &LuaState, gc: &GarbageCollector, table: &Table, name: &str) -> bool {
+    matches!(get_field_gc(l, gc, table, name), Value::Boolean(true))
 }
 
 fn set_bytes_field(
@@ -2394,11 +2444,7 @@ fn value_to_write_bytes(l: &LuaState, value: &Value) -> Vec<u8> {
 }
 
 fn number_to_lua_string(n: f64) -> String {
-    if n.fract() == 0.0 && n.is_finite() {
-        format!("{n:.0}")
-    } else {
-        n.to_string()
-    }
+    lua_core::number_format::format_lua_number(n)
 }
 
 #[cfg(test)]
@@ -2441,8 +2487,23 @@ mod tests {
                 pipe: None,
             });
         }
-        // SAFETY: the preceding call constructed IoFileData in this payload.
-        assert!(unsafe { userdata.data_as::<IoFileData>() }.is_some());
+        assert!(userdata.typed_ref::<IoFileData>().is_some());
+    }
+
+    #[test]
+    fn file_access_rejects_untyped_userdata_even_with_a_file_metatable() {
+        let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let (mut state, _, _) = state_with_io_table(&mut gc, &mut pool);
+        let metatable = gc.create_root(Table::new());
+        let mut bytes = Userdata::new(std::mem::size_of::<IoFileData>());
+        bytes.set_metatable(Some(metatable));
+        let impostor = gc.create_root(bytes);
+        assert!(with_file_data_gc(&gc, impostor, |_| ()).is_none());
+        assert!(with_file_data_mut(&mut gc, impostor, |_| ()).is_none());
+        lua_vm::with_vm_context(&mut state, &mut gc, &mut pool, |state| {
+            assert!(with_file_data(state, impostor, |_| ()).is_none());
+        });
     }
 
     #[test]
@@ -2487,6 +2548,59 @@ mod tests {
         assert_eq!(gc.sweep(&mut pool), object_count);
         assert_eq!(gc.object_count(), 0);
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn explicit_collector_file_drain_preserves_state_and_is_idempotent() {
+        let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let mut state = state_with_services();
+
+        lua_vm::with_vm_context_gc(&mut state, &mut gc, &mut pool, |state, gc| {
+            assert!(state.active_gc_ptr().is_none());
+            for stream in [
+                None,
+                Some(StandardStream::Stdin),
+                Some(StandardStream::Stdout),
+                Some(StandardStream::Stderr),
+            ] {
+                let file = gc
+                    .with_publication(|transaction| {
+                        let file = build_file(
+                            state,
+                            transaction,
+                            memory_file_construction(None, b"w+b", true, stream),
+                            &mut |_| Ok(()),
+                        )?;
+                        transaction.publish_as_explicit_root(file)
+                    })
+                    .expect("test file should publish");
+                let metatable = file_state_ref(gc, file).unwrap().unwrap();
+                set_bytes_field(state, metatable, gc, "__content", b"bytes\0\xff").unwrap();
+                assert_eq!(
+                    with_file_state_gc(gc, file, |table| {
+                        get_bytes_field_gc(state, gc, table, "__content")
+                    }),
+                    Some(b"bytes\0\xff".to_vec())
+                );
+
+                assert_eq!(
+                    drain_io_file_resource(state, gc, file.object_id()),
+                    RuntimeResourceDrainOutcome::Drained
+                );
+                assert_eq!(
+                    drain_io_file_resource(state, gc, file.object_id()),
+                    RuntimeResourceDrainOutcome::AlreadyClosed
+                );
+                assert_eq!(
+                    close_file_silent(state, gc, file),
+                    Err("attempt to close a closed file".to_string())
+                );
+                gc.remove_root(file);
+            }
+        });
+        gc.collect(&mut pool);
+        assert_eq!(gc.object_count(), 0);
     }
 
     #[test]

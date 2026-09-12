@@ -35,6 +35,17 @@ use crate::upvalue::Upvalue;
 ///
 pub type CFunction = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
 
+/// Internal native callback result: the top stack value is an explicit Lua
+/// error object and must retain its identity and bytes at protected boundaries.
+/// This result-count protocol is not the external Lua 5.1 C API's longjmp ABI.
+pub const NATIVE_ERROR_OBJECT: i32 = -1;
+
+/// Internal native callback result: the top stack string is a VM diagnostic.
+/// The VM captures its Lua caller before unwinding; a protected call can then
+/// add that location, while coroutine.resume keeps the pinned C++ raw message.
+/// Pending Runtime requests take precedence over this synchronous result code.
+pub const NATIVE_ERROR_DIAGNOSTIC: i32 = -2;
+
 /// Sealed VM-native operations that require Runtime scheduling support.
 ///
 /// Unlike a [`CFunction`], these operations are interpreted by `lua_vm` and
@@ -310,10 +321,6 @@ impl Function {
 unsafe impl GcObject for Function {
     fn gc_header(&self) -> &GcObjectHeader {
         &self.header
-    }
-
-    fn gc_header_mut(&mut self) -> &mut GcObjectHeader {
-        &mut self.header
     }
 
     /// 标记 Function 引用的所有 GC 对象

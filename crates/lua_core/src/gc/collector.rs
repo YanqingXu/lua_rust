@@ -19,6 +19,7 @@ use crate::gc::header::GcObjectHeader;
 use crate::gc::header::bits;
 use crate::gc::object_id::ObjectId;
 use crate::gc::strategy::{GcStrategy, MarkSweepGc};
+use crate::gc::write::GcWrite;
 use crate::gc_string::GcString;
 use crate::heap::HeapId;
 use crate::string_pool::StringPool;
@@ -29,6 +30,8 @@ use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LiveAllocation {
+    /// Retain allocation provenance for identity-only registry lookups.
+    pub(crate) pointer: NonNull<GcObjectHeader>,
     pub(crate) object_id: ObjectId,
     pub(crate) object_type: GcObjectType,
     pub(crate) accounted_size: usize,
@@ -368,6 +371,7 @@ impl GarbageCollector {
         match self.live_allocations.entry(address) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(LiveAllocation {
+                    pointer: raw.cast(),
                     object_id,
                     object_type: T::expected_gc_type(),
                     accounted_size: object_size,
@@ -822,28 +826,37 @@ impl GarbageCollector {
         Ok(read(unsafe { pointer.as_ref() }))
     }
 
-    /// Mutably borrow a validated object for exactly the duration of `write`.
+    /// Mutate a validated object's payload for exactly the duration of `write`.
+    ///
+    /// The [`GcWrite`] view cannot replace the allocation or its header.
+    /// Accounting and write barriers run even if the callback unwinds.
     pub fn with_mut<T: GcObject, R>(
         &mut self,
         value: GcRef<T>,
-        write: impl for<'a> FnOnce(&'a mut T) -> R,
+        write: impl for<'a> FnOnce(&mut GcWrite<'a, T>) -> R,
     ) -> Result<R, GcRefValidationError> {
         let mut pointer = self.validate_ref(value)?;
         let header = pointer.as_ptr().cast::<GcObjectHeader>();
         let previous_state_edge = self.managed_state_edge(header, T::expected_gc_type());
-        // SAFETY: the side table matched address, identity, and concrete tag.
-        // `&mut self` prevents collection and other collector-mediated
-        // mutation while the callback is running.
-        let result = write(unsafe { pointer.as_mut() });
-        // SAFETY: the callback cannot replace or destroy its managed owner.
-        let current_size = unsafe { pointer.as_ref() }.get_size();
-        // SAFETY: same concrete allocation; this metric only reads capacities.
-        let current_allocator_size = unsafe { pointer.as_ref() }.get_allocator_payload_size();
-        self.reconcile_managed_object_size(header as usize, current_size, current_allocator_size);
-        let state_edge_changed =
-            previous_state_edge != self.managed_state_edge(header, T::expected_gc_type());
-        self.after_managed_mutation(header, T::expected_gc_type(), state_edge_changed);
-        Ok(result)
+        let _mutation = ManagedMutation {
+            collector: self,
+            pointer,
+            previous_state_edge,
+        };
+        // SAFETY: validation matched address, identity and concrete tag. The
+        // guard exclusively borrows the collector until the callback ends,
+        // and GcWrite exposes only payload mutation, never `&mut T`.
+        let mut payload = GcWrite::new(unsafe { pointer.as_mut() });
+        Ok(write(&mut payload))
+    }
+
+    /// Keep a validated allocation alive until explicit collector teardown.
+    pub fn fix<T: GcObject>(&mut self, value: GcRef<T>) -> Result<(), GcRefValidationError> {
+        let pointer = self.validate_ref(value)?;
+        // SAFETY: membership and type were checked before accessing the header.
+        unsafe { pointer.as_ref() }.gc_header().mark_fixed();
+        self.write_root_barrier(value);
+        Ok(())
     }
 
     /// Read a live Lua string's bytes for exactly the duration of `read`.
@@ -934,7 +947,7 @@ impl GarbageCollector {
     ///
     /// This is intended for weak service registries that must not retain a
     /// pointer or add a collector root. The authoritative side table is
-    /// searched as integer metadata; object memory is not touched until the
+    /// searched as metadata; object memory is not touched until the
     /// identity and concrete type both match.
     pub fn registered_ref_by_id<T: GcObject>(&self, object_id: ObjectId) -> Option<GcRef<T>> {
         if object_id.is_null() {
@@ -942,16 +955,15 @@ impl GarbageCollector {
         }
         let expected = T::expected_gc_type();
         self.live_allocations
-            .iter()
-            .find_map(|(address, live)| {
+            .values()
+            .find_map(|live| {
                 (live.object_id == object_id && live.object_type == expected)
-                    .then_some((*address, live.object_id))
+                    .then_some((live.pointer.cast::<T>(), live.object_id))
             })
-            .and_then(|(address, object_id)| {
-                let pointer = NonNull::new(address as *mut T)?;
+            .map(|(pointer, object_id)| {
                 // SAFETY: the authoritative table matched this address,
                 // process-unique identity, and concrete object type.
-                Some(unsafe { GcRef::from_registered(pointer, object_id) })
+                unsafe { GcRef::from_registered(pointer, object_id) }
             })
     }
 
@@ -1086,6 +1098,32 @@ impl GarbageCollector {
             }
             _ => self.is_value_dead(value),
         }
+    }
+}
+
+struct ManagedMutation<'collector, T: GcObject> {
+    collector: &'collector mut GarbageCollector,
+    pointer: NonNull<T>,
+    previous_state_edge: Option<crate::state_handle::StateHandle>,
+}
+
+impl<T: GcObject> Drop for ManagedMutation<'_, T> {
+    fn drop(&mut self) {
+        let header = self.pointer.as_ptr().cast::<GcObjectHeader>();
+        // SAFETY: the callback has ended, and the guard's exclusive collector
+        // borrow kept the allocation live. GcWrite cannot replace its owner.
+        let object = unsafe { self.pointer.as_ref() };
+        self.collector.reconcile_managed_object_size(
+            header as usize,
+            object.get_size(),
+            object.get_allocator_payload_size(),
+        );
+        let state_edge_changed = self.previous_state_edge
+            != self
+                .collector
+                .managed_state_edge(header, T::expected_gc_type());
+        self.collector
+            .after_managed_mutation(header, T::expected_gc_type(), state_edge_changed);
     }
 }
 

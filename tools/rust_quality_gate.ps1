@@ -46,6 +46,7 @@ $Results = [ordered]@{
     Clippy      = "NOT_RUN"
     TestDebug   = "NOT_RUN"
     TestRelease = "NOT_RUN"
+    DocTests    = "NOT_RUN"
     Doc         = "NOT_RUN"
     Audit       = "NOT_RUN"
 }
@@ -82,9 +83,9 @@ Write-Host "  Time:    $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n"
 Push-Location $ProjectRoot
 
 try {
-    # ── 1/6: Format Check ──────────────────────────────────────────
+    # ── 1/7: Format Check ──────────────────────────────────────────
     if (-not $SkipFmt) {
-        Write-Host "[1/6] Format Check (cargo fmt --check)" -ForegroundColor Yellow
+        Write-Host "[1/7] Format Check (cargo fmt --check)" -ForegroundColor Yellow
         $fmt = Invoke-Cargo -Arguments @("fmt", "--check")
         $Results.Format = if ($fmt.ExitCode -eq 0) { "PASS" } else { "FAIL" }
         $color = if ($Results.Format -eq "PASS") { "Green" } else { "Red" }
@@ -94,13 +95,13 @@ try {
         }
     }
     else {
-        Write-Host "[1/6] Format Check -- SKIPPED" -ForegroundColor Gray
+        Write-Host "[1/7] Format Check -- SKIPPED" -ForegroundColor Gray
         $Results.Format = "SKIPPED"
     }
 
-    # ── 2/6: Clippy Lint ────────────────────────────────────────────
+    # ── 2/7: Clippy Lint ────────────────────────────────────────────
     if (-not $SkipClippy) {
-        Write-Host "`n[2/6] Clippy Lint (cargo clippy --workspace --all-targets -- -D warnings)" -ForegroundColor Yellow
+        Write-Host "`n[2/7] Clippy Lint (cargo clippy --workspace --all-targets -- -D warnings)" -ForegroundColor Yellow
         $clippy = Invoke-Cargo -Arguments @(
             "clippy",
             "--workspace",
@@ -117,11 +118,11 @@ try {
         }
     }
     else {
-        Write-Host "`n[2/6] Clippy Lint -- SKIPPED" -ForegroundColor Gray
+        Write-Host "`n[2/7] Clippy Lint -- SKIPPED" -ForegroundColor Gray
         $Results.Clippy = "SKIPPED"
     }
 
-    # ── 3/6: Debug and Release Test Suites ─────────────────────────
+    # ── 3/7: Debug and Release Test Suites ─────────────────────────
     $hasNextest = $null -ne (Get-Command "cargo-nextest" -ErrorAction SilentlyContinue)
     if ($hasNextest) {
         $debugTestArguments = @("nextest", "run", "--workspace")
@@ -129,12 +130,12 @@ try {
         $testRunner = "cargo nextest"
     }
     else {
-        $debugTestArguments = @("test", "--workspace")
-        $releaseTestArguments = @("test", "--workspace", "--release")
+        $debugTestArguments = @("test", "--workspace", "--all-targets")
+        $releaseTestArguments = @("test", "--workspace", "--all-targets", "--release")
         $testRunner = "cargo test (cargo-nextest not installed)"
     }
 
-    Write-Host "`n[3/6] Debug Tests ($testRunner)" -ForegroundColor Yellow
+    Write-Host "`n[3/7] Debug Tests ($testRunner)" -ForegroundColor Yellow
     $debugTests = Invoke-Cargo -Arguments $debugTestArguments
     $Results.TestDebug = if ($debugTests.ExitCode -eq 0) { "PASS" } else { "FAIL" }
     $color = if ($Results.TestDebug -eq "PASS") { "Green" } else { "Red" }
@@ -143,7 +144,7 @@ try {
         Write-FailureOutput -Output $debugTests.Output
     }
 
-    Write-Host "`n[4/6] Release Tests ($testRunner --release)" -ForegroundColor Yellow
+    Write-Host "`n[4/7] Release Tests ($testRunner --release)" -ForegroundColor Yellow
     $releaseTests = Invoke-Cargo -Arguments $releaseTestArguments
     $Results.TestRelease = if ($releaseTests.ExitCode -eq 0) { "PASS" } else { "FAIL" }
     $color = if ($Results.TestRelease -eq "PASS") { "Green" } else { "Red" }
@@ -152,8 +153,19 @@ try {
         Write-FailureOutput -Output $releaseTests.Output
     }
 
-    # ── 5/6: Documentation ──────────────────────────────────────────
-    Write-Host "`n[5/6] Documentation (RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps)" -ForegroundColor Yellow
+    # nextest does not execute doctests, including public API compile-fail
+    # contracts. Always run these separately, regardless of the test runner.
+    Write-Host "`n[5/7] Doctests (cargo test --workspace --doc)" -ForegroundColor Yellow
+    $docTests = Invoke-Cargo -Arguments @("test", "--workspace", "--doc")
+    $Results.DocTests = if ($docTests.ExitCode -eq 0) { "PASS" } else { "FAIL" }
+    $color = if ($Results.DocTests -eq "PASS") { "Green" } else { "Red" }
+    Write-Host "  Result: $($Results.DocTests)" -ForegroundColor $color
+    if ($Results.DocTests -eq "FAIL") {
+        Write-FailureOutput -Output $docTests.Output
+    }
+
+    # ── 6/7: Documentation ──────────────────────────────────────────
+    Write-Host "`n[6/7] Documentation (RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps)" -ForegroundColor Yellow
     $previousRustdocFlags = $env:RUSTDOCFLAGS
     try {
         $env:RUSTDOCFLAGS = "-D warnings"
@@ -169,9 +181,9 @@ try {
         Write-FailureOutput -Output $doc.Output
     }
 
-    # ── 6/6: Security Audit ─────────────────────────────────────────
+    # ── 7/7: Security Audit ─────────────────────────────────────────
     if (-not $SkipAudit) {
-        Write-Host "`n[6/6] Security Audit (cargo audit --json)" -ForegroundColor Yellow
+        Write-Host "`n[7/7] Security Audit (cargo audit --json)" -ForegroundColor Yellow
         if ($null -eq (Get-Command "cargo-audit" -ErrorAction SilentlyContinue)) {
             $Results.Audit = "TOOL_MISSING"
             Write-Host "  Result: TOOL_MISSING" -ForegroundColor Red
@@ -220,7 +232,7 @@ try {
         }
     }
     else {
-        Write-Host "`n[6/6] Security Audit -- SKIPPED" -ForegroundColor Gray
+        Write-Host "`n[7/7] Security Audit -- SKIPPED" -ForegroundColor Gray
         $Results.Audit = "SKIPPED"
     }
 }

@@ -9,7 +9,8 @@ local defaults = {
 
 local env = {
     value = 5,
-    writes = writes
+    writes = writes,
+    tostring = tostring
 }
 
 setmetatable(env, {

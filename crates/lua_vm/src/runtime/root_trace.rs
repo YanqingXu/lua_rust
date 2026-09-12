@@ -1109,6 +1109,13 @@ mod tests {
             state.current_call_info_mut().proto = None;
             state.current_call_info_mut().varargs.clear();
             state.set_top(0);
+            // Logical top does not retire the initialized function slot or
+            // an active caller window. This fixture discards the entire root
+            // frame, so release its slots and restore the idle sentinel.
+            assert_eq!(state.current_ci, 0);
+            state.stack.as_mut_slice().fill(Value::Nil);
+            state.stack.clear();
+            state.current_call_info_mut().reset();
         }
         runtime.global_root = None;
         runtime.registry_root = None;

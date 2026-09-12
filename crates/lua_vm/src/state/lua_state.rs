@@ -278,7 +278,8 @@ impl LuaState {
     ///
     /// Validation checks address, process-unique object identity, and concrete
     /// type before object memory is touched. The higher-ranked callback keeps
-    /// the managed borrow from escaping or overlapping destructive collection.
+    /// the managed borrow from escaping. Context isolation prevents safe code
+    /// from obtaining an explicit collector while this dynamic read is active.
     pub fn with_gc_ref<T: GcObject, R>(
         &self,
         reference: GcRef<T>,
@@ -351,15 +352,32 @@ impl LuaState {
         self.top.saturating_sub(self.current_call_info().base) as i32
     }
 
-    /// 设置栈大小
+    /// Set the logical stack top relative to the current frame's base.
+    ///
+    /// Non-negative indices specify an element count. A negative index is
+    /// relative to the current top: `-1` keeps it unchanged and `-2` removes
+    /// one value. Indices below this frame saturate at its base, preserving
+    /// caller slots. Newly exposed logical slots are initialized to nil.
     pub fn set_top(&mut self, idx: i32) {
         let base = self.current_call_info().base;
         let new_top = if idx >= 0 {
             base + idx as usize
         } else {
-            self.top.saturating_sub((-idx) as usize)
+            self.top
+                .saturating_sub(idx.unsigned_abs() as usize - 1)
+                .max(base)
         };
-        self.stack.set_top(new_top);
+        // The C API top is logical. Lowering it must preserve initialized
+        // registers owned by the active caller frames for GC and continuation
+        // snapshots, even when a native callback returns fewer arguments.
+        if self.stack.size() < new_top {
+            self.stack.set_top(new_top);
+        }
+        for index in self.top.max(base)..new_top {
+            if let Some(slot) = self.stack.at_mut(index) {
+                *slot = Value::Nil;
+            }
+        }
         self.top = new_top;
     }
 
@@ -636,10 +654,8 @@ impl LuaState {
             return Err(NativeRequestPublishError::MailboxOccupied);
         }
         self.native_request_scope = true;
-        let guard = NativeRequestScopeGuard {
-            state: std::ptr::NonNull::from(&mut *self),
-        };
-        let result = f(self);
+        let guard = NativeRequestScopeGuard { state: self };
+        let result = f(guard.state);
         drop(guard);
         Ok(result)
     }
@@ -886,15 +902,13 @@ impl LuaState {
     }
 }
 
-struct NativeRequestScopeGuard {
-    state: std::ptr::NonNull<LuaState>,
+struct NativeRequestScopeGuard<'state> {
+    state: &'state mut LuaState,
 }
 
-impl Drop for NativeRequestScopeGuard {
+impl Drop for NativeRequestScopeGuard<'_> {
     fn drop(&mut self) {
-        // SAFETY: the guard is created from the uniquely borrowed LuaState and
-        // drops before `with_native_request_scope` returns or unwinds.
-        let state = unsafe { self.state.as_mut() };
+        let state = &mut *self.state;
         state.native_request_scope = false;
         if std::thread::panicking() {
             state.pending_native_request = None;

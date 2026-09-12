@@ -157,7 +157,7 @@ impl<'scope> PublicationTxn<'scope> {
     pub fn with_mut<T: GcObject, R>(
         &mut self,
         rooted: &Rooted<'scope, T>,
-        write: impl for<'a> FnOnce(&'a mut T) -> R,
+        write: impl for<'a> FnOnce(&mut super::write::GcWrite<'a, T>) -> R,
     ) -> Result<R, GcRefValidationError> {
         self.validate_protection(rooted)?;
         self.collector.with_mut(rooted.reference, write)

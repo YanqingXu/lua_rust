@@ -2,6 +2,7 @@
 
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
+use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
 use lua_core::value::Value;
 use lua_vm::runtime::Runtime;
@@ -48,8 +49,8 @@ pub(crate) fn complete(runtime: &mut Runtime, line: &str) -> Result<CompletionRe
     }
 
     let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
-    let (state, gc, _) = parts.split_mut();
-    complete_lua(state, gc, line)
+    let (state, gc, string_pool) = parts.split_mut();
+    complete_lua(state, gc, string_pool, line)
 }
 
 fn complete_meta(line: &str, command_start: usize) -> CompletionResult {
@@ -96,6 +97,7 @@ fn complete_meta(line: &str, command_start: usize) -> CompletionResult {
 fn complete_lua(
     state: &LuaState,
     gc: &GarbageCollector,
+    string_pool: &StringPool,
     line: &str,
 ) -> Result<CompletionResult, String> {
     let token_start = line
@@ -110,7 +112,7 @@ fn complete_lua(
 
     let (table, prefix, candidate_prefix) = if let Some(dot) = token.rfind('.') {
         let path = &token[..dot];
-        let Some(table) = resolve_table_path(state, gc, path)? else {
+        let Some(table) = resolve_table_path(state, gc, string_pool, path)? else {
             return Ok(no_completion(line));
         };
         (table, &token[dot + 1..], format!("{path}."))
@@ -127,6 +129,7 @@ fn complete_lua(
 fn resolve_table_path(
     state: &LuaState,
     gc: &GarbageCollector,
+    string_pool: &StringPool,
     path: &str,
 ) -> Result<Option<GcRef<Table>>, String> {
     let mut parts = path.split('.');
@@ -136,7 +139,7 @@ fn resolve_table_path(
     let Some(global) = state.global_table else {
         return Ok(None);
     };
-    let mut current = table_string_value(state, gc, global, first)?;
+    let mut current = table_string_value(gc, string_pool, global, first)?;
     for part in parts {
         if part.is_empty() {
             return Ok(None);
@@ -144,7 +147,7 @@ fn resolve_table_path(
         let Value::Table(table) = current else {
             return Ok(None);
         };
-        current = table_string_value(state, gc, table, part)?;
+        current = table_string_value(gc, string_pool, table, part)?;
     }
     Ok(match current {
         Value::Table(table) => Some(table),
@@ -153,17 +156,16 @@ fn resolve_table_path(
 }
 
 fn table_string_value(
-    state: &LuaState,
     gc: &GarbageCollector,
+    string_pool: &StringPool,
     table: GcRef<Table>,
     key: &str,
 ) -> Result<Value, String> {
-    let Some(key) = state
-        .find_interned_string(key.as_bytes())
-        .map_err(|error| error.to_string())?
-    else {
+    let Some(key) = string_pool.find_bytes(key.as_bytes()) else {
         return Ok(Value::Nil);
     };
+    gc.with_ref(key, |_| ())
+        .map_err(|error| error.to_string())?;
     gc.with_ref(table, |table| table.get(&Value::String(key)))
         .map_err(|error| error.to_string())
 }

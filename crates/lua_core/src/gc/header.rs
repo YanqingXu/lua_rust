@@ -51,6 +51,27 @@ pub mod bits {
 ///
 /// 使用 `Cell` 实现内部可变性，因为 GC 标记在共享引用下也需要修改。
 ///
+/// Header mutation is private to the collector crate. Even a validated
+/// shared object borrow cannot redirect its ownership list.
+///
+/// ```compile_fail
+/// use lua_core::{gc::{collector::GarbageCollector, gc_object::GcObject}, table::Table};
+/// let mut gc = GarbageCollector::new();
+/// let table = gc.create(Table::new());
+/// gc.with_ref(table, |table| table.gc_header().set_next(std::ptr::null_mut())).unwrap();
+/// ```
+///
+/// There is no mutable-header accessor on a managed payload.
+///
+/// ```compile_fail
+/// use lua_core::{gc::{collector::GarbageCollector, gc_object::GcObject, header::GcObjectHeader},
+///                table::Table, types::GcObjectType};
+/// let mut gc = GarbageCollector::new();
+/// let table = gc.create(Table::new());
+/// gc.with_mut(table, |table| {
+///     *table.gc_header_mut() = GcObjectHeader::new(GcObjectType::String);
+/// }).unwrap();
+/// ```
 #[repr(C)]
 pub struct GcObjectHeader {
     /// 侵入式链表指针 — 指向下一个 GC 对象
@@ -87,7 +108,7 @@ impl GcObjectHeader {
 
     /// 设置链表中的下一个对象指针
     #[inline]
-    pub fn set_next(&self, next: *mut GcObjectHeader) {
+    pub(crate) fn set_next(&self, next: *mut GcObjectHeader) {
         self.next.set(next);
     }
 
@@ -109,7 +130,7 @@ impl GcObjectHeader {
 
     /// 设置原始标记位
     #[inline]
-    pub fn set_marked(&self, mark: u8) {
+    pub(crate) fn set_marked(&self, mark: u8) {
         self.marked.set(mark);
     }
 
@@ -127,7 +148,7 @@ impl GcObjectHeader {
 
     /// 设置 GC 颜色
     ///
-    pub fn set_color(&self, color: crate::types::GcColor) {
+    pub(crate) fn set_color(&self, color: crate::types::GcColor) {
         let m = self.marked.get();
         // 清除颜色位
         let cleared = m & !(bits::WHITEBITS | bits::BLACK);
@@ -168,7 +189,7 @@ impl GcObjectHeader {
 
     /// 标记为固定对象（防止 GC 回收）
     #[inline]
-    pub fn mark_fixed(&self) {
+    pub(crate) fn mark_fixed(&self) {
         self.marked.set(self.marked.get() | bits::FIXED);
     }
 
@@ -180,7 +201,7 @@ impl GcObjectHeader {
 
     /// 标记为终结
     #[inline]
-    pub fn mark_finalized(&self) {
+    pub(crate) fn mark_finalized(&self) {
         self.marked.set(self.marked.get() | bits::FINALIZED);
     }
 

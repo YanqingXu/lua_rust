@@ -23,6 +23,21 @@ use crate::value::Value;
 /// 防止过大的索引导致内存问题
 const MAX_ARRAY_INDEX: i32 = 1_000_000;
 
+/// Avoid rebuilding the iteration index for every deletion in small tables.
+const MIN_HASH_ORDER_COMPACTION: usize = 32;
+
+/// The cursor supplied to `Table::try_next` does not identify a table slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidNextKey;
+
+impl std::fmt::Display for InvalidNextKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid key to 'next'")
+    }
+}
+
+impl std::error::Error for InvalidNextKey {}
+
 // =====================================================================
 // Table 结构体
 // =====================================================================
@@ -51,10 +66,11 @@ pub struct Table {
 
     /// 哈希部分：存储其他类型的键或非连续的整数键
     hash: HashMap<Value, Value>,
-    /// 哈希键的稳定迭代顺序。删除会留下 nil 墓碑，避免 `next`
-    /// 在遍历期间删除当前键时退化或失去位置。
+    /// 哈希键的稳定迭代顺序。删除后保留键身份作为墓碑，避免 `next`
+    /// 在遍历期间删除当前键时失去位置。墓碑不保持 GC 对象存活；
+    /// Value 的 Eq/Hash 只比较身份，绝不解引用墓碑中的 GcRef。
     hash_order: Vec<Value>,
-    /// 哈希键到 `hash_order` 位置的索引。
+    /// 活跃及已删除哈希键到 `hash_order` 位置的索引。
     hash_positions: HashMap<Value, usize>,
 
     /// 元表指针（None 表示无元表）
@@ -110,6 +126,7 @@ impl Table {
     /// 3. 如果键不存在，返回 nil
     ///
     pub fn get(&self, key: &Value) -> Value {
+        let key = self.normalize_zero_key(key);
         let mut index: i32 = 0;
         if Self::is_array_index(key, &mut index) {
             return self.get_array(index);
@@ -128,6 +145,7 @@ impl Table {
     /// 5. 否则存储到哈希部分
     ///
     pub fn set(&mut self, key: &Value, value: &Value) {
+        let key = self.normalize_zero_key(key);
         // Lua 语义：nil 键不允许
         if key.is_nil() {
             panic!("table index is nil");
@@ -157,10 +175,14 @@ impl Table {
         // TODO Phase 1.3: 写屏障 — gc->writeBarrier(this, key) / gc->writeBarrier(this, value)
         // 当前 Phase 1.2 GC 骨架尚未实现 writeBarrier，后续阶段补全。
 
-        // 存储到哈希部分。Value 的 Eq/Hash 已按字符串内容处理，因此即使
-        // 调用方没有使用同一个 StringPool 驻留，同内容字符串也会命中同一键。
+        // Runtime strings are canonical-interned; Value Eq/Hash compare the
+        // allocation identity without dereferencing a possibly dead tombstone.
         let hash_key = key.clone();
-        if !self.hash.contains_key(&hash_key) {
+        if !self.hash_positions.contains_key(&hash_key) {
+            // Lua permits deletion of existing fields during iteration, but
+            // does not guarantee traversal after inserting a new field. Only
+            // such insertions may invalidate old tombstone cursors.
+            self.compact_hash_order_for_insert();
             self.hash_positions
                 .insert(hash_key.clone(), self.hash_order.len());
             self.hash_order.push(hash_key.clone());
@@ -172,6 +194,7 @@ impl Table {
     /// 检查键是否存在且值不为 nil
     ///
     pub fn has(&self, key: &Value) -> bool {
+        let key = self.normalize_zero_key(key);
         let mut index: i32 = 0;
         if Self::is_array_index(key, &mut index) {
             if index >= 1 && (index as usize) <= self.array.len() {
@@ -188,6 +211,7 @@ impl Table {
     /// 等价于 `set(key, &Value::Nil)`
     ///
     pub fn remove(&mut self, key: &Value) {
+        let key = self.normalize_zero_key(key);
         self.flags = 0;
 
         let mut index: i32 = 0;
@@ -198,17 +222,9 @@ impl Table {
             return;
         }
 
-        let removed_key = self
-            .hash
-            .remove_entry(key)
-            .map(|(removed_key, _)| removed_key);
-
-        if let Some(removed_key) = removed_key
-            && let Some(pos) = self.hash_positions.remove(&removed_key)
-            && let Some(slot) = self.hash_order.get_mut(pos)
-        {
-            *slot = Value::Nil;
-        }
+        // Keep the iteration position, including for collectable keys. Its
+        // identity is safe to compare after collection and is not a GC edge.
+        self.hash.remove(key);
     }
 
     /// 清空表内容和元表引用
@@ -365,8 +381,17 @@ impl Table {
     ///
     /// 返回 `Some((next_key, next_value))` 如果找到下一个键值对，
     /// 返回 `None` 如果已到表尾。
+    /// 无效游标也返回 `None`；需要区分它与表尾的 Lua 边界应使用 `try_next`。
     ///
     pub fn next(&self, key: &Value) -> Option<(Value, Value)> {
+        self.try_next(key).ok().flatten()
+    }
+
+    /// Continue traversal from an existing or deleted slot, rejecting unknown
+    /// cursors. Deleting or updating fields preserves cursor positions; adding
+    /// a new hash key can invalidate deleted cursors when storage is rebuilt.
+    pub fn try_next(&self, key: &Value) -> Result<Option<(Value, Value)>, InvalidNextKey> {
+        let key = self.normalize_zero_key(key);
         // 如果 key 是 nil，从头开始遍历
         if key.is_nil() {
             // 先检查数组部分
@@ -376,13 +401,13 @@ impl Table {
                     if !val.is_nil() {
                         let next_key = Value::Number((i + 1) as LuaNumber); // Lua 索引从 1 开始
                         let next_value = val.clone();
-                        return Some((next_key, next_value));
+                        return Ok(Some((next_key, next_value)));
                     }
                 }
             }
 
             // 数组部分为空或全是 nil，检查哈希部分
-            return self.next_hash_from(0);
+            return Ok(self.next_hash_from(0));
 
             // 表为空
         }
@@ -390,34 +415,29 @@ impl Table {
         // 查找当前键的位置
         let mut arr_idx: i32 = 0;
         if Self::is_array_index(key, &mut arr_idx) {
+            if arr_idx as usize > self.array.len() {
+                return Err(InvalidNextKey);
+            }
             // 当前键在数组部分 — 继续遍历数组部分
             for i in (arr_idx as usize)..self.array.len() {
                 if !self.array[i].is_nil() {
                     let next_key = Value::Number((i + 1) as LuaNumber);
                     let next_value = self.array[i].clone();
-                    return Some((next_key, next_value));
+                    return Ok(Some((next_key, next_value)));
                 }
             }
 
             // 数组部分遍历完毕，转到哈希部分
-            return self.next_hash_from(0);
+            return Ok(self.next_hash_from(0));
         }
 
-        // 当前键在哈希部分
-        // Lua 5.1 允许遍历过程中删除当前键，此时从任意剩余哈希条目继续
-        if !self.hash.contains_key(key) {
-            return self.next_hash_from(0);
-        }
-
-        let next_pos = self.hash_positions.get(key).map(|pos| pos + 1).unwrap_or(0);
-        self.next_hash_from(next_pos)
+        // 已删除键仍保留原位置；绝不从头重启，避免重复访问保留的键。
+        let pos = self.hash_positions.get(key).ok_or(InvalidNextKey)?;
+        Ok(self.next_hash_from(pos + 1))
     }
 
     fn next_hash_from(&self, start: usize) -> Option<(Value, Value)> {
         for key in self.hash_order.iter().skip(start) {
-            if key.is_nil() {
-                continue;
-            }
             if let Some(value) = self.hash.get(key)
                 && !value.is_nil()
             {
@@ -425,6 +445,26 @@ impl Table {
             }
         }
         None
+    }
+
+    fn compact_hash_order_for_insert(&mut self) {
+        let dead = self.hash_order.len() - self.hash.len();
+        if self.hash_order.len() < MIN_HASH_ORDER_COMPACTION || dead <= self.hash.len() {
+            return;
+        }
+
+        self.hash_order.retain(|key| self.hash.contains_key(key));
+        self.hash_positions.clear();
+        for (pos, key) in self.hash_order.iter().enumerate() {
+            self.hash_positions.insert(key.clone(), pos);
+        }
+
+        // Also release an obsolete peak after a large table shrinks. With a
+        // fixed live set and changing keys, the index stays O(live + minimum).
+        let retained = self.hash.len().max(MIN_HASH_ORDER_COMPACTION);
+        self.hash_order.shrink_to(retained);
+        self.hash_positions.shrink_to(retained);
+        self.hash.shrink_to(retained);
     }
 
     // =====================================================================
@@ -488,6 +528,23 @@ impl Table {
     // 内部辅助方法
     // =====================================================================
 
+    /// Lua considers both signed zeros the same key, while Value preserves
+    /// their bits for constant storage. Resolve to the sign first registered
+    /// in this table so iteration also preserves the original key's sign.
+    fn normalize_zero_key<'key>(&self, key: &'key Value) -> &'key Value {
+        if let Value::Number(number) = key
+            && *number == 0.0
+        {
+            if self.hash_positions.contains_key(&Value::Number(0.0)) {
+                return &Value::Number(0.0);
+            }
+            if self.hash_positions.contains_key(&Value::Number(-0.0)) {
+                return &Value::Number(-0.0);
+            }
+        }
+        key
+    }
+
     /// 检查键是否是有效的数组索引
     ///
     /// 有效的数组索引必须满足：
@@ -535,10 +592,6 @@ impl Default for Table {
 unsafe impl GcObject for Table {
     fn gc_header(&self) -> &GcObjectHeader {
         &self.header
-    }
-
-    fn gc_header_mut(&mut self) -> &mut GcObjectHeader {
-        &mut self.header
     }
 
     /// 标记表中引用的所有 GC 对象
@@ -1097,6 +1150,192 @@ mod tests {
 
         // 从 k 继续 → 结束
         assert!(table.next(&k).is_none());
+    }
+
+    #[test]
+    fn next_after_deleting_current_hash_key_does_not_repeat_retained_keys() {
+        let mut table = Table::new();
+        for i in 1..=3 {
+            table.set(&Value::Number(-(i as f64)), &Value::Boolean(true));
+        }
+        let first = table.next(&Value::Nil).unwrap().0;
+        let current = table.next(&first).unwrap().0;
+        table.remove(&current);
+        let following = table.next(&current).unwrap().0;
+        assert_ne!(following, first);
+        assert!(table.next(&following).is_none());
+    }
+
+    #[test]
+    fn next_visits_every_key_once_when_some_or_all_current_keys_are_deleted() {
+        use std::collections::HashSet;
+
+        for remove_all in [false, true] {
+            let mut table = Table::new();
+            for i in 1..=80 {
+                table.set(&Value::Number(-(i as f64)), &Value::Number(i as f64));
+                table.set_array(i, &Value::Number(i as f64));
+            }
+            let mut seen = HashSet::new();
+            let mut cursor = Value::Nil;
+            while let Some((key, value)) = table.try_next(&cursor).unwrap() {
+                assert!(seen.insert(key.clone()), "repeated key {key:?}");
+                if remove_all || value.as_number() as i32 % 2 == 0 {
+                    table.remove(&key);
+                }
+                cursor = key;
+            }
+            assert_eq!(seen.len(), 160);
+            assert_eq!(table.hash_size(), if remove_all { 0 } else { 40 });
+        }
+    }
+
+    #[test]
+    fn try_next_distinguishes_unknown_keys_from_deleted_and_array_slots() {
+        let mut table = Table::new();
+        table.set_array(3, &Value::Boolean(true));
+        let deleted = Value::Boolean(false);
+        table.set(&deleted, &Value::Boolean(true));
+        table.remove(&deleted);
+        // Holes within the allocated array are valid cursors, like Lua 5.1.
+        assert_eq!(
+            table.try_next(&Value::Number(2.0)),
+            Ok(Some((Value::Number(3.0), Value::Boolean(true))))
+        );
+        assert_eq!(table.try_next(&deleted), Ok(None));
+        for key in [
+            Value::Boolean(true),
+            Value::Number(4.0),
+            Value::Number(-1.0),
+            Value::Number(f64::NAN),
+        ] {
+            table.remove(&key);
+            assert_eq!(table.try_next(&key), Err(InvalidNextKey));
+            assert_eq!(table.next(&key), None);
+        }
+    }
+
+    #[test]
+    fn signed_zero_keys_share_one_entry_and_preserve_the_original_cursor() {
+        for initial in [0.0_f64, -0.0_f64] {
+            let key = Value::Number(initial);
+            let equivalent = Value::Number(-initial);
+            let mut table = Table::new();
+            table.set(&key, &Value::Number(1.0));
+            table.set(&Value::Boolean(true), &Value::Number(2.0));
+            assert!(table.has(&equivalent));
+            assert_eq!(table.get(&equivalent), Value::Number(1.0));
+            let first = table.next(&Value::Nil).unwrap().0.as_number();
+            assert_eq!(first.to_bits(), initial.to_bits());
+
+            table.set(&equivalent, &Value::Number(3.0));
+            assert_eq!(table.hash_size(), 2);
+            assert_eq!(table.get(&key), Value::Number(3.0));
+            assert_eq!(
+                table.try_next(&equivalent),
+                Ok(Some((Value::Boolean(true), Value::Number(2.0))))
+            );
+            table.remove(&equivalent);
+            assert!(!table.has(&key));
+            assert_eq!(table.get(&key), Value::Nil);
+            assert_eq!(table.get(&equivalent), Value::Nil);
+            assert_eq!(table.try_next(&key), table.try_next(&equivalent));
+
+            // Reinsert through the other representation, including repeated
+            // set-to-nil deletions, without duplicating an iteration slot.
+            let warm_size = table.get_allocator_payload_size();
+            for _ in 0..100 {
+                table.set(&equivalent, &Value::Number(4.0));
+                table.set(&key, &Value::Nil);
+            }
+            assert_eq!(table.hash_size(), 1);
+            assert_eq!(table.get_allocator_payload_size(), warm_size);
+        }
+    }
+
+    #[test]
+    fn repeated_hash_key_churn_reuses_storage_with_a_retained_entry() {
+        let mut table = Table::new();
+        table.set(&Value::Boolean(true), &Value::Number(1.0));
+        let key = Value::Boolean(false);
+        table.set(&key, &Value::Number(2.0));
+        table.remove(&key);
+        let warm_size = table.get_allocator_payload_size();
+        for _ in 0..100_000 {
+            table.set(&key, &Value::Number(2.0));
+            table.remove(&key);
+        }
+        assert_eq!(table.hash_size(), 1);
+        assert_eq!(table.get_allocator_payload_size(), warm_size);
+    }
+
+    #[test]
+    fn changing_hash_keys_reach_a_memory_plateau_without_clearing_live_entries() {
+        let mut table = Table::new();
+        let retained = Value::Boolean(true);
+        table.set(&retained, &Value::Number(123.0));
+        for i in 1..=8 {
+            table.set(&Value::Number(-(i as f64)), &Value::Number(i as f64));
+        }
+        let mut warm_peak = 0;
+        let mut later_peak = 0;
+        for i in 9..=100_008 {
+            table.remove(&Value::Number(-((i - 8) as f64)));
+            table.set(&Value::Number(-(i as f64)), &Value::Number(i as f64));
+            let size = table.get_allocator_payload_size();
+            if i < 4096 {
+                warm_peak = warm_peak.max(size);
+            } else {
+                later_peak = later_peak.max(size);
+            }
+        }
+        assert!(
+            later_peak <= warm_peak,
+            "{later_peak} > warm peak {warm_peak}"
+        );
+        assert_eq!(table.hash_size(), 9);
+        assert_eq!(table.get(&retained), Value::Number(123.0));
+        for i in 100_001..=100_008 {
+            assert_eq!(
+                table.get(&Value::Number(-(i as f64))),
+                Value::Number(i as f64)
+            );
+        }
+    }
+
+    #[test]
+    fn deleted_gc_key_tombstones_do_not_retain_or_dereference_collected_objects() {
+        let mut gc = GarbageCollector::new();
+        let mut pool = StringPool::new();
+        let key = pool.intern_bytes(&mut gc, b"recreated key");
+        let stale = Value::String(key);
+        let retained = Value::Boolean(true);
+        let mut table = Table::new();
+        table.set(&stale, &Value::Number(1.0));
+        table.set(&retained, &Value::Number(2.0));
+        table.remove(&stale);
+        let table = gc.create(table);
+        gc.add_root(table);
+
+        gc.collect(&mut pool);
+        assert!(!gc.contains_registered(key), "a tombstone is not a GC root");
+        let fresh_key = pool.intern_bytes(&mut gc, b"recreated key");
+        assert_ne!(fresh_key.object_id(), key.object_id());
+        let fresh = Value::String(fresh_key);
+        gc.with_mut(table, |table| table.set(&fresh, &Value::Number(3.0)))
+            .unwrap();
+        gc.with_ref(table, |table| {
+            assert_eq!(table.get(&stale), Value::Nil);
+            assert_eq!(
+                table.try_next(&stale),
+                Ok(Some((retained.clone(), Value::Number(2.0))))
+            );
+            assert_eq!(
+                table.try_next(&retained),
+                Ok(Some((fresh, Value::Number(3.0))))
+            );
+        })
+        .unwrap();
     }
 
     // ── GcObject trait 测试 ─────────────────────────────────────

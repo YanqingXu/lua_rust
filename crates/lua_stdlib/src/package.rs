@@ -666,13 +666,7 @@ fn value_to_string(l: &LuaState, value: Value) -> String {
     match value {
         Value::Nil => "nil".to_string(),
         Value::Boolean(b) => b.to_string(),
-        Value::Number(n) => {
-            if n.fract() == 0.0 && n.is_finite() {
-                format!("{n:.0}")
-            } else {
-                n.to_string()
-            }
-        }
+        Value::Number(n) => lua_core::number_format::format_lua_number(n),
         Value::String(s) => l
             .with_string_bytes(s, |bytes| String::from_utf8_lossy(bytes).into_owned())
             .unwrap_or_default(),

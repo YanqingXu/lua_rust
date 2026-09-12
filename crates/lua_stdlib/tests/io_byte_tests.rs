@@ -3,15 +3,14 @@ use lua_compiler::parser::Parser;
 use lua_core::value::Value;
 use lua_stdlib::catalog::open_all;
 use lua_vm::Runtime;
-use lua_vm::execute::execute_proto;
 use std::path::{Path, PathBuf};
 
 fn compile_and_run(source: &str) -> Runtime {
     let mut runtime = Runtime::new();
-    {
+    let proto = {
         let mut parts = runtime.parts_mut().expect("runtime parts are available");
-        let (state, gc, string_pool) = parts.split_mut();
-        open_all(state, gc);
+        parts.with_context_gc(open_all);
+        let (_, gc, string_pool) = parts.split_mut();
 
         let mut parser = Parser::new(source);
         let chunk = parser.parse().expect("parse should succeed");
@@ -19,17 +18,20 @@ fn compile_and_run(source: &str) -> Runtime {
         let proto = cg
             .generate(&chunk, "<io-byte-test>")
             .expect("codegen should succeed");
-        let proto = gc.create(proto);
-        execute_proto(state, proto, gc).expect("VM should execute");
-    }
+        gc.create(proto)
+    };
+    runtime.execute_proto(proto).expect("VM should execute");
     runtime
 }
 
 fn returned_bytes(runtime: &mut Runtime) -> Vec<u8> {
-    let mut parts = runtime.parts_mut().expect("runtime parts remain available");
-    let (state, _, _) = parts.split_mut();
-    match state.stack.at(0).cloned().unwrap_or(Value::Nil) {
-        Value::String(value) => state
+    match runtime
+        .main_state()
+        .and_then(|state| state.stack.at(0))
+        .cloned()
+        .unwrap_or(Value::Nil)
+    {
+        Value::String(value) => runtime
             .copy_string_bytes(value)
             .expect("returned string should be live"),
         value => panic!("expected returned string, got {value:?}"),

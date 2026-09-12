@@ -15,3 +15,4 @@ pub mod publication;
 pub mod strategy;
 pub mod sweep;
 pub mod weak;
+pub mod write;

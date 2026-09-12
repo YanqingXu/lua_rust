@@ -3,12 +3,12 @@ title: lua_rust 完整复刻 lua_cpp 开发计划
 status: in-progress
 current_milestone: M1
 m0_status: completed
-last_updated: 2026-08-12
-rust_baseline: 6284135
+last_updated: 2026-09-12
+rust_baseline: 503bf99
 cpp_oracle: 87c15e6
 lua_oracle: Lua 5.1.5
-implementation_checkpoint: working-tree@f7e8380+m2-bytecode-tool-contract
-next_primary_task: M2.9 arithmetic error provenance for tables.metamethod-arith
+implementation_checkpoint: working-tree@503bf99+audit-remediation
+next_primary_task: M2 official db per-frame line hooks, then remaining source failures
 ---
 
 # lua_rust 完整复刻 lua_cpp 开发计划
@@ -31,9 +31,19 @@ next_primary_task: M2.9 arithmetic error provenance for tables.metamethod-arith
 本计划优先保证正确性和可验证性。在行为对齐完成前，不以性能优化、内部重构或增加
 非 `lua_cpp` 功能作为主要目标。
 
-## 2. 当前基线
+## 2. 基线与当前状态
 
-### 2.1 版本基线
+2026-09-12 深度审计以 `503bf99` 为基线，已重新打开 M1 公开访问与 GC mutation
+安全合同。**当前工作区修复和验收状态唯一入口为
+[审计整改状态](docs/audits/2026-09-12-remediation.md)**。下列 2.1–2.3 保存早期迁移
+快照，不可将“已闭环”或测试计数直接作为本轮修复的证明。原始审计见
+[风险与复现](docs/audits/2026-09-12.md)。
+
+下一顺序：公开边界与宿主错误 → 表/浮点/参数合同 → M2 具体债务与官方执行、
+内存/延迟基线 → 稳定合同上的 M3 ABI 与二进制格式设计。保留 oracle pin，
+不使用放宽比较规则来关闭问题。
+
+### 2.1 历史版本基线
 
 | 项目 | 当前基线 | 用途 |
 |---|---|---|
@@ -44,7 +54,7 @@ next_primary_task: M2.9 arithmetic error provenance for tables.metamethod-arith
 `lua_cpp` 基线升级必须通过独立 PR 完成。升级 PR 必须列出新增/变化合同、差分结果和
 Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
 
-### 2.2 已有能力
+### 2.2 历史迁移能力快照
 
 - 6 crate Cargo workspace 已建立。
 - Lexer、Parser、AST、CodeGen 和 38 条 opcode 主链已打通。
@@ -91,7 +101,7 @@ Rust 侧新增任务，禁止在普通功能 PR 中静默移动 oracle。
   `foundationPassed=false`、1 hard failure。最近一次具备 `cargo-audit 0.22.2` 的完整 M1
   仍为 `foundationPassed=true`、1 项跨平台/allocator 债务、73,578 ms；远程 CI 尚待首次运行。
 
-### 2.3 已确认的主要阻塞
+### 2.3 历史阻塞快照（当前状态见本节开头）
 
 | 领域 | 当前问题 | 优先级 |
 |---|---|---|
@@ -164,20 +174,20 @@ M5 跨平台 SDK、性能与发布
 M0 是所有工作的共同前置。M1 完成后，M2 的源码兼容和 M3 的 C API 边界可以有限并行；
 M4 必须建立在 M1 和 M3 的生命周期、allocator 和公开状态合同之上。
 
-### 4.1 里程碑执行状态
+### 4.1 里程碑执行状态（2026-09-12）
 
 | 里程碑 | 状态 | 当前证据或入口 |
 |---|---|---|
-| M0 | `completed` | 本地统一 M0 gate 通过，0 hard failure、1 项已登记 non-official 语义债务；代表性 bytecode 与 Complete 核心 trace 债务均已从 gate debt 中移除。详见 [M0 收口报告](docs/rust_migration/m0_report.md)。 |
-| M1 | `active` | P1 provenance、managed Proto、shutdown、临时对象/状态根、StateHandle fail-closed identity/generation、arena-owned main/coroutine states、Runtime coroutine/protected-call/callback-helper activation trampoline、checked open-Upvalue owner、debug/protected Runtime-native upvalue scheduling、`tostring/__tostring`、`load` reader、VM metamethod、`dofile`、`table.foreach[i]`、package 与 `string.gsub` callback suspension、compiler/library/package/IO/VM/app/result publication、production string contract、唯一 Heap/service owner、weak/finalizer/resurrection、Lua-visible full STW、write-barrier mutation inventory、explicit incremental phase/debt/step、managed allocator live/peak/total、allocation-triggered automatic gate、allocator/scheduler/resource-registry failure injection、显式 IO resource drain、本地 Miri、Windows ASan、1000 轮组合生命周期矩阵、1000-resource drain、1000 层 resume/wrap 与 128 层 nested `pcall` 深链已完成；M1.7 已清零 stdlib/VM dispatch 直接 managed-object 访问并收敛 VmContext alias 边界。最近一次具备 audit 工具的完整 M1 已通过；fresh 重验除本机缺 `cargo-audit` 外全部通过，剩余跨平台 sanitizer/public allocator 合同继续开放。 |
-| M2 | `active-limited` | 固定 C++ byte-safe constant/local evidence sidecar 已受审计接入；当前仓库 131/131 个有效 Lua 源码均为完整 structured 零差异，覆盖全部 24 个 vendored official 文件与固定 C++ 的 36/36 frontend-produced opcode。M2.1 compiler limits/error categories、M2.7 trace lifecycle、M2.16 CLI、M2.17 REPL 与 M2.18 bytecode viewer 已 completed-local；M2.12 text seek/tell 与 `io.popen` 已关闭，使 non-official 推进到 81 match / 11 differences。下一步处理 M2.9 arithmetic error provenance；binary chunk 仍由 M3 跟踪。 |
-| M3 | `pending` | 等待 M1 的字节表示和生命周期合同稳定。 |
-| M4 | `pending` | 等待 M1/M3 的 runtime、allocator 与公开状态合同。 |
+| M0 | `completed-with-known-debt` | 固定 case/渠道/签名策略、doctests 和官方 source lane 已加入；REPL completion 漏迁移修正后最终完整 M0 为 0 hard failure，9 个具体 non-official case debt 保留。见[整改状态](docs/audits/2026-09-12-remediation.md)。 |
+| M1 | `reopened-safety` | 公开 Runtime/GC、callback/栈窗口及普通 Lua 迭代调用通过定向默认 Miri；递归 Debug/Release 和 1/2/8 MiB 宿主线程栈通过，完整 M0/M1 基础门复验通过。公开 allocator、自动 GC 暂停上界与完整资源预算仍开放。 |
+| M2 | `active-limited` | 本轮 non-official 已为 83 match / 9 具体 debt；数字显示和普通 arithmetic provenance 已收口。官方 source 快照 11/19 完成、5 失败、3 超时，保留具体根因与双 oracle 冲突。已有 bytecode/trace 历史切片保持独立证据。 |
+| M3 | `design-draft` | 已核实 stock 与固定 C++ 的不同 dump payload，形成[格式、verifier、ABI 与模块生存期设计](docs/rust_migration/m3_contract_design.md)。实现等待前置风险收口。 |
+| M4 | `pending` | 预算、取消、公开 allocator 与 capability 合同仍待实现；记账不能替代可恢复 OOM。 |
 | M5 | `pending` | 等待兼容性与生产运行时门槛。 |
 
-这里的 M0 `completed` 表示本地验证基础设施和 fail-closed 报告合同达到 M0
-完成门槛，不表示剩余 1 项已登记语义债务已经修复，也不表示总计划完成。远程 CI 尚待首次
-运行；其结果若暴露 workflow 或平台故障，必须重新打开对应 M0 项。
+2026-09-01 提交 `503bf99` 的远程 CI 已成功；后续审计整改不能沿用该结果
+宣布新修复通过远程 CI。历史 M0 completed 表示验证基础设施达到当时门槛，不代表
+全部语义债务关闭。当前完整 gate、局部 smoke、已知失败及显式排除项分开报告。
 
 ## 5. M0：可信基线与验证闭环
 

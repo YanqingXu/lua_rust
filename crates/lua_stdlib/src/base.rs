@@ -154,11 +154,7 @@ fn append_print_value(l: &LuaState, output: &mut Vec<u8>, v: &Value) {
         Value::Nil => output.extend_from_slice(b"nil"),
         Value::Boolean(b) => output.extend_from_slice(if *b { b"true" } else { b"false" }),
         Value::Number(n) => {
-            let text = if n.fract() == 0.0 && n.is_finite() {
-                format!("{n:.0}")
-            } else {
-                n.to_string()
-            };
+            let text = lua_core::number_format::format_lua_number(*n);
             output.extend_from_slice(text.as_bytes());
         }
         Value::String(s) => {
@@ -213,13 +209,7 @@ fn value_to_string_helper(l: &LuaState, v: &Value) -> String {
     match v {
         Value::Nil => "nil".to_string(),
         Value::Boolean(b) => b.to_string(),
-        Value::Number(n) => {
-            if n.fract() == 0.0 && n.is_finite() {
-                format!("{:.0}", n)
-            } else {
-                n.to_string()
-            }
-        }
+        Value::Number(n) => lua_core::number_format::format_lua_number(*n),
         Value::String(s) => l
             .with_string_bytes(*s, |bytes| String::from_utf8_lossy(bytes).into_owned())
             .unwrap_or_default(),
@@ -588,11 +578,23 @@ unsafe extern "C" fn lua_b_rawget_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_b_rawset_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: _l_ptr is the LuaState pointer passed by the VM CALL handler.
     let l: &mut LuaState = unsafe { &mut *(_l_ptr as *mut LuaState) };
+    if l.get_top() < 3 {
+        let _ = push_lua_string(l, "rawset: missing arguments");
+        return -1;
+    }
     let Some(Value::Table(table_ref)) = l.at(1).cloned() else {
+        let _ = push_lua_string(l, "rawset: table expected");
         return -1;
     };
     let key = l.at(2).cloned().unwrap_or(Value::Nil);
     if key.is_nil() {
+        let _ = push_lua_string(l, "rawset: table index is nil");
+        return -1;
+    }
+    // Table::set requires a valid key. Reject Lua input before entering the
+    // mutation callback: a Rust panic cannot unwind across this C ABI boundary.
+    if matches!(&key, Value::Number(number) if number.is_nan()) {
+        let _ = push_lua_string(l, "rawset: table index is NaN");
         return -1;
     }
     let value = l.at(3).cloned().unwrap_or(Value::Nil);
@@ -756,6 +758,9 @@ unsafe extern "C" fn lua_b_setmetatable_raw(_l_ptr: *mut std::ffi::c_void) -> i3
         let _ = push_lua_string(l, "cannot change a protected metatable");
         return -1;
     }
+    // Finish dynamic collector reads before taking the explicit mutable
+    // collector borrow used to install and register this metatable.
+    let mode = mt.and_then(|metatable| weak_mode(l, metatable));
     let Some(gc_ptr) = l.active_gc_ptr() else {
         return -1;
     };
@@ -767,9 +772,7 @@ unsafe extern "C" fn lua_b_setmetatable_raw(_l_ptr: *mut std::ffi::c_void) -> i3
     {
         return -1;
     }
-    if let Some(mt_ref) = mt
-        && let Some((weak_keys, weak_values)) = weak_mode(l, mt_ref)
-    {
+    if let Some((weak_keys, weak_values)) = mode {
         gc.register_weak_table(table_ref, weak_keys, weak_values);
     }
     // Match the fixed C++ base library: retain only argument 1 as the result
@@ -902,7 +905,10 @@ fn set_function_env(l: &LuaState, func_ref: GcRef<Function>, env: GcRef<Table>) 
 }
 
 fn raw_equal(a: &Value, b: &Value) -> bool {
-    a == b
+    match (a, b) {
+        (Value::Number(a), Value::Number(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -917,10 +923,17 @@ unsafe extern "C" fn lua_b_next_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     let key = l.at(2).cloned().unwrap_or(Value::Nil);
 
-    let next = l
-        .with_gc_ref(table_ref, |table| table.next(&key))
-        .ok()
-        .flatten();
+    let next = match l.with_gc_ref(table_ref, |table| table.try_next(&key)) {
+        Ok(Ok(next)) => next,
+        Ok(Err(error)) => {
+            let _ = push_lua_string(l, &error.to_string());
+            return -1;
+        }
+        Err(_) => {
+            let _ = push_lua_string(l, "next: table is unavailable");
+            return -1;
+        }
+    };
     if let Some((next_key, next_value)) = next {
         l.push_value(next_key);
         l.push_value(next_value);

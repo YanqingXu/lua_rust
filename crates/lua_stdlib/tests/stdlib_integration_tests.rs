@@ -13,8 +13,8 @@ fn compile_runtime(source: &str) -> (Runtime, GcRef<Proto>) {
     let mut runtime = Runtime::new();
     let proto = {
         let mut parts = runtime.parts_mut().expect("runtime parts are available");
-        let (state, gc, string_pool) = parts.split_mut();
-        open_all(state, gc);
+        parts.with_context_gc(open_all);
+        let (_, gc, string_pool) = parts.split_mut();
 
         let mut parser = Parser::new(source);
         let chunk = parser.parse().expect("parse should succeed");
@@ -3347,13 +3347,10 @@ fn thousand_level_resume_and_wrap_chains_bound_borrows_and_release_transfers() {
     assert_eq!(stats.current_rooted_activation_depth(), 0);
     assert_eq!(runtime.active_execution_count(), 0);
     assert_eq!(runtime.temporary_state_root_count(), 0);
-    // The fixed C++ compiler freezes the `coroutine.wrap(function ...)` lvalue
-    // before its RHS call. The last wrapper/closure therefore remains in a dead
-    // temporary register while this chunk's frame is active, and Lua 5.1-style
-    // conservative frame tracing keeps exactly one coroutine state alive during
-    // the in-script collection. Runtime shutdown below must still reclaim it
-    // after the frame has unwound.
-    assert_eq!(runtime.live_coroutine_state_count(), 1);
+    // The final collectgarbage call clears reused native spare slots before
+    // taking its root snapshot. Dead wrapper temporaries therefore retain no
+    // coroutine states after all Lua owner references have been released.
+    assert_eq!(runtime.live_coroutine_state_count(), 0);
 
     let report = runtime.close().expect("deep-chain Runtime closes");
     assert_eq!(report.remaining_objects, 0);

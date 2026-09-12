@@ -160,10 +160,6 @@ unsafe impl GcObject for GcString {
         &self.header
     }
 
-    fn gc_header_mut(&mut self) -> &mut GcObjectHeader {
-        &mut self.header
-    }
-
     unsafe fn mark_children(&self, _collector: &mut GarbageCollector) {
         // 字符串对象不引用其他 GC 对象
     }

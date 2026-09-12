@@ -166,22 +166,26 @@ impl<'source> TokenStream<'source> {
 
 /// 解析状态
 ///
+#[derive(Clone)]
 struct ParseState {
-    recursion_depth: i32,
+    recursion_depth: std::rc::Rc<std::cell::Cell<i32>>,
 }
 
 impl ParseState {
     fn new() -> Self {
-        Self { recursion_depth: 0 }
+        Self {
+            recursion_depth: std::rc::Rc::new(std::cell::Cell::new(0)),
+        }
     }
 
-    fn enter_syntax_level(&mut self) -> i32 {
-        self.recursion_depth += 1;
-        self.recursion_depth
+    fn enter_syntax_level(&self) -> i32 {
+        let depth = self.recursion_depth.get() + 1;
+        self.recursion_depth.set(depth);
+        depth
     }
 
-    fn leave_syntax_level(&mut self) {
-        self.recursion_depth -= 1;
+    fn leave_syntax_level(&self) {
+        self.recursion_depth.set(self.recursion_depth.get() - 1);
     }
 }
 
@@ -194,21 +198,15 @@ impl ParseState {
 /// 在进入递归解析函数时增加深度计数，离开（Drop）时自动减少。
 /// 如果超出最大深度则返回错误。
 ///
-/// SAFETY: `state` 是从 `&mut ParseState` 派生的裸指针。
-/// 守卫的生命周期始终短于 Parser（它在 `&mut self` 方法内创建），
-/// 因此该指针在守卫的 Drop 期间始终有效。
+/// The counter is separately owned so recursive `&mut Parser` borrows cannot
+/// invalidate a pointer into Parser storage. The guard uses no raw references.
 ///
 struct RecursionGuard {
-    state: *mut ParseState,
-    entered: bool,
+    state: ParseState,
 }
 
 impl RecursionGuard {
-    fn new(
-        parse_state: &mut ParseState,
-        max_depth: i32,
-        token: &Token,
-    ) -> Result<Self, ParseError> {
+    fn new(parse_state: &ParseState, max_depth: i32, token: &Token) -> Result<Self, ParseError> {
         if parse_state.enter_syntax_level() > max_depth {
             parse_state.leave_syntax_level();
             return Err(ParseError::new(
@@ -218,22 +216,14 @@ impl RecursionGuard {
             ));
         }
         Ok(Self {
-            state: parse_state as *mut ParseState,
-            entered: true,
+            state: parse_state.clone(),
         })
     }
 }
 
 impl Drop for RecursionGuard {
     fn drop(&mut self) {
-        if self.entered {
-            // SAFETY: self.state is derived from a &mut ParseState that
-            // outlives this guard (the guard is always dropped before the
-            // parser method returns, and ParseState is owned by Parser).
-            unsafe {
-                (*self.state).leave_syntax_level();
-            }
-        }
+        self.state.leave_syntax_level();
     }
 }
 
@@ -556,7 +546,7 @@ impl<'source> Parser<'source> {
 
     fn recursion_guard(&mut self, max_depth: i32) -> Result<RecursionGuard, ParseError> {
         let token = self.current().clone();
-        RecursionGuard::new(&mut self.parse_state, max_depth, &token)
+        RecursionGuard::new(&self.parse_state, max_depth, &token)
     }
 
     // ── Token 工具函数 ──────────────────────────────────────────────

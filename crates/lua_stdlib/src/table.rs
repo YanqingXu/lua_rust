@@ -88,11 +88,7 @@ fn string_arg_bytes(l: &LuaState, idx: i32) -> Option<Vec<u8>> {
 }
 
 fn number_to_lua_string(n: f64) -> String {
-    if n.fract() == 0.0 && n.is_finite() {
-        format!("{n:.0}")
-    } else {
-        n.to_string()
-    }
+    lua_core::number_format::format_lua_number(n)
 }
 
 fn value_to_concat_bytes(l: &LuaState, value: &Value) -> Option<Vec<u8>> {

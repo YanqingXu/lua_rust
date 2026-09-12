@@ -1,0 +1,924 @@
+{
+  "schema_version": 1,
+  "suite": "non-official",
+  "provenance": {
+    "commit": "503bf99d12a5ebae81862ad3ea4dbf7e97af38ca",
+    "audit": "docs/audits/2026-09-12.md#A09",
+    "artifact": "target/audit-2026-09-12/m0/non-official.json",
+    "artifact_sha256": "7659ef8831ea9f8398c4e63e2087b50ca3bf017ef908251ab93684533d063f2f",
+    "observed_matches": 81,
+    "observed_differences": 11,
+    "note": "This initially froze ten historical stdout debts, not permission for new differences. The env-metatable-loader expected-exit failure was never waived. Arithmetic formatting/provenance is now fixed and its debt removed after exact Debug/Release/C++ byte verification (target/error-provenance-evidence/verification.json). Nine historical debts remain. Missing required cases, new failing cases, unexpected exits, changed channels and changed signatures must fail. Remove each debt when its fix lands."
+  },
+  "required_cases": [
+    {
+      "id": "alien-signals.bit",
+      "kind": "helper",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "alien-signals.constants",
+      "kind": "helper",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "alien-signals.engine",
+      "kind": "helper",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "alien-signals.example",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "alien-signals.graph",
+      "kind": "helper",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "alien-signals.init",
+      "kind": "helper",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "alien-signals.primitives",
+      "kind": "helper",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "alien-signals.scheduler",
+      "kind": "helper",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "alien-signals.tracer",
+      "kind": "helper",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "basic.syntax-error",
+      "kind": "negative",
+      "expected_exit": 1,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "basic.arithmetic",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "basic.basic",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "basic.print",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "bytecode.debug",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "bytecode.basic",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.break-counter",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.break-for",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.break-minimal",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.break-nested",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.break-simple",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.for-simple",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.if-basic",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.if-comparison",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.if-else",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.if-elseif",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.if-eq-simple",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.if-in-while",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.if-logic",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.if-nested",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.if-simple",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.if-truthy",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.if-smoke",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.simple-if-while",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "control-flow.simple-if",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.factorial",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.call-success",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.closure-simple",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.direct-call",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.definitions",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.multiret",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.simple-call",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.syntax-sugar",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.table-constructor-multiret",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.vararg-simple",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.vararg-table",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "functions.vararg",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "integration.workflow-helper",
+      "kind": "helper",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": false
+    },
+    {
+      "id": "integration.closure-pipeline",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "integration.coroutine-scheduler",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "integration.env-metatable-loader",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "integration.loadfile-dofile-workflow",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": false
+    },
+    {
+      "id": "regressions.call-pipeline",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "regressions.logical-return-combo",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "regressions.lvalue-matrix",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "regressions.lvalue-pipeline",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "regressions.move-bug",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "regressions.multiret-edges",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "regressions.return-bug",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "regressions.short-circuit-materialization",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "regressions.upvalue-close",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "regressions.value-pipeline",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "regressions.vm-self-limitation",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "runtime.arg-index",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "runtime.arg-minimal",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "runtime.arg-negative",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "runtime.arg-simple",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "runtime.arg-table",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "runtime.arg-very-simple",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "runtime.arg",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "runtime.global-access",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "runtime.globals",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "runtime.register",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.collectgarbage-count",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.collectgarbage-simple",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.collectgarbage",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.coroutine-basic",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.coroutine-closures",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.coroutine-errors",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.coroutine-generators",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.coroutine-status",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.coroutine-values",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.debug",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.gcinfo-return",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.gcinfo-simple",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.gcinfo",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.getfenv",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.io-debug",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.io-minimal",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.io-type",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.iolib-core",
+      "kind": "entry",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.iolib-simple",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.iolib",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.print-gcinfo",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.setfenv-detailed",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "stdlib.setfenv",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "steps.basic",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "steps.logic",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "steps.table",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "tables.metamethod-arith",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "tables.access",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    },
+    {
+      "id": "tables.zero-key",
+      "kind": "manual-output",
+      "expected_exit": 0,
+      "compare_stdout": true,
+      "compare_stderr": true,
+      "compare_side_effects": true
+    }
+  ],
+  "debts": [
+    {
+      "id": "functions.call-success",
+      "channels": [
+        "stdout"
+      ],
+      "reason": "Historical userdata rendering differs from the pinned C++ oracle; only Rust allocation addresses may vary.",
+      "stdout_patterns": {
+        "lua_rust": "\\A===\\ Test\\ 1:\\ Simple\\ call\\ ===\\nType:\\tuserdata\\nValue:\\tuserdata: 0x[0-9a-fA-F]+\\n\\n===\\ Test\\ 2:\\ Multiple\\ assignment\\ ===\\na:\\tuserdata\\tuserdata: 0x[0-9a-fA-F]+\\nb:\\tstring\\thello\\n\\n===\\ SUCCESS\\ ===\\n\\z",
+        "lua_cpp": "\\A===\\ Test\\ 1:\\ Simple\\ call\\ ===\\nType:\\tuserdata\\nValue:\\tunknown\\n\\n===\\ Test\\ 2:\\ Multiple\\ assignment\\ ===\\na:\\tuserdata\\tunknown\\nb:\\tstring\\thello\\n\\n===\\ SUCCESS\\ ===\\n\\z"
+      }
+    },
+    {
+      "id": "regressions.move-bug",
+      "channels": [
+        "stdout"
+      ],
+      "reason": "Historical userdata rendering differs from the pinned C++ oracle; only Rust allocation addresses may vary.",
+      "stdout_patterns": {
+        "lua_rust": "\\Af\\ =\\tuserdata: 0x[0-9a-fA-F]+\\ntype\\(f\\)\\ =\\tuserdata\\n\\z",
+        "lua_cpp": "\\Af\\ =\\tunknown\\ntype\\(f\\)\\ =\\tuserdata\\n\\z"
+      }
+    },
+    {
+      "id": "stdlib.collectgarbage-count",
+      "channels": [
+        "stdout"
+      ],
+      "reason": "Collector accounting is implementation-dependent; only the existing nonnegative memory measurements may vary.",
+      "stdout_patterns": {
+        "lua_rust": "\\ATesting\\ collectgarbage\\ count\\.\\.\\.\\nMemory:\\t[0-9]+(?:\\.[0-9]+)?\\tKB\\nDone!\\n\\z",
+        "lua_cpp": "\\ATesting\\ collectgarbage\\ count\\.\\.\\.\\nMemory:\\t[0-9]+(?:\\.[0-9]+)?\\tKB\\nDone!\\n\\z"
+      }
+    },
+    {
+      "id": "stdlib.collectgarbage-simple",
+      "channels": [
+        "stdout"
+      ],
+      "reason": "Collector accounting is implementation-dependent; only the existing nonnegative memory measurements may vary.",
+      "stdout_patterns": {
+        "lua_rust": "\\A===\\ Testing\\ collectgarbage\\(\\)\\ ===\\nTest\\ 1:\\ Count\\ operation\\nMemory\\ usage\\ \\(KB\\):\\t[0-9]+(?:\\.[0-9]+)?\\nTest\\ 2:\\ Collect\\ operation\\nResult:\\t0\\n===\\ Tests\\ complete\\ ===\\n\\z",
+        "lua_cpp": "\\A===\\ Testing\\ collectgarbage\\(\\)\\ ===\\nTest\\ 1:\\ Count\\ operation\\nMemory\\ usage\\ \\(KB\\):\\t[0-9]+(?:\\.[0-9]+)?\\nTest\\ 2:\\ Collect\\ operation\\nResult:\\t0\\n===\\ Tests\\ complete\\ ===\\n\\z"
+      }
+    },
+    {
+      "id": "stdlib.collectgarbage",
+      "channels": [
+        "stdout"
+      ],
+      "reason": "Collector accounting is implementation-dependent; only the existing nonnegative memory measurements may vary.",
+      "stdout_patterns": {
+        "lua_rust": "\\A===\\ Testing\\ collectgarbage\\(\\)\\ ===\\n\\nTest\\ 1:\\ Default\\ operation\\ \\(collect\\)\\nCalling\\ collectgarbage\\(\\)\\.\\.\\.\\nResult:\\t0\\n\\nTest\\ 2:\\ Explicit\\ collect\\ operation\\nCalling\\ collectgarbage\\('collect'\\)\\.\\.\\.\\nResult:\\t0\\n\\nTest\\ 3:\\ Count\\ operation\\ \\(memory\\ usage\\)\\nCalling\\ collectgarbage\\('count'\\)\\.\\.\\.\\nMemory\\ usage\\ \\(KB\\):\\t[0-9]+(?:\\.[0-9]+)?\\n\\nTest\\ 4:\\ Stop\\ operation\\nCalling\\ collectgarbage\\('stop'\\)\\.\\.\\.\\nResult:\\t0\\n\\nTest\\ 5:\\ Restart\\ operation\\nCalling\\ collectgarbage\\('restart'\\)\\.\\.\\.\\nResult:\\t0\\n\\nTest\\ 6:\\ Step\\ operation\\nCalling\\ collectgarbage\\('step'\\)\\.\\.\\.\\nResult:\\tfalse\\n\\nTest\\ 7:\\ Setpause\\ operation\\nCalling\\ collectgarbage\\('setpause',\\ 200\\)\\.\\.\\.\\nResult:\\t200\\n\\nTest\\ 8:\\ Setstepmul\\ operation\\nCalling\\ collectgarbage\\('setstepmul',\\ 200\\)\\.\\.\\.\\nResult:\\t200\\n\\nTest\\ 9:\\ Memory\\ usage\\ before\\ and\\ after\\ creating\\ objects\\nMemory\\ before:\\t[0-9]+(?:\\.[0-9]+)?\\tKB\\nMemory\\ after:\\t[0-9]+(?:\\.[0-9]+)?\\tKB\\nMemory\\ after\\ GC:\\t[0-9]+(?:\\.[0-9]+)?\\tKB\\n\\n===\\ All\\ collectgarbage\\(\\)\\ tests\\ passed!\\ ===\\n\\z",
+        "lua_cpp": "\\A===\\ Testing\\ collectgarbage\\(\\)\\ ===\\n\\nTest\\ 1:\\ Default\\ operation\\ \\(collect\\)\\nCalling\\ collectgarbage\\(\\)\\.\\.\\.\\nResult:\\t0\\n\\nTest\\ 2:\\ Explicit\\ collect\\ operation\\nCalling\\ collectgarbage\\('collect'\\)\\.\\.\\.\\nResult:\\t0\\n\\nTest\\ 3:\\ Count\\ operation\\ \\(memory\\ usage\\)\\nCalling\\ collectgarbage\\('count'\\)\\.\\.\\.\\nMemory\\ usage\\ \\(KB\\):\\t[0-9]+(?:\\.[0-9]+)?\\n\\nTest\\ 4:\\ Stop\\ operation\\nCalling\\ collectgarbage\\('stop'\\)\\.\\.\\.\\nResult:\\t0\\n\\nTest\\ 5:\\ Restart\\ operation\\nCalling\\ collectgarbage\\('restart'\\)\\.\\.\\.\\nResult:\\t0\\n\\nTest\\ 6:\\ Step\\ operation\\nCalling\\ collectgarbage\\('step'\\)\\.\\.\\.\\nResult:\\tfalse\\n\\nTest\\ 7:\\ Setpause\\ operation\\nCalling\\ collectgarbage\\('setpause',\\ 200\\)\\.\\.\\.\\nResult:\\t200\\n\\nTest\\ 8:\\ Setstepmul\\ operation\\nCalling\\ collectgarbage\\('setstepmul',\\ 200\\)\\.\\.\\.\\nResult:\\t200\\n\\nTest\\ 9:\\ Memory\\ usage\\ before\\ and\\ after\\ creating\\ objects\\nMemory\\ before:\\t[0-9]+(?:\\.[0-9]+)?\\tKB\\nMemory\\ after:\\t[0-9]+(?:\\.[0-9]+)?\\tKB\\nMemory\\ after\\ GC:\\t[0-9]+(?:\\.[0-9]+)?\\tKB\\n\\n===\\ All\\ collectgarbage\\(\\)\\ tests\\ passed!\\ ===\\n\\z"
+      }
+    },
+    {
+      "id": "stdlib.gcinfo-return",
+      "channels": [
+        "stdout"
+      ],
+      "reason": "Collector accounting is implementation-dependent; only the existing nonnegative memory measurements may vary.",
+      "stdout_patterns": {
+        "lua_rust": "\\ATesting\\ gcinfo\\ return\\ value\\.\\.\\.\\nCalling\\ gcinfo\\(\\)\\.\\.\\.\\nResult:\\t[0-9]+\\nType:\\tnumber\\nDone!\\n\\z",
+        "lua_cpp": "\\ATesting\\ gcinfo\\ return\\ value\\.\\.\\.\\nCalling\\ gcinfo\\(\\)\\.\\.\\.\\nResult:\\t[0-9]+\\nType:\\tnumber\\nDone!\\n\\z"
+      }
+    },
+    {
+      "id": "stdlib.gcinfo-simple",
+      "channels": [
+        "stdout"
+      ],
+      "reason": "Collector accounting is implementation-dependent; only the existing nonnegative memory measurements may vary.",
+      "stdout_patterns": {
+        "lua_rust": "\\ATesting\\ gcinfo\\.\\.\\.\\nType\\ of\\ gcinfo:\\tfunction\\nResult:\\t[0-9]+\\nDone!\\n\\z",
+        "lua_cpp": "\\ATesting\\ gcinfo\\.\\.\\.\\nType\\ of\\ gcinfo:\\tfunction\\nResult:\\t[0-9]+\\nDone!\\n\\z"
+      }
+    },
+    {
+      "id": "stdlib.gcinfo",
+      "channels": [
+        "stdout"
+      ],
+      "reason": "Collector accounting is implementation-dependent; only the existing nonnegative memory measurements may vary.",
+      "stdout_patterns": {
+        "lua_rust": "\\A===\\ Testing\\ gcinfo\\(\\)\\ ===\\nTest\\ 1:\\ Basic\\ functionality\\nMemory\\ usage\\ \\(KB\\):\\t[0-9]+\\nTest\\ 2:\\ Multiple\\ calls\\nCall\\ 1:\\t[0-9]+\\tKB\\nCall\\ 2:\\t[0-9]+\\tKB\\nCall\\ 3:\\t[0-9]+\\tKB\\n===\\ All\\ gcinfo\\(\\)\\ tests\\ passed!\\ ===\\n\\z",
+        "lua_cpp": "\\A===\\ Testing\\ gcinfo\\(\\)\\ ===\\nTest\\ 1:\\ Basic\\ functionality\\nMemory\\ usage\\ \\(KB\\):\\t[0-9]+\\nTest\\ 2:\\ Multiple\\ calls\\nCall\\ 1:\\t[0-9]+\\tKB\\nCall\\ 2:\\t[0-9]+\\tKB\\nCall\\ 3:\\t[0-9]+\\tKB\\n===\\ All\\ gcinfo\\(\\)\\ tests\\ passed!\\ ===\\n\\z"
+      }
+    },
+    {
+      "id": "stdlib.print-gcinfo",
+      "channels": [
+        "stdout"
+      ],
+      "reason": "Collector accounting is implementation-dependent; only the existing nonnegative memory measurements may vary.",
+      "stdout_patterns": {
+        "lua_rust": "\\ATesting\\ gcinfo\\.\\.\\.\\n[0-9]+\\nDone!\\n\\z",
+        "lua_cpp": "\\ATesting\\ gcinfo\\.\\.\\.\\n[0-9]+\\nDone!\\n\\z"
+      }
+    }
+  ]
+}

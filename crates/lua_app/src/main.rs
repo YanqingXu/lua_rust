@@ -233,9 +233,7 @@ fn run_app(args: &[String], options: &AppOptions, program_name: &str) -> i32 {
     };
     let initialized = match runtime.parts_mut() {
         Ok(mut parts) => {
-            let (state, gc, string_pool) = parts.split_mut();
-            let _ = string_pool;
-            open_all(state, gc);
+            parts.with_context_gc(open_all);
             Ok(())
         }
         Err(err) => Err(err.to_string()),
@@ -407,10 +405,12 @@ fn execute_source(
 ) -> Result<(), String> {
     let proto = {
         let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
-        let (state, gc, string_pool) = parts.split_mut();
         if let Some(path) = script_path {
-            lua_stdlib::package::add_script_directory_to_path(state, gc, &format!("@{path}"));
+            parts.with_context_gc(|state, gc| {
+                lua_stdlib::package::add_script_directory_to_path(state, gc, &format!("@{path}"));
+            });
         }
+        let (_, gc, string_pool) = parts.split_mut();
         compile_or_load_proto(gc, string_pool, source, chunk_name)?
     };
     let (argument_values, argument_roots) = {
@@ -562,8 +562,7 @@ fn run_interactive(runtime: &mut Runtime, style: InteractiveStyle) -> Result<(),
         };
         let prompt = {
             let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
-            let (state, _, _) = parts.split_mut();
-            global_string(state, prompt_name)
+            parts.with_context(|state| global_string(state, prompt_name))
         }
         .unwrap_or_else(|| default_prompt.to_string());
         write_stdout_text(prompt.as_bytes()).map_err(|err| err.to_string())?;
@@ -756,13 +755,7 @@ fn value_to_string(state: &LuaState, value: &Value) -> String {
     match value {
         Value::Nil => "nil".to_string(),
         Value::Boolean(value) => value.to_string(),
-        Value::Number(value) => {
-            if value.fract() == 0.0 && value.is_finite() {
-                format!("{value:.0}")
-            } else {
-                value.to_string()
-            }
-        }
+        Value::Number(value) => lua_core::number_format::format_lua_number(*value),
         Value::String(value) => state
             .with_string_bytes(*value, |bytes| String::from_utf8_lossy(bytes).into_owned())
             .unwrap_or_default(),

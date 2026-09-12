@@ -18,6 +18,7 @@ use crate::gc::gc_ref::GcRef;
 use crate::gc::header::GcObjectHeader;
 use crate::table::Table;
 use crate::types::GcObjectType;
+use std::any::TypeId;
 
 // =====================================================================
 // Userdata 结构体
@@ -77,6 +78,9 @@ pub struct Userdata {
     /// Whether `write_typed` installed a live value whose padding and
     /// invariants make safe raw-byte views invalid.
     typed_payload_active: bool,
+    /// Concrete type installed by write_typed. Metatables and payload sizes
+    /// are not evidence that a userdata contains a particular Rust type.
+    typed_payload_type: Option<TypeId>,
 }
 
 impl Userdata {
@@ -91,6 +95,7 @@ impl Userdata {
             metatable: None,
             data_destructor: None,
             typed_payload_active: false,
+            typed_payload_type: None,
         }
     }
 
@@ -163,6 +168,28 @@ impl Userdata {
         self.data.as_mut_ptr().cast()
     }
 
+    /// Read the live typed payload installed by [`Self::write_typed`].
+    /// Returns `None` for raw bytes, a different Rust type, or destroyed data.
+    pub fn typed_ref<T: 'static>(&self) -> Option<&T> {
+        if self.typed_payload_type != Some(TypeId::of::<T>()) {
+            return None;
+        }
+        // SAFETY: write_typed recorded this exact type after construction.
+        // Safe byte mutation is disabled while it is live, and destruction
+        // clears the type identity before invoking the payload destructor.
+        unsafe { self.data_as::<T>() }
+    }
+
+    /// Mutate the live typed payload after checking its concrete Rust type.
+    pub fn typed_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        if self.typed_payload_type != Some(TypeId::of::<T>()) {
+            return None;
+        }
+        // SAFETY: the same checked construction invariant as typed_ref, with
+        // an exclusive borrow for the duration of the returned reference.
+        unsafe { self.data_as_mut::<T>() }
+    }
+
     /// 获取类型化的不可变引用
     ///
     /// 如果 `sizeof<T>() > self.len()` 则返回 `None`。
@@ -212,7 +239,7 @@ impl Userdata {
     /// destructor is present, or `T` exceeds the explicit alignment contract,
     /// this method panics before construction.
     ///
-    pub unsafe fn write_typed<T>(&mut self, value: T) {
+    pub unsafe fn write_typed<T: 'static>(&mut self, value: T) {
         assert!(
             std::mem::size_of::<T>() <= self.data_len,
             "Userdata buffer is too small for requested type"
@@ -233,6 +260,7 @@ impl Userdata {
         }
         self.data_destructor = Some(Self::destroy_typed::<T>);
         self.typed_payload_active = true;
+        self.typed_payload_type = Some(TypeId::of::<T>());
     }
 
     /// 类型化析构回调生成器
@@ -285,6 +313,9 @@ impl Userdata {
     /// 执行后清除析构器以防止重复调用。
     pub fn run_destructor(&mut self) {
         if let Some(dtor) = self.data_destructor.take() {
+            // A destructor may unwind after partially destroying its value.
+            // No later checked access may reinterpret that storage as T.
+            self.typed_payload_type = None;
             // SAFETY: the destructor was registered when data was constructed;
             // the pointer points to valid data within our buffer.
             unsafe {
@@ -315,10 +346,6 @@ impl Drop for Userdata {
 unsafe impl GcObject for Userdata {
     fn gc_header(&self) -> &GcObjectHeader {
         &self.header
-    }
-
-    fn gc_header_mut(&mut self) -> &mut GcObjectHeader {
-        &mut self.header
     }
 
     /// 标记 Userdata 引用的 GC 对象
@@ -550,6 +577,26 @@ mod tests {
     }
 
     #[test]
+    fn checked_typed_access_requires_a_live_exact_type() {
+        let mut userdata = Userdata::new(std::mem::size_of::<u64>());
+        assert!(userdata.typed_ref::<u64>().is_none());
+        assert!(userdata.typed_mut::<u64>().is_none());
+        // SAFETY: u64 fits the fresh allocation and needs no external lifetime.
+        unsafe { userdata.write_typed(7_u64) };
+        assert_eq!(userdata.typed_ref::<u64>(), Some(&7));
+        assert!(
+            userdata.typed_ref::<i64>().is_none(),
+            "size is not type identity"
+        );
+        assert!(userdata.typed_mut::<f64>().is_none());
+        *userdata.typed_mut::<u64>().unwrap() = 9;
+        assert_eq!(userdata.typed_ref::<u64>(), Some(&9));
+        userdata.run_destructor();
+        assert!(userdata.typed_ref::<u64>().is_none());
+        assert!(userdata.typed_mut::<u64>().is_none());
+    }
+
+    #[test]
     fn successful_typed_destructor_restores_zeroed_raw_payload() {
         let mut userdata = Userdata::new(std::mem::size_of::<u64>());
         // SAFETY: u64 fits the supported size/alignment contract.
@@ -562,6 +609,7 @@ mod tests {
         assert_eq!(userdata.data(), &[0; std::mem::size_of::<u64>()]);
         assert!(userdata.data_destructor.is_none());
         assert!(!userdata.typed_payload_active);
+        assert!(userdata.typed_ref::<u64>().is_none());
     }
 
     #[test]
@@ -589,6 +637,7 @@ mod tests {
         );
         assert!(userdata.data_destructor.is_none());
         assert!(userdata.typed_payload_active);
+        assert!(userdata.typed_ref::<u64>().is_none());
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = userdata.data();

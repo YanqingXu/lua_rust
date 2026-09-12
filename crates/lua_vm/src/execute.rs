@@ -7,7 +7,7 @@
 use lua_compiler::codegen::CodeGenerator;
 use lua_compiler::opcode::{self, OpCode};
 use lua_compiler::parser::Parser;
-use lua_core::function::{CFunction, Function, RuntimeNativeFunction};
+use lua_core::function::{CFunction, Function, NATIVE_ERROR_DIAGNOSTIC, RuntimeNativeFunction};
 use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc::publication::{PublicationTxn, Rooted};
@@ -275,9 +275,26 @@ pub fn execute_proto(
     proto: GcRef<Proto>,
     gc: &mut GarbageCollector,
 ) -> Result<VmExit, RuntimeError> {
+    execute_proto_scoped(l, proto, gc, None)
+}
+
+fn execute_proto_scoped(
+    l: &mut LuaState,
+    proto: GcRef<Proto>,
+    gc: &mut GarbageCollector,
+    forced_pc: Option<usize>,
+) -> Result<VmExit, RuntimeError> {
     let entry_ci = l.current_ci;
-    let result = execute_proto_inner(l, proto, gc, None);
-    if result.is_err() && entry_ci == 0 && l.current_ci == 0 {
+    let entry_nccalls = l.nccalls;
+    let result = execute_proto_inner(l, proto, gc, forced_pc);
+    // Preserve the synchronous-turn trace count. The persistent Lua-frame
+    // budget is checked separately when publishing a call frame.
+    l.nccalls = entry_nccalls;
+    let failed = matches!(&result, Err(error) if !error.is_native_request_suspend());
+    if failed && l.current_thread.is_none() && l.current_ci > entry_ci {
+        unwind_lua_frames_to(l, gc, entry_ci)?;
+    }
+    if failed && entry_ci == 0 && l.current_ci == 0 {
         let ci = l.current_call_info_mut();
         if ci.proto == Some(proto) {
             ci.proto = None;
@@ -301,7 +318,7 @@ pub(crate) fn resume_lua_instruction_after_debug_hook(
             "debug-hook instruction continuation no longer matches its Lua frame",
         ));
     }
-    execute_proto_inner(l, proto, gc, Some(pc))
+    execute_proto_scoped(l, proto, gc, Some(pc))
 }
 
 /// Resume a freshly pushed Lua CALL frame after its call hook completes while
@@ -326,6 +343,7 @@ fn execute_proto_inner(
             "VM: stack overflow (too many nested calls)",
         ));
     }
+    let entry_ci = l.current_ci;
     let mut active_proto_ref = proto;
     let initial_max_stack = gc
         .with_ref(active_proto_ref, Proto::max_stack_size)
@@ -365,7 +383,25 @@ fn execute_proto_inner(
 
     // ANCHOR: lua_vm_dispatch
     // 主解释循环
-    while let Some(inst) = proto_instruction(gc, active_proto_ref, pc)? {
+    loop {
+        let Some(inst) = proto_instruction(gc, active_proto_ref, pc)? else {
+            let returning_ci = l.current_ci;
+            let ci = l.current_call_info().clone();
+            close_state_upvalues(l, gc, ci.base)?;
+            let wanted = if returning_ci == 0 || ci.nresults == LUA_MULTRET {
+                0
+            } else {
+                ci.nresults.max(0) as usize
+            };
+            let result = finish_lua_return_after_debug_hook(l, &ci, vec![Value::Nil; wanted])?;
+            flush_instruction_diff(l, gc);
+            if returning_ci == entry_ci {
+                return Ok(result);
+            }
+            l.nccalls -= 1;
+            (active_proto_ref, pc) = lua_caller_successor(l)?;
+            continue;
+        };
         let op = opcode::get_opcode(inst);
         let base_idx = l.current_call_info().base;
         l.current_call_info_mut().savedpc = Some(pc);
@@ -648,13 +684,12 @@ fn execute_proto_inner(
                     Err(err)
                         if err.message == "attempt to perform arithmetic on a non-number value" =>
                     {
-                        return Err(RuntimeError::new(arith_error_message(
+                        return Err(runtime_diagnostic_at(
                             gc,
                             active_proto_ref,
                             pc,
-                            (b, &lhs),
-                            (c, &rhs),
-                        )));
+                            arith_error_message(gc, active_proto_ref, pc, (b, &lhs), (c, &rhs)),
+                        ));
                     }
                     Err(err) => return Err(err),
                 }
@@ -683,13 +718,12 @@ fn execute_proto_inner(
                     Err(err)
                         if err.message == "attempt to perform arithmetic on a non-number value" =>
                     {
-                        return Err(RuntimeError::new(unm_error_message(
+                        return Err(runtime_diagnostic_at(
                             gc,
                             active_proto_ref,
                             pc,
-                            b,
-                            &val,
-                        )));
+                            unm_error_message(gc, active_proto_ref, pc, b, &val),
+                        ));
                     }
                     Err(err) => return Err(err),
                 }
@@ -904,172 +938,63 @@ fn execute_proto_inner(
                 let b = opcode::get_arg_b(inst);
                 let c = opcode::get_arg_c(inst);
                 let func_pos = base_idx + a;
-                let nargs = if b == 0 {
-                    l.top.saturating_sub(func_pos + 1) as i32
+                let mut nargs = if b == 0 {
+                    l.top.saturating_sub(func_pos + 1)
                 } else {
-                    b - 1
+                    (b - 1) as usize
                 };
-                let nresults = if c == 0 { LUA_MULTRET } else { c - 1 };
-                let func = l.stack.at(func_pos).cloned().unwrap_or(Value::Nil);
+                let wanted_results = if c == 0 { None } else { Some((c - 1) as usize) };
+                let mut func = l.stack.at(func_pos).cloned().unwrap_or(Value::Nil);
                 emit_call_trace(l, gc, active_proto_ref, pc, &func);
+                if !matches!(func, Value::Function(_))
+                    && let Some(metamethod) = find_metamethod(l, gc, &func, &func, "__call")
+                {
+                    ensure_stack_slot(l, func_pos + nargs + 1);
+                    for i in (0..=nargs).rev() {
+                        let value = l.stack.at(func_pos + i).cloned().unwrap_or(Value::Nil);
+                        if let Some(slot) = l.stack.at_mut(func_pos + i + 1) {
+                            *slot = value;
+                        }
+                    }
+                    if let Some(slot) = l.stack.at_mut(func_pos) {
+                        *slot = metamethod.clone();
+                    }
+                    func = metamethod;
+                    nargs += 1;
+                }
 
                 if let Value::Function(func_ref) = func {
                     let (callee_proto, callable) = inspect_function(gc, func_ref)?;
                     if let Some(callee_proto_ref) = callee_proto {
-                        // Setup new call frame
-                        let new_base = base_idx + a + 1;
-                        let (varargs, max_stack_size) =
-                            prepare_lua_varargs(l, gc, callee_proto_ref, new_base, nargs)?;
-                        let saved_ci = l.current_ci;
-                        let ci = l.push_call_info();
-                        ci.func = base_idx + a;
-                        ci.base = new_base;
-                        ci.top = new_base + max_stack_size;
-                        ci.nresults = nresults;
-                        ci.nargs = nargs;
-                        ci.varargs = varargs;
-                        ci.savedpc = None;
-                        ci.proto = Some(callee_proto_ref);
-                        ci.tailcalls = 0;
-
-                        match publish_debug_hook_event(
-                            l,
-                            gc,
-                            "call",
-                            None,
-                            DebugHookContinuation::LuaCall {
-                                proto: callee_proto_ref,
-                            },
-                        ) {
-                            Ok(Some(request_id)) => {
-                                return Ok(VmExit::NativeRequest(request_id));
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                if l.current_thread.is_none() {
-                                    unwind_lua_frames_to(l, gc, saved_ci)?;
-                                }
-                                return Err(error);
-                            }
+                        start_lua_call_at_stack(l, gc, func_pos, nargs, wanted_results)?;
+                        if let Some(request_id) = dispatch_started_lua_call_hook(l, gc)? {
+                            return Ok(VmExit::NativeRequest(request_id));
                         }
-
-                        // Recursively execute the called function
-                        match execute_nested_proto_at(l, active_proto_ref, pc, callee_proto_ref, gc)
-                        {
-                            Ok(VmExit::Complete(ExecResult::Returned)) => {
-                                // Results already placed by RETURN handler
-                            }
-                            Ok(VmExit::Complete(ExecResult::Yielded)) => {
-                                return Ok(VmExit::Complete(ExecResult::Yielded));
-                            }
-                            Ok(VmExit::NativeRequest(id)) => {
-                                return Ok(VmExit::NativeRequest(id));
-                            }
-                            Ok(VmExit::UpvalueAccess(request)) => {
-                                return Ok(VmExit::UpvalueAccess(request));
-                            }
-                            Ok(VmExit::AutomaticGc) => {
-                                return Ok(VmExit::AutomaticGc);
-                            }
-                            Err(e) => {
-                                // A failed coroutine keeps its Lua frames intact so
-                                // debug.traceback(thread) can inspect the complete
-                                // failure stack and any still-open Upvalues keep
-                                // reading their owning registers. Main-state calls
-                                // retain the eager unwind used by top-level errors;
-                                // protected Runtime callbacks unwind explicitly at
-                                // their stop_ci boundary.
-                                if l.current_thread.is_none() {
-                                    unwind_lua_frames_to(l, gc, saved_ci)?;
-                                }
-                                return Err(e);
-                            }
-                        }
-
-                        if l.current_ci != saved_ci {
-                            unwind_lua_frames_to(l, gc, saved_ci)?;
-                            return Err(RuntimeError::new("VM: call frame imbalance"));
-                        }
-                        pc += 1;
+                        // Switch the heap-owned Lua frame inside this dispatch
+                        // loop. No Rust execute frame is retained per Lua call.
+                        l.nccalls += 1;
+                        active_proto_ref = callee_proto_ref;
+                        pc = 0;
                         continue;
                     } else if let Some(callable) = callable {
-                        let func_pos = base_idx + a;
-                        let actual_nargs = if b == 0 {
-                            l.top.saturating_sub(func_pos + 1)
-                        } else {
-                            nargs as usize
-                        };
-                        let wanted_results = if c == 0 {
-                            None
-                        } else {
-                            Some(nresults as usize)
-                        };
                         match call_native_function(
                             l,
                             gc,
                             func_pos,
-                            actual_nargs,
+                            nargs,
                             wanted_results,
                             callable,
-                        ) {
-                            Ok(VmExit::Complete(ExecResult::Yielded)) => {
-                                return Ok(VmExit::Complete(ExecResult::Yielded));
-                            }
-                            Ok(VmExit::Complete(ExecResult::Returned)) => {}
-                            Ok(VmExit::NativeRequest(id)) => {
-                                return Ok(VmExit::NativeRequest(id));
-                            }
-                            Ok(VmExit::UpvalueAccess(request)) => {
-                                return Ok(VmExit::UpvalueAccess(request));
-                            }
-                            Ok(VmExit::AutomaticGc) => {
-                                return Ok(VmExit::AutomaticGc);
-                            }
-                            Err(err) if err.message.starts_with("bad argument") => {
-                                return Err(runtime_error_at(
-                                    gc,
-                                    active_proto_ref,
-                                    pc,
-                                    err.message,
-                                ));
-                            }
-                            Err(err) => return Err(err),
+                        )? {
+                            VmExit::Complete(ExecResult::Returned) => {}
+                            exit => return Ok(exit),
                         }
                     }
-                } else if let Some(metamethod) = find_metamethod(l, gc, &func, &func, "__call") {
-                    let actual_nargs = nargs.max(0) as usize;
-                    ensure_stack_slot(l, func_pos + actual_nargs + 1);
-                    for i in (0..=actual_nargs).rev() {
-                        let src = l.stack.at(func_pos + i).cloned().unwrap_or(Value::Nil);
-                        if let Some(dst) = l.stack.at_mut(func_pos + i + 1) {
-                            *dst = src;
-                        }
-                    }
-                    if let Some(dst) = l.stack.at_mut(func_pos) {
-                        *dst = metamethod;
-                    }
-                    let wanted_results = if c == 0 {
-                        None
-                    } else {
-                        Some(nresults as usize)
-                    };
-                    call_value_at_stack(l, gc, func_pos, actual_nargs + 1, wanted_results)?;
                 } else {
-                    let type_desc = match &func {
-                        Value::Nil => "nil",
-                        Value::Boolean(_) => "boolean",
-                        Value::Number(_) => "number",
-                        Value::String(_) => "string",
-                        _ => "userdata",
-                    };
-                    let detail = describe_register_at(gc, active_proto_ref, pc, a, 8)
-                        .map(|name| format!("{} (a {} value)", name, type_desc))
-                        .unwrap_or_else(|| format!("a {} value", type_desc));
                     return Err(runtime_error_at(
                         gc,
                         active_proto_ref,
                         pc,
-                        format!("attempt to call {detail}"),
+                        call_error_message(gc, active_proto_ref, pc, a, &func),
                     ));
                 }
             }
@@ -1132,7 +1057,14 @@ fn execute_proto_inner(
                             VmExit::AutomaticGc => return Ok(VmExit::AutomaticGc),
                         }
                     } else {
-                        call_value_at_stack(l, gc, func_pos, actual_nargs, None)?;
+                        start_lua_call_at_stack(l, gc, func_pos, actual_nargs, None)?;
+                        let callee_proto = l.current_call_info().proto.ok_or_else(|| {
+                            RuntimeError::new("root tail call lost its Lua Proto")
+                        })?;
+                        l.nccalls += 1;
+                        active_proto_ref = callee_proto;
+                        pc = 0;
+                        continue;
                     }
                     pc += 1;
                     continue;
@@ -1218,7 +1150,12 @@ fn execute_proto_inner(
                         continue;
                     }
                 }
-                return Err(RuntimeError::new("tail call: only Lua functions supported"));
+                return Err(runtime_error_at(
+                    gc,
+                    active_proto_ref,
+                    pc,
+                    call_error_message(gc, active_proto_ref, pc, a, &func),
+                ));
             }
 
             OpCode::RETURN => {
@@ -1267,9 +1204,15 @@ fn execute_proto_inner(
                     return Ok(VmExit::NativeRequest(request_id));
                 }
 
-                let result = finish_lua_return_after_debug_hook(l, &ci, results);
+                let returning_ci = l.current_ci;
+                let result = finish_lua_return_after_debug_hook(l, &ci, results)?;
                 flush_instruction_diff(l, gc);
-                return result;
+                if returning_ci == entry_ci {
+                    return Ok(result);
+                }
+                l.nccalls -= 1;
+                (active_proto_ref, pc) = lua_caller_successor(l)?;
+                continue;
             }
 
             // ── 循环 (3) ─────────────────────────────────────
@@ -1427,54 +1370,16 @@ fn execute_proto_inner(
                                 *dst = control;
                             }
 
-                            let saved_ci = l.current_ci;
-                            let (varargs, max_stack_size) =
-                                prepare_lua_varargs(l, gc, iter_proto_ref, call_pos + 1, 2)?;
-                            let ci = l.push_call_info();
-                            ci.func = call_pos;
-                            ci.base = call_pos + 1;
-                            ci.top = ci.base + max_stack_size;
-                            ci.nresults = c as i32;
-                            ci.nargs = 2;
-                            ci.varargs = varargs;
-                            ci.savedpc = None;
-                            ci.proto = Some(iter_proto_ref);
-                            ci.tailcalls = 0;
-
-                            match execute_nested_proto_at(
-                                l,
-                                active_proto_ref,
-                                pc,
-                                iter_proto_ref,
-                                gc,
-                            ) {
-                                Ok(VmExit::Complete(ExecResult::Returned)) => {}
-                                Ok(VmExit::Complete(ExecResult::Yielded)) => {
-                                    return Ok(VmExit::Complete(ExecResult::Yielded));
-                                }
-                                Ok(VmExit::NativeRequest(id)) => {
-                                    return Ok(VmExit::NativeRequest(id));
-                                }
-                                Ok(VmExit::UpvalueAccess(request)) => {
-                                    return Ok(VmExit::UpvalueAccess(request));
-                                }
-                                Ok(VmExit::AutomaticGc) => {
-                                    return Ok(VmExit::AutomaticGc);
-                                }
-                                Err(e) => {
-                                    if l.current_thread.is_none() {
-                                        unwind_lua_frames_to(l, gc, saved_ci)?;
-                                    }
-                                    return Err(e);
-                                }
-                            }
-
-                            if l.current_ci != saved_ci {
-                                unwind_lua_frames_to(l, gc, saved_ci)?;
-                                return Err(RuntimeError::new(
-                                    "VM: generic-for call frame imbalance",
-                                ));
-                            }
+                            start_lua_call_at_stack(l, gc, call_pos, 2, Some(c))?;
+                            l.current_call_info_mut().return_continuation =
+                                DeferredVmContinuation::GenericFor {
+                                    base: base_idx,
+                                    register: a,
+                                };
+                            l.nccalls += 1;
+                            active_proto_ref = iter_proto_ref;
+                            pc = 0;
+                            continue;
                         } else {
                             return Err(RuntimeError::new(
                                 "generic for: iterator function has no callable body",
@@ -1681,10 +1586,6 @@ fn execute_proto_inner(
             return Ok(VmExit::AutomaticGc);
         }
     }
-
-    flush_instruction_diff(l, gc);
-    l.pop_call_info();
-    Ok(VmExit::Complete(ExecResult::Returned))
 }
 
 fn run_debug_instruction_hooks(
@@ -2137,18 +2038,21 @@ pub(crate) fn finish_lua_return_after_debug_hook(
     }
     l.top = new_top;
     l.pop_call_info();
+    let caller_pc = l.current_call_info().savedpc;
+    apply_vm_continuation(l, &call_info.return_continuation, l.current_ci, caller_pc)?;
     Ok(VmExit::Complete(ExecResult::Returned))
 }
 
-fn execute_nested_proto_at(
-    l: &mut LuaState,
-    caller_proto: GcRef<Proto>,
-    caller_pc: usize,
-    callee_proto: GcRef<Proto>,
-    gc: &mut GarbageCollector,
-) -> Result<VmExit, RuntimeError> {
-    let overflow = stack_overflow_error(l, gc, caller_proto, caller_pc);
-    execute_counted_proto(l, callee_proto, gc, overflow)
+fn lua_caller_successor(l: &LuaState) -> Result<(GcRef<Proto>, usize), RuntimeError> {
+    let caller = l.current_call_info();
+    let proto = caller
+        .proto
+        .ok_or_else(|| RuntimeError::new("VM: Lua return lost its caller Proto"))?;
+    let pc = caller
+        .savedpc
+        .and_then(|pc| pc.checked_add(1))
+        .ok_or_else(|| RuntimeError::new("VM: Lua return lost its caller PC"))?;
+    Ok((proto, pc))
 }
 
 fn execute_counted_proto(
@@ -2208,7 +2112,10 @@ pub fn call_value_with_results(
 ) -> Result<(), RuntimeError> {
     let saved_ci = l.current_ci;
     let saved_top = l.top;
-    let call_pos = saved_top;
+    // Native helpers may be entered with a logical top below the caller's
+    // initialized register window. Keep their scratch arguments and native
+    // spare slots above that entire window, then restore only logical top.
+    let call_pos = saved_top.max(l.current_call_info().top);
     ensure_stack_slot(l, call_pos + args.len());
     if let Some(dst) = l.stack.at_mut(call_pos) {
         *dst = func.clone();
@@ -2273,6 +2180,20 @@ pub fn start_lua_call_at_stack(
         return Err(RuntimeError::new("coroutine entry must be a Lua function"));
     };
 
+    // Count retained Lua frames, rather than Rust invocations. The same
+    // limit applies after hooks, yields, automatic GC and native requests.
+    let active_lua_frames = l.call_stack[..=l.current_ci]
+        .iter()
+        .filter(|ci| ci.proto.is_some())
+        .count();
+    if active_lua_frames >= MAX_CALLS as usize {
+        let caller = l.current_call_info();
+        return Err(match caller.proto {
+            Some(proto) => stack_overflow_error(l, gc, proto, caller.savedpc.unwrap_or(0)),
+            None => RuntimeError::new("stack overflow"),
+        });
+    }
+
     let new_base = func_pos + 1;
     let (varargs, max_stack_size) =
         prepare_lua_varargs(l, gc, callee_proto_ref, new_base, nargs as i32)?;
@@ -2318,6 +2239,10 @@ pub(crate) fn start_finalizer_callback(
             "VM: finalizer callback started at an unexpected frame depth",
         ));
     }
+    // Automatic GC uses Yield to resume the interrupted Lua frame's saved PC.
+    // A new callback starts normally; only a yield raised by this callback
+    // itself may be interpreted as an illegal finalizer yield.
+    l.status = ThreadStatus::Ok;
     // The deferred collectgarbage native frame may have lowered logical `top`
     // into the caller's register window. Use the frame's reserved boundary as
     // scratch space so callback arguments cannot overwrite still-live caller
@@ -2614,19 +2539,7 @@ fn call_value_at_stack(
     };
 
     let saved_ci = l.current_ci;
-    let new_base = func_pos + 1;
-    let (varargs, max_stack_size) =
-        prepare_lua_varargs(l, gc, callee_proto_ref, new_base, nargs as i32)?;
-    let ci = l.push_call_info();
-    ci.func = func_pos;
-    ci.base = new_base;
-    ci.top = new_base + max_stack_size;
-    ci.nresults = wanted_results.map_or(LUA_MULTRET, |n| n as i32);
-    ci.nargs = nargs as i32;
-    ci.varargs = varargs;
-    ci.savedpc = None;
-    ci.proto = Some(callee_proto_ref);
-    ci.tailcalls = 0;
+    start_lua_call_at_stack(l, gc, func_pos, nargs, wanted_results)?;
 
     gc.suspend_automatic_checkpoints();
     let protected_result =
@@ -2755,6 +2668,18 @@ fn runtime_error_at(
     pc: usize,
     message: impl Into<String>,
 ) -> RuntimeError {
+    runtime_diagnostic_at(gc, proto, pc, message).located()
+}
+
+/// Capture diagnostic provenance while the owning Lua frame is still alive.
+/// Unlike an explicit Lua error object, this location is rendered only at the
+/// boundary that owns the error policy.
+fn runtime_diagnostic_at(
+    gc: &GarbageCollector,
+    proto: GcRef<Proto>,
+    pc: usize,
+    message: impl Into<String>,
+) -> RuntimeError {
     let (source_ref, line) = gc
         .with_ref(proto, |proto| (proto.source(), proto.line(pc)))
         .unwrap_or((None, 0));
@@ -2764,7 +2689,9 @@ fn runtime_error_at(
                 .ok()
         })
         .unwrap_or_else(|| "?".to_string());
-    RuntimeError::new(format!("{}:{}: {}", source, line, message.into()))
+    let mut error = RuntimeError::new(message);
+    error.diagnostic_location = Some(DiagnosticLocation { source, line });
+    error
 }
 
 fn stack_overflow_error(
@@ -2901,6 +2828,20 @@ fn describe_register_at(
     .flatten()
 }
 
+fn call_error_message(
+    gc: &GarbageCollector,
+    proto: GcRef<Proto>,
+    pc: usize,
+    reg: usize,
+    value: &Value,
+) -> String {
+    let type_name = value_type_name(value);
+    let detail = describe_register_at(gc, proto, pc, reg, 8)
+        .map(|name| format!("{name} (a {type_name} value)"))
+        .unwrap_or_else(|| format!("a {type_name} value"));
+    format!("attempt to call {detail}")
+}
+
 fn operand_error_message(
     gc: &GarbageCollector,
     proto: &Proto,
@@ -2913,7 +2854,7 @@ fn operand_error_message(
     let type_desc = value_type_name(value);
     describe_operand(gc, proto, pc, rk, constants, 8)
         .map(|name| format!("{prefix} {name} (a {type_desc} value)"))
-        .unwrap_or_else(|| format!("{prefix} a non-number value"))
+        .unwrap_or_else(|| format!("{prefix} a {type_desc} value"))
 }
 
 fn describe_operand(
@@ -2966,11 +2907,23 @@ fn describe_register_impl(
         return None;
     }
 
+    let code = proto.code();
+    // The pinned C++ diagnostic resolver suppresses names for values used by
+    // a recent short-circuit guard. An unrelated JMP (for example `break` in
+    // a preceding loop branch) does not invalidate a later GETGLOBAL result.
+    if respect_name_barrier
+        && code[..pc].iter().rev().take(8).any(|&inst| {
+            matches!(opcode::get_opcode(inst), OpCode::TEST | OpCode::TESTSET)
+                && opcode::get_arg_a(inst) as usize == reg
+        })
+    {
+        return None;
+    }
+
     if let Some(name) = local_name_for_reg(gc, proto, reg, pc) {
         return Some(format!("local '{name}'"));
     }
 
-    let code = proto.code();
     for cursor in (0..pc).rev().take(16) {
         let inst = code[cursor];
         let op = opcode::get_opcode(inst);
@@ -3000,13 +2953,6 @@ fn describe_register_impl(
                     .map(|name| format!("upvalue '{name}'"));
             }
             OpCode::GETGLOBAL => {
-                if respect_name_barrier
-                    && cursor > 0
-                    && is_name_barrier(opcode::get_opcode(code[cursor - 1]))
-                    && has_prior_write_to_register(code, cursor, reg)
-                {
-                    return None;
-                }
                 let bx = opcode::get_arg_bx(inst) as usize;
                 return constant_string(gc, constants, bx).map(|name| format!("global '{name}'"));
             }
@@ -3029,56 +2975,6 @@ fn describe_register_impl(
     }
 
     None
-}
-
-fn is_name_barrier(op: OpCode) -> bool {
-    matches!(op, OpCode::JMP | OpCode::TEST | OpCode::TESTSET)
-}
-
-fn has_prior_write_to_register(
-    code: &[lua_core::proto::Instruction],
-    cursor: usize,
-    reg: usize,
-) -> bool {
-    for inst in code[..cursor].iter().rev().take(12) {
-        let op = opcode::get_opcode(*inst);
-        if instruction_writes_register(op, *inst, reg) {
-            return true;
-        }
-    }
-    false
-}
-
-fn instruction_writes_register(op: OpCode, inst: lua_core::proto::Instruction, reg: usize) -> bool {
-    match op {
-        OpCode::MOVE
-        | OpCode::LOADK
-        | OpCode::LOADBOOL
-        | OpCode::GETUPVAL
-        | OpCode::GETGLOBAL
-        | OpCode::GETTABLE
-        | OpCode::NEWTABLE
-        | OpCode::SELF
-        | OpCode::ADD
-        | OpCode::SUB
-        | OpCode::MUL
-        | OpCode::DIV
-        | OpCode::MOD
-        | OpCode::POW
-        | OpCode::UNM
-        | OpCode::NOT
-        | OpCode::LEN
-        | OpCode::CONCAT
-        | OpCode::CALL
-        | OpCode::TAILCALL
-        | OpCode::VARARG => opcode::get_arg_a(inst) as usize == reg,
-        OpCode::LOADNIL => {
-            let a = opcode::get_arg_a(inst) as usize;
-            let b = opcode::get_arg_b(inst) as usize;
-            (a..=b).contains(&reg)
-        }
-        _ => false,
-    }
 }
 
 fn local_name_for_reg(
@@ -3290,12 +3186,15 @@ fn call_native_function(
         l.stack.set_top(ci_top);
     }
     let argument_top = func_pos + 1 + nargs;
-    if matches!(callable, NativeCallable::C(_)) {
-        // The fixed C++ C frame initializes its unused register window. This
-        // is observable in full-register snapshots even though it lies above
-        // the callback's logical argument top.
-        record_trace_nil_range(l, argument_top, ci_top);
+    // A reused native frame must not retain dead temporaries from an earlier
+    // Lua scope. Both ordinary C callbacks and Runtime-native continuations
+    // expose this initialized window to the canonical GC root snapshot.
+    for index in argument_top..ci_top {
+        if let Some(slot) = l.stack.at_mut(index) {
+            *slot = Value::Nil;
+        }
     }
+    record_trace_nil_range(l, argument_top, ci_top);
     l.top = argument_top;
 
     match publish_debug_hook_event(
@@ -3438,7 +3337,29 @@ fn finish_native_call(
         unwind_lua_frames_to(l, gc, saved_ci)?;
         l.top = saved_top;
         return Err(error_value
-            .map(|value| RuntimeError::with_value(gc, value))
+            .map(|value| {
+                if nret == NATIVE_ERROR_DIAGNOSTIC && matches!(value, Value::String(_)) {
+                    let message = value_to_string(gc, &value);
+                    let caller = frame.caller_proto.zip(frame.caller_pc).or_else(|| {
+                        // `pcall(string.char, 256)` has a native immediate
+                        // caller. The pinned C++ boundary walks outward to the
+                        // nearest Lua frame, including on coroutine stacks.
+                        l.call_stack[..=l.current_ci]
+                            .iter()
+                            .rev()
+                            .find_map(|ci| ci.proto.zip(ci.savedpc))
+                    });
+                    if let Some((proto, pc)) = caller {
+                        runtime_diagnostic_at(gc, proto, pc, message)
+                    } else {
+                        RuntimeError::new(message)
+                    }
+                } else {
+                    // Existing -1 and unknown negative codes retain the legacy
+                    // explicit-object behavior; none is a result count.
+                    RuntimeError::with_value(gc, value)
+                }
+            })
             .unwrap_or_else(|| {
                 RuntimeError::new(format!("C function call failed: {display_name}"))
             }));
@@ -3516,7 +3437,7 @@ pub(crate) fn finish_native_call_after_debug_hook(
         // after a native target completes. Preserve that frame/PC here.
         close_state_upvalues(l, gc, l.current_call_info().base)?;
     } else {
-        apply_vm_continuation(l, gc, &continuation, saved_ci, caller_pc)?;
+        apply_vm_continuation(l, &continuation, saved_ci, caller_pc)?;
     }
     Ok(VmExit::Complete(ExecResult::Returned))
 }
@@ -3817,7 +3738,6 @@ fn validate_deferred_native_call(
 
 fn apply_vm_continuation(
     l: &mut LuaState,
-    _gc: &mut GarbageCollector,
     continuation: &DeferredVmContinuation,
     saved_ci: usize,
     caller_pc: Option<usize>,
@@ -4063,11 +3983,7 @@ fn gsub_replacement_bytes(
 }
 
 fn lua_number_bytes(number: f64) -> Vec<u8> {
-    if number.fract() == 0.0 && number.is_finite() {
-        format!("{number:.0}").into_bytes()
-    } else {
-        number.to_string().into_bytes()
-    }
+    lua_core::number_format::format_lua_number(number).into_bytes()
 }
 
 enum DefaultTableSortComparison {
@@ -5808,18 +5724,11 @@ fn exec_arith_into(
             OpCode::ADD => a + b,
             OpCode::SUB => a - b,
             OpCode::MUL => a * b,
-            OpCode::DIV => {
-                if b == 0.0 {
-                    return Err(RuntimeError::new("attempt to divide by zero"));
-                }
-                a / b
-            }
-            OpCode::MOD => {
-                if b == 0.0 {
-                    return Err(RuntimeError::new("attempt to modulo by zero"));
-                }
-                a - (a / b).floor() * b
-            }
+            // Lua 5.1 uses floating-point division, including signed
+            // infinities and NaN for zero divisors. Its modulo is defined
+            // by this floor expression, not Rust's remainder operator.
+            OpCode::DIV => a / b,
+            OpCode::MOD => a - (a / b).floor() * b,
             OpCode::POW => a.powf(b),
             _ => unreachable!(),
         };
@@ -6211,11 +6120,7 @@ fn to_concat_bytes(gc: &GarbageCollector, value: &Value) -> Option<Vec<u8>> {
     match value {
         Value::String(s) => gc.with_string_bytes(*s, <[u8]>::to_vec).ok(),
         Value::Number(n) => {
-            let text = if n.fract() == 0.0 && n.is_finite() {
-                format!("{n:.0}")
-            } else {
-                n.to_string()
-            };
+            let text = lua_core::number_format::format_lua_number(*n);
             Some(text.into_bytes())
         }
         _ => None,
@@ -6224,7 +6129,12 @@ fn to_concat_bytes(gc: &GarbageCollector, value: &Value) -> Option<Vec<u8>> {
 
 /// 值相等
 fn values_equal(lhs: &Value, rhs: &Value) -> bool {
-    lhs == rhs
+    match (lhs, rhs) {
+        // Value's bitwise equality is also used by constant/table storage;
+        // Lua comparisons require IEEE equality (+0 == -0, NaN != NaN).
+        (Value::Number(a), Value::Number(b)) => a == b,
+        _ => lhs == rhs,
+    }
 }
 
 /// 提取数值（含字符串强制转换）
@@ -6252,14 +6162,7 @@ fn value_to_string(gc: &GarbageCollector, val: &Value) -> String {
     match val {
         Value::Nil => "nil".to_string(),
         Value::Boolean(b) => b.to_string(),
-        Value::Number(n) => {
-            // Format Lua-style: integer if whole number
-            if n.fract() == 0.0 && n.is_finite() {
-                format!("{:.0}", n)
-            } else {
-                n.to_string()
-            }
-        }
+        Value::Number(n) => lua_core::number_format::format_lua_number(*n),
         Value::String(s) => gc
             .with_string_bytes(*s, |bytes| String::from_utf8_lossy(bytes).into_owned())
             .unwrap_or_default(),
@@ -6279,7 +6182,14 @@ fn value_to_string(gc: &GarbageCollector, val: &Value) -> String {
 pub struct RuntimeError {
     pub message: String,
     error_value: Option<Value>,
+    diagnostic_location: Option<DiagnosticLocation>,
     native_request_suspend: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DiagnosticLocation {
+    source: String,
+    line: i32,
 }
 
 fn invalid_proto_error(error: lua_core::gc::collector::GcRefValidationError) -> RuntimeError {
@@ -6291,6 +6201,7 @@ impl RuntimeError {
         Self {
             message: msg.into(),
             error_value: None,
+            diagnostic_location: None,
             native_request_suspend: false,
         }
     }
@@ -6299,6 +6210,7 @@ impl RuntimeError {
         Self {
             message: value_to_string(gc, &value),
             error_value: Some(value),
+            diagnostic_location: None,
             native_request_suspend: false,
         }
     }
@@ -6307,10 +6219,21 @@ impl RuntimeError {
         self.error_value.clone()
     }
 
+    /// Materialize captured VM provenance exactly once. Explicit Lua objects
+    /// never carry this metadata, including strings already containing a
+    /// source prefix or strings intentionally raised with error(message, 0).
+    pub(crate) fn located(mut self) -> Self {
+        if let Some(location) = self.diagnostic_location.take() {
+            self.message = format!("{}:{}: {}", location.source, location.line, self.message);
+        }
+        self
+    }
+
     fn native_request_suspend() -> Self {
         Self {
             message: "Runtime-native request suspended protected helper".to_string(),
             error_value: None,
+            diagnostic_location: None,
             native_request_suspend: true,
         }
     }
@@ -6522,6 +6445,42 @@ mod proto_handle_tests {
             .generate(&chunk, "<proto-handle-test>")
             .expect("test source compiles");
         gc.create(proto)
+    }
+
+    #[test]
+    fn empty_iterator_proto_returns_nil_and_completes_its_caller() {
+        let mut gc = GarbageCollector::new();
+        let mut strings = StringPool::new();
+        let mut state = LuaState::new();
+        let caller = compile(&mut gc, &mut strings, "return 1");
+        let callee = gc.create(Proto::new());
+        let function = gc.create(Function::new_lua(callee));
+        ensure_stack_slot(&mut state, 7);
+        *state.stack.at_mut(2).unwrap() = Value::Number(42.0);
+        *state.stack.at_mut(3).unwrap() = Value::Function(function);
+        let ci = state.current_call_info_mut();
+        ci.proto = Some(caller);
+        ci.savedpc = Some(7);
+        ci.top = 8;
+
+        crate::state::with_vm_context_gc(&mut state, &mut gc, &mut strings, |state, gc| {
+            start_lua_call_at_stack(state, gc, 3, 2, Some(2)).unwrap();
+            state.current_call_info_mut().return_continuation =
+                DeferredVmContinuation::GenericFor {
+                    base: 0,
+                    register: 0,
+                };
+            assert!(matches!(
+                execute_proto(state, callee, gc),
+                Ok(VmExit::Complete(ExecResult::Returned))
+            ));
+            assert_eq!(state.current_ci, 0);
+            assert_eq!(state.current_call_info().savedpc, Some(8));
+            assert_eq!(state.stack.at(2), Some(&Value::Number(42.0)));
+            assert_eq!(state.stack.at(3), Some(&Value::Nil));
+            assert_eq!(state.stack.at(4), Some(&Value::Nil));
+            assert_eq!(state.top, 5);
+        });
     }
 
     #[test]

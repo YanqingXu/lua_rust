@@ -27,7 +27,7 @@ impl GarbageCollector {
     /// Begin a cycle and seed collector-owned roots without tracing the
     /// Runtime's separate `StateArena`.
     pub fn begin_incremental_mark(&mut self) -> MarkRootSeedReport {
-        debug_assert_eq!(self.incremental_phase, IncrementalPhase::Pause);
+        assert_eq!(self.incremental_phase, IncrementalPhase::Pause);
         self.gray_list.reserve(self.object_count);
         self.weak_tables.reserve(self.object_count);
         self.incremental_collected = 0;
@@ -41,13 +41,13 @@ impl GarbageCollector {
 
     /// Publish that bounded root/object propagation reached a fixed point.
     pub fn enter_incremental_atomic(&mut self) {
-        debug_assert_eq!(self.incremental_phase, IncrementalPhase::Propagate);
+        assert_eq!(self.incremental_phase, IncrementalPhase::Propagate);
         self.incremental_phase = IncrementalPhase::Atomic;
     }
 
     /// Start bounded sweeping after Runtime atomic work and state pre-sweep.
     pub fn begin_incremental_sweep(&mut self) {
-        debug_assert_eq!(self.incremental_phase, IncrementalPhase::Atomic);
+        assert_eq!(self.incremental_phase, IncrementalPhase::Atomic);
         self.incremental_sweep_current = self.all_objects;
         self.incremental_sweep_previous = std::ptr::null_mut();
         self.incremental_phase = IncrementalPhase::Sweep;
@@ -62,7 +62,7 @@ impl GarbageCollector {
         budget: usize,
     ) -> (usize, usize, bool) {
         string_pool.bind_or_assert_owner(self.heap_id());
-        debug_assert_eq!(self.incremental_phase, IncrementalPhase::Sweep);
+        assert_eq!(self.incremental_phase, IncrementalPhase::Sweep);
         let mut processed = 0usize;
         let mut collected = 0usize;
         let budget = budget.max(1);
@@ -118,7 +118,7 @@ impl GarbageCollector {
 
     /// Complete the Finalize phase after Runtime has scheduled callbacks.
     pub fn complete_incremental_cycle(&mut self) -> usize {
-        debug_assert_eq!(self.incremental_phase, IncrementalPhase::Finalize);
+        assert_eq!(self.incremental_phase, IncrementalPhase::Finalize);
         let collected = self.incremental_collected;
         self.last_completed_collected = collected;
         self.reset_incremental_state();

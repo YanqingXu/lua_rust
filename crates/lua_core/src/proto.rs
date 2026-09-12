@@ -646,10 +646,6 @@ unsafe impl GcObject for Proto {
         &self.header
     }
 
-    fn gc_header_mut(&mut self) -> &mut GcObjectHeader {
-        &mut self.header
-    }
-
     /// 标记 Proto 引用的所有 GC 对象
     ///
     /// 标记路径：

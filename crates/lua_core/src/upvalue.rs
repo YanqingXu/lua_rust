@@ -185,10 +185,6 @@ unsafe impl GcObject for Upvalue {
         &self.header
     }
 
-    fn gc_header_mut(&mut self) -> &mut GcObjectHeader {
-        &mut self.header
-    }
-
     /// 标记 Upvalue 引用的 GC 对象
     ///
     /// - Closed 状态：标记 closed_value 中的 GC 对象

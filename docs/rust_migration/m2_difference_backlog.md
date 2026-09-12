@@ -1,7 +1,7 @@
 ---
 status: provisional
 milestone: M2
-last_updated: 2026-08-12
+last_updated: 2026-09-12
 evidence_snapshot: target/compatibility/m218-bytecode-m0-final/non-official.json
 bytecode_evidence_snapshot: target/compatibility/m2-compiler-limits-bytecode-131-final/report.json
 bytecode_integration_snapshot: target/compatibility/bytecode-integration-bounded-12-after-coroutine/report.json
@@ -11,7 +11,18 @@ cpp_oracle: 87c15e69ceb94eb74e28226ccbefb7e196635711
 
 # M2 non-official 差异聚类与开发 backlog
 
-## 结论
+## 当前入口
+
+2026-09-12 审计后的修复与最终验证统一见
+[审计整改状态](../audits/2026-09-12-remediation.md)。env loader fixture 已修复并执行
+后续断言，数字显示已完成定向双 oracle 验证，错误来源与 print 的 oracle 冲突继续
+单独处理。GC count 的历史差异签名是回归约束，不是两种 allocator 计数相等的承诺。
+官方源码执行另有[完整分类和失败证据](../audits/official-source-lane.md)。
+
+下文为 2026-08-12 及后续逐次追加的历史快照；不同计数对应不同产物，不应互相拼接
+为当前通过率。M2 不以差异数量归零代替每项行为合同及显式决策。
+
+## 历史结论
 
 当前可审计结论是 **92 个已执行 case 中 runner status match 81、difference 11**。
 `stdlib.iolib` 的 Windows text seek/tell 与 `io.popen` 已关闭并移入 match；

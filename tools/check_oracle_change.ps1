@@ -97,6 +97,9 @@ if (-not [string]::IsNullOrWhiteSpace($BaseRef)) {
             "tests/compatibility/lua51-loadnil-oracle.lua",
             "tests/compatibility/lua51-differential-cases.json",
             "tests/compatibility/lua51-version-probe.lua",
+            "tests/compatibility/lua_fixtures.json",
+            "tests/compatibility/non-official-debt.json",
+            "tests/compatibility/official-source-lane.json",
             "tests/lua/differential",
             "tests/lua/official"
         )

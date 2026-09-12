@@ -7,8 +7,9 @@
 //! LuaState stores no collector or string-pool backpointer: each state
 //! turn installs a dynamically scoped service context. Callers can borrow the
 //! three execution parts together through `Runtime::parts_mut`; the returned
-//! guard records the service scope, Runtime execution, and main-state arena
-//! borrow.
+//! guard records Runtime execution and the main-state arena borrow. Explicit
+//! component borrows do not install dynamic Heap access; callers enter a
+//! synchronous context through the guard when native services are needed.
 //!
 //! The first coroutine-trampoline substrate additionally provides a
 //! Runtime-owned turn driver. It confines one state borrow to one callback,
@@ -88,9 +89,7 @@ use crate::native::{
     UpvalueAccessRequest,
 };
 use crate::state::lua_state::LuaStateShutdownReport;
-use crate::state::{
-    ActiveVmContext, LuaState, ThreadStatus, enter_vm_context, with_vm_context, with_vm_context_gc,
-};
+use crate::state::{LuaState, ThreadStatus, enter_vm_context, with_vm_context, with_vm_context_gc};
 use crate::trace::{
     InstructionTrace, InstructionTraceError, InstructionTraceMode, InstructionTraceSummary,
     SharedInstructionTrace, discard_all_instruction_diffs, emit_coroutine_resume_trace,
@@ -2868,20 +2867,10 @@ impl Runtime {
         // SAFETY: the arena owns this allocation and marked the exact handle
         // exclusively borrowed until RuntimePartsMut releases it on Drop.
         let state = unsafe { state_ptr.as_mut() };
-        // SAFETY: RuntimePartsMut owns the three exclusive borrows and drops
-        // vm_context before releasing the arena borrow or any service.
-        let vm_context = unsafe {
-            enter_vm_context(
-                NonNull::from(&mut *state),
-                NonNull::from(&mut *gc),
-                NonNull::from(&mut *string_pool),
-            )
-        };
         Ok(RuntimePartsMut {
             state,
             gc,
             string_pool,
-            vm_context: Some(vm_context),
             state_arena: arena,
             state_handle,
             active_executions: &mut self.active_executions,
@@ -3030,11 +3019,13 @@ impl Runtime {
         unsafe { arena.as_mut() }.peak_turn_borrowed_slots = 0;
         activations.begin_session();
         gc.begin_automatic_checkpoint_driver();
-        let _activation_cleanup = NativeActivationSessionGuard {
-            activations: NonNull::from(&mut *activations),
-            gc: NonNull::from(&mut *gc),
+        let activation_cleanup = NativeActivationSessionGuard {
+            activations,
+            gc,
             arena,
         };
+        let activations = &mut *activation_cleanup.activations;
+        let gc = &mut *activation_cleanup.gc;
 
         let mut current = initial;
         let mut action = NativeDriverAction::StartProto(proto);
@@ -4064,8 +4055,7 @@ impl Runtime {
 
         let execution = self.execute_proto(proto);
         let mut parts = self.parts_mut()?;
-        let (state, _, _) = parts.split_mut();
-        (|| -> Result<(), RuntimeExecutionError> {
+        parts.with_context(|state| {
             let results = execution.is_ok().then(|| state_stack_values(state));
             if let Err(RuntimeExecutionError::Vm(error)) = &execution {
                 emit_runtime_error_trace(state, &error.message);
@@ -4079,7 +4069,7 @@ impl Runtime {
                     .expect("successful execution exposes its result buffer"),
             );
             Ok(())
-        })()
+        })
     }
 
     /// Deterministically reclaim Runtime-owned Rust states and GC allocations.
@@ -4222,8 +4212,7 @@ impl Runtime {
                 let mut parts = self
                     .parts_mut()
                     .expect("shutdown preflight validated the main-state service turn");
-                let (state, gc, _) = parts.split_mut();
-                (entry.drain)(state, gc, entry.object_id)
+                parts.with_context_gc(|state, gc| (entry.drain)(state, gc, entry.object_id))
             }));
             match outcome {
                 Ok(RuntimeResourceDrainOutcome::Drained) => {
@@ -5358,7 +5347,7 @@ fn classify_native_turn(
                 stop_ci, saved_top, ..
             } = role
             {
-                let error = runtime_error_value(state, gc, &error);
+                let error = runtime_error_value(state, gc, &error.located());
                 abort_runtime_callback_turn(state, gc, stop_ci, saved_top)?;
                 return Ok(NativeTurnEvent::ProtectedCall(ResumeResponse::Error(error)));
             }
@@ -5368,7 +5357,7 @@ fn classify_native_turn(
             let Some(thread) = state.current_thread else {
                 unwind_top_level_lua_error(state, gc)?;
                 discard_all_instruction_diffs(state);
-                return Ok(NativeTurnEvent::Main(Err(error)));
+                return Ok(NativeTurnEvent::Main(Err(error.located())));
             };
             discard_all_instruction_diffs(state);
             release_yield_permission(state)?;
@@ -5553,21 +5542,16 @@ fn release_yield_permission(state: &mut LuaState) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-struct NativeActivationSessionGuard {
-    activations: NonNull<NativeActivationStack>,
-    gc: NonNull<GarbageCollector>,
+struct NativeActivationSessionGuard<'session> {
+    activations: &'session mut NativeActivationStack,
+    gc: &'session mut GarbageCollector,
     arena: NonNull<StateArena>,
 }
 
-impl Drop for NativeActivationSessionGuard {
+impl Drop for NativeActivationSessionGuard<'_> {
     fn drop(&mut self) {
-        // SAFETY: both pointers target disjoint fields of the pinned RuntimeStorage
-        // and this guard drops before `Runtime::execute_proto` releases its
-        // exclusive Runtime borrow.
-        let activations = unsafe { self.activations.as_mut() };
-        // SAFETY: see the invariant above; no other collector reference is used
-        // during this cleanup loop.
-        let gc = unsafe { self.gc.as_mut() };
+        let activations = &mut *self.activations;
+        let gc = &mut *self.gc;
         // A fault can leave one or more nested protected-call barriers installed
         // after the last state turn has ended. Restore them innermost-first so a
         // nested frame saved under an outer barrier cannot make its requester
@@ -5619,21 +5603,58 @@ impl Drop for ActiveExecutionGuard<'_> {
 }
 
 /// Scoped mutable access to the three execution components.
+///
+/// [`Self::split_mut`] exposes explicit component borrows with no dynamic Heap
+/// context. [`Self::with_context`] and [`Self::with_context_gc`] install native
+/// services only inside a callback which exclusively borrows this whole guard.
 #[must_use = "dropping the guard ends the active execution borrow"]
 pub struct RuntimePartsMut<'runtime> {
     state: &'runtime mut LuaState,
     gc: &'runtime mut GarbageCollector,
     string_pool: &'runtime mut StringPool,
-    vm_context: Option<ActiveVmContext>,
     state_arena: NonNull<StateArena>,
     state_handle: StateHandle,
     active_executions: &'runtime mut usize,
 }
 
 impl RuntimePartsMut<'_> {
-    /// Borrow all execution components at once.
+    /// Borrow all execution components at once, without dynamic Heap access.
+    ///
+    /// Use the returned collector for managed-object reads. State-side dynamic
+    /// access fails with `CollectorUnavailable`, so a callback cannot hold a
+    /// managed borrow while separately using this mutable collector to sweep.
     pub fn split_mut(&mut self) -> (&mut LuaState, &mut GarbageCollector, &mut StringPool) {
         (self.state, self.gc, self.string_pool)
+    }
+
+    /// Run a native operation with dynamic Heap access and no explicit service
+    /// references available to the callback.
+    ///
+    /// The callback cannot acquire an independent collector borrow:
+    ///
+    /// ```compile_fail
+    /// let mut runtime = lua_vm::Runtime::new();
+    /// let mut parts = runtime.parts_mut().unwrap();
+    /// parts.with_context(|state| {
+    ///     let (_, gc, strings) = parts.split_mut();
+    ///     gc.collect(strings);
+    ///     state.push_nil();
+    /// });
+    /// ```
+    pub fn with_context<R>(&mut self, execute: impl FnOnce(&mut LuaState) -> R) -> R {
+        with_vm_context(self.state, self.gc, self.string_pool, execute)
+    }
+
+    /// Run initialization or VM code with an explicit collector and a dynamic
+    /// StringPool. Dynamic collector recovery is disabled during this callback.
+    ///
+    /// The StringPool is deliberately not passed to the callback: interning
+    /// helpers borrow it through the state without aliasing an explicit borrow.
+    pub fn with_context_gc<R>(
+        &mut self,
+        execute: impl FnOnce(&mut LuaState, &mut GarbageCollector) -> R,
+    ) -> R {
+        with_vm_context_gc(self.state, self.gc, self.string_pool, execute)
     }
 
     /// Return the main state through a shared borrow.
@@ -5649,7 +5670,6 @@ impl RuntimePartsMut<'_> {
 
 impl Drop for RuntimePartsMut<'_> {
     fn drop(&mut self) {
-        drop(self.vm_context.take());
         let mut arena = self.state_arena;
         // SAFETY: RuntimePartsMut is tied to the exclusive Runtime borrow, so
         // its pinned heap and StateArena outlive this guard.
@@ -5669,7 +5689,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
-    use lua_core::gc::header::GcObjectHeader;
     use lua_core::userdata::Userdata;
 
     use super::*;
@@ -5719,8 +5738,8 @@ mod tests {
 
         {
             let _cleanup = NativeActivationSessionGuard {
-                activations: NonNull::from(&mut activations),
-                gc: NonNull::from(&mut gc),
+                activations: &mut activations,
+                gc: &mut gc,
                 arena: NonNull::from(&mut arena),
             };
         }
@@ -5849,11 +5868,8 @@ mod tests {
             assert_eq!(state.state_handle(), Some(main_handle));
             assert!(state.state_arena.is_some());
             assert!(gc.is_root(global_root));
-            assert_eq!(state.active_gc_ptr(), Some(std::ptr::from_mut(gc)));
-            assert_eq!(
-                state.active_string_pool_ptr(),
-                Some(std::ptr::from_mut(string_pool))
-            );
+            assert!(state.active_gc_ptr().is_none());
+            assert!(state.active_string_pool_ptr().is_none());
             (std::ptr::from_mut(gc), std::ptr::from_mut(string_pool))
         };
         assert!(
@@ -5868,8 +5884,12 @@ mod tests {
         assert_eq!(std::ptr::from_ref(state), main_state_address);
         assert_eq!(std::ptr::from_mut(gc), gc_address);
         assert_eq!(std::ptr::from_mut(string_pool), string_pool_address);
-        assert_eq!(state.active_gc_ptr(), Some(gc_address));
-        assert_eq!(state.active_string_pool_ptr(), Some(string_pool_address));
+        assert!(state.active_gc_ptr().is_none());
+        assert!(state.active_string_pool_ptr().is_none());
+        parts.with_context(|state| {
+            assert!(state.active_gc_ptr().is_some());
+            assert!(state.active_string_pool_ptr().is_some());
+        });
     }
 
     #[test]
@@ -7277,10 +7297,8 @@ mod tests {
             let (_, gc, _) = parts.split_mut();
             gc.create(probe_userdata(&ordinary_drops));
             let fixed = gc.create(probe_userdata(&fixed_drops));
-            // SAFETY: fixed is a live Userdata header registered in gc.
-            unsafe {
-                (*(fixed.as_ptr() as *const GcObjectHeader)).mark_fixed();
-            }
+            gc.fix(fixed)
+                .expect("fixed userdata belongs to this collector");
         }
 
         assert_eq!(ordinary_drops.load(Ordering::SeqCst), 1);

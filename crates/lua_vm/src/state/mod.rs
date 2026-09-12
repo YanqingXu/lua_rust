@@ -11,5 +11,5 @@ mod vm_context;
 pub use call_info::{CallInfo, LUA_MULTRET};
 pub use lua_state::{LuaState, ThreadStatus};
 pub use stack::Stack;
-pub(crate) use vm_context::{ActiveVmContext, enter_vm_context};
+pub(crate) use vm_context::enter_vm_context;
 pub use vm_context::{with_vm_context, with_vm_context_gc};

@@ -74,30 +74,73 @@ unsafe extern "C" fn lua_os_time(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
         Value::Table(table_ref) => {
             let fields = l.with_gc_ref(table_ref, |table| {
-                (
-                    table_number_field(l, table, "year").unwrap_or(1970.0) as i64,
-                    table_number_field(l, table, "month").unwrap_or(1.0) as i64,
-                    table_number_field(l, table, "day").unwrap_or(1.0) as i64,
-                    table_number_field(l, table, "hour").unwrap_or(12.0) as i64,
-                    table_number_field(l, table, "min").unwrap_or(0.0) as i64,
-                    table_number_field(l, table, "sec").unwrap_or(0.0) as i64,
-                )
+                // Preserve the fixed C++ oracle's field validation order.
+                let sec = time_field(l, table, "sec", Some(0))?;
+                let min = time_field(l, table, "min", Some(0))?;
+                let hour = time_field(l, table, "hour", Some(12))?;
+                let day = time_field(l, table, "day", None)?;
+                let month = time_field(l, table, "month", None)?;
+                let year = time_field(l, table, "year", None)?;
+                Ok::<_, String>([year, month, day, hour, min, sec])
             });
-            let Ok((year, month, day, hour, min, sec)) = fields else {
-                l.push_nil();
-                return 1;
+            let fields = match fields {
+                Ok(Ok(fields)) => fields,
+                Ok(Err(message)) => return time_error(l, &message),
+                Err(_) => return time_error(l, "time: date table is unavailable"),
             };
-            let days = days_from_civil(year, month, day);
-            l.push_value(Value::Number(
-                (days * 86_400 + hour * 3_600 + min * 60 + sec) as f64,
-            ));
+            if let Some(timestamp) = timestamp_from_fields(fields) {
+                l.push_value(Value::Number(timestamp as f64));
+            } else {
+                l.push_nil();
+            }
             1
         }
-        _ => {
-            l.push_nil();
-            1
-        }
+        _ => time_error(l, "time: argument must be a table"),
     }
+}
+
+fn time_error(l: &mut LuaState, message: &str) -> i32 {
+    let _ = push_lua_string(l, message);
+    -1
+}
+
+fn time_field(
+    l: &LuaState,
+    table: &Table,
+    name: &str,
+    default: Option<i32>,
+) -> Result<i32, String> {
+    match table_field(l, table, name) {
+        Value::Number(number) => checked_time_integer(number)
+            .ok_or_else(|| "date table field has no valid integer representation".to_string()),
+        _ => default.ok_or_else(|| format!("field '{name}' missing in date table")),
+    }
+}
+
+fn checked_time_integer(number: f64) -> Option<i32> {
+    // The oracle truncates finite fractions before its i32 range check. Rust's
+    // saturating `as` conversion would otherwise hide invalid Lua arguments.
+    let truncated = number.trunc();
+    if !number.is_finite() || truncated < i32::MIN as f64 || truncated > i32::MAX as f64 {
+        return None;
+    }
+    Some(truncated as i32)
+}
+
+fn timestamp_from_fields([year, month, day, hour, min, sec]: [i32; 6]) -> Option<i64> {
+    // Normalize all representable months, including zero/negative months,
+    // before applying the civil-calendar formula. Promote before offsets so
+    // i32::MIN month/year cannot overflow as they do in a C `tm` conversion.
+    let month_index = i64::from(month).checked_sub(1)?;
+    let year = i64::from(year).checked_add(month_index.div_euclid(12))?;
+    let month = month_index.rem_euclid(12) + 1;
+    // The validated i32 fields bound normalized year to +/- 2.4 billion;
+    // days_from_civil's intermediate operations therefore fit in i64.
+    let days = days_from_civil(year, month, i64::from(day));
+    days.checked_mul(86_400)?
+        .checked_add(i64::from(hour).checked_mul(3_600)?)?
+        .checked_add(i64::from(min).checked_mul(60)?)?
+        .checked_add(i64::from(sec))
 }
 
 unsafe extern "C" fn lua_os_difftime(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -346,17 +389,6 @@ fn number_arg(l: &LuaState, idx: i32) -> Option<f64> {
     }
 }
 
-fn table_number_field(l: &LuaState, table: &Table, name: &str) -> Option<f64> {
-    match table_field(l, table, name) {
-        Value::Number(n) => Some(n),
-        Value::String(s) => l
-            .with_string_bytes(s, parse_lua_number_bytes)
-            .ok()
-            .flatten(),
-        _ => None,
-    }
-}
-
 fn table_field(l: &LuaState, table: &Table, name: &str) -> Value {
     let Ok(Some(key)) = l.find_interned_string(name.as_bytes()) else {
         return Value::Nil;
@@ -482,5 +514,44 @@ mod byte_string_tests {
         assert_eq!(parse_lua_number_bytes(b" 123.5 "), Some(123.5));
         assert_eq!(parse_lua_number_bytes(&[b'1', 0xff]), None);
         assert_eq!(parse_lua_number_bytes(b"12\0"), None);
+    }
+
+    #[test]
+    fn time_integer_conversion_checks_the_truncated_i32_domain() {
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300, -1e300] {
+            assert_eq!(checked_time_integer(number), None);
+        }
+        for number in [2147483648.0, -2147483649.0, 2147483648.75, -2147483649.75] {
+            assert_eq!(checked_time_integer(number), None);
+        }
+        assert_eq!(checked_time_integer(2147483647.75), Some(i32::MAX));
+        assert_eq!(checked_time_integer(-2147483648.75), Some(i32::MIN));
+        assert_eq!(checked_time_integer(-0.75), Some(0));
+        assert_eq!(checked_time_integer(1.75), Some(1));
+    }
+
+    #[test]
+    fn time_calendar_normalizes_fields_without_integer_wraparound() {
+        assert_eq!(timestamp_from_fields([1970, 1, 1, 0, 0, 0]), Some(0));
+        assert_eq!(timestamp_from_fields([1969, 13, 1, 0, 0, 0]), Some(0));
+        assert_eq!(timestamp_from_fields([1970, 0, 32, 0, 0, 0]), Some(0));
+        assert_eq!(timestamp_from_fields([1970, 1, 2, -24, 0, 0]), Some(0));
+        assert_eq!(
+            timestamp_from_fields([2000, 2, 30, 0, 0, 0]),
+            Some(951868800)
+        );
+        for mask in 0..64 {
+            let fields = std::array::from_fn(|bit| {
+                if mask & (1 << bit) == 0 {
+                    i32::MIN
+                } else {
+                    i32::MAX
+                }
+            });
+            // Every combination is inside the accepted field domain; promote
+            // before arithmetic and preserve the sign even at both extremes.
+            let timestamp = timestamp_from_fields(fields).expect("i32 calendar fits i64 seconds");
+            assert_eq!(timestamp.is_positive(), fields[0].is_positive());
+        }
     }
 }

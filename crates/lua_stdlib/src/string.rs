@@ -15,6 +15,23 @@ use lua_vm::state::LuaState;
 
 const STRING_DUMP_UNSUPPORTED: &str =
     "string.dump is unsupported until Lua 5.1 binary chunk serialization is implemented";
+// Match the pinned C++ ResourcePolicy's default output ceiling while the Rust
+// Runtime's configurable native resource policy remains a separate work item.
+const STRING_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
+
+mod args;
+use args::{check_arity, check_integer, check_string};
+
+// Native callbacks return a negative result count only after publishing the
+// error value. Keep argument failures out of the original argument stack.
+macro_rules! checked {
+    ($state:expr, $result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(message) => return string_format_error($state, &message),
+        }
+    };
+}
 
 pub fn open_string(l: &mut LuaState, gc: &mut GarbageCollector) {
     let string_lib = find_lib_table(l, gc, "string");
@@ -76,27 +93,8 @@ fn string_arg(l: &LuaState, idx: i32) -> Option<Vec<u8>> {
     }
 }
 
-fn number_arg(l: &LuaState, idx: i32) -> Option<f64> {
-    match l.at(idx) {
-        Some(Value::Number(n)) => Some(*n),
-        Some(Value::String(s)) => l
-            .with_string_bytes(*s, |bytes| {
-                std::str::from_utf8(bytes)
-                    .ok()
-                    .and_then(|text| text.parse::<f64>().ok())
-            })
-            .ok()
-            .flatten(),
-        _ => None,
-    }
-}
-
 fn number_to_lua_string(n: f64) -> String {
-    if n.fract() == 0.0 && n.is_finite() {
-        format!("{n:.0}")
-    } else {
-        n.to_string()
-    }
+    lua_core::number_format::format_lua_number(n)
 }
 
 fn make_lua_string(l: &mut LuaState, bytes: &[u8]) -> Option<GcRef<GcString>> {
@@ -147,9 +145,8 @@ fn lua_string_position(pos: i32, len: usize) -> i32 {
 unsafe extern "C" fn lua_string_len(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(s) = string_arg(l, 1) else {
-        return -1;
-    };
+    checked!(l, check_arity(l, 1, "len"));
+    let s = checked!(l, check_string(l, 1, "len"));
     l.push_value(Value::Number(s.len() as f64));
     1
 }
@@ -157,13 +154,12 @@ unsafe extern "C" fn lua_string_len(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_string_byte(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(s) = string_arg(l, 1) else {
-        return -1;
-    };
+    checked!(l, check_arity(l, 1, "byte"));
+    let s = checked!(l, check_string(l, 1, "byte"));
 
     let len = s.len();
-    let start = number_arg(l, 2).map_or(1, |n| n as i32);
-    let end = number_arg(l, 3).map_or(start, |n| n as i32);
+    let start = checked!(l, check_integer(l, 2, "byte", Some(1)));
+    let end = checked!(l, check_integer(l, 3, "byte", Some(start)));
     let start = lua_string_position(start, len).max(1);
     let end = lua_string_position(end, len).min(len as i32);
 
@@ -186,12 +182,12 @@ unsafe extern "C" fn lua_string_char(l_ptr: *mut std::ffi::c_void) -> i32 {
     let mut bytes = Vec::with_capacity(nargs.max(0) as usize);
 
     for idx in 1..=nargs {
-        let Some(n) = number_arg(l, idx) else {
-            return -1;
-        };
-        let byte = n as i32;
+        let byte = checked!(l, check_integer(l, idx, "char", None));
         if !(0..=255).contains(&byte) {
-            return -1;
+            return string_format_error(
+                l,
+                &args::argument_error(idx, "char", "value out of range"),
+            );
         }
         bytes.push(byte as u8);
     }
@@ -206,15 +202,17 @@ unsafe extern "C" fn lua_string_dump(l_ptr: *mut std::ffi::c_void) -> i32 {
         return string_format_error(l, "bad argument #1 to 'dump' (function expected)");
     }
 
-    string_format_error(l, STRING_DUMP_UNSUPPORTED)
+    // This stable unsupported-feature result is an explicit error object,
+    // rather than a Lua operation diagnostic with a caller-dependent prefix.
+    push_lua_string(l, STRING_DUMP_UNSUPPORTED.as_bytes());
+    lua_core::function::NATIVE_ERROR_OBJECT
 }
 
 unsafe extern "C" fn lua_string_format(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(format_bytes) = string_arg(l, 1) else {
-        return string_format_error(l, "bad argument #1 to 'format' (string expected)");
-    };
+    checked!(l, check_arity(l, 1, "format"));
+    let format_bytes = checked!(l, check_string(l, 1, "format"));
 
     match format_lua_string(l, &format_bytes) {
         Ok(result) => {
@@ -231,18 +229,14 @@ unsafe extern "C" fn lua_string_format(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_string_find(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(source) = string_arg(l, 1) else {
-        return string_format_error(l, "bad argument #1 to 'find' (string expected)");
-    };
-    let Some(pattern) = string_arg(l, 2) else {
-        return string_format_error(l, "bad argument #2 to 'find' (string expected)");
-    };
-    if let Err(message) = validate_pattern(&pattern) {
+    checked!(l, check_arity(l, 2, "find"));
+    let source = checked!(l, check_string(l, 1, "find"));
+    let pattern = checked!(l, check_string(l, 2, "find"));
+    let init = checked!(l, check_integer(l, 3, "find", Some(1)));
+    let plain = l.at(4).is_some_and(|v| !v.is_false());
+    if !plain && let Err(message) = validate_pattern(&pattern) {
         return string_format_error(l, &message);
     }
-
-    let init = number_arg(l, 3).unwrap_or(1.0) as i32;
-    let plain = l.at(4).is_some_and(|v| !v.is_false());
     let start_pos = lua_string_position(init, source.len()).max(1);
     let start_idx = (start_pos - 1).min(source.len() as i32) as usize;
 
@@ -283,17 +277,14 @@ unsafe extern "C" fn lua_string_find(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_string_match(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(source) = string_arg(l, 1) else {
-        return string_format_error(l, "bad argument #1 to 'match' (string expected)");
-    };
-    let Some(pattern) = string_arg(l, 2) else {
-        return string_format_error(l, "bad argument #2 to 'match' (string expected)");
-    };
+    checked!(l, check_arity(l, 2, "match"));
+    let source = checked!(l, check_string(l, 1, "match"));
+    let pattern = checked!(l, check_string(l, 2, "match"));
+    let init = checked!(l, check_integer(l, 3, "match", Some(1)));
     if let Err(message) = validate_pattern(&pattern) {
         return string_format_error(l, &message);
     }
 
-    let init = number_arg(l, 3).unwrap_or(1.0) as i32;
     let start_pos = lua_string_position(init, source.len()).max(1);
     let start_idx = (start_pos - 1).min(source.len() as i32) as usize;
 
@@ -334,29 +325,21 @@ unsafe extern "C" fn lua_string_match(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_string_gsub(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(source) = string_arg(l, 1) else {
-        return -1;
-    };
-    let Some(pattern) = string_arg(l, 2) else {
-        return -1;
-    };
-    if let Err(message) = validate_pattern(&pattern) {
-        return string_format_error(l, &message);
-    }
+    checked!(l, check_arity(l, 3, "gsub"));
+    let source = checked!(l, check_string(l, 1, "gsub"));
+    let pattern = checked!(l, check_string(l, 2, "gsub"));
     let replacement = l.at(3).cloned().unwrap_or(Value::Nil);
     if !matches!(
         replacement,
         Value::String(_) | Value::Number(_) | Value::Table(_) | Value::Function(_)
     ) {
-        return string_format_error(
-            l,
-            "bad argument #3 to 'gsub' (string/function/table expected)",
-        );
+        return string_format_error(l, "bad argument #3 to 'string.gsub' (string expected)");
     }
 
-    let max_replacements = number_arg(l, 4)
-        .map(|n| if n <= 0.0 { 0 } else { n as usize })
-        .unwrap_or(usize::MAX);
+    let max_replacements = checked!(l, check_integer(l, 4, "gsub", Some(i32::MAX))).max(0) as usize;
+    if let Err(message) = validate_pattern(&pattern) {
+        return string_format_error(l, &message);
+    }
 
     if matches!(replacement, Value::Function(_) | Value::Table(_)) {
         return gsub_callback_replacement(l, &source, &pattern, replacement, max_replacements);
@@ -377,10 +360,18 @@ unsafe extern "C" fn lua_string_gsub(l_ptr: *mut std::ffi::c_void) -> i32 {
             continue;
         }
 
+        checked!(
+            l,
+            check_output_size(output.len(), found.start - cursor, "gsub")
+        );
         output.extend_from_slice(&source[cursor..found.start]);
         let Some(replacement_bytes) = gsub_replacement(l, &source, &found, &replacement) else {
             return -1;
         };
+        checked!(
+            l,
+            check_output_size(output.len(), replacement_bytes.len(), "gsub")
+        );
         output.extend_from_slice(&replacement_bytes);
         count += 1;
 
@@ -393,6 +384,10 @@ unsafe extern "C" fn lua_string_gsub(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
     }
 
+    checked!(
+        l,
+        check_output_size(output.len(), source.len() - cursor, "gsub")
+    );
     output.extend_from_slice(&source[cursor..]);
     if !push_lua_string(l, &output) {
         return -1;
@@ -532,12 +527,9 @@ fn push_gsub_runtime_error(l: &mut LuaState, error: &lua_vm::RuntimeError) {
 unsafe extern "C" fn lua_string_gmatch(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(source) = string_arg(l, 1) else {
-        return string_format_error(l, "bad argument #1 to 'gmatch' (string expected)");
-    };
-    let Some(pattern) = string_arg(l, 2) else {
-        return string_format_error(l, "bad argument #2 to 'gmatch' (string expected)");
-    };
+    checked!(l, check_arity(l, 2, "gmatch"));
+    let source = checked!(l, check_string(l, 1, "gmatch"));
+    let pattern = checked!(l, check_string(l, 2, "gmatch"));
     if let Err(message) = validate_pattern(&pattern) {
         return string_format_error(l, &message);
     }
@@ -632,17 +624,13 @@ unsafe extern "C" fn lua_string_gmatch_iter(l_ptr: *mut std::ffi::c_void) -> i32
 unsafe extern "C" fn lua_string_sub(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(s) = string_arg(l, 1) else {
-        return -1;
-    };
-    let Some(start_num) = number_arg(l, 2) else {
-        return -1;
-    };
-
+    checked!(l, check_arity(l, 2, "sub"));
+    let s = checked!(l, check_string(l, 1, "sub"));
+    let start_num = checked!(l, check_integer(l, 2, "sub", None));
     let len = s.len();
-    let end_num = number_arg(l, 3).unwrap_or(len as f64);
-    let mut start = lua_string_position(start_num as i32, len);
-    let mut end = lua_string_position(end_num as i32, len);
+    let end_num = checked!(l, check_integer(l, 3, "sub", Some(-1)));
+    let mut start = lua_string_position(start_num, len);
+    let mut end = lua_string_position(end_num, len);
 
     if start < 1 {
         start = 1;
@@ -703,25 +691,26 @@ fn format_lua_string(l: &LuaState, format: &[u8]) -> Result<Vec<u8>, String> {
 
     while idx < format.len() {
         if format[idx] != b'%' {
+            check_output_size(out.len(), 1, "format")?;
             out.push(format[idx]);
             idx += 1;
             continue;
         }
 
         if format.get(idx + 1) == Some(&b'%') {
+            check_output_size(out.len(), 1, "format")?;
             out.push(b'%');
             idx += 2;
             continue;
         }
 
         let (spec, next_idx) = parse_format_spec(format, idx + 1)?;
-        let arg = l
-            .at(arg_idx)
-            .cloned()
-            .ok_or_else(|| "string.format: not enough arguments".to_string())?;
+        if l.at(arg_idx).is_none() {
+            return Err("string.format: not enough arguments".to_string());
+        }
+        let piece = format_value_with_spec(l, arg_idx, &spec)?;
         arg_idx += 1;
-
-        let piece = format_value_with_spec(l, &arg, &spec)?;
+        check_output_size(out.len(), piece.len(), "format")?;
         out.extend_from_slice(&piece);
         idx = next_idx;
     }
@@ -749,9 +738,7 @@ fn parse_format_spec(format: &[u8], mut idx: usize) -> Result<(FormatSpec, usize
         idx += 1;
     }
     if idx > width_start {
-        spec.width = std::str::from_utf8(&format[width_start..idx])
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
+        spec.width = Some(parse_format_size(&format[width_start..idx])?);
     }
 
     if format.get(idx) == Some(&b'.') {
@@ -761,20 +748,14 @@ fn parse_format_spec(format: &[u8], mut idx: usize) -> Result<(FormatSpec, usize
             idx += 1;
         }
         spec.precision = if idx > precision_start {
-            std::str::from_utf8(&format[precision_start..idx])
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
+            Some(parse_format_size(&format[precision_start..idx])?)
         } else {
             Some(0)
         };
     }
 
-    while matches!(format.get(idx), Some(b'h' | b'l' | b'L')) {
-        idx += 1;
-    }
-
     let Some(conv) = format.get(idx).copied() else {
-        return Err("string.format: incomplete format option".to_string());
+        return Err("invalid option '%%' to 'format'".to_string());
     };
     spec.conv = conv;
     if !matches!(
@@ -802,39 +783,69 @@ fn parse_format_spec(format: &[u8], mut idx: usize) -> Result<(FormatSpec, usize
     Ok((spec, idx + 1))
 }
 
-fn format_value_with_spec(
-    l: &LuaState,
-    value: &Value,
-    spec: &FormatSpec,
-) -> Result<Vec<u8>, String> {
+fn format_value_with_spec(l: &LuaState, index: i32, spec: &FormatSpec) -> Result<Vec<u8>, String> {
     match spec.conv {
         b's' => Ok(apply_string_precision_and_width(
-            value_to_format_bytes(l, value),
+            check_string(l, index, "format")?,
             spec,
         )),
-        b'q' => Ok(lua_quote_string(&value_to_format_bytes(l, value))),
+        b'q' => {
+            let value = check_string(l, index, "format")?;
+            let quoted_size = value
+                .len()
+                .checked_mul(4)
+                .and_then(|size| size.checked_add(2));
+            if quoted_size.is_none_or(|size| size > STRING_OUTPUT_LIMIT) {
+                return Err("string.format: result exceeds resource limit".to_string());
+            }
+            Ok(lua_quote_string(&value))
+        }
         b'c' => {
-            let byte = numeric_value(l, value)? as i32 as u8;
+            let byte = check_integer(l, index, "format", None)? as u8;
             Ok(apply_byte_width(vec![byte], spec))
         }
-        b'd' | b'i' => {
-            Ok(format_integer(numeric_value(l, value)? as i64, 10, false, spec).into_bytes())
+        b'd' | b'i' => Ok(format_integer(
+            i64::from(check_integer(l, index, "format", None)?),
+            10,
+            false,
+            spec,
+        )
+        .into_bytes()),
+        b'u' => Ok(format_unsigned_integer(
+            u64::from(check_integer(l, index, "format", None)? as u32),
+            10,
+            false,
+            spec,
+        )
+        .into_bytes()),
+        b'o' => Ok(format_unsigned_integer(
+            u64::from(check_integer(l, index, "format", None)? as u32),
+            8,
+            false,
+            spec,
+        )
+        .into_bytes()),
+        b'x' => Ok(format_unsigned_integer(
+            u64::from(check_integer(l, index, "format", None)? as u32),
+            16,
+            false,
+            spec,
+        )
+        .into_bytes()),
+        b'X' => Ok(format_unsigned_integer(
+            u64::from(check_integer(l, index, "format", None)? as u32),
+            16,
+            true,
+            spec,
+        )
+        .into_bytes()),
+        b'f' => Ok(format_float_fixed(args::check_number(l, index, "format")?, spec).into_bytes()),
+        b'e' | b'E' => {
+            Ok(format_float_exp(args::check_number(l, index, "format")?, spec).into_bytes())
         }
-        b'u' => Ok(
-            format_unsigned_integer(numeric_value(l, value)? as u64, 10, false, spec).into_bytes(),
-        ),
-        b'o' => Ok(
-            format_unsigned_integer(numeric_value(l, value)? as u64, 8, false, spec).into_bytes(),
-        ),
-        b'x' => Ok(
-            format_unsigned_integer(numeric_value(l, value)? as u64, 16, false, spec).into_bytes(),
-        ),
-        b'X' => Ok(
-            format_unsigned_integer(numeric_value(l, value)? as u64, 16, true, spec).into_bytes(),
-        ),
-        b'f' => Ok(format_float_fixed(numeric_value(l, value)?, spec).into_bytes()),
-        b'e' | b'E' => Ok(format_float_exp(numeric_value(l, value)?, spec).into_bytes()),
-        b'g' | b'G' => Ok(format_float_general(numeric_value(l, value)?, spec).into_bytes()),
+        b'g' | b'G' => {
+            Ok(format_float_general(args::check_number(l, index, "format")?, spec).into_bytes())
+        }
         _ => Err(format!(
             "invalid option '%{}' to 'format'",
             char::from(spec.conv)
@@ -846,46 +857,24 @@ fn string_format_error(l: &mut LuaState, message: &str) -> i32 {
     if !push_lua_string(l, message.as_bytes()) {
         return -1;
     }
-    -1
+    lua_core::function::NATIVE_ERROR_DIAGNOSTIC
 }
 
-fn value_to_format_string(l: &LuaState, value: &Value) -> String {
-    match value {
-        Value::Nil => "nil".to_string(),
-        Value::Boolean(b) => b.to_string(),
-        Value::Number(n) => number_to_lua_string(*n),
-        Value::String(s) => l
-            .with_string_bytes(*s, |bytes| String::from_utf8_lossy(bytes).into_owned())
-            .unwrap_or_default(),
-        Value::Table(t) => format!("table: {:p}", t.as_ptr()),
-        Value::Function(f) => format!("function: {:p}", f.as_ptr()),
-        Value::Userdata(u) => format!("userdata: {:p}", u.as_ptr()),
-        Value::Thread(t) => format!("thread: {:p}", t.as_ptr()),
-        Value::LightUserdata(p) => format!("lightuserdata: {:p}", p.as_ptr()),
-    }
+fn parse_format_size(bytes: &[u8]) -> Result<usize, String> {
+    let size = bytes.iter().try_fold(0usize, |size, byte| {
+        size.checked_mul(10)?.checked_add(usize::from(byte - b'0'))
+    });
+    let size = size
+        .filter(|size| *size <= STRING_OUTPUT_LIMIT)
+        .ok_or_else(|| "string.format: result exceeds resource limit".to_string())?;
+    Ok(size)
 }
 
-fn value_to_format_bytes(l: &LuaState, value: &Value) -> Vec<u8> {
-    match value {
-        Value::String(s) => l.copy_string_bytes(*s).unwrap_or_default(),
-        _ => value_to_format_string(l, value).into_bytes(),
+fn check_output_size(current: usize, addition: usize, function: &str) -> Result<(), String> {
+    if addition > STRING_OUTPUT_LIMIT || current > STRING_OUTPUT_LIMIT - addition {
+        return Err(format!("string.{function}: result exceeds resource limit"));
     }
-}
-
-fn numeric_value(l: &LuaState, value: &Value) -> Result<f64, String> {
-    match value {
-        Value::Number(n) => Ok(*n),
-        Value::String(s) => l
-            .with_string_bytes(*s, |bytes| {
-                std::str::from_utf8(bytes)
-                    .ok()
-                    .and_then(|text| text.trim().parse::<f64>().ok())
-            })
-            .ok()
-            .flatten()
-            .ok_or_else(|| "string.format: number expected".to_string()),
-        _ => Err("string.format: number expected".to_string()),
-    }
+    Ok(())
 }
 
 fn apply_string_precision_and_width(mut value: Vec<u8>, spec: &FormatSpec) -> Vec<u8> {
@@ -1020,6 +1009,9 @@ fn alternate_prefix(radix: u32, uppercase: bool, alternate: bool, value: u64) ->
 }
 
 fn format_float_fixed(value: f64, spec: &FormatSpec) -> String {
+    if !value.is_finite() {
+        return format_float_general(value, spec);
+    }
     let precision = spec.precision.unwrap_or(6);
     let mut result = format!("{:.*}", precision, value.abs());
     if spec.alternate && !result.contains('.') {
@@ -1030,6 +1022,9 @@ fn format_float_fixed(value: f64, spec: &FormatSpec) -> String {
 }
 
 fn format_float_exp(value: f64, spec: &FormatSpec) -> String {
+    if !value.is_finite() {
+        return format_float_general(value, spec);
+    }
     let precision = spec.precision.unwrap_or(6);
     let mut result = normalize_exponent(format!("{:.*e}", precision, value.abs()), spec.conv);
     result = add_float_sign(value, result, spec);
@@ -1037,29 +1032,16 @@ fn format_float_exp(value: f64, spec: &FormatSpec) -> String {
 }
 
 fn format_float_general(value: f64, spec: &FormatSpec) -> String {
-    let precision = spec.precision.unwrap_or(6).max(1);
-    let abs = value.abs();
-    let exponent = if abs == 0.0 {
-        0
-    } else {
-        abs.log10().floor() as i32
-    };
-
-    let mut result = if exponent < -4 || exponent >= precision as i32 {
-        normalize_exponent(format!("{:.*e}", precision - 1, abs), spec.conv)
-    } else {
-        let decimals = (precision as i32 - exponent - 1).max(0) as usize;
-        format!("{:.*}", decimals, abs)
-    };
-
-    if !spec.alternate {
-        trim_float_trailing_zeroes(&mut result);
-    }
-    if matches!(spec.conv, b'G') {
-        result = result.to_ascii_uppercase();
+    let rendered =
+        lua_core::number_format::format_general(value, spec.precision.unwrap_or(6), spec.alternate);
+    // The shared formatter preserves the NaN category and negative zero.
+    // Field flags add the sign once, without applying abs() to a NaN payload.
+    let mut result = rendered.strip_prefix('-').unwrap_or(&rendered).to_string();
+    if matches!(spec.conv, b'G' | b'E') {
+        result.make_ascii_uppercase();
     }
     result = add_float_sign(value, result, spec);
-    apply_width(result, spec, spec.zero && !spec.left)
+    apply_width(result, spec, spec.zero && !spec.left && value.is_finite())
 }
 
 fn add_float_sign(value: f64, mut result: String, spec: &FormatSpec) -> String {
@@ -1086,22 +1068,6 @@ fn normalize_exponent(mut value: String, conv: u8) -> String {
     };
     value = format!("{mantissa}{marker}{exp:+03}");
     value
-}
-
-fn trim_float_trailing_zeroes(value: &mut String) {
-    let exponent_pos = value.find(['e', 'E']);
-    let exponent = exponent_pos.map(|pos| value.split_off(pos));
-    if value.contains('.') {
-        while value.ends_with('0') {
-            value.pop();
-        }
-        if value.ends_with('.') {
-            value.pop();
-        }
-    }
-    if let Some(exponent) = exponent {
-        value.push_str(&exponent);
-    }
 }
 
 fn lua_quote_string(bytes: &[u8]) -> Vec<u8> {
@@ -1776,7 +1742,12 @@ fn expand_replacement_template(
     let mut out = Vec::new();
     let mut idx = 0usize;
     while idx < template.len() {
-        if template[idx] == b'%' && idx + 1 < template.len() {
+        if template[idx] == b'%' {
+            if idx + 1 == template.len() {
+                // The fixed C++ oracle discards a trailing escape. Official
+                // 5.1 instead appends a NUL; keep this distinction explicit.
+                break;
+            }
             let escaped = template[idx + 1];
             match escaped {
                 b'%' => out.push(b'%'),
@@ -1806,7 +1777,7 @@ fn replacement_capture_bytes(
     found: &PatternMatch,
     capture_idx: usize,
 ) -> Option<Vec<u8>> {
-    if capture_idx == 0 || found.captures.is_empty() {
+    if capture_idx == 0 || (capture_idx == 1 && found.captures.is_empty()) {
         return Some(source[found.start..found.end].to_vec());
     }
 
@@ -1835,9 +1806,8 @@ fn push_captures(l: &mut LuaState, source: &[u8], captures: &[Capture]) -> bool 
 unsafe extern "C" fn lua_string_upper(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(mut s) = string_arg(l, 1) else {
-        return -1;
-    };
+    checked!(l, check_arity(l, 1, "upper"));
+    let mut s = checked!(l, check_string(l, 1, "upper"));
     s.make_ascii_uppercase();
     if push_lua_string(l, &s) { 1 } else { -1 }
 }
@@ -1845,9 +1815,8 @@ unsafe extern "C" fn lua_string_upper(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_string_lower(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(mut s) = string_arg(l, 1) else {
-        return -1;
-    };
+    checked!(l, check_arity(l, 1, "lower"));
+    let mut s = checked!(l, check_string(l, 1, "lower"));
     s.make_ascii_lowercase();
     if push_lua_string(l, &s) { 1 } else { -1 }
 }
@@ -1855,9 +1824,8 @@ unsafe extern "C" fn lua_string_lower(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_string_reverse(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(mut s) = string_arg(l, 1) else {
-        return -1;
-    };
+    checked!(l, check_arity(l, 1, "reverse"));
+    let mut s = checked!(l, check_string(l, 1, "reverse"));
     s.reverse();
     if push_lua_string(l, &s) { 1 } else { -1 }
 }
@@ -1865,17 +1833,29 @@ unsafe extern "C" fn lua_string_reverse(l_ptr: *mut std::ffi::c_void) -> i32 {
 unsafe extern "C" fn lua_string_rep(l_ptr: *mut std::ffi::c_void) -> i32 {
     // SAFETY: l_ptr comes from the VM CALL handler and remains valid for this call.
     let l = unsafe { &mut *l_ptr.cast::<LuaState>() };
-    let Some(s) = string_arg(l, 1) else {
-        return -1;
-    };
-    let Some(n) = number_arg(l, 2) else {
-        return -1;
-    };
-    let count = n as i32;
+    checked!(l, check_arity(l, 2, "rep"));
+    let s = checked!(l, check_string(l, 1, "rep"));
+    let count = checked!(l, check_integer(l, 2, "rep", None));
     let result = if count <= 0 {
         Vec::new()
     } else {
-        s.repeat(count as usize)
+        let count = count as usize;
+        let Some(size) = s.len().checked_mul(count) else {
+            return string_format_error(l, "string.rep: result exceeds resource limit");
+        };
+        checked!(l, check_output_size(0, size, "rep"));
+        if size == 0 {
+            Vec::new()
+        } else {
+            let mut result = Vec::new();
+            if result.try_reserve_exact(size).is_err() {
+                return string_format_error(l, "string.rep: allocation failed");
+            }
+            for _ in 0..count {
+                result.extend_from_slice(&s);
+            }
+            result
+        }
     };
     if push_lua_string(l, &result) { 1 } else { -1 }
 }

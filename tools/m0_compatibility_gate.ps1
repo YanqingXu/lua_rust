@@ -7,9 +7,9 @@
     runs the focused dual-oracle differential suite, and emits the
     non-official compatibility debt report.
 
-    Ordinary differences in the 101-case non-official corpus are recorded as
-    migration debt. Missing tools, invalid manifests, runner errors, timeouts,
-    and focused four-case differential failures are hard gate failures.
+    Non-official differences must match the reviewed case, channel, and stdout
+    signatures. New differences, unexpected exits, missing tools, invalid
+    manifests, runner errors, timeouts, and focused differential failures fail.
 .PARAMETER ReuseExistingOracles
     Reuse executables under target/oracles instead of rebuilding them. This is
     a smoke-only shortcut.
@@ -345,6 +345,8 @@ $cppBuildArtifact = Join-Path $resultRoot "cpp-oracle-build.json"
 $lua51BuildArtifact = Join-Path $resultRoot "lua51-oracle-build.json"
 $differentialArtifact = Join-Path $resultRoot "lua51-differential.json"
 $nonOfficialArtifact = Join-Path $resultRoot "non-official.json"
+$nonOfficialPolicyArtifact = Join-Path $resultRoot "non-official-policy.json"
+$nonOfficialPolicySelfTest = Join-Path $resultRoot "non-official-policy-self-test.json"
 $paritySelfTestRoot = Join-Path $resultRoot "parity-runner-self-test"
 $paritySelfTestArtifact = Join-Path $resultRoot "parity-runner-self-test.json"
 $bytecodeSelfTestReport = Join-Path $paritySelfTestRoot "bytecode/report.json"
@@ -1010,7 +1012,7 @@ try {
         }
 
     $null = Invoke-ExternalStep `
-        -Name "non-official-101-run" `
+        -Name "non-official-run" `
         -FilePath "cargo" `
         -Arguments @(
             "run",
@@ -1027,6 +1029,22 @@ try {
         ) `
         -Artifact $nonOfficialArtifact
 
+    $null = Invoke-PowerShellStep `
+        -Name "non-official-policy-self-test" `
+        -ScriptPath (Join-Path $Root "tools/test_non_official_policy.ps1") `
+        -Arguments @("-ResultPath", $nonOfficialPolicySelfTest) `
+        -Artifact $nonOfficialPolicySelfTest
+    $null = Invoke-PowerShellStep `
+        -Name "non-official-regression-check" `
+        -ScriptPath (Join-Path $Root "tools/check_non_official_policy.ps1") `
+        -Arguments @(
+            "-ArtifactPath", $nonOfficialArtifact,
+            "-ManifestPath", $fixtureManifest,
+            "-PolicyPath", (Join-Path $Root "tests/compatibility/non-official-debt.json"),
+            "-ResultPath", $nonOfficialPolicyArtifact
+        ) `
+        -Artifact $nonOfficialPolicyArtifact
+
     $nonOfficialStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $nonOfficialStatus = "passed"
     $nonOfficialDetail = ""
@@ -1036,42 +1054,25 @@ try {
         }
         $nonOfficial = Get-Content -LiteralPath $nonOfficialArtifact -Raw |
             ConvertFrom-Json
-        if ($nonOfficial.schema_version -ne "lua-fixture-differential/v1") {
-            throw "unsupported non-official artifact schema"
+        $policyResult = Get-Content -LiteralPath $nonOfficialPolicyArtifact -Raw |
+            ConvertFrom-Json
+        if ($policyResult.passed -ne $true) {
+            throw "non-official regression policy failed: $($policyResult.failures -join '; ')"
         }
-        if ($nonOfficial.fixture_inventory.current_total -ne $fixtureInventoryTotal) {
-            throw (
-                "artifact fixture total $($nonOfficial.fixture_inventory.current_total) " +
-                "does not match manifest total $fixtureInventoryTotal"
-            )
-        }
-        if ($nonOfficial.summary.selected -ne 101 -or
-            @($nonOfficial.cases).Count -ne 101) {
-            throw "non-official suite must contain exactly 101 records"
-        }
-        if ($nonOfficial.summary.runner_errors -ne 0) {
-            throw "non-official runner reported $($nonOfficial.summary.runner_errors) errors"
-        }
-        if ($nonOfficial.summary.timed_out -ne 0) {
-            throw "non-official runner reported $($nonOfficial.summary.timed_out) timeouts"
-        }
-        if ($nonOfficial.summary.executed +
-            $nonOfficial.summary.helpers_skipped -ne 101) {
-            throw "non-official execution accounting does not total 101"
-        }
-        if ($nonOfficial.summary.differences -gt 0) {
+        if (@($policyResult.acceptedDebt).Count -gt 0) {
             $nonOfficialStatus = "debt"
             $nonOfficialDetail = (
-                "{0} known semantic differences; {1} matches; {2} helpers skipped" -f
-                $nonOfficial.summary.differences,
+                "{0} case/channel/signature-bounded debts; {1} matches; {2} helpers skipped" -f
+                @($policyResult.acceptedDebt).Count,
                 $nonOfficial.summary.matches,
                 $nonOfficial.summary.helpers_skipped
             )
             $debts.Add([ordered]@{
                 id = "non-official-semantic-differences"
-                acceptedBy = "M0 compatibility policy"
-                artifact = $nonOfficialArtifact
-                differences = $nonOfficial.summary.differences
+                acceptedBy = "tests/compatibility/non-official-debt.json"
+                artifact = $nonOfficialPolicyArtifact
+                cases = @($policyResult.acceptedDebt)
+                differences = @($policyResult.acceptedDebt).Count
                 matches = $nonOfficial.summary.matches
                 helpersSkipped = $nonOfficial.summary.helpers_skipped
             })
@@ -1087,7 +1088,7 @@ try {
         -Status $nonOfficialStatus `
         -DurationMs $nonOfficialStopwatch.ElapsedMilliseconds `
         -Detail $nonOfficialDetail `
-        -Artifact $nonOfficialArtifact
+        -Artifact $nonOfficialPolicyArtifact
 } catch {
     $fatalError = $_.Exception.Message
     Add-Step `
@@ -1120,7 +1121,9 @@ try {
         durationMs = $gateStart.ElapsedMilliseconds
         policy = [ordered]@{
             focusedDifferentialMustMatch = $true
-            nonOfficialSemanticDifferencesAreDebt = $true
+            nonOfficialDifferencesRequireCaseChannelAndSignature = $true
+            resolvedDebtMustBeRemoved = $true
+            unexpectedProcessExitsFail = $true
             manifestRunnerErrorsAndTimeoutsFail = $true
         }
         inputs = [ordered]@{

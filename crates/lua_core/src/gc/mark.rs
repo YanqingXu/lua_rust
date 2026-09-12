@@ -22,6 +22,8 @@ use crate::value::Value;
 /// Result of seeding the collector's explicit roots for a mark-only traversal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MarkRootSeedReport {
+    /// Fixed allocations seeded independently of explicit root handles.
+    pub fixed_seeded: usize,
     /// Explicit and temporary root handles that still named registered
     /// objects.
     pub seeded: usize,
@@ -71,6 +73,8 @@ impl GarbageCollector {
     /// destruction. State roots are deliberately not accepted here: the
     /// Runtime owns and validates those through its `StateArena`.
     pub fn begin_mark_only(&mut self) -> MarkRootSeedReport {
+        // Restarting colors invalidates an in-progress incremental traversal.
+        self.abort_incremental_cycle();
         // 1. 重置所有对象为白色（保留 FIXED 和 FINALIZED）
         let mut current = self.all_objects;
         while !current.is_null() {
@@ -91,6 +95,19 @@ impl GarbageCollector {
 
         // 3. 标记所有仍属于本 collector 的显式根对象为灰色
         let mut report = MarkRootSeedReport::default();
+        // Fixed payloads can own ordinary children. Keeping only their own
+        // header out of sweep would leave those children dangling next cycle.
+        let mut current = self.all_objects;
+        while !current.is_null() {
+            // SAFETY: the collector owns every intrusive node, and no object
+            // mutation or destruction occurs during this mark-only traversal.
+            let (next, fixed) = unsafe { ((*current).next(), (*current).is_fixed()) };
+            if fixed {
+                self.mark_live_object(current);
+                report.fixed_seeded += 1;
+            }
+            current = next;
+        }
         let roots = self.roots.clone();
         for root in roots {
             match self.validate_erased(root) {

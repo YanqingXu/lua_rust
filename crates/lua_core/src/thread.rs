@@ -216,10 +216,6 @@ unsafe impl GcObject for Thread {
         &self.header
     }
 
-    fn gc_header_mut(&mut self) -> &mut GcObjectHeader {
-        &mut self.header
-    }
-
     /// 标记 Thread 引用的 GC 对象
     ///
     /// Phase 1.4: 标记 caller 协程。

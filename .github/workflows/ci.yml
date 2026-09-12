@@ -71,6 +71,24 @@ jobs:
           -Labels "$env:PR_LABELS"
           -ResultPath target/compatibility/oracle-change.json
 
+      - name: Test official source runner contracts
+        if: always()
+        shell: powershell
+        run: py -3 -m unittest discover -s tools/tests -p test_official_suite_lane.py -v
+
+      - name: Enforce verified official source cases
+        if: always()
+        shell: powershell
+        run: >-
+          py -3 tools/run_official_suite.py
+          --rust target/x86_64-pc-windows-msvc/debug/lua_app.exe
+          --official target/oracles/lua-5.1.5/build/Release/lua51.exe
+          --cpp target/oracles/lua_cpp/build/Release/lua_app.exe
+          --case constructs.lua --case literals.lua --case locals.lua
+          --case math.lua --case nextvar.lua --case pm.lua
+          --case strings.lua --case vararg.lua
+          --artifact target/compatibility/official-source-required.json
+
       - name: M1 foundation and quality gate
         if: always()
         shell: powershell
@@ -113,6 +131,53 @@ jobs:
         run: >-
           cargo +nightly-2026-07-29 miri test
           -p lua_vm --test runtime_durability
+
+      - name: Run public Runtime access contracts under Miri
+        run: >-
+          cargo +nightly-2026-07-29 miri test
+          -p lua_vm --test runtime_access_contract
+
+      - name: Run managed payload mutation contracts under Miri
+        run: >-
+          cargo +nightly-2026-07-29 miri test
+          -p lua_core --test gc_write_contract
+
+      - name: Run deleted table key lifetimes under Miri
+        run: >-
+          cargo +nightly-2026-07-29 miri test
+          -p lua_core --lib
+          table::tests::deleted_gc_key_tombstones_do_not_retain_or_dereference_collected_objects
+
+      - name: Run source and native library lifecycle under Miri
+        run: >-
+          cargo +nightly-2026-07-29 miri test
+          -p lua_stdlib --test runtime_gc_boundary
+
+      - name: Reject untyped IO userdata under Miri
+        run: >-
+          cargo +nightly-2026-07-29 miri test
+          -p lua_stdlib --lib
+          file_access_rejects_untyped_userdata_even_with_a_file_metatable
+
+  m1-miri-gc-semantics:
+    name: M1 GC and Native Stack (Miri)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pinned nightly with Miri
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-29
+          components: miri, rust-src
+
+      - name: Run automatic GC and native stack contracts under Miri
+        run: >-
+          cargo +nightly-2026-07-29 miri test
+          -p lua_stdlib --test gc_semantics
 
   m1-asan:
     name: M1 Unsafe Durability (Linux ASan)
