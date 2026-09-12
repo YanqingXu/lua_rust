@@ -9,9 +9,13 @@ cpp_oracle: 87c15e6
 lua_oracle: Lua 5.1.5
 implementation_checkpoint: source-manifest@ed0cc750243c22cc
 next_primary_task: M2 local-time/UTC conversion, then bounded large workloads
+continuation_handoff: SESSION_HANDOFF.md
 ---
 
 # lua_rust 完整复刻 lua_cpp 开发计划
+
+跨会话继续请先读 [未完成目标交接](SESSION_HANDOFF.md)，其中记录最近已推送提交、
+CI 待核验项和下一任务的最小复现。原整改目标暂停，尚未全部完成。
 
 ## 1. 目标与范围
 

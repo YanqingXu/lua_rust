@@ -1,0 +1,172 @@
+# 未完成目标交接
+
+更新：2026-09-12，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
+[审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
+
+## 目标和暂停位置
+
+- 用户最初要求：拉取最新代码，深度审计项目，给出方向；随后要求“按照建议依次推进！”。
+- 本线程目标工具显示 objective 为“按照建议依次推进！”，状态为 **paused**；目标未完成。
+- 用户要求生成交接供下次会话识别，随后明确要求提交并推送。本次仅交付文档，没有恢复整改或启动新修复。
+- 用户要求快速收敛，避免扩大当前工作包。下次用户要求继续时，直接从下面的首项接续。
+- 下一任务：**修复 `os.date` / `os.time` 把本地时间按 UTC 处理的问题**，再处理受限大负载与剩余兼容性。
+- 完整 M1/M2、资源预算和 M3 都未完成；完整 M0 或 M1 基础门通过不表示总目标完成。
+
+## 已交付检查点
+
+代码仓库：`G:\github\lua_rust`，PowerShell，分支 `main`。
+远端：`https://github.com/YanqingXu/lua_rust.git`。
+
+最近已推送的代码修复检查点：
+[`834eee3d9f698eb7ea997d1434c5c9493247f12e`](https://github.com/YanqingXu/lua_rust/commit/834eee3d9f698eb7ea997d1434c5c9493247f12e)
+`fix: propagate nested compile errors and align Windows popen`。
+推送后已核对远端 main 与本地 HEAD 完全一致，生成本交接前工作区干净。
+用户已要求将本交接单独提交并推送；文档提交号以 `git log -1 -- SESSION_HANDOFF.md` 为准。
+本次只涉及 AGENTS.md、SESSION_HANDOFF.md、plan.md 和整改状态入口，源码检查点仍为上述提交。
+
+| 已推送批次 | 内容 |
+| --- | --- |
+| `4024f9e` | Runtime/GC 公开访问、异常边界、普通 Lua 调用迭代调度及审计基础整改 |
+| `33aba8e` | debug hook/协程 traceback、原始诊断字节、REPL 续行恢复、无循环 break 拒绝、bytecode 工具诊断 |
+| `834eee3` | 嵌套 codegen 错误传播、失败子 Proto 拒绝发布、Windows 精确 `ls` 可用性检查、对应回归及文档 |
+
+交接时远程状态（2026-09-12 17:54 CST 的观察，后续须重新查询）：
+
+- [Rust CI 34686860957](https://github.com/YanqingXu/lua_rust/actions/runs/34686860957)：运行中，不能写成通过。
+- [mdBook 34686860956](https://github.com/YanqingXu/lua_rust/actions/runs/34686860956)：成功。
+- `4024f9e` 和 `33aba8e` 的 Rust CI 四项及 mdBook 均成功；这些是历史结果。
+- 本地构建、门禁、探针和代理工作均已结束，没有可继续轮询的本地进程句柄。
+
+## 下次会话先做什么
+
+1. 读取本文件，执行 `git status --short --branch` 和 `git log -3 --oneline`，核对是否已有后来修改。
+   如果用户要求同步远端，先 fetch；存在未提交内容时先保护，不使用 reset/clean 覆盖。
+2. 查询代码检查点 `834eee3` 的 CI 终态及其后文档提交的检查状态。如果失败，先读取失败 job
+   日志并处理与对应批次有关的问题。
+3. 读取下述时间转换反例和源码，再冻结实际输入、建立最小回归。不要重新做一次全项目审计。
+4. 按独立工作包修复和验收，更新交接。提交/推送按当次用户指令处理，不把上一次已完成的推送
+   请求扩大为以后每个工作包自动推送。
+
+```powershell
+gh run view 34686860957 --json headSha,status,conclusion,url,jobs
+gh run view 34686860956 --json headSha,status,conclusion,url
+gh run list --branch main --limit 5 --json headSha,workflowName,status,conclusion,url
+```
+
+## 首项：本地时间、UTC 和 DST
+
+这是已确认的问题，尚未修改 `crates/lua_stdlib/src/os.rs`：
+
+- `lua_os_time` 从约第 63 行开始，以 civil-date 公式计算 UTC，忽略本地时区及 isdst。
+- `lua_os_date` 从约第 212 行开始，去掉 `!` 后仍在第 243 行无条件调用
+  `DateParts::from_timestamp`，第 268 行把 table 的 isdst 固定为 false。
+- 固定 C++ 的 `src/lib/oslib.cpp` 第 382 行使用 mktime，第 418/421 行分别使用
+  gmtime_s/localtime_s；不能仅改显示小时而不改反向转换、日期跨界和 DST。
+
+最小 Lua 反例（即使本机 target 证据丢失也可重建）：
+
+```lua
+local t = 1577836800
+print(os.date('%Y-%m-%d %H:%M:%S', t), os.date('!%Y-%m-%d %H:%M:%S', t))
+local l, u = os.date('*t', t), os.date('!*t', t)
+print(l.hour, u.hour, l.isdst, u.isdst)
+print(os.time{year=2020, month=1, day=1, hour=8, min=0, sec=0})
+print('continued')
+```
+
+每个引擎使用独立子进程，分别设置其私有环境 `TZ=UTC0`、`TZ=CST-8`，不能改宿主全局 TZ。
+已运行两时区 × Rust/固定 C++/stock 共六个进程，全部正常退出、空 stderr、输出 continued。
+
+| 时区 | 固定 C++ 与 stock | 旧 Rust |
+| --- | --- | --- |
+| UTC0 | 本地/UTC 均为 2020-01-01 00:00:00；反向 os.time=1577865600 | 相同 |
+| CST-8 | 本地 08:00:00、UTC 00:00:00；table hour=8/0；反向 os.time=1577836800 | 本地仍为 00:00:00、hour=0/0；反向仍为 1577865600 |
+
+原始证据：`target/os-time-boundary-evidence/from-files-probe/observations.json` 与 `probe.lua`。
+这里的 Rust 观测使用嵌套 codegen 修复后的旧快照 `0def4d314fd8…`，**不是最新 app**；
+被观察的 os.rs SHA 为 `a96f6e3312a84c79b8271c54c8e311d1c8cce62d74bb46715781b03192492f10`，
+后续 popen 批次没有修改该文件。新会话需在实际新输入上复现，不能把历史二进制冒充 HEAD。
+
+建议验收边界：
+
+- 先核实两个 oracle 对本地/UTC、`*t`/`!*t`、省略字段、isdst 和非法范围的实际合同；
+  DST 尚未做完整矩阵，不把固定 UTC+8 反例外推为 DST 已验证。
+- 回归覆盖日期跨界、反向转换及错误后继续执行；保留原有非法字段、范围和溢出的可捕获错误。
+  相关既有回归：`crates/lua_app/tests/stdlib_error_boundary.rs`、
+  `tests/characterization/os-time-error-boundary.lua`。
+- 若调用平台时间 API，先确认有效范围和错误路径，避免重新引入 CRT 参数失败 abort 或 native panic。
+  每个时区独立进程，避免进程级时区缓存影响测试。
+- Debug/Release 定向双 oracle；随后运行与变更相关的门禁。若引入 unsafe/FFI，按真实边界补验证；
+  不为不支持的宿主 OS 调用伪造 Miri 通过。
+
+## 后续队列和未关闭项
+
+| 顺序 | 工作包 | 已知事实与完成条件 |
+| --- | --- | --- |
+| 1 | 代码检查点与交接提交的远程 CI 收尾 | 查询实际终态，有失败先定位；不重复启动已经结束的本地任务 |
+| 2 | 本地时间/UTC/DST | 上述已证实反例；以双 oracle 与 Debug/Release 回归闭环 |
+| 3 | 大负载、资源与其余平台/native diagnostic | gc/sort/verybig 曾在并发负载下超时，尚不能认定挂死；隔离并限制预算观察后再决定修复 |
+| 4 | M3 首批 reader/verifier | 两种 chunk 格式显式识别、受限解码、字节码验证、失败不发布部分图；再接 serializer 和 Lua 入口 |
+| 5 | C ABI / native module | 在调用、异常和生命周期合同稳定后推进；当前未完成 |
+
+- 受限大负载：原版 gc 约 200k 节点、sort 30k、verybig 70k；此前 60 秒超时受并发影响。
+  `big.lua` 的 >4 GiB 压力、TestC 私有测试和完整 `all.lua` 不在已验证范围。
+- main 已越过交互段，仍在第 135 行 string.dump 未实现失败；calls/main 的 binary chunk 依赖
+  归 M3，不通过放宽断言或仅延长超时关闭。
+- Windows files.lua：最新 Rust/C++ 八次正常完成；stock 四次在第 59 行 rename 失败。
+  四组 runner 正确保留 exit 1；files 不在要求三引擎全部通过的严格 CI 子集。
+- popen：空 COMSPEC 下 C++ abort、Rust 受控错误；NUL 前缀、无效 COMSPEC 通用 pipe 路径、
+  旧模式错误的位置及普通 shell 本地化差异仍明确未对齐，不算 parity 通过。
+- 9 个历史 non-official debt 是 2 个 userdata 显示和 7 个内存计量差异。
+  callback/xpcall/tostring 的双 oracle 冲突仍需记录兼容目标，不能扩大 normalization 隐藏。
+- 自动 GC pause、进程 RSS、内存配额、可恢复 OOM 和任意宿主栈安全没有完整证明。
+  现有普通 Lua 活动帧上限为 512，相关通过结果不能外推全部 native 重入。
+- [M3 合同设计](docs/rust_migration/m3_contract_design.md)：固定 C++ dump 与 stock payload 不同；
+  首批先做 reader/verifier 和原子发布，再做 serializer，最后公开 C ABI。
+
+## 验证证据索引：不要混用源码版本
+
+| 范围 | 结果 | 本机证据 |
+| --- | --- | --- |
+| 最新 popen 最终输入 | 377 文件，清单 ed0cc750243c22cc…，验收后零漂移 | `target/files-popen-evidence/source-final.json`、`final-verification.json` |
+| 最新完整 M0 | 75,542 ms，0 hard failure，83 match / 9 debt，无 skip/smoke | `target/files-popen-evidence/m0-final.json` |
+| 最新 popen 定向 | Debug/Release 各 8/8；各九项 raw 回放及三个独立边界探针完成 | 同目录 `current-work/report.md`、`independent-boundaries/final-review.md` |
+| 最新静态检查 | fmt；lua_app/lua_stdlib all-targets Clippy -D warnings 通过 | 同目录 `clippy-final.log`、`final-verification.json` |
+| 最新 files 原版 | 12 进程：Rust/C++ 8 完成，stock 4 失败，无超时 | 同目录 `official-final-*.json`、对应 `.validation.json` |
+| 前一个嵌套 codegen 快照 | 完整 M0/M1 基础门，1,080 普通测试，默认 Miri 2/2；Debug/Release 各十个严格官方文件与工具合同，共 218 进程核验 | `target/compiler-error-propagation-evidence/final-verification.json`、`m1-final.json`、`miri-compiler-boundary.log`、`final-independent-validation.json` |
+
+最新 popen 后未重跑完整 M1/Miri；按用户快速收敛要求结束本地验证。
+不能将前一个快照的 1,080 测试计数或 Miri 结果写成最新整个提交的完整验证。
+嵌套 codegen 的清单为 `b29389c486d4537440e68e10e655a975179d6a2c9453f695f3f079a94023f25a`。
+
+最新 app SHA-256：
+
+- Debug：`a2b149894295c125696d5763df8358b34f91b060fb788b7f146269f5e215c8b9`
+- Release：`e40fb59e53345083d0505e0c2a3a83bb0c8417afdf0f223da5bc40037f1ca797`
+
+这些 target 目录是本机忽略的产物，**不会随 git clone 到另一台机器**。缺失时使用提交内的
+整改报告、永久测试和本文件中的反例重建，并为新结果记录新身份，不声称旧原始证据仍在。
+摘要入口：[嵌套 codegen 整改](docs/audits/2026-09-12-nested-codegen-remediation.md)、
+[popen 整改](docs/audits/2026-09-12-popen-remediation.md)、
+[官方源码 lane](docs/audits/official-source-lane.md)、
+[Runtime 基线](docs/audits/runtime-performance-baseline.md)。
+
+## 工具和 oracle 提醒
+
+- Windows Python 使用 `py -3`；本机 `python`/`python3` 指向 WindowsApps 别名，曾返回 9009。
+- `.cargo/config.toml` 默认 target 为 x86_64-pc-windows-msvc，app 在
+  `target/x86_64-pc-windows-msvc/{debug,release}/lua_app.exe`。
+- C++ pin：`87c15e69ceb94eb74e28226ccbefb7e196635711`，本地源在
+  `target/oracles/audit-cpp-source`；不可在普通修复中移动 pin。
+- C++ app：`target/oracles/lua_cpp/build/Release/lua_app.exe`，SHA
+  `d495f6710ac5063a7061446b24f66a00ca8dbbe1d8841875048e13bd3e89c329`。
+- stock：`target/oracles/lua-5.1.5/build/Release/lua51.exe`，SHA
+  `47fd81e426c4f598e9fe2fdf28a0b36df721984ecfd66c8991eeef763693978d`。
+- 官方原文件使用 `tools/run_official_suite.py`，不是不存在的 run_official_source_lane.ps1。
+  保持原 Lua 文件、完成标记和失败退出码；不要给 stock 参数偷偷传 C++ 来取得全绿。
+- 全门禁入口：`tools/m0_compatibility_gate.ps1`、`tools/m1_foundation_gate.ps1`。
+  需要固定 `-CppRoot target/oracles/audit-cpp-source` 和新的 ResultPath；M0 另指定 ResultDirectory。
+  full 验收不加 skip/smoke。先检查 cargo-audit 可用性；本机额外工具曾位于
+  `target/audit-2026-09-12/audit-tool/cargo-audit-x86_64-pc-windows-msvc-v0.22.2`。
+- 不覆盖旧门禁 JSON 或失败历史。输入冻结工具为 `tools/run_runtime_baseline.py` 的
+  snapshot_source，扩入 tests/tools/.github 后记录全部输入。工作区构建不等于从 ZIP 重建。
