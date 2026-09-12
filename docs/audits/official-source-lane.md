@@ -37,9 +37,22 @@ py -3 -m unittest discover -s tools/tests -p test_official_suite_lane.py -v
 
 ## 24 个文件的分类与已完成的 Release 轮
 
-### 后续定向复验：REPL 与编译错误整改
+### 最新定向复验：嵌套 codegen 错误传播
 
-最新联合冻结后，Debug 十项严格子集及 Release db/errors 在三个引擎全部完成。
+本轮 Debug/Release 各自执行 constructs、db、errors、literals、locals、math、nextvar、
+pm、strings、vararg 十文件，在三个引擎均完成，共 60 个正常退出且含完成标记的进程。
+Rust 两种构建的 literals 均保留原版 `pt_BR` locale 不可用跳过，没有修改上游源码。
+产物在 `target/compiler-error-propagation-evidence/official-required-{debug,release}-final.json`，
+原始输出复核见同目录 `final-independent-validation.json`，输入身份见
+[嵌套 codegen 整改](2026-09-12-nested-codegen-remediation.md)。本轮没有重跑 main 或完整 19 项。
+
+Windows files/popen 的后续修复及最终原文件复验另见
+[popen 整改](2026-09-12-popen-remediation.md)。Rust 已补齐精确 `ls` 的可用性检查；
+stock 的 Windows rename/close 差异独立保留，不加入要求三引擎全部通过的严格子集。
+
+### 前一定向复验：REPL 与编译错误整改
+
+前一联合冻结后，Debug 十项严格子集及 Release db/errors 在三个引擎全部完成。
 原版 main 的最终 Debug/Release 则都越过交互段，停在第 135 行首次 `string.dump`
 未实现，退出 1，没有完成标记；main 仍不加入严格通过子集。固定 C++ main 完成，
 stock Windows 仍在临时模块 require 阶段失败。
@@ -115,5 +128,5 @@ errors/files 的该轮定位与短探针保存在 `official-final-diagnostics.js
 1. 完整 19 项冻结轮已完成；保留 source/binary/runner hash 和原始失败 artifact。对压力 timeout，在空闲机器上另做有明确预算的定向观察。
 2. CI 已接入 runner 的五个工具测试及十个严格入口（原八项加后续验证的 db/errors）。attrib/closure/events 在前批三个引擎均完成，可经复核扩入严格子集。完整 19 项保持独立结果，任何失败都返回非零，不能因“已登记官方库存”变成通过。
 3. 在 Linux 增加 stock 官方基准，单独处理 Windows `main.lua`/`files.lua` 的非可移植行为。保留两 oracle 的分歧，不把 stock 自身失败归成 Rust 回归。
-4. db/errors 原版已到达完成标记，main 已越过交互段但仍依赖 binary chunk；先修已实测的嵌套 codegen 吞错误 P1，再处理平台 IO、binary chunk 和长负载问题。只有相应原文件真正到达完成标记，才将其加入通过清单。
+4. db/errors 原版已到达完成标记，嵌套 codegen 错误传播 P1 已单独验收；main 已越过交互段但仍依赖 binary chunk。Windows files/popen 已定向验收；下一步处理本地时间/UTC 转换、其余平台 IO 与长负载，再推进 binary chunk。只有相应原文件真正到达完成标记，才将其加入通过清单。
 5. 后续分别建立有内存约束的 `big.lua` 协程/溢出 lane、TestC 内部测试 lane、以及完整 `all.lua` dump/undump/共享状态/清理 lane。更换测试能力时保持 oracle pin 与来源审批制度。

@@ -27,6 +27,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         linedefined: i32,
         lastlinedefined: i32,
     ) -> Result<CompiledFunction, String> {
+        self.check_codegen_error()?;
         let vararg_usage = scan_vararg_usage(body);
         let needs_arg = is_vararg && !vararg_usage.uses_vararg_expr;
 
@@ -94,7 +95,10 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
         // Compile the body, but always restore the parent generator state even
         // when a user-triggered lowering error occurs inside the child.
-        let body_error = self.emit_block(body).err();
+        let body_error = self
+            .emit_block(body)
+            .and_then(|()| self.check_codegen_error())
+            .err();
         let upvalues = if body_error.is_none() {
             // 末尾兜底 RETURN
             let final_line = if lastlinedefined > 0 {
@@ -146,6 +150,9 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         self.future_reads = saved_future_reads;
         self.force_nil_local_initialization = saved_force_nil_local_initialization;
 
+        // Restore the parent before propagating either a direct error or an
+        // earlier expression failure; neither may attach the partial child.
+        self.check_codegen_error()?;
         if let Some(error) = body_error {
             return Err(error);
         }

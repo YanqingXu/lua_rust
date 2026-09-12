@@ -562,6 +562,12 @@ unsafe extern "C" fn lua_io_popen(l_ptr: *mut std::ffi::c_void) -> i32 {
         return push_error(l, gc, "io.popen: invalid mode (must be 'r' or 'w')");
     }
 
+    #[cfg(windows)]
+    if command == "ls" && !windows_ls_available() {
+        push_lua_string(l, gc, "io.popen: command not available");
+        return lua_core::function::NATIVE_ERROR_DIAGNOSTIC;
+    }
+
     match prepare_pipe(&command, &mode) {
         Ok(construction) => match publish_file_to_stack(l, gc, construction) {
             Ok(()) => 1,
@@ -574,6 +580,53 @@ unsafe extern "C" fn lua_io_popen(l_ptr: *mut std::ffi::c_void) -> i32 {
             push_io_error_tuple(l, gc, &error.to_string(), error.raw_os_error().unwrap_or(0))
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_ls_available() -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    // The pinned C++ preflight is system("where ls >NUL 2>NUL"). Keep
+    // this command fixed: no part of the Lua command is interpolated here.
+    let probe = |shell: &std::ffi::OsStr| {
+        Command::new(shell)
+            .arg("/c")
+            .raw_arg("where ls >NUL 2>NUL")
+            .status()
+    };
+    let default_shell = std::ffi::OsStr::new("cmd.exe");
+    let status = match std::env::var_os("COMSPEC") {
+        Some(mut shell) => {
+            // UCRT rejects an empty shell through its invalid-parameter path.
+            // Preserve a controlled Lua failure instead of aborting the host.
+            if shell.is_empty() {
+                return false;
+            }
+            // UCRT's first _spawnve attempt does not search PATH. A shell
+            // basename must therefore be explicitly relative to the cwd.
+            let has_directory = shell.encode_wide().any(|unit| {
+                unit == u16::from(b'\\') || unit == u16::from(b'/') || unit == u16::from(b':')
+            });
+            if !has_directory {
+                let mut relative = std::ffi::OsString::from(".\\");
+                relative.push(shell);
+                shell = relative;
+            }
+            match probe(&shell) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    probe(default_shell)
+                }
+                result => result,
+            }
+        }
+        None => probe(default_shell),
+    };
+    status.is_ok_and(|status| status.success())
 }
 
 fn prepare_pipe(command: &str, mode: &[u8]) -> std::io::Result<FileConstruction> {

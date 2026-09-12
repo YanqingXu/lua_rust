@@ -54,7 +54,10 @@ protected loadstring 回归进一步暴露错误来源：Rust 给无位置 codeg
 裸 break 在官方 Lua REPL 的解析续行阶段与固定 C++ 有不同错误时机，本项目遵循
 固定 C++ 的 codegen 阶段；不会将 stock 的表现冒称为相同。
 
-## 后续 P1：嵌套 emitter 吞掉直接错误
+## 后续发现的 P1：嵌套 emitter 吞掉直接错误
+
+以下保留发现时证据。后续实现和验证已在
+[嵌套 codegen 整改](2026-09-12-nested-codegen-remediation.md) 单独记录，不把两批源码混为一体。
 
 冻结后的独立审核用 `loadstring` 编译、没有执行返回的 Proto，确认仍有另一项
 缺陷：`do 1=2 end` 和 `if true then 1=2 end` 在 Rust 返回 function/nil，固定
@@ -65,6 +68,6 @@ C++ 报较早的 lvalue 错误。原因是现有嵌套 emitter 的 `let _ = emit
 所有直接错误的传播。
 
 六个短进程的源码、快照 SHA 和原始输出保留在
-`target/compiler-error-propagation-evidence/observations.json`。这是下一优先修复项，
-完整门通过也不会关闭它；必须让嵌套无效源码受控失败、保留最早诊断，并验证合法
-嵌套循环/函数仍正确执行。当前联合冻结源码尚未修改该路径。
+`target/compiler-error-propagation-evidence/observations.json`。该发现时是下一优先修复项，
+当时完整门通过也不能关闭它；必须传播嵌套 codegen 错误、保留最早诊断，并验证合法
+嵌套循环/函数仍正确执行。该联合冻结源码尚未修改此路径，后续证据见上方链接。

@@ -58,7 +58,7 @@ loader break 回归。联合冻结后完整 M0/M1 基础门通过，普通测试
 - 固定 C++ 完整 main 通过；官方 Windows 在带点临时模块名的 require 阶段失败。
   Rust 的剩余 main 失败是 binary chunk 依赖，与 `calls.lua` 一起保留到 M3。
 
-下一步先修 [嵌套 codegen 吞错误 P1](2026-09-12-break-scope-remediation.md)，
-随后处理 Windows files 行为、其余诊断入口与有界大负载，再按
+该批验收后的首项 [嵌套 codegen 错误传播](2026-09-12-nested-codegen-remediation.md)
+现已单独完成。下一步处理 Windows files 行为、其余诊断入口与有界大负载，再按
 [M3 合同设计](../rust_migration/m3_contract_design.md) 推进格式 reader/verifier、
 原子发布和 serializer。不会因为修复交互段就把整份 main 纳入严格通过子集。

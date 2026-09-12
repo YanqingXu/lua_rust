@@ -170,30 +170,32 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
     /// 发射单条语句
     pub fn emit_statement(&mut self, stmt: &Stmt) -> Result<(), String> {
+        self.check_codegen_error()?;
         match stmt {
             Stmt::Empty(_) => {}
             Stmt::Assign(a) => self.emit_assign(a)?,
             Stmt::Local(l) => self.emit_local(l),
             Stmt::Call(c) => self.emit_call_stmt(c)?,
-            Stmt::If(i) => self.emit_if(i),
-            Stmt::While(w) => self.emit_while(w),
-            Stmt::Repeat(r) => self.emit_repeat(r),
-            Stmt::ForNum(f) => self.emit_for_num(f),
-            Stmt::ForIn(f) => self.emit_for_in(f),
+            Stmt::If(i) => self.emit_if(i)?,
+            Stmt::While(w) => self.emit_while(w)?,
+            Stmt::Repeat(r) => self.emit_repeat(r)?,
+            Stmt::ForNum(f) => self.emit_for_num(f)?,
+            Stmt::ForIn(f) => self.emit_for_in(f)?,
             Stmt::Function(f) => self.emit_function_stmt(f)?,
             Stmt::Return(r) => self.emit_return(r),
             Stmt::Break(b) => {
                 self.current_line = b.location.line;
                 self.emit_break();
             }
-            Stmt::Do(d) => self.emit_do(d),
+            Stmt::Do(d) => self.emit_do(d)?,
         }
         self.reg_alloc.reset_to_locals(self.active_var_count);
-        Ok(())
+        self.check_codegen_error()
     }
 
     /// 发射语句块
     pub fn emit_block(&mut self, stmts: &[Box<Stmt>]) -> Result<(), String> {
+        self.check_codegen_error()?;
         let block_level = self.active_var_count;
         let block_line = self.current_line;
         let mut reads_after = vec![HashSet::new(); stmts.len() + 1];
@@ -215,7 +217,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         }
         self.future_reads = previous_future_reads;
         self.remove_local_vars(block_level);
-        Ok(())
+        self.check_codegen_error()
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -553,17 +555,19 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // If 语句
     // ═══════════════════════════════════════════════════════════════
 
-    fn emit_if(&mut self, i: &IfStmt) {
+    fn emit_if(&mut self, i: &IfStmt) -> Result<(), String> {
         self.current_line = i.location.line;
         let mut exit_list: Vec<i32> = Vec::new();
 
         for (idx, branch) in i.branches.iter().enumerate() {
+            self.check_codegen_error()?;
             self.current_line = branch.condition.line();
             let cond = self.emit_cond_result(&branch.condition);
+            self.check_codegen_error()?;
             self.patch_list_to_here(&cond.true_list);
 
             self.enter_block(false);
-            let _ = self.emit_block(&branch.body);
+            self.emit_block(&branch.body)?;
             self.current_line = i.location.line;
             self.leave_block();
 
@@ -578,7 +582,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
         if !i.else_branch.is_empty() {
             self.enter_block(false);
-            let _ = self.emit_block(&i.else_branch);
+            self.emit_block(&i.else_branch)?;
             self.current_line = i.location.line;
             self.leave_block();
         }
@@ -587,22 +591,24 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         for pc in exit_list {
             self.fix_jump(pc, target);
         }
+        Ok(())
     }
 
     // ═══════════════════════════════════════════════════════════════
     // While 循环
     // ═══════════════════════════════════════════════════════════════
 
-    fn emit_while(&mut self, w: &WhileStmt) {
+    fn emit_while(&mut self, w: &WhileStmt) -> Result<(), String> {
         self.current_line = w.location.line;
         self.enter_block(true);
 
         let loop_start = self.get_label();
         let cond = self.emit_cond_result(&w.condition);
+        self.check_codegen_error()?;
         self.patch_list_to_here(&cond.true_list);
 
         let body_level = self.active_var_count;
-        let _ = self.emit_block(&w.body);
+        self.emit_block(&w.body)?;
         self.current_line = w.location.line;
         self.remove_local_vars(body_level);
 
@@ -612,13 +618,14 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
         self.patch_list_to_here(&cond.false_list);
         self.leave_block();
+        Ok(())
     }
 
     // ═══════════════════════════════════════════════════════════════
     // Repeat 循环
     // ═══════════════════════════════════════════════════════════════
 
-    fn emit_repeat(&mut self, r: &RepeatStmt) {
+    fn emit_repeat(&mut self, r: &RepeatStmt) -> Result<(), String> {
         self.current_line = r.location.line;
         let block_level = self.active_var_count;
         self.enter_block(true);
@@ -626,16 +633,18 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         let loop_start = self.get_label();
         let saved_force_nil_local_initialization = self.force_nil_local_initialization;
         self.force_nil_local_initialization = true;
-        for stmt in &r.body {
-            let _ = self.emit_statement(stmt);
+        let body_result: Result<(), String> = r.body.iter().try_for_each(|stmt| {
+            self.emit_statement(stmt)?;
             self.current_line = r.location.line;
-        }
+            Ok(())
+        });
         self.force_nil_local_initialization = saved_force_nil_local_initialization;
+        body_result?;
 
         if matches!(r.condition.as_ref(), Expr::Boolean(boolean) if boolean.value) {
             self.remove_local_vars(block_level);
             self.leave_block();
-            return;
+            return Ok(());
         }
 
         // The pinned C++ compiler deliberately lowers repeat conditions through
@@ -648,6 +657,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         } else {
             self.emit_value(&r.condition)
         };
+        self.check_codegen_error()?;
         let cond = self.force_single_value(cond);
         let cond_reg = self.value_to_any_reg(cond);
 
@@ -658,13 +668,14 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         self.fix_jump(repeat_jump, loop_start);
 
         self.leave_block();
+        Ok(())
     }
 
     // ═══════════════════════════════════════════════════════════════
     // ForNum 循环
     // ═══════════════════════════════════════════════════════════════
 
-    fn emit_for_num(&mut self, f: &ForNumStmt) {
+    fn emit_for_num(&mut self, f: &ForNumStmt) -> Result<(), String> {
         self.current_line = f.location.line;
         let loop_line = f.location.line;
         let base = self.active_var_count;
@@ -674,11 +685,13 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         // Lua numeric for uses four consecutive slots:
         // R(A)=internal index, R(A+1)=limit, R(A+2)=step, R(A+3)=visible variable.
         let init = self.emit_value(&f.init);
+        self.check_codegen_error()?;
         let init = self.force_single_value(init);
         self.materialize_value(init, base);
         self.reg_alloc.set_freereg(base + 1);
 
         let mut limit = self.emit_value(&f.limit);
+        self.check_codegen_error()?;
         limit = self.force_single_value(limit);
         self.materialize_value(limit, base + 1);
         self.reg_alloc.set_freereg(base + 2);
@@ -689,6 +702,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         } else {
             ValueResult::make_number(1.0)
         };
+        self.check_codegen_error()?;
         self.materialize_value(step, base + 2);
         self.reg_alloc.set_freereg(base + 3);
 
@@ -707,7 +721,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
         let loop_start = self.get_label();
 
-        let _ = self.emit_block(&f.body);
+        self.emit_block(&f.body)?;
         // The pinned C++ compiler emits an iteration-scope CLOSE for every
         // non-empty numeric-for body, independently of captured-local analysis.
         if !f.body.is_empty() {
@@ -725,13 +739,14 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
         // initial value is within range.
         self.fix_jump(forprep_pc, forloop_pc);
         self.leave_block();
+        Ok(())
     }
 
     // ═══════════════════════════════════════════════════════════════
     // ForIn 循环
     // ═══════════════════════════════════════════════════════════════
 
-    fn emit_for_in(&mut self, f: &ForInStmt) {
+    fn emit_for_in(&mut self, f: &ForInStmt) -> Result<(), String> {
         self.current_line = f.location.line;
         let base = self.active_var_count;
         let nvars = f.vars.len() as i32;
@@ -753,6 +768,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
                 if is_last && let Expr::Call(call) = iter.as_ref() {
                     let mut info = self.emit_call_expr(call, target_reg);
+                    self.check_codegen_error()?;
                     self.set_wanted_results(&mut info, wanted);
                     filled = 3;
                     self.reg_alloc.ensure_at_least(base + 3);
@@ -769,12 +785,14 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
                 }
 
                 let val = self.emit_value(iter);
+                self.check_codegen_error()?;
                 let val = self.force_single_value(val);
                 self.materialize_value(val, target_reg);
                 filled += 1;
                 self.reg_alloc.ensure_at_least(base + filled);
             } else {
                 let val = self.emit_value(iter);
+                self.check_codegen_error()?;
                 let val = self.force_single_value(val);
                 let reg = self.value_to_any_reg(val);
                 self.reg_alloc.free_reg(reg, self.active_var_count);
@@ -798,7 +816,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
 
         let jump_to_tfor = self.emit_jump();
         let loop_start = self.get_label();
-        let _ = self.emit_block(&f.body);
+        self.emit_block(&f.body)?;
 
         // The pinned C++ compiler closes the visible loop-variable scope on
         // every generic-for iteration, even when the body itself is empty. The
@@ -816,6 +834,7 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
             .emit_as_bx(iterator_line, OpCode::JMP, 0, offset);
 
         self.leave_block();
+        Ok(())
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1053,11 +1072,12 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // Do 块
     // ═══════════════════════════════════════════════════════════════
 
-    fn emit_do(&mut self, d: &DoStmt) {
+    fn emit_do(&mut self, d: &DoStmt) -> Result<(), String> {
         self.current_line = d.location.line;
         self.enter_block(false);
-        let _ = self.emit_block(&d.body);
+        self.emit_block(&d.body)?;
         self.current_line = d.location.line;
         self.leave_block();
+        Ok(())
     }
 }

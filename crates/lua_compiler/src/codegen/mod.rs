@@ -219,6 +219,15 @@ impl<'services, A: CodegenObjectAllocator + ?Sized> CodeGenerator<'services, A> 
         }
     }
 
+    /// Stop fallible lowering boundaries after an infallible expression failed.
+    /// The owned CodegenError remains available to the public generation API.
+    pub(crate) fn check_codegen_error(&self) -> Result<(), String> {
+        match &self.pending_error {
+            Some(error) => Err(error.message.clone()),
+            None => Ok(()),
+        }
+    }
+
     fn from_services(allocator: &'services mut A, string_pool: &'services mut StringPool) -> Self {
         let mut proto = Proto::new();
         proto.set_max_stack_size(2);

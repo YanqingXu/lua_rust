@@ -163,6 +163,11 @@ jobs:
           cargo +nightly-2026-07-29 miri test
           -p lua_stdlib --test error_diagnostic_boundary
 
+      - name: Run rejected compiler publication and reader GC under Miri
+        run: >-
+          cargo +nightly-2026-07-29 miri test
+          -p lua_stdlib --test compiler_error_boundary
+
       - name: Reject untyped IO userdata under Miri
         run: >-
           cargo +nightly-2026-07-29 miri test

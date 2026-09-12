@@ -7,8 +7,8 @@ last_updated: 2026-09-12
 rust_baseline: 503bf99
 cpp_oracle: 87c15e6
 lua_oracle: Lua 5.1.5
-implementation_checkpoint: source-manifest@d9423c05874c8c5e
-next_primary_task: M2 nested codegen error propagation, then files and bounded large workloads
+implementation_checkpoint: source-manifest@ed0cc750243c22cc
+next_primary_task: M2 local-time/UTC conversion, then bounded large workloads
 ---
 
 # lua_rust 完整复刻 lua_cpp 开发计划
@@ -40,12 +40,14 @@ next_primary_task: M2 nested codegen error propagation, then files and bounded l
 [风险与复现](docs/audits/2026-09-12.md)。
 
 第一批修复已提交并推送为 `4024f9e`，该提交远程 Rust CI / mdBook 全部成功。
-后续工作区已关闭 db/errors、REPL 续行和错误阶段、无循环 break 挂死及 bytecode
-诊断出口。最新联合完整 M0/M1 基础门通过，普通测试清单 1,056 项；Debug 十项
-官方严格子集及 Release db/errors 通过，CLI/REPL/bytecode 工具两种构建的合同通过。
-main 已越过交互段，仍依赖 M3 dump；下一优先项是已实测的嵌套 codegen 吞错误 P1。
-前批 debug/诊断边界默认 Miri 按各自源码身份保留，本批未新增 Miri。这些后续批次
-纳入本次提交，远程 CI 须按提交 SHA 单独验收。完整证据见上述唯一整改状态入口。
+后续 db/errors、REPL 续行和错误阶段、无循环 break 挂死及 bytecode 诊断批次已
+提交推送为 `33aba8e`，该 SHA 的远程 Rust CI 四项及 mdBook 已全部通过。其后的工作区已修复嵌套 codegen
+错误传播 P1，完整 M0/M1 基础门通过，普通测试清单 1,080 项；默认 Miri 新增
+publication 失败和 reader GC 边界两项通过。Debug/Release 各十项官方严格子集及
+CLI/REPL/bytecode 工具合同通过。嵌套编译与 Windows popen 修复纳入本次提交。
+popen 最终 Debug/Release 新增测试各 8/8，独立边界复核通过；详见
+[popen 整改](docs/audits/2026-09-12-popen-remediation.md)。main 仍依赖 M3 dump，
+下一优先项是已用固定时间戳复现的本地时间/UTC 转换错误，随后补大负载观测。完整证据与范围限制见上述唯一整改状态入口，M1/M2 整体未完成。
 
 下一顺序：公开边界与宿主错误 → 表/浮点/参数合同 → M2 具体债务与官方执行、
 内存/延迟基线 → 稳定合同上的 M3 ABI 与二进制格式设计。保留 oracle pin，
