@@ -23,7 +23,6 @@ $knownKinds = @(
     "OPEN_UPVALUES",
     "THREAD_CALLER_CHAIN",
     "DEBUG_HOOK",
-    "DEBUG_PROTO",
     "YIELDED_VALUES",
     "LAST_ERROR",
     "PENDING_FINALIZERS",

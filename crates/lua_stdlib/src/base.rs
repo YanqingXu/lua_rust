@@ -12,6 +12,7 @@ use lua_core::gc::gc_ref::GcRef;
 use lua_core::table::Table;
 use lua_core::userdata::Userdata;
 use lua_core::value::Value;
+use lua_vm::execute::ChunkLoaderContext;
 use lua_vm::state::LuaState;
 use std::io::Write;
 
@@ -269,13 +270,22 @@ unsafe extern "C" fn lua_b_error_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
         Value::Nil => 1,
         _ => 1,
     };
-    if level > 0
-        && let Value::String(message_ref) = message
-        && let Some(prefix) = error_location_prefix(l, level)
+    let located_message = if level > 0 {
+        match &message {
+            Value::String(message_ref) => l.copy_string_bytes(*message_ref).ok(),
+            Value::Number(number) => {
+                Some(lua_core::number_format::format_lua_number(*number).into_bytes())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(message_bytes) = located_message
+        && let Some(mut bytes) = error_location_prefix(l, level)
     {
-        let mut bytes = prefix.into_bytes();
         bytes.extend_from_slice(b": ");
-        let _ = l.with_string_bytes(message_ref, |message| bytes.extend_from_slice(message));
+        bytes.extend_from_slice(&message_bytes);
         // The fixed C++ `error` implementation resets the native frame before
         // publishing the located error object. Besides matching the protected
         // call's result slot, this prevents the original argument from staying
@@ -326,9 +336,9 @@ unsafe extern "C" fn lua_b_loadstring_raw(_l_ptr: *mut std::ffi::c_void) -> i32 
         })
         .unwrap_or_else(|| default_loadstring_chunk_name(&source));
 
-    match compile_chunk_function(l, &source, &chunk_name) {
+    match compile_chunk_function(l, &source, &chunk_name, ChunkLoaderContext::LoadString) {
         Ok(_) => 1,
-        Err(message) => push_load_error(l, &message),
+        Err(message) => push_load_error_bytes(l, &message),
     }
 }
 
@@ -345,15 +355,26 @@ unsafe extern "C" fn lua_b_loadfile_raw(_l_ptr: *mut std::ffi::c_void) -> i32 {
     };
     let chunk_name = format!("@{filename}").into_bytes();
 
-    match compile_chunk_function(l, &source, &chunk_name) {
+    match compile_chunk_function(
+        l,
+        &source,
+        &chunk_name,
+        ChunkLoaderContext::LoadFile {
+            display_name: filename.as_bytes(),
+        },
+    ) {
         Ok(_) => 1,
-        Err(message) => push_load_error(l, &message),
+        Err(message) => push_load_error_bytes(l, &message),
     }
 }
 
 fn push_load_error(l: &mut LuaState, message: &str) -> i32 {
+    push_load_error_bytes(l, message.as_bytes())
+}
+
+fn push_load_error_bytes(l: &mut LuaState, message: &[u8]) -> i32 {
     l.push_value(Value::Nil);
-    if !push_lua_string(l, message) {
+    if !push_lua_bytes(l, message) {
         return -1;
     }
     2
@@ -384,14 +405,15 @@ fn compile_chunk_function(
     l: &mut LuaState,
     source: &[u8],
     chunk_name: &[u8],
-) -> Result<GcRef<Function>, String> {
+    loader: ChunkLoaderContext<'_>,
+) -> Result<GcRef<Function>, Vec<u8>> {
     let Some(gc_ptr) = l.active_gc_ptr() else {
-        return Err("chunk compilation unavailable without an active GC".to_string());
+        return Err(b"chunk compilation unavailable without an active GC".to_vec());
     };
     // SAFETY: LuaState::gc is installed by the VM for the duration of execution.
     let gc = unsafe { &mut *gc_ptr };
 
-    lua_vm::execute::compile_chunk_function(l, gc, source, chunk_name)
+    lua_vm::execute::compile_chunk_function(l, gc, source, chunk_name, loader)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -821,7 +843,7 @@ fn function_ref_at_level(l: &LuaState, level: usize) -> Option<GcRef<Function>> 
     }
 }
 
-fn error_location_prefix(l: &LuaState, level: usize) -> Option<String> {
+fn error_location_prefix(l: &LuaState, level: usize) -> Option<Vec<u8>> {
     let gc_ptr = l.active_gc_ptr()?;
     // SAFETY: the VM installs the owning collector for the duration of the
     // active base-library callback.
@@ -839,11 +861,11 @@ fn error_location_prefix(l: &LuaState, level: usize) -> Option<String> {
         .ok()?;
     let source = source_ref
         .and_then(|source_ref| {
-            l.with_string_bytes(source_ref, lua_vm::execute::chunk_name_for_diagnostic)
+            l.with_string_bytes(source_ref, lua_vm::execute::chunk_name_for_diagnostic_bytes)
                 .ok()
         })
-        .unwrap_or_else(|| "?".to_string());
-    Some(format!("{source}:{line}"))
+        .unwrap_or_else(|| b"?".to_vec());
+    Some([source, format!(":{line}").into_bytes()].concat())
 }
 
 fn is_thread_env_stack_level(l: &LuaState, level: usize) -> bool {

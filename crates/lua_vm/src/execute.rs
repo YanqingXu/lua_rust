@@ -107,6 +107,32 @@ fn rooted_vm_bytes<'scope>(
     transaction.intern_bytes(unsafe { &mut *pool }, bytes)
 }
 
+/// Native loader responsible for a location-free code-generation diagnostic.
+/// Custom chunk names do not identify the loader that requested compilation.
+#[derive(Clone, Copy, Debug)]
+pub enum ChunkLoaderContext<'name> {
+    LoadString,
+    Load,
+    LoadFile { display_name: &'name [u8] },
+}
+
+impl ChunkLoaderContext<'_> {
+    fn codegen_error_prefix(self) -> Vec<u8> {
+        match self {
+            Self::LoadString => b"loadstring: ".to_vec(),
+            Self::Load => b"load: ".to_vec(),
+            Self::LoadFile { display_name } => {
+                let mut prefix = b"loadfile: ".to_vec();
+                if !display_name.is_empty() {
+                    prefix.extend_from_slice(display_name);
+                    prefix.extend_from_slice(b": ");
+                }
+                prefix
+            }
+        }
+    }
+}
+
 /// Compile one byte-oriented Lua chunk and publish the resulting closure onto
 /// the active state stack before releasing construction roots.
 pub fn compile_chunk_function(
@@ -114,35 +140,44 @@ pub fn compile_chunk_function(
     gc: &mut GarbageCollector,
     source: &[u8],
     chunk_name: &[u8],
-) -> Result<GcRef<Function>, String> {
+    loader: ChunkLoaderContext<'_>,
+) -> Result<GcRef<Function>, Vec<u8>> {
     let mut parser = Parser::from_bytes(source);
     let chunk = parser.parse().map_err(|err| {
-        format!(
-            "{}:{}: {}",
-            chunk_name_for_diagnostic(chunk_name),
-            err.line,
-            err.message
-        )
+        let mut message = chunk_name_for_diagnostic_bytes(chunk_name);
+        message.extend_from_slice(format!(":{}: ", err.line).as_bytes());
+        message.extend_from_slice(err.message_bytes());
+        message
     })?;
 
     let environment = l.thread_env.or(l.global_table);
     let pool_ptr = l
         .active_string_pool_ptr()
-        .ok_or_else(|| "chunk compilation unavailable without an active StringPool".to_string())?;
+        .ok_or_else(|| b"chunk compilation unavailable without an active StringPool".to_vec())?;
     gc.with_publication(|transaction| {
         // SAFETY: the pool belongs to this dynamically scoped Runtime turn.
         let generator =
             CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr });
         let proto = generator
             .generate_with_source_bytes(&chunk, chunk_name)
-            .map_err(|err| format!("{}:{err}", chunk_name_for_diagnostic(chunk_name)))?;
+            .map_err(|err| {
+                let mut message = if err.line == 0 && err.column == 0 {
+                    loader.codegen_error_prefix()
+                } else {
+                    let mut prefix = chunk_name_for_diagnostic_bytes(chunk_name);
+                    prefix.extend_from_slice(format!(":{}:{}: ", err.line, err.column).as_bytes());
+                    prefix
+                };
+                message.extend_from_slice(err.message_bytes());
+                message
+            })?;
         let proto = transaction.alloc(proto);
         let function = transaction
             .alloc_lua_function(&proto)
-            .map_err(|err| format!("invalid chunk Function publication: {err}"))?;
+            .map_err(|err| format!("invalid chunk Function publication: {err}").into_bytes())?;
         transaction
             .set_lua_function_environment(&function, environment)
-            .map_err(|err| format!("invalid chunk environment publication: {err}"))?;
+            .map_err(|err| format!("invalid chunk environment publication: {err}").into_bytes())?;
 
         // SAFETY: the callback installs the Function on the active Lua stack
         // before its object root is released.
@@ -155,7 +190,7 @@ pub fn compile_chunk_function(
                 function
             })
         }
-        .map_err(|err| format!("invalid chunk stack publication: {err}"))
+        .map_err(|err| format!("invalid chunk stack publication: {err}").into_bytes())
     })
 }
 
@@ -165,15 +200,21 @@ pub fn compile_chunk_function(
 /// the user-facing name. Other names are source snippets and use the fixed
 /// C++ oracle's `[string "..."]` envelope.
 pub fn chunk_name_for_diagnostic(chunk_name: &[u8]) -> String {
+    diagnostic_bytes(&chunk_name_for_diagnostic_bytes(chunk_name))
+}
+
+/// Render a Lua diagnostic chunk id without decoding or escaping its bytes.
+/// Source snippets retain the pinned C++ quote/backslash and length rules.
+pub fn chunk_name_for_diagnostic_bytes(chunk_name: &[u8]) -> Vec<u8> {
     if let Some(name) = chunk_name
         .strip_prefix(b"=")
         .or_else(|| chunk_name.strip_prefix(b"@"))
     {
-        return diagnostic_bytes(name);
+        return name.to_vec();
     }
 
     const SNIPPET_LIMIT: usize = 60;
-    let mut snippet = String::new();
+    let mut snippet = Vec::new();
     let mut truncated = false;
     for &byte in chunk_name {
         if matches!(byte, b'\n' | b'\r') || snippet.len() >= SNIPPET_LIMIT {
@@ -181,14 +222,14 @@ pub fn chunk_name_for_diagnostic(chunk_name: &[u8]) -> String {
             break;
         }
         if matches!(byte, b'"' | b'\\') {
-            snippet.push('\\');
+            snippet.push(b'\\');
         }
-        push_diagnostic_byte(&mut snippet, byte);
+        snippet.push(byte);
     }
     if truncated {
-        snippet.push_str("...");
+        snippet.extend_from_slice(b"...");
     }
-    format!("[string \"{snippet}\"]")
+    [b"[string \"".as_slice(), &snippet, b"\"]"].concat()
 }
 
 fn diagnostic_bytes(bytes: &[u8]) -> String {
@@ -234,7 +275,7 @@ mod chunk_name_diagnostic_tests {
     }
 }
 
-pub(crate) fn definite_load_syntax_error(source: &[u8]) -> Option<String> {
+pub(crate) fn definite_load_syntax_error(source: &[u8]) -> Option<Vec<u8>> {
     let first = source
         .iter()
         .copied()
@@ -250,10 +291,11 @@ pub(crate) fn definite_load_syntax_error(source: &[u8]) -> Option<String> {
     match parser.parse() {
         Ok(_) => None,
         Err(err) if err.message.contains("<eof>") => None,
-        Err(err) => Some(format!(
-            "=(load):{}:{}: {}",
-            err.line, err.column, err.message
-        )),
+        Err(err) => {
+            let mut message = format!("=(load):{}:{}: ", err.line, err.column).into_bytes();
+            message.extend_from_slice(err.message_bytes());
+            Some(message)
+        }
     }
 }
 
@@ -1105,6 +1147,8 @@ fn execute_proto_inner(
                         ci.savedpc = Some(0);
                         ci.proto = Some(tail_proto_ref);
                         ci.tailcalls += 1;
+                        ci.debug_hook_last_line = -1;
+                        ci.debug_hook_last_pc = None;
 
                         if l.stack.size() < new_top {
                             l.stack.set_top(new_top);
@@ -1628,17 +1672,15 @@ pub(crate) fn dispatch_debug_line_hook(
         let line = gc
             .with_ref(proto, |active| active.line(pc))
             .map_err(invalid_proto_error)?;
-        let should_skip_setup_line =
-            l.debug_hook_skip_line == line && l.debug_hook_skip_proto == Some(proto);
-        let repeated_line_from_jump = pc <= l.debug_hook_last_pc && line == l.debug_hook_last_line;
-        if should_skip_setup_line {
-            l.debug_hook_skip_proto = None;
-            l.debug_hook_skip_line = -1;
-            l.debug_hook_last_line = line;
-            l.debug_hook_last_pc = pc;
-        } else if line > 0 && (line != l.debug_hook_last_line || repeated_line_from_jump) {
-            l.debug_hook_last_line = line;
-            l.debug_hook_last_pc = pc;
+        if line <= 0 {
+            return Ok(None);
+        }
+        let ci = l.current_call_info_mut();
+        let same_line_forward = ci.debug_hook_last_line == line
+            && ci.debug_hook_last_pc.is_some_and(|previous| pc > previous);
+        ci.debug_hook_last_line = line;
+        ci.debug_hook_last_pc = Some(pc);
+        if !same_line_forward {
             return publish_debug_hook_event(
                 l,
                 gc,
@@ -1646,8 +1688,6 @@ pub(crate) fn dispatch_debug_line_hook(
                 Some(line),
                 DebugHookContinuation::ResumeAt { proto, pc },
             );
-        } else {
-            l.debug_hook_last_pc = pc;
         }
     }
 
@@ -1690,9 +1730,6 @@ fn mark_vm_roots_for_weak_cleanup(l: &LuaState, gc: &mut GarbageCollector) {
     }
     if let Some(hook) = &l.debug_hook {
         gc.mark_value(hook);
-    }
-    if let Some(skip_proto) = l.debug_hook_skip_proto {
-        gc.mark_registered(skip_proto);
     }
     if let Some(error) = &l.last_error {
         gc.mark_value(error);
@@ -2666,7 +2703,7 @@ fn runtime_error_at(
     gc: &GarbageCollector,
     proto: GcRef<Proto>,
     pc: usize,
-    message: impl Into<String>,
+    message: impl Into<Vec<u8>>,
 ) -> RuntimeError {
     runtime_diagnostic_at(gc, proto, pc, message).located()
 }
@@ -2678,18 +2715,18 @@ fn runtime_diagnostic_at(
     gc: &GarbageCollector,
     proto: GcRef<Proto>,
     pc: usize,
-    message: impl Into<String>,
+    message: impl Into<Vec<u8>>,
 ) -> RuntimeError {
     let (source_ref, line) = gc
         .with_ref(proto, |proto| (proto.source(), proto.line(pc)))
         .unwrap_or((None, 0));
     let source = source_ref
         .and_then(|source_ref| {
-            gc.with_string_bytes(source_ref, chunk_name_for_diagnostic)
+            gc.with_string_bytes(source_ref, chunk_name_for_diagnostic_bytes)
                 .ok()
         })
-        .unwrap_or_else(|| "?".to_string());
-    let mut error = RuntimeError::new(message);
+        .unwrap_or_else(|| b"?".to_vec());
+    let mut error = RuntimeError::new_bytes(message);
     error.diagnostic_location = Some(DiagnosticLocation { source, line });
     error
 }
@@ -2756,15 +2793,22 @@ fn index_error_message(
     pc: usize,
     reg: usize,
     value: &Value,
-) -> String {
+) -> Vec<u8> {
     let type_desc = value_type_name(value);
     gc.with_ref(proto, |proto| {
         describe_register_for_index(gc, proto, pc, reg, proto.constants(), 8)
     })
     .ok()
     .flatten()
-    .map(|name| format!("attempt to index {name} (a {type_desc} value)"))
-    .unwrap_or_else(|| format!("attempt to index a {type_desc} value"))
+    .map(|name| {
+        [
+            b"attempt to index ".as_slice(),
+            &name,
+            format!(" (a {type_desc} value)").as_bytes(),
+        ]
+        .concat()
+    })
+    .unwrap_or_else(|| format!("attempt to index a {type_desc} value").into_bytes())
 }
 
 fn arith_error_message(
@@ -2773,7 +2817,7 @@ fn arith_error_message(
     pc: usize,
     lhs: (i32, &Value),
     rhs: (i32, &Value),
-) -> String {
+) -> Vec<u8> {
     let (bad_rk, bad_value) = if to_arith_number(gc, lhs.1).is_none() {
         lhs
     } else {
@@ -2790,7 +2834,7 @@ fn arith_error_message(
             "attempt to perform arithmetic on",
         )
     })
-    .unwrap_or_else(|_| "attempt to perform arithmetic on a non-number value".to_string())
+    .unwrap_or_else(|_| b"attempt to perform arithmetic on a non-number value".to_vec())
 }
 
 fn unm_error_message(
@@ -2799,7 +2843,7 @@ fn unm_error_message(
     pc: usize,
     rk: usize,
     value: &Value,
-) -> String {
+) -> Vec<u8> {
     gc.with_ref(proto, |proto| {
         operand_error_message(
             gc,
@@ -2811,7 +2855,7 @@ fn unm_error_message(
             "attempt to perform arithmetic on",
         )
     })
-    .unwrap_or_else(|_| "attempt to perform arithmetic on a non-number value".to_string())
+    .unwrap_or_else(|_| b"attempt to perform arithmetic on a non-number value".to_vec())
 }
 
 fn describe_register_at(
@@ -2820,7 +2864,7 @@ fn describe_register_at(
     pc: usize,
     reg: usize,
     depth: usize,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     gc.with_ref(proto, |proto| {
         describe_register(gc, proto, pc, reg, proto.constants(), depth)
     })
@@ -2834,12 +2878,12 @@ fn call_error_message(
     pc: usize,
     reg: usize,
     value: &Value,
-) -> String {
+) -> Vec<u8> {
     let type_name = value_type_name(value);
     let detail = describe_register_at(gc, proto, pc, reg, 8)
-        .map(|name| format!("{name} (a {type_name} value)"))
-        .unwrap_or_else(|| format!("a {type_name} value"));
-    format!("attempt to call {detail}")
+        .map(|name| [name, format!(" (a {type_name} value)").into_bytes()].concat())
+        .unwrap_or_else(|| format!("a {type_name} value").into_bytes());
+    [b"attempt to call ".as_slice(), &detail].concat()
 }
 
 fn operand_error_message(
@@ -2850,11 +2894,19 @@ fn operand_error_message(
     constants: &[Value],
     value: &Value,
     prefix: &str,
-) -> String {
+) -> Vec<u8> {
     let type_desc = value_type_name(value);
     describe_operand(gc, proto, pc, rk, constants, 8)
-        .map(|name| format!("{prefix} {name} (a {type_desc} value)"))
-        .unwrap_or_else(|| format!("{prefix} a {type_desc} value"))
+        .map(|name| {
+            [
+                prefix.as_bytes(),
+                b" ",
+                &name,
+                format!(" (a {type_desc} value)").as_bytes(),
+            ]
+            .concat()
+        })
+        .unwrap_or_else(|| format!("{prefix} a {type_desc} value").into_bytes())
 }
 
 fn describe_operand(
@@ -2864,7 +2916,7 @@ fn describe_operand(
     rk: i32,
     constants: &[Value],
     depth: usize,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     if opcode::is_k(rk) {
         None
     } else {
@@ -2879,7 +2931,7 @@ fn describe_register(
     reg: usize,
     constants: &[Value],
     depth: usize,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     describe_register_impl(gc, proto, pc, reg, constants, depth, true)
 }
 
@@ -2890,7 +2942,7 @@ fn describe_register_for_index(
     reg: usize,
     constants: &[Value],
     depth: usize,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     describe_register_impl(gc, proto, pc, reg, constants, depth, false)
 }
 
@@ -2902,7 +2954,7 @@ fn describe_register_impl(
     constants: &[Value],
     depth: usize,
     respect_name_barrier: bool,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     if depth == 0 {
         return None;
     }
@@ -2921,7 +2973,7 @@ fn describe_register_impl(
     }
 
     if let Some(name) = local_name_for_reg(gc, proto, reg, pc) {
-        return Some(format!("local '{name}'"));
+        return Some(named_operand(b"local", &name));
     }
 
     for cursor in (0..pc).rev().take(16) {
@@ -2949,24 +3001,25 @@ fn describe_register_impl(
                 let upvalue = opcode::get_arg_b(inst) as usize;
                 return proto
                     .upvalue_name(upvalue)
-                    .and_then(|name| gc_string_lossy(gc, name))
-                    .map(|name| format!("upvalue '{name}'"));
+                    .and_then(|name| gc_string_bytes(gc, name))
+                    .map(|name| named_operand(b"upvalue", &name));
             }
             OpCode::GETGLOBAL => {
                 let bx = opcode::get_arg_bx(inst) as usize;
-                return constant_string(gc, constants, bx).map(|name| format!("global '{name}'"));
+                return constant_string(gc, constants, bx)
+                    .map(|name| named_operand(b"global", &name));
             }
             OpCode::GETTABLE => {
                 let key = opcode::get_arg_c(inst);
                 if let Some(name) = rk_string(gc, constants, key) {
-                    return Some(format!("field '{name}'"));
+                    return Some(named_operand(b"field", &name));
                 }
                 return None;
             }
             OpCode::SELF => {
                 let key = opcode::get_arg_c(inst);
                 if let Some(name) = rk_string(gc, constants, key) {
-                    return Some(format!("method '{name}'"));
+                    return Some(named_operand(b"method", &name));
                 }
                 return None;
             }
@@ -2982,7 +3035,7 @@ fn local_name_for_reg(
     proto: &Proto,
     reg: usize,
     pc: usize,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     let pc = pc as i32;
     for idx in (0..proto.loc_var_count()).rev() {
         let loc = proto.loc_var(idx);
@@ -2991,13 +3044,17 @@ fn local_name_for_reg(
             && pc < loc.endpc
             && let Some(name_ref) = loc.varname
         {
-            return gc_string_lossy(gc, name_ref);
+            return gc_string_bytes(gc, name_ref);
         }
     }
     None
 }
 
-fn rk_string(gc: &GarbageCollector, constants: &[Value], rk: i32) -> Option<String> {
+fn named_operand(kind: &[u8], name: &[u8]) -> Vec<u8> {
+    [kind, b" '", name, b"'"].concat()
+}
+
+fn rk_string(gc: &GarbageCollector, constants: &[Value], rk: i32) -> Option<Vec<u8>> {
     if opcode::is_k(rk) {
         constant_string(gc, constants, opcode::index_k(rk) as usize)
     } else {
@@ -3005,18 +3062,15 @@ fn rk_string(gc: &GarbageCollector, constants: &[Value], rk: i32) -> Option<Stri
     }
 }
 
-fn constant_string(gc: &GarbageCollector, constants: &[Value], idx: usize) -> Option<String> {
+fn constant_string(gc: &GarbageCollector, constants: &[Value], idx: usize) -> Option<Vec<u8>> {
     match constants.get(idx) {
-        Some(Value::String(name_ref)) => gc_string_lossy(gc, *name_ref),
+        Some(Value::String(name_ref)) => gc_string_bytes(gc, *name_ref),
         _ => None,
     }
 }
 
-fn gc_string_lossy(gc: &GarbageCollector, name_ref: GcRef<GcString>) -> Option<String> {
-    gc.with_string_bytes(name_ref, |bytes| {
-        String::from_utf8_lossy(bytes).into_owned()
-    })
-    .ok()
+fn gc_string_bytes(gc: &GarbageCollector, name_ref: GcRef<GcString>) -> Option<Vec<u8>> {
+    gc.with_string_bytes(name_ref, <[u8]>::to_vec).ok()
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -3339,7 +3393,7 @@ fn finish_native_call(
         return Err(error_value
             .map(|value| {
                 if nret == NATIVE_ERROR_DIAGNOSTIC && matches!(value, Value::String(_)) {
-                    let message = value_to_string(gc, &value);
+                    let message = value_to_bytes(gc, &value);
                     let caller = frame.caller_proto.zip(frame.caller_pc).or_else(|| {
                         // `pcall(string.char, 256)` has a native immediate
                         // caller. The pinned C++ boundary walks outward to the
@@ -3352,7 +3406,7 @@ fn finish_native_call(
                     if let Some((proto, pc)) = caller {
                         runtime_diagnostic_at(gc, proto, pc, message)
                     } else {
-                        RuntimeError::new(message)
+                        RuntimeError::new_bytes(message)
                     }
                 } else {
                     // Existing -1 and unknown negative codes retain the legacy
@@ -3603,7 +3657,7 @@ pub(crate) fn finish_deferred_load_source(
 ) -> Result<VmExit, RuntimeError> {
     validate_deferred_native_call(l, deferred)?;
     l.top = deferred.func_pos + 1 + deferred.nargs;
-    match compile_chunk_function(l, gc, source, chunk_name) {
+    match compile_chunk_function(l, gc, source, chunk_name, ChunkLoaderContext::Load) {
         Ok(_) => finish_deferred_native_stack_results(l, gc, deferred, 1),
         Err(message) => finish_validated_deferred_load_error(l, gc, deferred, &message),
     }
@@ -3613,7 +3667,7 @@ pub(crate) fn finish_deferred_load_error_message(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     deferred: &DeferredNativeCall,
-    message: &str,
+    message: &[u8],
 ) -> Result<VmExit, RuntimeError> {
     validate_deferred_native_call(l, deferred)?;
     l.top = deferred.func_pos + 1 + deferred.nargs;
@@ -3648,11 +3702,11 @@ fn finish_validated_deferred_load_error(
     l: &mut LuaState,
     gc: &mut GarbageCollector,
     deferred: &DeferredNativeCall,
-    message: &str,
+    message: &[u8],
 ) -> Result<VmExit, RuntimeError> {
     l.push_value(Value::Nil);
     gc.with_publication(|transaction| {
-        let message = rooted_vm_bytes(l, transaction, message.as_bytes())?;
+        let message = rooted_vm_bytes(l, transaction, message)?;
         // SAFETY: the message is installed on the active native frame before
         // the publication root is released.
         unsafe {
@@ -4556,9 +4610,9 @@ fn invoke_load_runtime_native(l: &mut LuaState, gc: &mut GarbageCollector) -> i3
     match reader {
         Value::String(source) => {
             let Ok(source) = gc.with_string_bytes(source, <[u8]>::to_vec) else {
-                return publish_load_error(l, gc, "invalid source string");
+                return publish_load_error(l, gc, b"invalid source string");
             };
-            match compile_chunk_function(l, gc, &source, &chunk_name) {
+            match compile_chunk_function(l, gc, &source, &chunk_name, ChunkLoaderContext::Load) {
                 Ok(_) => 1,
                 Err(message) => publish_load_error(l, gc, &message),
             }
@@ -4583,10 +4637,10 @@ fn invoke_load_runtime_native(l: &mut LuaState, gc: &mut GarbageCollector) -> i3
                     }
                     NativeRequestPublishError::IdExhausted => "runtime-native request id exhausted",
                 };
-                publish_load_error(l, gc, message)
+                publish_load_error(l, gc, message.as_bytes())
             }
         },
-        _ => publish_load_error(l, gc, "bad argument #1 to 'load' (function expected)"),
+        _ => publish_load_error(l, gc, b"bad argument #1 to 'load' (function expected)"),
     }
 }
 
@@ -4718,10 +4772,18 @@ fn invoke_dofile_runtime_native(l: &mut LuaState, gc: &mut GarbageCollector) -> 
         }
     };
     let chunk_name = format!("@{filename}");
-    let function = match compile_chunk_function(l, gc, &source, chunk_name.as_bytes()) {
+    let function = match compile_chunk_function(
+        l,
+        gc,
+        &source,
+        chunk_name.as_bytes(),
+        ChunkLoaderContext::LoadFile {
+            display_name: filename.as_bytes(),
+        },
+    ) {
         Ok(function) => Value::Function(function),
         Err(message) => {
-            return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message.as_bytes());
+            return publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, &message);
         }
     };
     match l.publish_callback_helper_request(
@@ -4812,15 +4874,15 @@ fn invoke_table_foreach_runtime_native(
             }
         }
         Err(error) => {
-            publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, error.message.as_bytes())
+            publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, error.message_bytes())
         }
     }
 }
 
-fn publish_load_error(l: &mut LuaState, gc: &mut GarbageCollector, message: &str) -> i32 {
+fn publish_load_error(l: &mut LuaState, gc: &mut GarbageCollector, message: &[u8]) -> i32 {
     l.push_value(Value::Nil);
     gc.with_publication(|transaction| {
-        let message = rooted_vm_bytes(l, transaction, message.as_bytes())
+        let message = rooted_vm_bytes(l, transaction, message)
             .expect("load errors require the active Runtime StringPool");
         // SAFETY: the error is installed in the active native frame before its
         // publication root is released.
@@ -4917,10 +4979,13 @@ fn invoke_table_sort_runtime_native(l: &mut LuaState, gc: &mut GarbageCollector)
         Ok(TableSortAdvance::Complete) => match commit_table_sort(gc, &state) {
             Ok(()) => 0,
             Err(error) => {
-                publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, error.message.as_bytes())
+                publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, error.message_bytes())
             }
         },
-        Ok(TableSortAdvance::Error(message)) | Err(RuntimeError { message, .. }) => {
+        Err(error) => {
+            publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, error.message_bytes())
+        }
+        Ok(TableSortAdvance::Error(message)) => {
             publish_runtime_native_error(l, gc, ResumeEnvelope::Wrap, message.as_bytes())
         }
         Ok(TableSortAdvance::Callback { function, args }) => {
@@ -6174,13 +6239,24 @@ fn value_to_string(gc: &GarbageCollector, val: &Value) -> String {
     }
 }
 
+fn value_to_bytes(gc: &GarbageCollector, value: &Value) -> Vec<u8> {
+    if let Value::String(string) = value {
+        gc.with_string_bytes(*string, <[u8]>::to_vec)
+            .unwrap_or_default()
+    } else {
+        value_to_string(gc, value).into_bytes()
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // RuntimeError
 // ═══════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
+    /// Human-readable host view. Lua and byte-oriented hosts use message_bytes.
     pub message: String,
+    message_bytes: Vec<u8>,
     error_value: Option<Value>,
     diagnostic_location: Option<DiagnosticLocation>,
     native_request_suspend: bool,
@@ -6188,7 +6264,7 @@ pub struct RuntimeError {
 
 #[derive(Debug, Clone)]
 struct DiagnosticLocation {
-    source: String,
+    source: Vec<u8>,
     line: i32,
 }
 
@@ -6198,8 +6274,19 @@ fn invalid_proto_error(error: lua_core::gc::collector::GcRefValidationError) -> 
 
 impl RuntimeError {
     pub fn new(msg: impl Into<String>) -> Self {
+        Self::new_bytes(msg.into().into_bytes())
+    }
+
+    /// Capture an owned diagnostic while its source values are still valid.
+    pub fn new_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+        let bytes = bytes.into();
+        let message = match std::str::from_utf8(&bytes) {
+            Ok(text) => text.to_owned(),
+            Err(_) => diagnostic_bytes(&bytes),
+        };
         Self {
-            message: msg.into(),
+            message,
+            message_bytes: bytes,
             error_value: None,
             diagnostic_location: None,
             native_request_suspend: false,
@@ -6207,12 +6294,14 @@ impl RuntimeError {
     }
 
     pub fn with_value(gc: &GarbageCollector, value: Value) -> Self {
-        Self {
-            message: value_to_string(gc, &value),
-            error_value: Some(value),
-            diagnostic_location: None,
-            native_request_suspend: false,
-        }
+        let mut error = Self::new_bytes(value_to_bytes(gc, &value));
+        error.error_value = Some(value);
+        error
+    }
+
+    /// Raw diagnostic bytes, independent of the lifetime of any error Value.
+    pub fn message_bytes(&self) -> &[u8] {
+        &self.message_bytes
     }
 
     pub fn error_value(&self) -> Option<Value> {
@@ -6224,18 +6313,20 @@ impl RuntimeError {
     /// source prefix or strings intentionally raised with error(message, 0).
     pub(crate) fn located(mut self) -> Self {
         if let Some(location) = self.diagnostic_location.take() {
-            self.message = format!("{}:{}: {}", location.source, location.line, self.message);
+            let mut bytes = location.source;
+            bytes.extend_from_slice(format!(":{}: ", location.line).as_bytes());
+            bytes.extend_from_slice(&self.message_bytes);
+            let located = Self::new_bytes(bytes);
+            self.message = located.message;
+            self.message_bytes = located.message_bytes;
         }
         self
     }
 
     fn native_request_suspend() -> Self {
-        Self {
-            message: "Runtime-native request suspended protected helper".to_string(),
-            error_value: None,
-            diagnostic_location: None,
-            native_request_suspend: true,
-        }
+        let mut error = Self::new("Runtime-native request suspended protected helper");
+        error.native_request_suspend = true;
+        error
     }
 
     pub fn is_native_request_suspend(&self) -> bool {
@@ -6554,57 +6645,61 @@ mod proto_handle_tests {
     }
 
     #[test]
-    fn debug_line_skip_is_one_shot_and_matches_full_object_identity() {
+    fn line_history_belongs_to_the_frame_including_recursive_calls() {
+        fn dispatched(
+            state: &mut LuaState,
+            gc: &mut GarbageCollector,
+            proto: GcRef<Proto>,
+            pc: usize,
+        ) -> bool {
+            state
+                .with_native_request_scope(|state| {
+                    let request = run_debug_instruction_hooks(state, gc, proto, pc).unwrap();
+                    if let Some(request) = request {
+                        assert!(state.take_native_request(request).is_some());
+                        state.debug_hook_active = false;
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap()
+        }
         let mut gc = GarbageCollector::new();
-        let mut string_pool = StringPool::new();
-        let mut first = Proto::new();
-        first.add_line_info(17);
-        let first = gc.create(first);
-        let mut second = Proto::new();
-        second.add_line_info(17);
-        let second = gc.create(second);
-        assert_ne!(first.object_id(), second.object_id());
-
+        let mut strings = StringPool::new();
+        let mut proto = Proto::new();
+        proto.add_line_info(17);
+        proto.add_line_info(17);
+        let proto = gc.create(proto);
         let hook = gc.create(Function::new_c(test_noop_c_function));
         let mut state = LuaState::new();
         state.debug_hook = Some(Value::Function(hook));
         state.debug_hook_mask = "l".to_string();
-        state.debug_hook_skip_proto = Some(first);
-        state.debug_hook_skip_line = 17;
+        state.current_call_info_mut().proto = Some(proto);
+        state.current_call_info_mut().debug_hook_last_line = 17;
+        state.current_call_info_mut().debug_hook_last_pc = Some(0);
 
-        crate::state::with_vm_context_gc(&mut state, &mut gc, &mut string_pool, |state, gc| {
-            let different = state
-                .with_native_request_scope(|state| {
-                    let request_id = run_debug_instruction_hooks(state, gc, second, 0)?;
-                    let request_id = request_id.expect("different Proto publishes the hook");
-                    assert!(state.take_native_request(request_id).is_some());
-                    state.debug_hook_active = false;
-                    Ok::<_, RuntimeError>(())
-                })
-                .expect("native request scope opens");
-            different.expect("different Proto identity runs the hook");
-            assert_eq!(state.debug_hook_skip_proto, Some(first));
-
-            let matching = state
-                .with_native_request_scope(|state| {
-                    assert!(run_debug_instruction_hooks(state, gc, first, 0)?.is_none());
-                    Ok::<_, RuntimeError>(())
-                })
-                .expect("native request scope opens");
-            matching.expect("matching Proto consumes the skip");
-            assert_eq!(state.debug_hook_skip_proto, None);
-            assert_eq!(state.debug_hook_skip_line, -1);
-
-            let consumed = state
-                .with_native_request_scope(|state| {
-                    let request_id = run_debug_instruction_hooks(state, gc, first, 0)?;
-                    let request_id = request_id.expect("consumed skip publishes the hook");
-                    assert!(state.take_native_request(request_id).is_some());
-                    state.debug_hook_active = false;
-                    Ok::<_, RuntimeError>(())
-                })
-                .expect("native request scope opens");
-            consumed.expect("consumed skip no longer suppresses the line");
+        crate::state::with_vm_context_gc(&mut state, &mut gc, &mut strings, |state, gc| {
+            state.push_call_info().proto = Some(proto);
+            assert!(
+                dispatched(state, gc, proto, 0),
+                "recursive frame has its own first line"
+            );
+            assert_eq!(state.call_stack[0].debug_hook_last_pc, Some(0));
+            state.pop_call_info();
+            assert!(
+                !dispatched(state, gc, proto, 1),
+                "same-line caller successor is not a new line"
+            );
+            assert!(
+                dispatched(state, gc, proto, 0),
+                "backward jump on the same line still fires"
+            );
+            state.push_call_info().proto = Some(proto);
+            assert!(
+                dispatched(state, gc, proto, 0),
+                "reused frame clears its history"
+            );
         });
     }
 }

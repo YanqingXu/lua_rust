@@ -103,10 +103,11 @@ fn utf8_parser_wrapper_preserves_the_text_encoding_bytes() {
 }
 
 #[test]
-fn invalid_syntax_bytes_are_escaped_in_diagnostics_without_replacement() {
+fn invalid_syntax_bytes_retain_payload_and_have_readable_host_diagnostics() {
     let mut parser = Parser::from_bytes(b"return \xff");
     let error = parser.parse().expect_err("invalid syntax byte must fail");
 
+    assert_eq!(error.message_bytes(), b"unexpected byte 0xFF near '\xff'");
     assert!(error.message.contains("\\xff"), "{}", error.message);
     assert!(!error.message.contains('\u{fffd}'), "{}", error.message);
 }

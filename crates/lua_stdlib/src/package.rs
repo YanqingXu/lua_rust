@@ -130,7 +130,7 @@ unsafe extern "C" fn lua_package_require(l_ptr: *mut std::ffi::c_void) -> i32 {
             let func_ref =
                 match compile_chunk_function(l, gc, &source, &format!("@{}", path.display())) {
                     Ok(func_ref) => func_ref,
-                    Err(message) => return raise_string(l, &message),
+                    Err(message) => return raise_bytes(l, &message),
                 };
             compiled_loader_on_stack = true;
             Value::Function(func_ref)
@@ -297,35 +297,33 @@ fn compile_chunk_function(
     gc: &mut GarbageCollector,
     source: &[u8],
     chunk_name: &str,
-) -> Result<GcRef<Function>, String> {
+) -> Result<GcRef<Function>, Vec<u8>> {
     let mut parser = Parser::from_bytes(source);
     let chunk = parser.parse().map_err(|err| {
-        format!(
-            "{}:{}:{}: {}",
-            lua_vm::execute::chunk_name_for_diagnostic(chunk_name.as_bytes()),
-            err.line,
-            err.column,
-            err.message
-        )
+        let mut message = lua_vm::execute::chunk_name_for_diagnostic_bytes(chunk_name.as_bytes());
+        message.extend_from_slice(format!(":{}:{}: ", err.line, err.column).as_bytes());
+        message.extend_from_slice(err.message_bytes());
+        message
     })?;
-    let pool_ptr = l
-        .active_string_pool_ptr()
-        .ok_or_else(|| format!("{chunk_name}: loader unavailable without an active StringPool"))?;
+    let pool_ptr = l.active_string_pool_ptr().ok_or_else(|| {
+        format!("{chunk_name}: loader unavailable without an active StringPool").into_bytes()
+    })?;
 
     let func_ref = gc.with_publication(|transaction| {
         // SAFETY: the pool belongs to the dynamically scoped Runtime turn.
         let generator =
             CodeGenerator::new_in_publication_with_pool(transaction, unsafe { &mut *pool_ptr });
         let proto = generator.generate(&chunk, chunk_name).map_err(|err| {
-            format!(
-                "{}:{err}",
-                lua_vm::execute::chunk_name_for_diagnostic(chunk_name.as_bytes())
-            )
+            let mut message =
+                lua_vm::execute::chunk_name_for_diagnostic_bytes(chunk_name.as_bytes());
+            message.extend_from_slice(format!(":{}:{}: ", err.line, err.column).as_bytes());
+            message.extend_from_slice(err.message_bytes());
+            message
         })?;
         let proto = transaction.alloc(proto);
         let function = transaction
             .alloc_lua_function(&proto)
-            .map_err(|err| format!("{chunk_name}: invalid loader Function: {err}"))?;
+            .map_err(|err| format!("{chunk_name}: invalid loader Function: {err}").into_bytes())?;
         // SAFETY: the callback publishes the loader on the active require
         // stack before releasing its temporary object root.
         unsafe {
@@ -337,7 +335,9 @@ fn compile_chunk_function(
                 function
             })
         }
-        .map_err(|err| format!("{chunk_name}: invalid loader stack publication: {err}"))
+        .map_err(|err| {
+            format!("{chunk_name}: invalid loader stack publication: {err}").into_bytes()
+        })
     })?;
     Ok(func_ref)
 }
@@ -686,17 +686,21 @@ fn push_runtime_error_value(
     if let Some(value) = err.error_value() {
         l.push_value(value);
     } else {
-        let _ = crate::registration::push_string(l, gc, err.message.as_bytes());
+        let _ = crate::registration::push_string(l, gc, err.message_bytes());
     }
 }
 
 fn raise_string(l: &mut LuaState, message: &str) -> i32 {
+    raise_bytes(l, message.as_bytes())
+}
+
+fn raise_bytes(l: &mut LuaState, message: &[u8]) -> i32 {
     let Some(gc_ptr) = l.active_gc_ptr() else {
         l.push_value(Value::Nil);
         return -1;
     };
     // SAFETY: LuaState::gc is installed by the VM before calling C functions.
     let gc = unsafe { &mut *gc_ptr };
-    let _ = crate::registration::push_string(l, gc, message.as_bytes());
+    let _ = crate::registration::push_string(l, gc, message);
     -1
 }

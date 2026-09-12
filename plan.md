@@ -7,8 +7,8 @@ last_updated: 2026-09-12
 rust_baseline: 503bf99
 cpp_oracle: 87c15e6
 lua_oracle: Lua 5.1.5
-implementation_checkpoint: working-tree@503bf99+audit-remediation
-next_primary_task: M2 official db per-frame line hooks, then remaining source failures
+implementation_checkpoint: source-manifest@d9423c05874c8c5e
+next_primary_task: M2 nested codegen error propagation, then files and bounded large workloads
 ---
 
 # lua_rust 完整复刻 lua_cpp 开发计划
@@ -38,6 +38,14 @@ next_primary_task: M2 official db per-frame line hooks, then remaining source fa
 [审计整改状态](docs/audits/2026-09-12-remediation.md)**。下列 2.1–2.3 保存早期迁移
 快照，不可将“已闭环”或测试计数直接作为本轮修复的证明。原始审计见
 [风险与复现](docs/audits/2026-09-12.md)。
+
+第一批修复已提交并推送为 `4024f9e`，该提交远程 Rust CI / mdBook 全部成功。
+后续工作区已关闭 db/errors、REPL 续行和错误阶段、无循环 break 挂死及 bytecode
+诊断出口。最新联合完整 M0/M1 基础门通过，普通测试清单 1,056 项；Debug 十项
+官方严格子集及 Release db/errors 通过，CLI/REPL/bytecode 工具两种构建的合同通过。
+main 已越过交互段，仍依赖 M3 dump；下一优先项是已实测的嵌套 codegen 吞错误 P1。
+前批 debug/诊断边界默认 Miri 按各自源码身份保留，本批未新增 Miri。这些后续批次
+纳入本次提交，远程 CI 须按提交 SHA 单独验收。完整证据见上述唯一整改状态入口。
 
 下一顺序：公开边界与宿主错误 → 表/浮点/参数合同 → M2 具体债务与官方执行、
 内存/延迟基线 → 稳定合同上的 M3 ABI 与二进制格式设计。保留 oracle pin，

@@ -861,10 +861,11 @@ reachable Thread or open Upvalue publishes its handle. The state snapshot curren
 global table, thread/chunk environments, registry, nil/boolean/number
 metatables, exact `0..LuaState::top` stack window, active CallInfo function
 slots, managed Proto handles and varargs, every open Upvalue, current Thread,
-debug hook and its one-shot managed Proto identity, yielded values, and last
-error. `ACTIVE_PROTO` is a direct CallInfo root, including top-level
-pseudo-frames that do not have a Function value in their function slot;
-`DEBUG_PROTO` is likewise a direct root while line suppression is pending.
+debug hook, yielded values, and last error. `ACTIVE_PROTO` is a direct
+CallInfo root, including top-level pseudo-frames that do not have a Function
+value in their function slot. Per-frame line-hook history contains only a
+source line and optional PC, so it adds no GC edge. The retired thread-wide
+line-suppression Proto no longer needs a separate `DEBUG_PROTO` root kind.
 
 `MarkOnlyReport` exposes sorted state successes/failures, inventory-aligned
 root-edge counts, marked/total object counts, rejected collector roots,
@@ -887,8 +888,10 @@ Activity Proto ownership no longer uses raw state pointers:
   collector before dereference;
 - return, error unwind, frame reuse, and pop clear inactive Proto and vararg
   roots;
-- `debug_hook_skip_proto` is a managed identity, is traced as `DEBUG_PROTO`,
-  and is cleared immediately after its single matching suppression.
+- line hooks use the active `CallInfo::proto`; suspended debug-hook
+  continuations retain their managed Proto handles through the existing
+  `COROUTINE_ACTIVATION_BUFFER` roots. Clearing a retired CallInfo releases
+  its Proto when no Function or Runtime continuation still owns it.
 
 This slice still does not claim live sweep is safe. Interpreter and debug
 paths validate address, ObjectId, and concrete type immediately before

@@ -256,6 +256,17 @@ pub enum RuntimeExecutionError {
     Protocol(String),
 }
 
+impl RuntimeExecutionError {
+    /// Byte-preserving Lua diagnostic or the textual Runtime protocol error.
+    /// VM messages are owned snapshots and require no GC access by the host.
+    pub fn message_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Self::Vm(error) => std::borrow::Cow::Borrowed(error.message_bytes()),
+            _ => std::borrow::Cow::Owned(self.to_string().into_bytes()),
+        }
+    }
+}
+
 /// Result produced by one Runtime-owned state execution turn.
 ///
 /// This is the ownership substrate for the future coroutine trampoline. A
@@ -3758,7 +3769,7 @@ impl Runtime {
                                     false
                                 } else if source.try_reserve(chunk.len()).is_err() {
                                     *terminal_error = Some(
-                                        "not enough memory while reading load source".to_string(),
+                                        b"not enough memory while reading load source".to_vec(),
                                     );
                                     false
                                 } else {
@@ -4740,7 +4751,7 @@ fn execute_native_driver_action(
                         state,
                         gc,
                         &deferred,
-                        "reader function must return a string",
+                        b"reader function must return a string",
                     ),
                 },
                 (
@@ -5521,7 +5532,7 @@ fn runtime_error_value(
             .active_string_pool_ptr()
             .ok_or(GcRefValidationError::StringPoolUnavailable)?;
         // SAFETY: this state turn owns the dynamically scoped Heap services.
-        let message = transaction.intern_bytes(unsafe { &mut *pool }, error.message.as_bytes())?;
+        let message = transaction.intern_bytes(unsafe { &mut *pool }, error.message_bytes())?;
         // SAFETY: last_error is a Runtime-traced LuaState owner and receives
         // the string before its temporary publication root is released.
         unsafe {

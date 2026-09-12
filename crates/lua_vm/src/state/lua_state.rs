@@ -10,7 +10,6 @@ use lua_core::gc::collector::{GarbageCollector, GcRefValidationError};
 use lua_core::gc::gc_object::GcObject;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::gc_string::GcString;
-use lua_core::proto::Proto;
 use lua_core::state_handle::StateHandle;
 use lua_core::string_pool::StringPool;
 use lua_core::table::Table;
@@ -140,14 +139,6 @@ pub struct LuaState {
     pub debug_hook_countdown: i32,
     /// Guard against recursively invoking hooks from hook code.
     pub debug_hook_active: bool,
-    /// Last source line reported to a line hook.
-    pub debug_hook_last_line: i32,
-    /// Last program counter reported to a line hook.
-    pub debug_hook_last_pc: usize,
-    /// Caller Proto whose current source line should be skipped immediately after sethook.
-    pub debug_hook_skip_proto: Option<GcRef<Proto>>,
-    /// Caller source line to skip immediately after sethook.
-    pub debug_hook_skip_line: i32,
     /// Cache for debug.getinfo(..., "n") call-site name lookups.
     pub debug_name_cache: HashMap<(usize, usize, usize), (Option<String>, String)>,
     /// Open Upvalues owned by this state, sorted by descending stack index.
@@ -199,10 +190,6 @@ impl LuaState {
             debug_hook_count: 0,
             debug_hook_countdown: 0,
             debug_hook_active: false,
-            debug_hook_last_line: -1,
-            debug_hook_last_pc: usize::MAX,
-            debug_hook_skip_proto: None,
-            debug_hook_skip_line: -1,
             debug_name_cache: HashMap::new(),
             open_upvalues: Vec::new(),
             yielded_values: Vec::new(),
@@ -627,7 +614,6 @@ impl LuaState {
         self.debug_hook = None;
         self.yielded_values.clear();
         self.last_error = None;
-        self.debug_hook_skip_proto = None;
         self.state_handle = None;
         self.state_arena = None;
         self.native_request_scope = false;
@@ -925,6 +911,7 @@ impl Default for LuaState {
 #[cfg(test)]
 mod tests {
     use lua_core::heap::Heap;
+    use lua_core::proto::Proto;
 
     use super::*;
 

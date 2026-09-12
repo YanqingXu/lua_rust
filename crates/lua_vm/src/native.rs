@@ -303,7 +303,7 @@ pub(crate) enum CallbackHelperKind {
     LoadReader {
         chunk_name: Vec<u8>,
         source: Vec<u8>,
-        terminal_error: Option<String>,
+        terminal_error: Option<Vec<u8>>,
     },
     /// `table.sort(table, comparator?)` retaining its transactional working copy
     /// and exact merge cursor between comparator turns.

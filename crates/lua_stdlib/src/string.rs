@@ -520,7 +520,7 @@ fn push_gsub_runtime_error(l: &mut LuaState, error: &lua_vm::RuntimeError) {
     if let Some(error_value) = error.error_value() {
         l.push_value(error_value);
     } else {
-        push_lua_string(l, error.message.as_bytes());
+        push_lua_string(l, error.message_bytes());
     }
 }
 

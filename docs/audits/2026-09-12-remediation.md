@@ -7,7 +7,12 @@
 
 - 开始时已执行 `git pull --ff-only`，结果 Already up to date；HEAD 和
   origin/main 均为 `503bf99d12a5ebae81862ad3ea4dbf7e97af38ca`。
-- 下列验证来自整改提交前的本地工作区；提交与推送状态以 Git 记录为准，不能将本地结果当作远程 CI 结论。
+- 第一批整改已提交并推送为 `4024f9ea706654f20cb8e63686ac1cf5614ffb39`。
+  该提交的 [Rust CI](https://github.com/YanqingXu/lua_rust/actions/runs/34677728567)
+  四个 job（Windows quality、Miri、GC Miri、Linux ASan）全部成功；
+  [mdBook](https://github.com/YanqingXu/lua_rust/actions/runs/34677728565)
+  构建与部署成功。原始状态归档在 `target/push-4024f9e-ci`。
+  下文原有本地验证对应该批整改；后续工作区变化另列证据，不继承该提交的远程 CI 结论。
 - 固定 C++ oracle 仍为 `87c15e69ceb94eb74e28226ccbefb7e196635711`；
   第二 oracle 为官方 Lua 5.1.5。没有移动 oracle pin。
 - 本机使用 Windows x86_64、stable Rust 1.96.1；默认 Miri 使用
@@ -20,10 +25,84 @@
 | 1 | A01/A02：Runtime 和 GC 公开访问边界 | 公开访问修复、真实源码/callback 和 GC/栈窗口定向默认 Miri 已通过；最终完整 M0/M1 基础门通过，不外推全部 unsafe 安全 |
 | 2 | A03/A04/A09：Lua 异常与回归硬门 | rawset/os.time 子进程 Debug/Release 通过；窄签名策略、fixture 修复、doctest 与新 Miri 入口已实现；普通 Lua 调用已改为迭代调度，Debug/Release 及 1/2/8 MiB 宿主线程栈通过；本轮完整 M0/M1 基础门通过 |
 | 3 | A05–A08：表、浮点、参数/error object | 表/浮点/参数和共享数字 formatter 定向双 oracle、Debug/Release 通过；普通错误来源修复已关闭 metamethod-arith 具体 debt |
-| 4 | 余下 M2、状态文档、workload 基线 | 官方 source lane 已完成 19 项快照执行；状态文档已统一，四类 workload 的 800 批 Release 基线已完成；普通调用栈整改已验证；M2 剩余失败和 print/回调冲突仍开放 |
+| 4 | 余下 M2、状态文档、workload 基线 | db/errors 原版 Debug/Release 通过；main 交互段已越过，剩余 dump 依赖；REPL 错误阶段、裸 break 挂死及 bytecode 诊断出口已修复。下一 P1 是嵌套 codegen 吞错误，随后 files/大负载；历史性能基线及 oracle 冲突独立保留 |
 | 5 | M3 binary chunk / C API / native module | 已形成基于双格式源码与 dump 实测的合同设计；实现保持待前置风险收口，不发布未稳定 ABI |
 
 ## 已落地的关键改动
+
+### REPL、break 与 bytecode 联合批次（本次提交）
+
+本轮完成 [REPL 续行和错误阶段](2026-09-12-repl-continuation-remediation.md)、
+[无循环 break 挂死及加载器来源](2026-09-12-break-scope-remediation.md)、
+[bytecode 工具诊断](2026-09-12-bytecode-diagnostic-remediation.md)。后者保留 FF，
+并仅在工具异常出口按固定 C++ 的 C 字符串合同处理 NUL。
+
+- 最终完整 M0：379,238 ms，`fullGatePassed=true`，0 hard failure，83 match / 9 debt。
+- 最终完整 M1：540,280 ms，`foundationPassed=true`，0 hard failure；fmt、Clippy、
+  Debug/Release 全 targets、doctests、rustdoc、audit 均通过，无跳过。普通测试清单
+  1,056 项，无 ignored；新增 REPL 19、compiler break 7、bytecode 诊断 3 项。
+- 最终 Debug 官方严格子集十文件 × 三引擎完成；Release db/errors × 三引擎完成。
+- Debug/Release 各自 CLI 18/18、REPL 8/8、bytecode 工具 15/15 通过；工具合同
+  含 12 项跨语言比较与 3 项 Rust 扩展。合法四类循环的 break、捕获变量及随后 GC
+  在 Debug/Release/固定 C++ 三个进程中执行通过，原始输出一致。
+- 原版 main 在最终 Debug/Release 都越过交互段，停在第 135 行 `string.dump`
+  未实现；文件仍失败，不加入严格通过子集。固定 C++ 完成；stock Windows 仍在
+  临时模块 require 阶段失败。没有重跑完整 19 项或改写历史 11/19。
+
+完整产物在 `target/repl-break-bytecode-evidence/`：`m0-final.json`、`m1-final.json`、
+`test-list.log`、`official-*-final.json` 和各工具 `report.json`。M1 步骤 JSON 另存
+`m1-step-artifacts/`，最终四个二进制 SHA 在 `binaries-final.json`。
+Cargo/配置/源码/fixtures/tools/CI 共 372 个输入文件归档为 `source-final.zip`，
+清单 SHA-256 `d9423c05874c8c5e72898cec49376517d7f60efb8523010895abb3ad9e844292`，
+验收结束逐文件核对无变化。由同一工作区构建，未声称从 ZIP 重建。
+
+本批未新增 Miri 运行，前批定向 Miri 证据按各自源码身份保留。本次提交收录 debug、
+诊断字节及上述联合批次，提交前已核对 372 个输入文件与验收快照一致。远程 CI
+须按本次提交 SHA 单独验收，不能继承 `4024f9e` 的结果。联合门通过不关闭嵌套 emitter 吞直接
+错误 P1：`do 1=2 end` / `if true then 1=2 end` 在当前 Rust 仍错误地编译成功。
+该项原始证据和下一验收条件见 break 报告末节，优先于 files 和大负载处理。
+
+### 诊断字节后续批次（前一已验证工作区快照）
+
+完整说明见 [诊断字节整改](2026-09-12-diagnostic-bytes-remediation.md)。Parser、
+codegen、VM、加载器与 CLI 使用 owned 原始字节传递诊断，保留源码/token/field
+名称中的高位字节；Lua 显式错误对象仍保留类型与 identity。默认层级的数字 error
+按两 oracle 的共同合同添加位置并转为 string。
+
+- 最终完整 M0：74,375 ms，0 hard failure，83 match / 9 debt。
+- 最终完整 M1：50,465 ms，`foundationPassed=true`，0 hard failure；fmt、Clippy、
+  Debug/Release、doctests、rustdoc、audit 均通过。普通测试清单 1,027 项，无 ignored。
+- 默认 Miri：两项真实加载器/错误发布及 Runtime close/drop 后读取诊断回归通过，
+  282.20 秒，未设置 `MIRIFLAGS`。
+- 最终 Debug 官方严格子集：十文件 × 三引擎通过；Release 的 db/errors × 三引擎通过。
+- 产物在 `target/errors-byte-evidence/`，最终门为 `m0-final.json`、`m1-final.json`；
+  最终源码清单 369 文件，SHA-256
+  `091db23ba5ea1de4c426d5ccb35cbada21574ae195a0d8379c466ebc5e6d15b4`。
+
+首次 M1 的两处 Clippy 失败已修正并保留失败记录。该验收快照形成时 debug 与诊断
+字节批次尚未提交；现随上述联合批次收录。require 与 reader chunk name 的 oracle
+分歧仍单独保留，原版 errors 完成不意味着所有诊断正文已完全对齐。
+
+### debug 后续批次（前一已验证工作区快照）
+
+完整说明见 [调试库整改](2026-09-12-debug-hook-remediation.md)。本批将 line/PC
+历史移到调用帧，移除 traceback 人为重复帧，并修复 debug 帧访问过早持有可变 GC
+所触发的默认 Miri UB、自身协程层级偏移、跨协程 name-only 结果发布到错误栈。
+删除无用途的 `DEBUG_PROTO` 后，根库存为 23 类，真实活动 Proto 根仍有回收测试。
+
+- 最终完整 M0：191,163 ms，`fullGatePassed=true`，0 hard failure，83 match / 9 debt。
+- 最终完整 M1：209,515 ms，`foundationPassed=true`，0 hard failure，Debug/Release
+  全 targets 通过；普通测试清单 1,013 项，无 ignored，doctest 另行通过。
+- 默认 Miri：debug 访问与 hook 生命周期两项通过，163.54 / 192.75 秒，未禁用别名检查。
+- 最终 Debug 官方严格子集：9 文件 × 3 引擎通过；Release 的 `db.lua` 三引擎通过。
+- 产物统一在 `target/debug-hook-evidence/`，完整门为 `m0-verified.json`、
+  `m1-verified.json`；源码/fixtures/tools/CI 共 365 个文件的清单 SHA-256 为
+  `f87ec0ad8591e6a72dea86da80af6d506cc65f27164635eb5a9da901cf5e8099`。
+
+本批验收时为工作区修改，现随上述联合批次收录。后文原有
+1,009 测试、24 类根库存与性能数字保留为前批快照，不作为本批当前数量。
+
+### 第一批整改
 
 `RuntimePartsMut::split_mut` 只提供显式组件借用。需要原生服务时，通过
 `with_context` 只借用 LuaState，或通过 `with_context_gc` 显式借用 GC、动态借用
@@ -156,12 +235,14 @@ Release 使用每批 256 次操作、128 项存活窗口、5 批预热、100 批
 [普通调用整改](2026-09-12-recursive-call-remediation.md)。512 活动 Lua 帧是目前保留
 的 Rust 限制，完整的跨引擎资源预算与 native 重入合同仍待核实；不外推任意宿主栈安全。
 
-官方 db 的 hook 返回顺序、errors 后续断言、Windows files 行为以及 GC/sort/verybig
-负载继续单列。M2 的 9 个历史 non-official debt 是 2 个 userdata print 和 7 个内存
+官方 db 的 hook 返回顺序、后续 traceback 和 errors 原始诊断字节已修复，两个
+原版文件在 Debug/Release 完成。main 的 binary chunk 依赖、嵌套 codegen 错误传播、Windows files 行为以及
+GC/sort/verybig 负载继续单列。M2 的 9 个历史
+non-official debt 是 2 个 userdata print 和 7 个内存
 计量差异；普通 arithmetic debt 已关闭。新的 callback 错误定位、xpcall/tostring 的
 双 oracle 冲突不通过扩大文本 normalization 处理。
 
-下一批：官方 db 的逐帧 line hook → 其余官方具体失败与 native diagnostic 逐入口迁移 → 在基准上
+下一批：嵌套 codegen 错误传播 → files 平台行为 → 其余 native diagnostic 逐入口迁移 → 在基准上
 评估自动 GC 调度 → [M3 格式/ABI 合同](../rust_migration/m3_contract_design.md)。
 两个 oracle 的 dump 使用不同 payload；首批应先实现受限 reader/verifier 和原子发布，
 再接 serializer/Lua 入口，最后公开 C ABI 与动态库生命周期。
@@ -169,12 +250,12 @@ Release 使用每批 256 次操作、128 项存活窗口、5 批预热、100 批
 | 优先级 | 下一批交付 | 完成标准 |
 | --- | --- | --- |
 | 1 | 普通 Lua 调用的宿主栈边界 | 已验证：递归回归启用；Debug/Release、1/2/8 MiB 宿主线程栈通过，超限可捕获并继续；tail call、hook、coroutine、iterator 和 GC 定向及完整门通过 |
-| 2 | 官方 suite 的逐项兼容收口 | 为 db hook、errors 原始错误字节、files 平台行为和 main 多行交互建立最小回归，修正后重跑对应 case；calls 的 dump 依赖单列到 M3，不以放宽断言或延长超时冒充修复 |
+| 2 | 官方 suite 的逐项兼容收口 | db/errors 原版通过，main 已越过交互段；先修嵌套 codegen 吞错误 P1，再处理 files 平台行为；calls/main 的 dump 依赖单列到 M3，不以放宽断言或延长超时冒充修复 |
 | 3 | 资源与大负载定位 | 为自动 GC 安全点补充实际工作量与耗时观测；定位 gc/sort/verybig 超时及分配压力尾部，使用同一源码冻结流程比较；为配额和 OOM 明确可恢复边界 |
 | 4 | M3 首批实现 | 先完成两种 chunk 格式的显式识别、受限解码、字节码 verifier 和失败时原子回滚；在调用/异常/生命周期合同通过后再暴露 C ABI |
 
 两个 oracle 的 print、callback/xpcall/tostring 冲突需要项目维护者选定兼容目标，
-最小复现和决定进入 deviation log 后才能关闭；它们不阻止已定位的 db hook 与其余失败修复。
+最小复现和决定进入 deviation log 后才能关闭；它们不阻止其余已定位失败的修复。
 本轮 `RuntimePartsMut`、`GcWrite` 和 typed userdata 收紧了公开 Rust API，外部嵌入方
 需要迁移调用；仓内编译和测试通过不等价于未知外部使用方已完成迁移。
 

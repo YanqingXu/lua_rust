@@ -21,6 +21,17 @@ use std::process::ExitCode;
 
 const TOOL_NAME: &str = "bytecode_main";
 
+/// Compiler diagnostics retain their original bytes until the stderr writer.
+/// Host text errors enter through `From<String>`; Display is not a transport.
+#[derive(Debug)]
+struct ToolError(Vec<u8>);
+
+impl From<String> for ToolError {
+    fn from(message: String) -> Self {
+        Self(message.into_bytes())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ToolMode {
     Print,
@@ -145,7 +156,7 @@ fn main() -> ExitCode {
     let options = match parse_options(&args) {
         Ok(options) => options,
         Err(message) => {
-            write_stderr(&message);
+            write_stderr(message.as_bytes());
             return ExitCode::FAILURE;
         }
     };
@@ -156,13 +167,24 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            write_stderr(&format!("[ERROR] Exception: {error}\n"));
+            let mut diagnostic = b"[ERROR] Exception: ".to_vec();
+            // The pinned C++ exception envelope formats e.what() as a C
+            // string. Only this output boundary stops at the first NUL;
+            // ToolError retains the complete compiler diagnostic internally.
+            let end = error
+                .0
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(error.0.len());
+            diagnostic.extend_from_slice(&error.0[..end]);
+            diagnostic.push(b'\n');
+            write_stderr(&diagnostic);
             ExitCode::from(3)
         }
     }
 }
 
-fn run_tool(options: &ToolOptions) -> Result<Vec<u8>, String> {
+fn run_tool(options: &ToolOptions) -> Result<Vec<u8>, ToolError> {
     let mut heap = Heap::new();
     let mut roots = Vec::with_capacity(options.scripts.len());
     for filename in &options.scripts {
@@ -219,7 +241,7 @@ fn run_tool(options: &ToolOptions) -> Result<Vec<u8>, String> {
     for root in roots {
         heap.collector_mut().remove_root(root);
     }
-    result
+    result.map_err(ToolError::from)
 }
 
 fn compile_lua_source(
@@ -227,17 +249,19 @@ fn compile_lua_source(
     source_name: &str,
     gc: &mut GarbageCollector,
     string_pool: &mut StringPool,
-) -> Result<GcRef<Proto>, String> {
+) -> Result<GcRef<Proto>, ToolError> {
     let mut parser = Parser::from_bytes(source);
-    let chunk = parser.parse().map_err(|error| error.message)?;
+    let chunk = parser
+        .parse()
+        .map_err(|error| ToolError(error.message_bytes().to_vec()))?;
     gc.with_publication(|transaction| {
         let proto = CodeGenerator::new_in_publication_with_pool(transaction, string_pool)
             .generate(&chunk, source_name)
-            .map_err(|error| error.message)?;
+            .map_err(|error| ToolError(error.message_bytes().to_vec()))?;
         let proto = transaction.alloc(proto);
         transaction
             .publish_as_explicit_root(proto)
-            .map_err(|error| error.to_string())
+            .map_err(|error| ToolError::from(error.to_string()))
     })
 }
 
@@ -250,9 +274,9 @@ fn write_stdout(bytes: &[u8]) {
     write_host_text(&mut stdout, bytes);
 }
 
-fn write_stderr(message: &str) {
+fn write_stderr(message: &[u8]) {
     let mut stderr = io::stderr().lock();
-    write_host_text(&mut stderr, message.as_bytes());
+    write_host_text(&mut stderr, message);
 }
 
 fn write_host_text(output: &mut impl Write, bytes: &[u8]) {

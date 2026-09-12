@@ -33,18 +33,38 @@ use std::fmt;
 ///
 #[derive(Debug, Clone)]
 pub struct ParseError {
+    /// Host-readable view; use `message_bytes` for a Lua diagnostic value.
     pub message: String,
+    message_bytes: Vec<u8>,
     pub line: i32,
     pub column: i32,
 }
 
 impl ParseError {
     pub fn new(message: impl Into<String>, line: i32, column: i32) -> Self {
+        let message = message.into();
         Self {
-            message: message.into(),
+            message_bytes: message.as_bytes().to_vec(),
+            message,
             line,
             column,
         }
+    }
+
+    /// Preserve the original diagnostic bytes while providing a readable view.
+    pub fn new_bytes(message_bytes: impl Into<Vec<u8>>, line: i32, column: i32) -> Self {
+        let message_bytes = message_bytes.into();
+        Self {
+            message: diagnostic_message_text(&message_bytes),
+            message_bytes,
+            line,
+            column,
+        }
+    }
+
+    /// Original message bytes, without a source location or host escaping.
+    pub fn message_bytes(&self) -> &[u8] {
+        &self.message_bytes
     }
 }
 
@@ -55,6 +75,43 @@ impl fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+pub(crate) fn diagnostic_message_text(mut bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    fn push_valid_text(text: &mut String, valid: &str) {
+        for ch in valid.chars() {
+            if ch.is_control() {
+                text.extend(ch.escape_default());
+            } else {
+                text.push(ch);
+            }
+        }
+    }
+
+    let mut text = String::new();
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                push_valid_text(&mut text, valid);
+                return text;
+            }
+            Err(error) => {
+                let valid_len = error.valid_up_to();
+                push_valid_text(
+                    &mut text,
+                    std::str::from_utf8(&bytes[..valid_len])
+                        .expect("UTF-8 validation identified a valid prefix"),
+                );
+                let invalid_len = error.error_len().unwrap_or(bytes.len() - valid_len);
+                for byte in &bytes[valid_len..valid_len + invalid_len] {
+                    write!(text, "\\x{byte:02x}").expect("writing into a String cannot fail");
+                }
+                bytes = &bytes[valid_len + invalid_len..];
+            }
+        }
+    }
+}
 
 // =====================================================================
 // ParseRecoveryMode
@@ -412,16 +469,15 @@ impl<'source> Parser<'source> {
     fn error_with_near(&self, message: &str, token: &Token) -> ParseError {
         let diagnostic = if token.token_type == TokenType::Error && !token.error_message.is_empty()
         {
-            token.error_message.clone()
+            token.error_message.as_bytes()
         } else {
-            message.to_string()
+            message.as_bytes()
         };
-        let near_text = get_token_text(token);
-        ParseError::new(
-            format!("{} near '{}'", diagnostic, near_text),
-            token.line,
-            token.column,
-        )
+        let mut message = diagnostic.to_vec();
+        message.extend_from_slice(b" near '");
+        message.extend_from_slice(get_token_bytes(token));
+        message.push(b'\'');
+        ParseError::new_bytes(message, token.line, token.column)
     }
 
     #[allow(dead_code)] // TODO: used by error recovery path (pending)
@@ -573,25 +629,16 @@ impl<'source> Parser<'source> {
 // 辅助函数
 // =====================================================================
 
-/// 获取 Token 的文本表示（用于错误消息）
+/// 获取 Token 的原始字节表示（用于 Lua 错误消息）
 ///
-fn get_token_text(token: &Token) -> String {
+fn get_token_bytes(token: &Token) -> &[u8] {
     if token.token_type == TokenType::Eos {
-        return "<eof>".to_string();
+        return b"<eof>";
     }
     if !token.lexeme.is_empty() {
-        return match token.lexeme.to_utf8() {
-            Ok(text) => text.to_owned(),
-            Err(_) => token
-                .lexeme
-                .as_bytes()
-                .iter()
-                .flat_map(|byte| std::ascii::escape_default(*byte))
-                .map(char::from)
-                .collect(),
-        };
+        return token.lexeme.as_bytes();
     }
-    token.token_type.to_string()
+    token.token_type.name().as_bytes()
 }
 
 /// 检查 Token 是否为 Name 类型

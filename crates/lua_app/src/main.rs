@@ -5,7 +5,7 @@ mod repl_console;
 mod repl_meta;
 
 use lua_compiler::codegen::CodeGenerator;
-use lua_compiler::parser::Parser;
+use lua_compiler::parser::{ParseError, Parser};
 use lua_core::gc::collector::GarbageCollector;
 use lua_core::gc::gc_ref::GcRef;
 use lua_core::proto::Proto;
@@ -21,6 +21,42 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
+
+/// Lua diagnostics are byte strings, including at the final CLI boundary.
+#[derive(Debug)]
+struct CliError(Vec<u8>);
+
+impl CliError {
+    fn with_prefix(prefix: impl AsRef<[u8]>, message: &[u8]) -> Self {
+        let mut bytes = prefix.as_ref().to_vec();
+        bytes.extend_from_slice(message);
+        Self(bytes)
+    }
+}
+
+impl From<Vec<u8>> for CliError {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<String> for CliError {
+    fn from(message: String) -> Self {
+        Self(message.into_bytes())
+    }
+}
+
+impl From<&str> for CliError {
+    fn from(message: &str) -> Self {
+        Self(message.as_bytes().to_vec())
+    }
+}
+
+impl AsRef<[u8]> for CliError {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunMode {
@@ -227,7 +263,7 @@ fn run_app(args: &[String], options: &AppOptions, program_name: &str) -> i32 {
     let mut runtime = match Runtime::try_new() {
         Ok(runtime) => runtime,
         Err(err) => {
-            report_error(program_name, &err.to_string());
+            report_error(program_name, err.to_string());
             return 1;
         }
     };
@@ -296,7 +332,7 @@ fn run_app(args: &[String], options: &AppOptions, program_name: &str) -> i32 {
     };
 
     if let Err(err) = runtime.close() {
-        report_error(program_name, &err.to_string());
+        report_error(program_name, err.to_string());
         return 1;
     }
 
@@ -312,7 +348,7 @@ fn run_app_with_runtime(
     runtime: &mut Runtime,
     args: &[String],
     options: &AppOptions,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     execute_startup_actions(runtime, options)?;
 
     if let (Some(script), Some(script_index)) = (&options.script_file, options.script_index) {
@@ -325,7 +361,7 @@ fn run_app_with_runtime(
         let result = if script == "-" {
             let mut source = Vec::new();
             if let Err(err) = io::stdin().read_to_end(&mut source) {
-                Err(err.to_string())
+                Err(CliError::from(err.to_string()))
             } else {
                 execute_source(runtime, &source, "=stdin", script_args, None, false)
             }
@@ -344,7 +380,7 @@ fn run_app_with_runtime(
     Ok(())
 }
 
-fn execute_startup_actions(runtime: &mut Runtime, options: &AppOptions) -> Result<(), String> {
+fn execute_startup_actions(runtime: &mut Runtime, options: &AppOptions) -> Result<(), CliError> {
     for action in &options.startup_actions {
         match action.kind {
             StartupActionKind::ExecuteChunk => {
@@ -382,7 +418,7 @@ fn execute_file(
     filename: &str,
     args: &[String],
     display_results: bool,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     let bytes = fs::read(filename).map_err(|_| format!("cannot open file: {filename}"))?;
     let chunk_name = format!("@{filename}");
     execute_source(
@@ -402,7 +438,7 @@ fn execute_source(
     args: &[String],
     script_path: Option<&str>,
     display_results: bool,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     let proto = {
         let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
         if let Some(path) = script_path {
@@ -438,7 +474,7 @@ fn execute_source(
                 print_values(state, results);
             }
         })
-        .map_err(|error| error.to_string());
+        .map_err(|error| CliError::from(error.message_bytes().into_owned()));
     {
         let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
         let (_, gc, _) = parts.split_mut();
@@ -455,15 +491,12 @@ fn compile_or_load_proto(
     string_pool: &mut StringPool,
     source: &[u8],
     chunk_name: &str,
-) -> Result<GcRef<Proto>, String> {
+) -> Result<GcRef<Proto>, CliError> {
     let mut parser = Parser::from_bytes(source);
     let chunk = parser.parse().map_err(|err| {
-        format!(
-            "{}:{}: {}",
-            lua_vm::execute::chunk_name_for_diagnostic(chunk_name.as_bytes()),
-            err.line,
-            err.message
-        )
+        let mut prefix = lua_vm::execute::chunk_name_for_diagnostic_bytes(chunk_name.as_bytes());
+        prefix.extend_from_slice(format!(":{}: ", err.line).as_bytes());
+        CliError::with_prefix(prefix, err.message_bytes())
     })?;
 
     gc.with_publication(|transaction| {
@@ -473,18 +506,18 @@ fn compile_or_load_proto(
                 if err.line == 0 && err.column == 0 {
                     // The fixed C++ CLI routes location-free code-generation
                     // failures through its trusted loadstring boundary.
-                    format!("loadstring: {}", err.message)
+                    CliError::with_prefix(b"loadstring: ", err.message_bytes())
                 } else {
-                    format!(
-                        "{}:{err}",
-                        lua_vm::execute::chunk_name_for_diagnostic(chunk_name.as_bytes())
-                    )
+                    let mut prefix =
+                        lua_vm::execute::chunk_name_for_diagnostic_bytes(chunk_name.as_bytes());
+                    prefix.extend_from_slice(format!(":{}:{}: ", err.line, err.column).as_bytes());
+                    CliError::with_prefix(prefix, err.message_bytes())
                 }
             })?;
         let proto = transaction.alloc(proto);
-        transaction
-            .publish_as_explicit_root(proto)
-            .map_err(|err| format!("{chunk_name}: invalid Proto publication: {err}"))
+        transaction.publish_as_explicit_root(proto).map_err(|err| {
+            CliError::from(format!("{chunk_name}: invalid Proto publication: {err}"))
+        })
     })
 }
 
@@ -537,7 +570,31 @@ enum InteractiveStyle {
     Full,
 }
 
-fn run_interactive(runtime: &mut Runtime, style: InteractiveStyle) -> Result<(), String> {
+/// Only the prepare/parse phase can request another line of source.
+#[derive(Debug)]
+enum ReplError {
+    Syntax(ParseError),
+    Terminal(CliError),
+}
+
+impl ReplError {
+    fn into_diagnostic(self) -> CliError {
+        match self {
+            Self::Syntax(error) => {
+                CliError::with_prefix(format!("stdin:{}: ", error.line), error.message_bytes())
+            }
+            Self::Terminal(error) => error,
+        }
+    }
+}
+
+impl From<CliError> for ReplError {
+    fn from(error: CliError) -> Self {
+        Self::Terminal(error)
+    }
+}
+
+fn run_interactive(runtime: &mut Runtime, style: InteractiveStyle) -> Result<(), CliError> {
     let stdin = io::stdin();
     let mut input = String::new();
     let mut buffer = String::new();
@@ -653,11 +710,16 @@ fn run_interactive(runtime: &mut Runtime, style: InteractiveStyle) -> Result<(),
                 first_line = true;
                 expression = false;
             }
-            Err(err) if is_incomplete_error(&err) => {
+            Err(ReplError::Syntax(ref err))
+                if is_incomplete_syntax(err)
+                    || (style == InteractiveStyle::Quiet
+                        && first_line
+                        && is_pending_assignment_name(buffer.as_bytes())) =>
+            {
                 first_line = false;
             }
             Err(err) => {
-                report_repl_error(&err);
+                report_repl_error(err.into_diagnostic());
                 buffer.clear();
                 first_line = true;
                 expression = false;
@@ -697,9 +759,11 @@ fn execute_repl_source(
     runtime: &mut Runtime,
     source: &[u8],
     display_results: bool,
-) -> Result<(), String> {
+) -> Result<(), ReplError> {
     let proto = {
-        let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
+        let mut parts = runtime
+            .parts_mut()
+            .map_err(|error| CliError::from(error.to_string()))?;
         let (_, gc, string_pool) = parts.split_mut();
         compile_repl_proto(gc, string_pool, source)?
     };
@@ -709,9 +773,11 @@ fn execute_repl_source(
                 print_values(state, results);
             }
         })
-        .map_err(|error| error.to_string());
+        .map_err(|error| ReplError::Terminal(error.message_bytes().into_owned().into()));
     {
-        let mut parts = runtime.parts_mut().map_err(|error| error.to_string())?;
+        let mut parts = runtime
+            .parts_mut()
+            .map_err(|error| CliError::from(error.to_string()))?;
         let (_, gc, _) = parts.split_mut();
         gc.remove_root(proto);
     }
@@ -722,20 +788,18 @@ fn compile_repl_proto(
     gc: &mut GarbageCollector,
     string_pool: &mut StringPool,
     source: &[u8],
-) -> Result<GcRef<Proto>, String> {
+) -> Result<GcRef<Proto>, ReplError> {
     let mut parser = Parser::from_bytes(source);
-    let chunk = parser
-        .parse()
-        .map_err(|err| format!("stdin:{}: {}", err.line, err.message))?;
+    let chunk = parser.parse().map_err(ReplError::Syntax)?;
 
     gc.with_publication(|transaction| {
         let proto: Proto = CodeGenerator::new_in_publication_with_pool(transaction, string_pool)
             .generate(&chunk, "=(repl)")
-            .map_err(|err| err.message)?;
+            .map_err(|err| CliError::from(err.message_bytes().to_vec()))?;
         let proto = transaction.alloc(proto);
-        transaction
-            .publish_as_explicit_root(proto)
-            .map_err(|err| format!("(repl): invalid Proto publication: {err}"))
+        transaction.publish_as_explicit_root(proto).map_err(|err| {
+            ReplError::Terminal(format!("(repl): invalid Proto publication: {err}").into())
+        })
     })
 }
 
@@ -783,13 +847,47 @@ fn global_string(state: &LuaState, name: &str) -> Option<String> {
         .ok()
 }
 
-fn is_incomplete_error(message: &str) -> bool {
-    message.contains("<eof>")
-        || message.contains("to close")
-        || message.contains("unterminated string")
-        || message.contains("unfinished string")
-        || message.contains("unfinished long string")
-        || message.contains("unfinished long comment")
+fn is_incomplete_syntax(error: &ParseError) -> bool {
+    // Fixed C++ repl_exe.cpp::isIncompleteInput checks only parse diagnostics.
+    let message = error.message_bytes();
+    const MARKERS: &[&[u8]] = &[
+        b"<eof>",
+        b"unexpected end of input",
+        b"Unterminated string",
+        b"Unterminated long string",
+        b"Unterminated long comment",
+    ];
+    MARKERS.iter().any(|marker| {
+        message
+            .windows(marker.len())
+            .any(|window| window == *marker)
+    }) || [
+        // Rust lexer.rs spells these same three lexer failures differently.
+        // Match their diagnostic prefixes, not arbitrary quoted token content.
+        b"unterminated string near '".as_slice(),
+        b"unfinished long string near '",
+        b"unfinished long comment near '",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+}
+
+fn is_pending_assignment_name(mut source: &[u8]) -> bool {
+    // Fixed C++ main.cpp trims C-locale isspace, which includes vertical tab.
+    let is_space = |byte: &u8| matches!(*byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+    while source.first().is_some_and(is_space) {
+        source = &source[1..];
+    }
+    while source.last().is_some_and(is_space) {
+        source = &source[..source.len() - 1];
+    }
+    let Some((&head, tail)) = source.split_first() else {
+        return false;
+    };
+    (head.is_ascii_alphabetic() || head == b'_')
+        && tail
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
 }
 
 fn lua_string_literal(text: &str) -> String {
@@ -821,10 +919,13 @@ fn write_stdout_text(bytes: &[u8]) -> io::Result<()> {
     stdout.flush()
 }
 
-fn report_error(program_name: &str, message: &str) {
+fn report_error(program_name: &str, message: impl AsRef<[u8]>) {
     let mut stderr = io::stderr().lock();
-    let diagnostic = format!("{program_name}: {message}\n");
-    let _ = lua_stdlib::host_io::write_text(&mut stderr, diagnostic.as_bytes());
+    let mut diagnostic = program_name.as_bytes().to_vec();
+    diagnostic.extend_from_slice(b": ");
+    diagnostic.extend_from_slice(message.as_ref());
+    diagnostic.push(b'\n');
+    let _ = lua_stdlib::host_io::write_text(&mut stderr, &diagnostic);
     let _ = stderr.flush();
 }
 
@@ -835,9 +936,9 @@ fn report_trace_warning(message: &str) {
     let _ = stderr.flush();
 }
 
-fn report_repl_error(message: &str) {
+fn report_repl_error(message: impl AsRef<[u8]>) {
     let mut stderr = io::stderr().lock();
-    let _ = lua_stdlib::host_io::write_text(&mut stderr, message.as_bytes());
+    let _ = lua_stdlib::host_io::write_text(&mut stderr, message.as_ref());
     let _ = lua_stdlib::host_io::write_text(&mut stderr, b"\n");
     let _ = stderr.flush();
 }

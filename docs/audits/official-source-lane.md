@@ -37,13 +37,48 @@ py -3 -m unittest discover -s tools/tests -p test_official_suite_lane.py -v
 
 ## 24 个文件的分类与已完成的 Release 轮
 
+### 后续定向复验：REPL 与编译错误整改
+
+最新联合冻结后，Debug 十项严格子集及 Release db/errors 在三个引擎全部完成。
+原版 main 的最终 Debug/Release 则都越过交互段，停在第 135 行首次 `string.dump`
+未实现，退出 1，没有完成标记；main 仍不加入严格通过子集。固定 C++ main 完成，
+stock Windows 仍在临时模块 require 阶段失败。
+产物在 `target/repl-break-bytecode-evidence/`，分别为
+`official-required-debug-final.json`、`official-db-errors-release-final.json` 和
+`official-main-{debug,release}-final.json`。源码、二进制及完整门证据见
+[当前整改状态](2026-09-12-remediation.md)。没有重跑完整 19 项，历史表不改写。
+
+### 前一定向复验：诊断原始字节整改
+
+Parser 至 CLI 的诊断字节损失已修复。最终 Debug 十项严格子集（此前九项加
+`errors.lua`）在三个引擎全部完成；Release 的 `db.lua` 与 `errors.lua` 也在三个
+引擎全部完成。产物为 `target/errors-byte-evidence/official-required-debug-final.json`
+及 `official-db-errors-release-final.json`，固定源文件没有修改。
+CI 已接入十项严格入口。完整说明和源码/二进制身份见
+[诊断字节整改](2026-09-12-diagnostic-bytes-remediation.md)。
+
+本轮没有重跑完整 19 项，下表保留历史快照；db/errors 的旧失败分别由定向原版
+完成证据关闭。require 的通用错误正文与 reader 源名仍存在 oracle 分歧。
+
+### 前一定向复验：debug 整改
+
+`4024f9e` 之后的工作区已修复逐帧行事件、重复 traceback 帧及 debug API 访问边界。
+最终 Debug 严格子集九项（原八项加 `db.lua`）在 Rust、固定 C++、官方 Lua 中
+全部完成；最终 Release 的 `db.lua` 也在三引擎完成，stdout 原始字节一致、stderr
+为空。对应 `target/debug-hook-evidence/official-required-debug-final.json` 与
+`official-db-release-final.json`，两个文件均记录最终二进制和原版源码身份。
+本次没有重跑完整 19 项，因此下表完整快照的 11/19 数字保持历史原值；其中 db
+现已由上述定向结果关闭。完整说明见 [调试库整改](2026-09-12-debug-hook-remediation.md)。
+
+### 前批完整 19 项快照
+
 2026-09-12 core 安全/语义修复后的完整轮使用 Rust 副本 SHA-256 `fc06b34e4a2ab22729dcc5d3979fa0ccd78ecfc416d30db84ade7da0c327d886`。它早于随后宿主 REPL 点路径补全的 `with_context_gc` 迁移及两个 VM 测试 fixture 修正；这些后续变化不经过本轮源码脚本执行路径，但本轮仍只作为所记录 binary SHA 的实测证据。Artifact：`target/audit-fixes-2026-09-12/official-source-final.json`。19 项全部实际运行：**Rust 11 完成、5 失败、3 超时；固定 C++ 19 完成；官方 Lua 5.1.5 在本机 Windows 上 17 完成、2 失败。** Runner 如实返回 1，`complete:true, passed:false`。
 
 本轮与 quality/M0 门并行运行，机器存在测试/构建负载；三项 60 秒超时是该预算下未完成，不证明死循环，也不是空闲机器的性能结论。后续空闲机器的定向观察应另存结果，不能覆盖本轮原始 timeout。
 
 历史中间轮 `official-source-verified.json` 的 Rust SHA 为 `dbc038f8077139026d7567f3b4784a24ef6d87dae7cf9def0a10162706ba7e65`，当时 8 完成、9 失败、2 超时；它早于 GC callback/物理栈窗口等修复，仅用于追踪改善，不作为最新源码状态。
 
-| 文件 | 分类 | 最新 Rust 观察 / 排除原因 |
+| 文件 | 分类 | 该完整快照的 Rust 观察 / 排除原因 |
 |---|---|---|
 | all.lua | helper | 上游总编排；本 lane 展开源码入口，不冒称覆盖其 dump/undump、共享状态和最终清理。 |
 | api.lua | excluded | 需要 TestC `T.testC` 等私有 API；三个 stock 引擎均不提供。 |
@@ -54,14 +89,14 @@ py -3 -m unittest discover -s tools/tests -p test_official_suite_lane.py -v
 | closure.lua | run | 完成；T yield/hook 子块另有明确排除。原 root trace unsafe gap 已越过。 |
 | code.lua | excluded | 全文件依赖 `T.listcode`；现有 bytecode parity 属于其他测试，不能算此文件执行通过。 |
 | constructs.lua | run | 完成。 |
-| db.lua | run | `wrong trace!!`；诊断包装定位到第 17 行，期望 line 序列耗尽后仍收到 line=19。 |
-| errors.lua | run | 第 196 行的 `checksyntax("\255a = 1", ..., "\255", 1)` 在 helper 第 20 行失败：Rust 诊断把原始 0xFF 写成字面 `\xff`，两个 oracle 均保留 raw byte。旧 `global 'insert'` 等错误来源段落已越过。 |
+| db.lua | run | 当时 `wrong trace!!`；第 17 行期望序列耗尽后多收到 line=19。后续已修复，最终 Debug/Release 原版通过，见上节。 |
+| errors.lua | run | 当时第 196 行的 `checksyntax("\255a = 1", ..., "\255", 1)` 在 helper 第 20 行失败：Rust 诊断把原始 0xFF 写成字面 `\xff`。后续原始字节修复后，最终 Debug/Release 原版通过，见上节。 |
 | events.lua | run | 完成并验证返回 12。原 root trace unsafe gap 已越过。 |
 | files.lua | run | 第 271 行 `assert(y:close())` 失败：`io.popen("ls")` 的 Windows 命令不存在，随后 close 返回失败。官方 Windows 更早在第 59 行 `os.rename` 返回 Permission denied；固定 C++ 完成。原 root trace 失败已越过。 |
 | gc.lua | run | 60 秒超时，已打印 `deep structures`，越过原 weak tables 断言；200k 深结构负载未在预算内完成。 |
 | literals.lua | run | 完成；pt_BR/ptb locale 不可用时的上游条件跳过单独记录。 |
 | locals.lua | run | 完成并验证返回 5；私有 querytab 子块不在 stock profile 中。 |
-| main.lua | run | `-i` 多行 `a` / `= 10` 的续读合同失败，输出 6/10/nil/nil 而期望 6/10/10。官方 Windows 的临时文件名带 `.0`，require 将点转目录分隔，较早的 `-l` 临时模块失败；固定 C++ 完成。 |
+| main.lua | run | 当时 `-i` 多行 `a` / `= 10` 续读失败，输出 6/10/nil/nil 而期望 6/10/10。后续修复后最终 Debug/Release 越过交互段，仍在 dump 未实现处失败。stock Windows 的带点临时模块 require 失败独立保留；固定 C++ 完成。 |
 | math.lua | run | 完成完整源码，未用 `_soft` 跳过 NaN、随机数及文件段落。 |
 | nextvar.lua | run | 完成；私有 table sizing/int2fb 的 if-T 块不在 stock profile 中。 |
 | pm.lua | run | 完成。 |
@@ -70,14 +105,15 @@ py -3 -m unittest discover -s tools/tests -p test_official_suite_lane.py -v
 | vararg.lua | run | 完成。 |
 | verybig.lua | run | >64k 源码/70001 字段负载在 60 秒内未完成；未通过 `_soft` 将整个文件跳过。 |
 
-db 的细定位来自历史独立诊断包装；其最新原始错误仍为 `wrong trace!!`。errors/files 的最新定位与短探针保存在 `official-final-diagnostics.json`，使用同一 Rust binary SHA，包装仅输出失败位置/局部变量，原源码未修改。这些诊断不是通过证据。
+db 的旧细定位来自历史独立诊断包装；该完整快照的原始错误为 `wrong trace!!`。
+errors/files 的该轮定位与短探针保存在 `official-final-diagnostics.json`，使用同一 Rust binary SHA，包装仅输出失败位置/局部变量，原源码未修改。这些诊断不是通过证据。
 
 保留独立的 oracle 分歧：Windows `io.popen("cmd /c exit 7"):close()` 在 Rust 与固定 C++ 均返回 nil/string/number，而官方 Lua 5.1.5 返回 true；不能把完整 files.lua 的平台命令失败简化成三个引擎共同的关闭返回合同。主 JSON 保留原始字节，非法 UTF-8 在辅助可读文本中的替换字符不代表真实输出字节。
 
 ## 集成建议
 
 1. 完整 19 项冻结轮已完成；保留 source/binary/runner hash 和原始失败 artifact。对压力 timeout，在空闲机器上另做有明确预算的定向观察。
-2. CI 已接入 runner 的五个工具测试及原八个稳定通过入口。新增 attrib/closure/events 在本轮三个引擎均完成，可经复核扩入严格子集。完整 19 项保持独立结果，任何失败都返回非零，不能因“已登记官方库存”变成通过。
+2. CI 已接入 runner 的五个工具测试及十个严格入口（原八项加后续验证的 db/errors）。attrib/closure/events 在前批三个引擎均完成，可经复核扩入严格子集。完整 19 项保持独立结果，任何失败都返回非零，不能因“已登记官方库存”变成通过。
 3. 在 Linux 增加 stock 官方基准，单独处理 Windows `main.lua`/`files.lua` 的非可移植行为。保留两 oracle 的分歧，不把 stock 自身失败归成 Rust 回归。
-4. 依次处理剩余 debug trace、错误文本字节合同、交互续读、平台 IO、binary chunk 和长负载问题。只有相应原文件真正到达完成标记，才将其加入通过清单。
+4. db/errors 原版已到达完成标记，main 已越过交互段但仍依赖 binary chunk；先修已实测的嵌套 codegen 吞错误 P1，再处理平台 IO、binary chunk 和长负载问题。只有相应原文件真正到达完成标记，才将其加入通过清单。
 5. 后续分别建立有内存约束的 `big.lua` 协程/溢出 lane、TestC 内部测试 lane、以及完整 `all.lua` dump/undump/共享状态/清理 lane。更换测试能力时保持 oracle pin 与来源审批制度。

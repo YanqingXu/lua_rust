@@ -463,36 +463,6 @@
       }
     },
     {
-      "root_kind": "DEBUG_PROTO",
-      "source_locations": [
-        {
-          "path": "crates/lua_vm/src/state/lua_state.rs",
-          "line": 116,
-          "symbol": "LuaState::debug_hook_skip_proto"
-        },
-        {
-          "path": "crates/lua_vm/src/runtime/root_trace.rs",
-          "line": 399,
-          "symbol": "snapshot_state DEBUG_PROTO"
-        }
-      ],
-      "status": "partial",
-      "owner": {
-        "current": "LuaState stores an ObjectId-bearing GcRef<Proto> for one-shot hook line suppression and clears it immediately after the matching instruction.",
-        "target": "Debug state uses a validated frame/Proto identity scoped by the owning Runtime."
-      },
-      "tracer": {
-        "current": "The mark-only state snapshot marks debug_hook_skip_proto directly; debug inspection validates Proto handles against the owning collector before dereference.",
-        "target": "The canonical StateTracer feeds destructive collection at a proven safe point."
-      },
-      "missing_risk": "Collection remains disabled during debug callbacks. Explicit full STW consumes this root at Runtime safe points; debug Proto reads still use validated transitional unsafe borrows rather than a scoped Heap/VmContext API.",
-      "planned_test": {
-        "name": "debug_line_skip_is_one_shot_and_matches_full_object_identity",
-        "layer": "lua_vm execute",
-        "assertion": "A same-line different-ObjectId Proto does not consume the skip; the matching managed Proto consumes it once and the next instruction is no longer suppressed."
-      }
-    },
-    {
       "root_kind": "YIELDED_VALUES",
       "source_locations": [
         {

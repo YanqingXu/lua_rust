@@ -47,8 +47,6 @@ pub enum RuntimeRootKind {
     CallFunction,
     /// Managed Proto handle stored by an active CallInfo.
     ActiveProto,
-    /// Proto retained by one-shot debug line suppression state.
-    DebugProto,
     /// Vararg snapshot of an active CallInfo.
     CallVarargs,
     /// Open-Upvalue list head owned by a reachable state.
@@ -88,7 +86,6 @@ impl RuntimeRootKind {
             Self::CoroutineStack => "COROUTINE_STACK",
             Self::CallFunction => "CALL_FUNCTION",
             Self::ActiveProto => "ACTIVE_PROTO",
-            Self::DebugProto => "DEBUG_PROTO",
             Self::CallVarargs => "CALL_VARARGS",
             Self::OpenUpvalues => "OPEN_UPVALUES",
             Self::ThreadCallerChain => "THREAD_CALLER_CHAIN",
@@ -767,9 +764,6 @@ fn snapshot_state(state: &LuaState, handle: StateHandle, is_main: bool) -> State
     if let Some(hook) = &state.debug_hook {
         snapshot.push_value(RuntimeRootKind::DebugHook, hook.clone());
     }
-    if let Some(proto) = state.debug_hook_skip_proto {
-        snapshot.push_proto(RuntimeRootKind::DebugProto, proto);
-    }
     for value in &state.yielded_values {
         snapshot.push_value(RuntimeRootKind::YieldedValues, value.clone());
     }
@@ -997,7 +991,6 @@ mod tests {
             state.current_call_info_mut().func = 0;
             state.current_call_info_mut().proto = Some(active_proto);
             state.current_call_info_mut().varargs = vec![Value::Table(vararg)];
-            state.debug_hook_skip_proto = Some(active_proto);
             state.push_call_info().varargs = vec![Value::Table(inactive_vararg)];
             state.pop_call_info();
 
@@ -1047,7 +1040,6 @@ mod tests {
             RuntimeRootKind::MainStack,
             RuntimeRootKind::CallFunction,
             RuntimeRootKind::ActiveProto,
-            RuntimeRootKind::DebugProto,
             RuntimeRootKind::CallVarargs,
             RuntimeRootKind::OpenUpvalues,
             RuntimeRootKind::DebugHook,
@@ -1102,7 +1094,6 @@ mod tests {
             state.number_metatable = None;
             state.current_thread = None;
             state.debug_hook = None;
-            state.debug_hook_skip_proto = None;
             state.yielded_values.clear();
             state.last_error = None;
             state.open_upvalues.clear();
@@ -1143,7 +1134,6 @@ mod tests {
             RuntimeRootKind::CoroutineStack,
             RuntimeRootKind::CallFunction,
             RuntimeRootKind::ActiveProto,
-            RuntimeRootKind::DebugProto,
             RuntimeRootKind::CallVarargs,
             RuntimeRootKind::OpenUpvalues,
             RuntimeRootKind::ThreadCallerChain,
@@ -1233,6 +1223,9 @@ mod tests {
             let mut parts = runtime.parts_mut().expect("runtime parts");
             let (state, gc, _) = parts.split_mut();
             let active_proto = gc.create(Proto::new());
+            // A top-level Lua frame has an initialized, non-Function slot.
+            // Keep that physical window valid so a real sweep can run.
+            state.push_nil();
             state.current_call_info_mut().proto = Some(active_proto);
             active_proto
         };
@@ -1244,6 +1237,28 @@ mod tests {
         assert_eq!(report.root_edge_count(RuntimeRootKind::ActiveProto), 1);
         assert!(report.unresolved_object_edges.is_empty());
         assert_marked(active_proto);
+
+        assert_eq!(
+            runtime
+                .collect_garbage_full()
+                .expect("active CallInfo keeps its Proto alive"),
+            0
+        );
+        {
+            let mut parts = runtime.parts_mut().expect("runtime parts");
+            let (state, gc, _) = parts.split_mut();
+            assert!(gc.validate_ref(active_proto).is_ok());
+            state.current_call_info_mut().proto = None;
+        }
+        assert_eq!(
+            runtime
+                .collect_garbage_full()
+                .expect("retired CallInfo releases its sole Proto root"),
+            1
+        );
+        let mut parts = runtime.parts_mut().expect("runtime parts");
+        let (_, gc, _) = parts.split_mut();
+        assert!(gc.validate_ref(active_proto).is_err());
     }
 
     #[test]

@@ -84,7 +84,7 @@ jobs:
           --rust target/x86_64-pc-windows-msvc/debug/lua_app.exe
           --official target/oracles/lua-5.1.5/build/Release/lua51.exe
           --cpp target/oracles/lua_cpp/build/Release/lua_app.exe
-          --case constructs.lua --case literals.lua --case locals.lua
+          --case constructs.lua --case db.lua --case errors.lua --case literals.lua --case locals.lua
           --case math.lua --case nextvar.lua --case pm.lua
           --case strings.lua --case vararg.lua
           --artifact target/compatibility/official-source-required.json
@@ -152,6 +152,16 @@ jobs:
         run: >-
           cargo +nightly-2026-07-29 miri test
           -p lua_stdlib --test runtime_gc_boundary
+
+      - name: Run debug frame access and publication under Miri
+        run: >-
+          cargo +nightly-2026-07-29 miri test
+          -p lua_stdlib --test debug_access_boundary
+
+      - name: Run raw diagnostic ownership under Miri
+        run: >-
+          cargo +nightly-2026-07-29 miri test
+          -p lua_stdlib --test error_diagnostic_boundary
 
       - name: Reject untyped IO userdata under Miri
         run: >-

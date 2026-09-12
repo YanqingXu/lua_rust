@@ -106,25 +106,50 @@ unsafe extern "C" fn lua_debug_getinfo(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    // SAFETY: LuaState::gc is installed by the VM before calling C functions.
-    let gc = unsafe { &mut *gc_ptr };
-
-    if name_only_options(debug_options(l, 2).as_deref()) {
-        return match l.at(1).cloned().unwrap_or(Value::Nil) {
-            Value::Function(_) => push_name_info(l, gc, None, Vec::new()),
-            Value::Number(level) if level >= 0.0 => {
-                push_name_info_for_level(l, gc, level as usize, false)
+    let argument = l.at(1).cloned().unwrap_or(Value::Nil);
+    let options_arg = if matches!(argument, Value::Thread(_)) {
+        3
+    } else {
+        2
+    };
+    if name_only_options(debug_options(l, options_arg).as_deref()) {
+        let name_info = match argument {
+            Value::Function(_) => Some((None, Vec::new())),
+            Value::Number(level) if level >= 0.0 => name_info_for_level(l, level as usize, false),
+            Value::Thread(thread_ref) => {
+                let level = match l.at(2).cloned().unwrap_or(Value::Nil) {
+                    Value::Number(level) if level >= 1.0 => level as usize,
+                    _ => {
+                        l.push_nil();
+                        return 1;
+                    }
+                };
+                let caller = l.state_handle();
+                with_thread_state_mut(l, thread_ref, |target| {
+                    name_info_for_level(target, level, target.state_handle() != caller)
+                })
+                .flatten()
             }
-            _ => {
-                l.push_nil();
-                1
-            }
+            _ => None,
         };
+        let Some((name, namewhat)) = name_info else {
+            l.push_nil();
+            return 1;
+        };
+        // SAFETY: scoped reads have ended. Publish on the calling state,
+        // including when the inspected frames belong to another coroutine.
+        let gc = unsafe { &mut *gc_ptr };
+        return push_name_info(l, gc, name, namewhat);
     }
 
-    let debug_info = match l.at(1).cloned().unwrap_or(Value::Nil) {
-        Value::Function(func_ref) => function_info(gc, func_ref)
-            .unwrap_or_else(|| c_debug_info(Some(Value::Function(func_ref)), None)),
+    let debug_info = match argument {
+        Value::Function(func_ref) => {
+            // SAFETY: this branch only reads the active collector, and its
+            // shared borrow ends before result publication below.
+            let gc = unsafe { &*gc_ptr };
+            function_info(gc, func_ref)
+                .unwrap_or_else(|| c_debug_info(Some(Value::Function(func_ref)), None))
+        }
         Value::Thread(thread_ref) => {
             let level = match l.at(2).cloned().unwrap_or(Value::Nil) {
                 Value::Number(level) if level >= 1.0 => level as usize,
@@ -133,17 +158,9 @@ unsafe extern "C" fn lua_debug_getinfo(l_ptr: *mut std::ffi::c_void) -> i32 {
                     return 1;
                 }
             };
-            if name_only_options(debug_options(l, 3).as_deref()) {
-                let Some(result) = with_thread_state_mut(l, thread_ref, |target| {
-                    push_name_info_for_level(target, gc, level, true)
-                }) else {
-                    l.push_nil();
-                    return 1;
-                };
-                return result;
-            }
+            let caller = l.state_handle();
             match with_thread_state_mut(l, thread_ref, |target| {
-                stack_frame_info(target, level, true)
+                stack_frame_info(target, level, target.state_handle() != caller)
             })
             .flatten()
             {
@@ -180,6 +197,8 @@ unsafe extern "C" fn lua_debug_getinfo(l_ptr: *mut std::ffi::c_void) -> i32 {
         }
     };
 
+    // SAFETY: all dynamic collector reads ended while producing owned info.
+    let gc = unsafe { &mut *gc_ptr };
     if publish_debug_info(l, gc, debug_info).is_err() {
         l.push_nil();
     }
@@ -197,29 +216,16 @@ fn name_only_options(options: Option<&[u8]>) -> bool {
     options.is_some_and(|options| !options.is_empty() && options.iter().all(|byte| *byte == b'n'))
 }
 
-fn push_name_info_for_level(
-    l: &mut LuaState,
-    gc: &mut GarbageCollector,
-    level: usize,
-    include_current: bool,
-) -> i32 {
-    let frame_idx = match resolve_debug_frame(l, level, include_current) {
-        Some(ResolvedFrame::Real(frame_idx)) => frame_idx,
-        Some(ResolvedFrame::Tail) => return push_name_info(l, gc, None, Vec::new()),
-        None => {
-            l.push_nil();
-            return 1;
-        }
+type FrameNameInfo = (Option<Vec<u8>>, Vec<u8>);
+
+fn name_info_for_level(l: &LuaState, level: usize, include_current: bool) -> Option<FrameNameInfo> {
+    let frame_idx = match resolve_debug_frame(l, level, include_current)? {
+        ResolvedFrame::Real(frame_idx) => frame_idx,
+        ResolvedFrame::Tail => return Some((None, Vec::new())),
     };
-    let func_ref = {
-        let Some(ci) = l.call_stack.get(frame_idx) else {
-            l.push_nil();
-            return 1;
-        };
-        frame_function_ref(l, ci)
-    };
-    let (name, namewhat) = debug_name_for_frame(l, frame_idx, func_ref);
-    push_name_info(l, gc, name, namewhat)
+    let ci = l.call_stack.get(frame_idx)?;
+    let func_ref = frame_function_ref(l, ci);
+    Some(debug_name_for_frame(l, frame_idx, func_ref))
 }
 
 fn push_name_info(
@@ -319,7 +325,6 @@ fn state_traceback(state: &mut LuaState) -> Vec<u8> {
         out.extend_from_slice(b"\t[C]: in function 'yield'\n");
     }
 
-    let mut duplicate_first_error_frame = state.last_error.is_some();
     let mut idx = state.current_ci + 1;
     while idx > 0 {
         idx -= 1;
@@ -369,10 +374,6 @@ fn state_traceback(state: &mut LuaState) -> Vec<u8> {
             frame_line.extend_from_slice(b">\n");
         }
         out.extend_from_slice(&frame_line);
-        if duplicate_first_error_frame {
-            out.extend_from_slice(&frame_line);
-            duplicate_first_error_frame = false;
-        }
         for _ in 0..ci.tailcalls {
             out.extend_from_slice(b"\t(tail call)\n");
         }
@@ -411,39 +412,47 @@ unsafe extern "C" fn lua_debug_sethook(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     if let Some(thread_ref) = target_thread {
         with_thread_state_mut(l, thread_ref, |target| {
-            install_hook(target, hook, mask, count, None);
+            install_hook(target, hook, mask, count);
         });
         return 0;
     }
 
-    let location = current_caller_location(l).unwrap_or((-1, usize::MAX, None));
-    install_hook(l, hook, mask, count, Some(location));
+    install_hook(l, hook, mask, count);
     0
 }
 
-fn install_hook(
-    target: &mut LuaState,
-    hook: Value,
-    mask: Vec<u8>,
-    count: i32,
-    current_location: Option<(i32, usize, Option<GcRef<Proto>>)>,
-) {
+fn install_hook(target: &mut LuaState, hook: Value, mask: Vec<u8>, count: i32) {
     let hook_was_active = target.debug_hook_active;
     target.debug_hook = Some(hook);
     target.debug_hook_mask = mask_bytes_to_storage(&mask);
     target.debug_hook_count = count;
     target.debug_hook_countdown = count;
     target.debug_hook_active = hook_was_active;
-    if let Some((line, pc, proto)) = current_location {
-        target.debug_hook_last_line = line;
-        target.debug_hook_last_pc = pc;
-        target.debug_hook_skip_line = line;
-        target.debug_hook_skip_proto = proto;
-    } else {
-        target.debug_hook_last_line = -1;
-        target.debug_hook_last_pc = usize::MAX;
-        target.debug_hook_skip_line = -1;
-        target.debug_hook_skip_proto = None;
+    // Installing a line hook seeds every suspended Lua caller as well as
+    // the current one. Each frame then retains its own history across calls.
+    let locations: Vec<_> = target
+        .call_stack
+        .iter()
+        .take(target.current_ci + 1)
+        .map(|ci| {
+            if !target.debug_hook_mask.contains('l') {
+                return None;
+            }
+            let proto = frame_proto_handle(target, ci)?;
+            target
+                .with_gc_ref(proto, |proto| {
+                    let pc = ci
+                        .savedpc
+                        .unwrap_or(0)
+                        .min(proto.code().len().saturating_sub(1));
+                    (proto.line(pc), pc)
+                })
+                .ok()
+        })
+        .collect();
+    for (ci, location) in target.call_stack.iter_mut().zip(locations) {
+        ci.debug_hook_last_line = location.map_or(-1, |(line, _)| line);
+        ci.debug_hook_last_pc = location.map(|(_, pc)| pc);
     }
 }
 
@@ -508,19 +517,10 @@ fn clear_hook(l: &mut LuaState) {
     l.debug_hook_count = 0;
     l.debug_hook_countdown = 0;
     l.debug_hook_active = false;
-    l.debug_hook_last_line = -1;
-    l.debug_hook_last_pc = usize::MAX;
-    l.debug_hook_skip_proto = None;
-    l.debug_hook_skip_line = -1;
-}
-
-fn current_caller_location(l: &LuaState) -> Option<(i32, usize, Option<GcRef<Proto>>)> {
-    let frame_idx = l.current_ci.checked_sub(1)?;
-    let ci = l.call_stack.get(frame_idx)?;
-    let pc = ci.savedpc?;
-    let proto_ref = frame_proto_handle(l, ci)?;
-    let line = l.with_gc_ref(proto_ref, |proto| proto.line(pc)).ok()?;
-    Some((line, pc, Some(proto_ref)))
+    for ci in &mut l.call_stack {
+        ci.debug_hook_last_line = -1;
+        ci.debug_hook_last_pc = None;
+    }
 }
 
 unsafe extern "C" fn lua_debug_getfenv(l_ptr: *mut std::ffi::c_void) -> i32 {
@@ -546,13 +546,11 @@ unsafe extern "C" fn lua_debug_getlocal(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    // SAFETY: LuaState::gc is installed by the VM before calling C functions.
-    let gc = unsafe { &mut *gc_ptr };
     let (target_thread, level_arg, local_arg) = match l.at(1).cloned().unwrap_or(Value::Nil) {
         Value::Thread(thread_ref) => (Some(thread_ref), 2, 3),
         _ => (None, 1, 2),
     };
-    let include_current = target_thread.is_some();
+    let caller = l.state_handle();
 
     let level = match l.at(level_arg).cloned().unwrap_or(Value::Nil) {
         Value::Number(value) if value >= 0.0 => value as usize,
@@ -571,16 +569,18 @@ unsafe extern "C" fn lua_debug_getlocal(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     let local = if let Some(thread_ref) = target_thread {
         with_thread_state_mut(l, thread_ref, |target| {
-            get_local_value(target, level, local_number, include_current)
+            get_local_value(target, level, local_number, target.state_handle() != caller)
         })
         .flatten()
     } else {
-        get_local_value(l, level, local_number, include_current)
+        get_local_value(l, level, local_number, false)
     };
     let Some((name, value)) = local else {
         l.push_nil();
         return 1;
     };
+    // SAFETY: frame and name reads have ended before mutable publication.
+    let gc = unsafe { &mut *gc_ptr };
     let _ = crate::registration::push_string(l, gc, &name);
     l.push_value(value);
     2
@@ -593,14 +593,12 @@ unsafe extern "C" fn lua_debug_setlocal(l_ptr: *mut std::ffi::c_void) -> i32 {
         l.push_nil();
         return 1;
     };
-    // SAFETY: LuaState::gc is installed by the VM before calling C functions.
-    let gc = unsafe { &mut *gc_ptr };
     let (target_thread, level_arg, local_arg, value_arg) =
         match l.at(1).cloned().unwrap_or(Value::Nil) {
             Value::Thread(thread_ref) => (Some(thread_ref), 2, 3, 4),
             _ => (None, 1, 2, 3),
         };
-    let include_current = target_thread.is_some();
+    let caller = l.state_handle();
 
     let level = match l.at(level_arg).cloned().unwrap_or(Value::Nil) {
         Value::Number(value) if value >= 0.0 => value as usize,
@@ -620,16 +618,24 @@ unsafe extern "C" fn lua_debug_setlocal(l_ptr: *mut std::ffi::c_void) -> i32 {
 
     let name = if let Some(thread_ref) = target_thread {
         with_thread_state_mut(l, thread_ref, |target| {
-            set_local_value(target, level, local_number, value, include_current)
+            set_local_value(
+                target,
+                level,
+                local_number,
+                value,
+                target.state_handle() != caller,
+            )
         })
         .flatten()
     } else {
-        set_local_value(l, level, local_number, value, include_current)
+        set_local_value(l, level, local_number, value, false)
     };
     let Some(name) = name else {
         l.push_nil();
         return 1;
     };
+    // SAFETY: frame mutation and its dynamic collector reads have ended.
+    let gc = unsafe { &mut *gc_ptr };
     let _ = crate::registration::push_string(l, gc, &name);
     1
 }
@@ -1426,6 +1432,9 @@ fn with_thread_state_mut<T>(
         .with_gc_ref(thread_ref, Thread::state_handle)
         .ok()
         .flatten()?;
+    if current.state_handle() == Some(handle) {
+        return Some(f(current));
+    }
     current.with_resolved_state_mut(handle, f).ok()
 }
 

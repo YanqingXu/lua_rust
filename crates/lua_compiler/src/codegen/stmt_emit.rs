@@ -1035,12 +1035,16 @@ impl<A: CodegenObjectAllocator + ?Sized> CodeGenerator<'_, A> {
     // ═══════════════════════════════════════════════════════════════
 
     fn emit_break(&mut self) {
-        if let Some(level) = self
+        let Some(level) = self
             .find_breakable_block()
             .map(|block| block.active_var_count)
-        {
-            self.close_scope_upvalues(level);
-        }
+        else {
+            // Infallible enclosing emitters must still reject the whole Proto.
+            // An unregistered NO_JUMP placeholder would execute as a self-jump.
+            self.record_codegen_error("no loop to break");
+            return;
+        };
+        self.close_scope_upvalues(level);
         let jump_pc = self.emit_jump();
         self.append_break_jump(jump_pc);
     }

@@ -43,7 +43,7 @@ use lua_core::string_pool::StringPool;
 
 use crate::ast::stmt::Chunk;
 use crate::opcode::OpCode;
-use crate::parser::ParseError;
+use crate::parser::{ParseError, diagnostic_message_text};
 
 // =====================================================================
 // CodegenError
@@ -51,18 +51,38 @@ use crate::parser::ParseError;
 
 #[derive(Debug, Clone)]
 pub struct CodegenError {
+    /// Host-readable view; use `message_bytes` for a Lua diagnostic value.
     pub message: String,
+    message_bytes: Vec<u8>,
     pub line: i32,
     pub column: i32,
 }
 
 impl CodegenError {
     pub fn new(message: impl Into<String>, line: i32, column: i32) -> Self {
+        let message = message.into();
         Self {
-            message: message.into(),
+            message_bytes: message.as_bytes().to_vec(),
+            message,
             line,
             column,
         }
+    }
+
+    /// Preserve the original diagnostic bytes while providing a readable view.
+    pub fn new_bytes(message_bytes: impl Into<Vec<u8>>, line: i32, column: i32) -> Self {
+        let message_bytes = message_bytes.into();
+        Self {
+            message: diagnostic_message_text(&message_bytes),
+            message_bytes,
+            line,
+            column,
+        }
+    }
+
+    /// Original message bytes, without a source location or host escaping.
+    pub fn message_bytes(&self) -> &[u8] {
+        &self.message_bytes
     }
 }
 
@@ -76,7 +96,7 @@ impl std::error::Error for CodegenError {}
 
 impl From<ParseError> for CodegenError {
     fn from(e: ParseError) -> Self {
-        CodegenError::new(e.message, e.line, e.column)
+        CodegenError::new_bytes(e.message_bytes().to_vec(), e.line, e.column)
     }
 }
 
@@ -240,11 +260,11 @@ impl<'services, A: CodegenObjectAllocator + ?Sized> CodeGenerator<'services, A> 
         self.builder.set_source(Some(source));
         self.builder.set_vararg(true);
 
-        self.emit_block(&chunk.statements)
-            .map_err(|msg| CodegenError::new(msg, 0, 0))?;
+        let emitted = self.emit_block(&chunk.statements);
         if let Some(error) = self.pending_error.take() {
             return Err(error);
         }
+        emitted.map_err(|msg| CodegenError::new(msg, 0, 0))?;
 
         let final_line = chunk.statements.last().map(|s| s.end_line()).unwrap_or(1);
         // The pinned C++ top-level block closes captured root locals before

@@ -58,6 +58,10 @@ pub struct CallInfo {
     pub varargs: Vec<Value>,
     /// 尾调用计数
     pub tailcalls: i32,
+    /// Last source line observed by this frame's line hook.
+    pub debug_hook_last_line: i32,
+    /// Last instruction observed by this frame's line hook.
+    pub debug_hook_last_pc: Option<usize>,
     /// Work belonging to the caller's instruction after this Lua frame returns.
     /// Kept on the frame so Runtime suspension cannot discard it.
     pub(crate) return_continuation: DeferredVmContinuation,
@@ -75,6 +79,8 @@ impl CallInfo {
             nargs: 0,
             varargs: Vec::new(),
             tailcalls: 0,
+            debug_hook_last_line: -1,
+            debug_hook_last_pc: None,
             return_continuation: DeferredVmContinuation::Call,
         }
     }
@@ -91,6 +97,8 @@ impl CallInfo {
             nargs: 0,
             varargs: Vec::new(),
             tailcalls: 0,
+            debug_hook_last_line: -1,
+            debug_hook_last_pc: None,
             return_continuation: DeferredVmContinuation::Call,
         }
     }
@@ -105,6 +113,8 @@ impl CallInfo {
         self.nargs = 0;
         self.varargs.clear();
         self.tailcalls = 0;
+        self.debug_hook_last_line = -1;
+        self.debug_hook_last_pc = None;
         self.return_continuation = DeferredVmContinuation::Call;
     }
 }

@@ -109,3 +109,69 @@ fn iterative_lua_frames_survive_collection_suspension_and_iterator_return() {
     assert_eq!(report.remaining_objects, 0);
     assert_eq!(report.remaining_allocator_live_bytes, 0);
 }
+
+#[test]
+fn debug_hook_lifecycle_preserves_scoped_state_access() {
+    let mut runtime = Runtime::new();
+    runtime
+        .parts_mut()
+        .unwrap()
+        .with_context_gc(lua_stdlib::open_all);
+    let proto = compile(
+        &mut runtime,
+        r#"
+        local seen, inside, collected = {0, 0}, false, false
+        local function leaf(value) return value + 1 end
+        local function make_hook(which)
+            return function(event)
+                assert(event == "line" and not inside)
+                inside = true
+                seen[which] = seen[which] + 1
+                assert(leaf(40) == 41)
+                if not collected then collected = true; collectgarbage("collect") end
+                inside = false
+            end
+        end
+        local first, second = make_hook(1), make_hook(2)
+        local co = coroutine.create(function()
+            local self = coroutine.running()
+            local held = {value = 40}
+            debug.sethook(self, first, "l")
+            local installed, mask, count = debug.gethook(self)
+            assert(installed == first and mask == "l" and count == 0)
+            coroutine.yield("paused")
+            local result = leaf(held.value)
+            debug.sethook(self)
+            assert(debug.gethook(self) == nil)
+            return result
+        end)
+        local ok, value = coroutine.resume(co)
+        assert(ok and value == "paused" and seen[1] > 0 and collected)
+        local before = seen[1]
+        debug.sethook(co, second, "l")
+        assert(debug.gethook(co) == second)
+        collectgarbage("collect")
+        ok, value = coroutine.resume(co)
+        assert(ok and value == 41 and seen[1] == before and seen[2] > 0)
+        debug.sethook(co)
+        assert(debug.gethook(co) == nil and debug.gethook() == nil and not inside)
+        return value
+        "#,
+    );
+    runtime
+        .execute_proto_with_args(proto, Vec::new(), |_, values| {
+            assert_eq!(values, &[Value::Number(41.0)]);
+        })
+        .unwrap();
+    let stats = runtime.activation_stats();
+    assert!(stats.peak_callback_helper_depth >= 1);
+    assert!(stats.peak_upvalue_transfer_depth >= 1);
+    assert_eq!(stats.current_rooted_activation_depth(), 0);
+    assert_eq!(runtime.active_execution_count(), 0);
+    assert_eq!(runtime.temporary_state_root_count(), 0);
+    let report = runtime.close().unwrap();
+    assert_eq!(report.remaining_objects, 0);
+    assert_eq!(report.remaining_coroutine_states, 0);
+    assert_eq!(report.remaining_allocator_live_bytes, 0);
+    assert_eq!(report.runtime_resource_drain_errors, 0);
+}
