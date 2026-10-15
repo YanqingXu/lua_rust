@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="708" viewBox="0 0 900 708" role="img" aria-labelledby="title desc">
+  <title id="title">跨输入 Session owner 与每个 chunk 的局部作用域</title>
+  <desc id="desc">run 一次创建 Session 和 Vm。多个 actions、script、REPL 输入只短暂可变借用同一 Session。Heap 中 global、package、registry 和闭包 upvalue 边保留状态；每个 chunk 的调用帧和普通 locals 结束。每次调用一次性 convenience API 则创建新 owner 丢状态。Rust 复制 Value 句柄不自动登记 GC root。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="708" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">输入可以结束，持有语言状态的 Session 继续存在</text>
+  <rect x="24" y="62" width="852" height="86" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="44" y="96" class="mono">run: let mut session = Session::new();</text><text x="44" y="129" class="small">唯一长期 owner：Session → Vm → Heap / globals / package / registry / coroutine / files</text>
+  <path d="M180 148V184" class="flow"/><path d="M450 148V184" class="flow"/><path d="M720 148V184" class="flow"/>
+  <rect x="24" y="188" width="252" height="92" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="44" y="222" class="label">action / chunk A</text><text x="44" y="258" class="mono">&amp;mut Session</text>
+  <rect x="300" y="188" width="276" height="92" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="320" y="222" class="label">script / chunk B</text><text x="320" y="258" class="mono">&amp;mut Session</text>
+  <rect x="600" y="188" width="276" height="92" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="620" y="222" class="label">REPL / chunk C</text><text x="620" y="258" class="mono">&amp;mut Session</text>
+  <rect x="24" y="306" width="852" height="116" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="44" y="340" class="label">靠真实 Heap edges 跨输入保留</text><text x="44" y="373" class="mono">global → table；global → closure → captured local table</text><text x="44" y="405" class="small">package cache / registry → 各自持有的对象；下一输入 collect 后实读字段与计数。</text>
+  <rect x="24" y="446" width="852" height="80" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="44" y="478" class="label">每次 chunk 仍重新开始执行帧</text><text x="44" y="509" class="small">活动帧 / temporary roots / 执行预算重置；普通 chunk local 不自动进入下一输入。</text>
+  <rect x="24" y="550" width="852" height="84" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="44" y="582" class="mono">错误：每次 lua_app::execute_multi(source) → Session::new()</text><text x="44" y="615" class="small">前一次 owner 随调用结束；下一次得到全新 globals/cache，无法继续使用前一行的状态。</text>
+  <text x="24" y="665" class="small">Rust 复制 Value handle ≠ 注册 GC root；移除真实 owner 后，旧 handle 仍可能 stale。</text>
+  <text x="24" y="692" class="small">验收：shared/fresh 对照、局部作用域、GC 后字段读取，以及真实多 -e → script / -i。</text>
+</svg>

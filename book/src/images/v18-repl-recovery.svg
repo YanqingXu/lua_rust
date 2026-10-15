@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="750" viewBox="0 0 900 750" role="img" aria-labelledby="title desc">
+  <title id="title">REPL source buffer 的保留、清空与 EOF 边界</title>
+  <desc id="desc">Session 始终保留。空 buffer 的空行忽略，首行等号改写 return，其他输入追加换行。成功显示结果清 buffer；编译错误 message 命中三段启发式则保留续行；其他编译或运行错误写 stderr 清 buffer 并继续，已发生副作用不回滚。EOF 直接返回零，不重试 pending source。return 40 加号是当前启发式漏判。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="750" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">清理当前 source，不清理长期 Session；普通错误后继续读下一行</text>
+  <rect x="24" y="62" width="852" height="92" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="44" y="95" class="label">读一行：空闲空行忽略；空 buffer 首行 = 改写 return；其余追加</text><text x="44" y="129" class="mono">source += line + '\n' → 同一 Session.execute_multi(source)</text>
+  <path d="M150 154V190" class="flow"/><path d="M450 154V190" class="flow"/><path d="M738 154V190" class="flow"/>
+  <rect x="24" y="194" width="252" height="150" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="44" y="227" class="label">Ok(values)</text><text x="44" y="263" class="small">显示结果；空 Vec 无输出</text><text x="44" y="296" class="mono">source.clear()</text><text x="44" y="329" class="small">回到主提示符 &gt;</text>
+  <rect x="300" y="194" width="276" height="150" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="320" y="227" class="label">命中 incomplete 启发式</text><text x="320" y="263" class="small">仅编译错误 message 匹配</text><text x="320" y="296" class="mono">保留 source</text><text x="320" y="329" class="small">续行提示符 &gt;&gt;</text>
+  <rect x="600" y="194" width="276" height="150" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="620" y="227" class="label">其他 compile/runtime Err</text><text x="620" y="263" class="small">stderr diagnostic</text><text x="620" y="296" class="mono">source.clear()</text><text x="620" y="329" class="small">Session 保留，继续下一行</text>
+  <rect x="24" y="370" width="852" height="84" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="44" y="402" class="mono">counter=counter+1; error('broken') → 下一行读 counter</text><text x="44" y="435" class="small">runtime error 前的修改仍在。恢复输入协议不等于回滚 global / 文件 / 输出副作用。</text>
+  <rect x="24" y="478" width="852" height="94" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="44" y="510" class="label">当前快照边界：消息匹配不是完整的 NeedMoreInput 分类</text><text x="44" y="542" class="mono">return 40 + → expected an expression → 未命中 → 清 source</text><text x="44" y="564" class="small">本来可追加 2；此漏判保留为反例，不假装已经修成完整续行 parser。</text>
+  <rect x="24" y="596" width="852" height="84" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="44" y="628" class="label">EOF：不重试 pending source，不额外报告未闭合，离开 REPL</text><text x="44" y="661" class="small">普通 EOF 返回 0，函数结束销毁 buffer；stdin read / stdout flush 错误仍可返回 1。</text>
+  <text x="24" y="715" class="small">-i + 管道：REPL；无 actions / script / -i 的管道：整段脚本，失败 exit 1。脚本 - 也读 stdin。</text>
+  <text x="24" y="738" class="small">验收：buffer / 事件 / 下一行真实值 / stdout / stderr / exit code 联合观察。</text>
+</svg>

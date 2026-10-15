@@ -23,3 +23,27 @@ members = [
 
 [lints.clippy]
 all = "warn"
+
+[[test]]
+name = "cli_exit_exercises"
+path = "exercises/cli_exit/acceptance.rs"
+
+[[test]]
+name = "cli_exit_reference"
+path = "exercises/cli_exit/reference.rs"
+
+[[test]]
+name = "repl_owner_exercises"
+path = "exercises/repl_owner/acceptance.rs"
+
+[[test]]
+name = "repl_owner_reference"
+path = "exercises/repl_owner/reference.rs"
+
+[[test]]
+name = "repl_recovery_exercises"
+path = "exercises/repl_recovery/acceptance.rs"
+
+[[test]]
+name = "repl_recovery_reference"
+path = "exercises/repl_recovery/reference.rs"

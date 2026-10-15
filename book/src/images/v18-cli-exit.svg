@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="696" viewBox="0 0 900 696" role="img" aria-labelledby="title desc">
+  <title id="title">CLI 运行结果、输出流与退出码</title>
+  <desc id="desc">main 将 run 成功映射退出零，Usage 错误写 stderr 加 usage 并退出二，Runtime 包括编译、Lua 和宿主文件错误写 stderr 并退出一。此前 Lua stdout 保留，脚本返回值不自动打印。打印错误却正常返回会假成功。REPL 内一行错误被循环处理，最终 EOF 可退出零，与脚本错误不同。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="696" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">stderr 说明发生了什么；exit code 决定 shell 如何判断</text>
+  <rect x="24" y="62" width="852" height="88" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="44" y="96" class="label">argv 全部解析 → 一次创建 Session → actions → script → 可选 REPL</text>
+  <text x="44" y="131" class="small">普通 action/script 失败用 ? 离开 run；后续 action、script 和 REPL 不再启动。</text>
+  <path d="M150 150V186" class="flow"/><path d="M450 150V186" class="flow"/><path d="M738 150V186" class="flow"/>
+  <rect x="24" y="190" width="252" height="150" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="44" y="224" class="mono">Ok(()) → exit 0</text><text x="44" y="261" class="small">stdout：保留协议输出</text><text x="44" y="292" class="small">stderr：可有 REPL 行诊断</text><text x="44" y="323" class="small">script return 不自动打印</text>
+  <rect x="300" y="190" width="276" height="150" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="320" y="224" class="mono">Usage → exit 2</text><text x="320" y="261" class="small">未知 option / 缺 operand</text><text x="320" y="292" class="small">stderr：diagnostic + usage</text><text x="320" y="323" class="small">尚未执行 Lua actions</text>
+  <rect x="600" y="190" width="276" height="150" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="620" y="224" class="mono">Runtime → exit 1</text><text x="620" y="261" class="small">compile / Lua / file error</text><text x="620" y="292" class="small">stderr：lua: message</text><text x="620" y="323" class="small">已有 stdout 保留</text>
+  <rect x="24" y="366" width="852" height="94" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="44" y="399" class="mono">print('before'); error('broken')</text><text x="44" y="433" class="small">stdout = before\n；stderr 包含 broken；exit = 1。错误不回滚已产生的输出。</text>
+  <rect x="24" y="484" width="852" height="78" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="44" y="517" class="label">固定错误：只打印 Err / 所有 Err 都给 1 / 自动打印 script return</text><text x="44" y="545" class="small">分别丢失失败状态、usage 分类、stdout 合同；三个通道必须一起验收。</text>
+  <rect x="24" y="586" width="852" height="68" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="44" y="615" class="small">REPL 行错误在循环内显示并清 buffer；继续输入后，普通 EOF 可正常 exit 0。</text><text x="44" y="642" class="small">help 在 parser 中直接 exit(0)，version 是 Action；它们不由纯边界模型证明。</text>
+  <text x="24" y="680" class="small">证据：模型逐字节断言 Transcript；真实 binary 另验 status / stdout / stderr 与中止顺序。</text>
+</svg>

@@ -3,6 +3,101 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.18 CLI 错误退出与 REPL 跨输入状态
+
+用户要求继续按问题链补齐 CLI 错误退出、REPL 跨输入状态的反例、差异、状态图和
+验收，完成验证并更新交接。本次完成该教学包，**没有恢复暂停的原审计整改目标**。
+用户随后明确要求将本批章节、状态图、练习包和交接记录一并提交并推送。
+
+- 起点为 `main@dcf325bd2ea251c504c1c807739227b734ff3436`（上一批 v0.17 files 已推送），
+  开始时工作区干净，本地跟踪 origin/main 同 SHA。本批生产 `crates/`、v0.18 快照
+  `src/`、`crates/` 与既有 `tests/` 均无 diff；Cargo 只增加六个 test targets，无新
+  依赖。新增教学代码位于三包、三个 Rust CLI 和两个共享 helper；没有修改真实 CLI、
+  parser/VM 或旧进程 runner 的行为。
+  提交前 fetch 确认 HEAD 与 origin/main 无分叉。本批提交号以
+  `git log -1 -- book/src/versions/v18-cli-tools.md` 为准，新提交 CI 按其 SHA 查询。
+- [主章](book/src/versions/v18-cli-tools.md) 按三问组织：打印错误但进程成功 →
+  Result/stream/exit code；每次 convenience API 创建新 VM → 借用同一 Session；
+  每行清 source / 错误不清 / 首错退出 → 成功与普通错误清 buffer、未完成保留。
+  每问均有预测、固定错误、starter/solution include、最小 diff、图、精确验收与
+  owner/失败边界；修正原章把 message 匹配写成结构化错误类别的表述。bytecode
+  JSON/CFG/trace 保留旧入口与原验收，没有扩成另一批工具实现任务。
+- [退出包](book/code/v18-cli-tools/exercises/cli_exit/README.md)：一个 finish TODO、
+  8 项参考。纯 Outcome→Transcript 模型接收已有 stdout 与 Result，不冒充捕获 Lua
+  print；验 success=0/Usage=2/Runtime=1，diagnostic/usage，script return 不自动
+  打印，已有输出不回滚。固定反例为只打印 Err 却 code0、全 Err code1、打印 return。
+  17 个真实 child cases 覆盖 help/version、未知/缺 operand、compile/runtime/file、
+  silent return、`-e/-l` 失败中止后续 action/script/-i、script 失败不进入 REPL。
+- [owner 包](book/code/v18-cli-tools/exercises/repl_owner/README.md)：一个 submit
+  TODO、5 项参考。直接用真实 Session，fresh 第二输入七项均 Nil；shared+GC 实读
+  global/table/closure captured cell/package/registry，普通 chunk local 下一次 Nil；
+  mutation 后再 GC 验字段与 loader 次数。独立公开 Vm probe 保留宿主 Value、撤真实
+  roots、结束旧执行帧后 GC，再向 registry/global 写旧值精确拒绝 StaleHandle；另验
+  registry 保活时实际读取 answer42，不把 Rust handle 副本当 root。真实 CLI 两个
+  `-e → script` 与 `-e → -i` 分别检查跨输入字段、闭包计数、module 身份与完整输出。
+- [恢复包](book/code/v18-cli-tools/exercises/repl_recovery/README.md)：一个 source
+  lifecycle TODO、7 项参考。固定持久 Session，三故障分别丢 continuation、保留错误
+  source 污染后续、首 Error 结束循环；合同检验 buffer/事件/下一输入值，runtime
+  失败前 effects 已递增而不回滚。空闲空行、首行 `=`、空 Vec 与单 Nil 分别验收。
+  8 个真实 child cases 覆盖 -i 编译/运行错后继续并最终 exit0、-e 错 exit1、返回
+  数量、pending EOF、整段 stdin 编译与分行执行差异、启发式漏判后仍能继续。
+- 实测当前续行边界：`return 40 +\n` 报 expected an expression，未命中三段 message
+  规则，buffer 清空；追加 `2\n` 本可编译为返回42。该漏判保留为反例，没有假称
+  已修完整 NeedMoreInput parser。pending EOF 不最终编译或另报未闭合，break 后局部
+  source 析构并正常退出。无 script、无 actions 且未指定 -i 时，非终端 stdin 才
+  默认 read_to_end；脚本 `-` 显式读 stdin，已有 -e 不自动再读管道。普通 REPL 行
+  diagnostic 不等于最终非零退出，read/flush 等宿主 I/O 错误仍可能离开循环。
+- Session 保留 Heap/global/package/registry/coroutine/resource owner，不保留普通
+  chunk 词法作用域；每次 execute_multi 重置 call stack、活动帧/函数、temporary
+  roots、manual GC mode 与指令预算。捕获的 local table 经真实闭包 upvalue 保活。
+  任意 Value 逃逸、活动 varargs、sort snapshot、重入与所有 GC 路径均不由此证明；
+  v0.15/v0.16 已登记 GC 缺口没有在本轮整改。
+- 共享 process helper 并发 drain stdout/stderr，writer 写完 drop stdin 交 EOF，
+  主线程五秒 try_wait deadline；超时只 kill/wait 自己的 child，然后 join，不把
+  helper timeout 当成 Lua 自己的退出码。fixture 有界且不启动后代，不承诺通用
+  process tree 或后代持 pipe 的 join 上界。旧 runner 仍先 wait 后读输出，未用其
+  small-fixture 结果冒充大输出安全。临时目录唯一、canonical 范围核验、显式 finish
+  合并清理错误、Drop fallback 不 panic；示例先 build 对应 profile binaries，按
+  current_exe sibling 定位，不嵌套 cargo，也不从 PATH 偷换另一个 Lua。
+- 三幅 SVG（exit/owner/recovery）经浏览器核对三路箭头、状态与页脚；正文六段新
+  starter/solution、chunks/classifier 正确展开，三幅图加载，无 unresolved include。
+  特别区分最终 Ok 可有 REPL stderr 诊断、EOF 局部析构、默认 pipe 的完整分支条件。
+- 本地 Windows Rust/cargo **1.96.1**：Debug/Release 先 build --bins；fmt、workspace
+  all-targets Clippy `-D warnings` 通过；两 profile 各 **149 通过、0 失败、3 ignored**
+  （原 v0.18 129 + 新参考20）。这是独立快照，不将 v0.17 教学习题数重复计入。
+  三个 learner 各初始1失败，均完成“失败 → 临时套解1通过 → 原字节/哈希恢复并刷新
+  mtime → 再失败”；交付保留 TODO。默认 ignored 或固定 CLI 退出0不代表学习者完成。
+- 三 CLI 每 profile **74 条关键断言**（exit25/owner8/recovery41），Debug/Release
+  共 **148 条**；主章与三个 README 去重 **14 条 exact** 各执行1项，11正向通过、
+  3 learner 按预期失败。demo 纯 stdout=1818，本版 stdlib_diff 纯 stdout=1550；
+  PATH `D:\lua51\lua.EXE` 确认为 **Lua5.1.5**，独立实际执行本版 fixture=1550。
+  差分范围是此确定性 fixture，不声称 REPL prompt/退出码与官方 Lua 全部等价。
+  55 个代码输入（含两 helper）前后哈希无漂移；20版本教学检查、mdBook构建、38页
+  链接检查通过：**1,299 站内链接、0 broken**。
+- 证据独立在 `target/teaching-v18-2026-10-15/`：
+  `full-validation/20261015T074853182144Z/summary.json`（36项检查、计数、oracle与
+  hash），同目录逐项来源和日志；局部套解为
+  `cli_exit/20261015T074537042289Z/summary.json`、
+  `repl_owner/{scoped-verification,starter-round-trip}.json`、
+  `repl_recovery/20261015T074649266Z/summary.json`。最终交付范围、哈希与站点/视觉
+  核对见 `final-verification.json`。这些是本机 ignored 产物，clone 后的永久入口为
+  主章、各包 README/contracts/real、examples 和共享 support，未覆盖以前版本证据。
+- 已推送基线 `dcf325b` 的 [mdBook 38699535934](https://github.com/YanqingXu/lua_rust/actions/runs/38699535934)
+  成功；本轮末次观察 [Rust CI 38699536098](https://github.com/YanqingXu/lua_rust/actions/runs/38699536098)
+  仍 in_progress，三个 Miri/ASan job 成功，Windows Quality Gate 尚在运行。初查与
+  末次明细分别是 `baseline-rust.json`、`baseline-rust-final.json`；mdBook 明细为
+  `baseline-book.json`。这是旧提交 CI，不是本批改动的远端验证结果，也不套用上一
+  SHA 的失败原因。提交前查终态：仅 Windows Quality Gate 失败，失败步骤为
+  `Enforce verified official source cases` 和 `M1 foundation and quality gate`，
+  其余三个 Miri/ASan job 成功。失败日志下载返回 HTTP 403 / API rate limit exceeded，
+  具体原因未核实；明细与输出分别保存于 `push-baseline-rust.json`、
+  `push-baseline-failed.log`。
+
+若继续本版教学，可按“bytes 常量为何不能直接输出 JSON 文本 → CFG 为何按指令找
+leader → trace 为何记录执行前状态”推进工具问题链；CLI/REPL 这三问已完成，后续
+不要重复生成同一包。功能上修复续行漏判、原有 GC 缺口可另按明确指令启动。原审计
+仍暂停在 os.date/os.time 本地时间、UTC、DST，交接本身不表示恢复。
+
 ## 2026-10-15：v0.17 文件 userdata、close/tombstone、GC prune 与 Drop drain
 
 用户要求继续按问题链讲清 Lua 对象可达性与宿主句柄释放，补齐反例、差异、状态图、
