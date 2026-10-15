@@ -28,3 +28,19 @@ path = "exercises/acceptance.rs"
 [[test]]
 name = "gc_reference"
 path = "exercises/reference.rs"
+
+[[test]]
+name = "gc_borrow_exercises"
+path = "exercises/borrow/acceptance.rs"
+
+[[test]]
+name = "gc_borrow_reference"
+path = "exercises/borrow/reference.rs"
+
+[[test]]
+name = "gc_callbacks_exercises"
+path = "exercises/callbacks/acceptance.rs"
+
+[[test]]
+name = "gc_callbacks_reference"
+path = "exercises/callbacks/reference.rs"

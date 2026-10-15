@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="610" viewBox="0 0 900 610" role="img" aria-labelledby="title desc">
+  <title id="title">短借用：先提取拥有型子边，再重新借用 Heap</title>
+  <desc id="desc">错误路径在循环内仍读取 record.fields，却调用需要整个 Heap 可变借用的 enqueue，触发 E0499。正确路径先设置 marked 并复制拥有型 Vec Value，在 record 最后一次使用之后结束借用，再循环 enqueue。Vec 中若保存引用则仍借用 record；复制 handle 也不自动注册 GC roots。验收同时检查编译和子边扫描。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; }
+      .label { font-size: 18px; }
+      .small { font-size: 16px; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .flow { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="900" height="610" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">扫描需要读 record；排队又需要修改整个 Heap</text>
+  <text x="24" y="65" class="small">借用边界由最后一次使用决定；显式块帮助读者看到这个边界。</text>
+
+  <rect x="20" y="86" width="420" height="374" rx="12" fill="#fff8ee" stroke="#a45a24"/>
+  <text x="38" y="119" class="heading">错误：record 仍在被循环使用</text>
+  <rect x="40" y="143" width="380" height="58" rx="6" fill="#f4e1c9" stroke="#a45a24"/>
+  <text x="58" y="178" class="mono">record = &amp;mut self.records[id]</text>
+  <path d="M230 201V233" stroke="#a45a24" stroke-width="2"/>
+  <rect x="40" y="234" width="380" height="131" rx="6" fill="#fff" stroke="#a45a24"/>
+  <text x="58" y="265" class="mono">for value in &amp;record.fields {</text>
+  <text x="78" y="298" class="mono">self.enqueue(value.clone());</text>
+  <text x="58" y="331" class="mono">}</text>
+  <path d="M405 286H412V218H260" fill="none" stroke="#a45a24" stroke-width="2"/>
+  <text x="38" y="397" class="label">E0499：第二次 &amp;mut self 与</text>
+  <text x="38" y="427" class="label">仍被使用的 record 借用重叠。</text>
+
+  <rect x="460" y="86" width="420" height="374" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="478" y="119" class="heading">修复：拥有型工作项跨过边界</text>
+  <rect x="480" y="143" width="380" height="100" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="498" y="173" class="mono">let children = {</text>
+  <text x="518" y="201" class="mono">/* marked */ record.fields.clone()</text>
+  <text x="498" y="229" class="mono">};</text>
+  <path d="M670 243V282" class="flow"/>
+  <text x="688" y="267" class="small">record 最后一次使用</text>
+  <rect x="480" y="284" width="380" height="81" rx="6" fill="#f1edf7" stroke="#75519a"/>
+  <text x="498" y="315" class="mono">for value in children {</text>
+  <text x="518" y="344" class="mono">self.enqueue(value); }</text>
+  <text x="478" y="397" class="label">Vec&lt;Value&gt; 拥有子边数据；</text>
+  <text x="478" y="427" class="label">这时可以重新借用 Heap。</text>
+
+  <text x="24" y="501" class="small">Vec&lt;&amp;Value&gt; 仍指向 record，无法切断借用；无需 drop(&amp;mut record) 来“强制结束”。</text>
+  <text x="24" y="532" class="small">clone 复制 Value / handle，不复制目标对象，也不自动注册 GC root。</text>
+  <text x="24" y="563" class="small">验收必须同时满足：修复版能编译、两个 child 入队并扫描、不可达自环仍未标记。</text>
+  <text x="24" y="594" class="small">这是 mark_one 的局部模型；真实实现另有 weak 分类、typed handle 校验和访问失败路径。</text>
+</svg>

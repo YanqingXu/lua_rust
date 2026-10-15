@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="576" viewBox="0 0 900 576" role="img" aria-labelledby="title desc">
+  <title id="title">回调报错：保存首错、继续 drain、恢复外层 roots 后再返回</title>
+  <desc id="desc">批次 A B C 的 A 和 B 报错。错误问号在 A 处立即返回，只执行 A 且跳过临时 roots 清理。修复保存 A 错误，继续 B 但不覆盖首错，再执行 C，最后 truncate 到 root_base 保留外层 root 900，然后返回 A 错误。后续 GC 可以回收无其他 roots 的兄弟对象。此流程是 Result 错误协议，不是 panic abort 清理保证。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; }
+      .label { font-size: 18px; }
+      .small { font-size: 16px; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .flow { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="900" height="576" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">先完成本批消费与清理，再把第一个错误交还调用者</text>
+  <text x="24" y="65" class="small">输入：A / B 报错、C 成功；已有外层 root 900；整批 roots 已在第一个回调前追加。</text>
+
+  <rect x="20" y="86" width="860" height="100" rx="12" fill="#fff8ee" stroke="#a45a24"/>
+  <text x="38" y="118" class="label">错误：invoke(A)? → 立即 Err(A)</text>
+  <text x="38" y="149" class="small">只执行 A；B / C 被跳过；truncate 未执行，整批 roots 仍保留，后续 GC 也无法回收。</text>
+  <text x="38" y="176" class="mono">calls = [1]    roots = [900, 101, 1, 102, 2, 103, 3]</text>
+
+  <rect x="40" y="226" width="222" height="102" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="151" y="257" text-anchor="middle" class="label">A → Err(1)</text>
+  <text x="151" y="288" text-anchor="middle" class="small">first_error = Some(1)</text>
+  <text x="151" y="313" text-anchor="middle" class="small">保存首错，继续循环</text>
+  <rect x="339" y="226" width="222" height="102" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="450" y="257" text-anchor="middle" class="label">B → Err(2)</text>
+  <text x="450" y="288" text-anchor="middle" class="small">已有首错，保留 Some(1)</text>
+  <text x="450" y="313" text-anchor="middle" class="small">继续循环</text>
+  <rect x="638" y="226" width="222" height="102" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="749" y="257" text-anchor="middle" class="label">C → Ok</text>
+  <text x="749" y="288" text-anchor="middle" class="small">仍然执行到第三项</text>
+  <text x="749" y="313" text-anchor="middle" class="small">batch 耗尽</text>
+  <path d="M262 276H338" class="flow"/>
+  <path d="M561 276H637" class="flow"/>
+
+  <rect x="40" y="376" width="821" height="92" rx="6" fill="#f1edf7" stroke="#75519a"/>
+  <text x="60" y="408" class="mono">truncate(root_base) → roots = [900] → Err(Callback(1))</text>
+  <text x="60" y="440" class="small">恢复旧长度，不用 clear() 删除外层 roots；下一轮 GC 可以回收无其他 roots 的兄弟对象。</text>
+  <path d="M749 328V375" class="flow"/>
+  <text x="24" y="509" class="small">验收四项：calls=[1,2,3]、返回 A 首错、仅保留外层 roots、后续对象可回收。</text>
+  <text x="24" y="540" class="small">同一个 VM 的错误后探针验证兄弟回调已执行；roots 清理由模型验收与真实源码共同核对。</text>
+  <text x="24" y="568" class="small">这是 Result::Err 路径协议，没有承诺 panic / abort 时仍执行相同清理。</text>
+</svg>

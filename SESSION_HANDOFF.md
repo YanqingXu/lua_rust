@@ -3,6 +3,62 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.14 短借用、finalizer 事件与回调重入
+
+用户要求沿问题链继续完善短借用、事件所有权与回调重入，补齐反例、代码差异、状态图
+和验收练习。本次完成该教学工作包，**没有恢复原审计整改目标**。以下旧记录属于各自
+历史版本，不代表本次验证范围。
+
+- 起点为 `main@14ca9c066af94b7a8ed2a86cf1561e6f94e7d435`，开始时工作区干净，
+  本地与 origin/main 一致，提交前 fetch 再次核对无分叉。这是上一批已提交并推送的
+  三问题教学包；用户随后明确要求把本次章节、状态图、练习包与交接一起提交并推送。
+  本批提交号以 `git log -1 -- book/src/versions/v14-incremental-gc.md` 为准，新提交
+  CI 须按其 SHA 查询。生产 `crates/`、v0.14 快照核心和既有测试均无 diff。
+- [主章](book/src/versions/v14-incremental-gc.md) 接续为四个微课：长 record 借用触发
+  E0499 → 提取拥有型子边；clone 队列重复消费 → `mem::take`；拥有事件不保活兄弟
+  handle → 第一个 callback 前注册全批 roots；`?` 跳过事件/清理 → 保存首错、继续
+  drain、`truncate(root_base)` 后返回。每题包含预测、反例、前后 include/diff、真实
+  源码对应与可观察完成条件。新增三幅 SVG，并已在浏览器核对文字、箭头及实际页面。
+- [短借用包](book/code/v14-incremental-gc/exercises/borrow/README.md) 用独立 rustc
+  子进程检查固定 before 的 **E0499**，参考解同时验收两个 child 入队/扫描与不可达
+  自环。默认参考 2 项，学习者 TODO 1 项；故意无法编译的输入不作为 Cargo target。
+- [回调包](book/code/v14-incremental-gc/exercises/callbacks/README.md) 有三个独立
+  hook TODO、固定故障与参考解、九项默认验收；`finalizer_problem_chain` CLI 固定
+  重放 `ownership|roots|errors|real|all`，重入总额度为 1，错误版不会无限递归。
+  真实 Heap 保留 owned events 后再运行下一周期，用 `userdata_is_finalized` 与
+  `function_proto` 实际访问证明兄弟对象的存活；真实 VM 两次 GC 重入得到序列 123，
+  第二个 callback 经 `setfinalizer(value,nil)` 校验 userdata。错误后同 VM 探针得到
+  `(Type,true)`，只证明错误类型与兄弟已执行；roots 的精确清理由模型合同与源码核对。
+- 教学边界已明确：NLL 结束的是 record 借用，复制 Value/handle 不自动注册 GC root；
+  `finalized` 防重复发现，take 防重复取出，全批 roots 防嵌套 GC 中兄弟 second death。
+  Result 首错清理不外推到 panic/abort；外层捕获的 step 不代表回调后的即时 phase。
+- 本地 `rustc/cargo 1.96.1`：fmt、all-targets Clippy `-D warnings` 通过；Debug/Release
+  workspace 各 **103 通过、7 ignored**（84 项原测试 + 8 项旧参考 + 11 项新参考）。
+  显式启用七题初始均失败；本轮新增四题分别完成“失败 → 临时参考解通过 → 字节恢复
+  后再失败”。最终 starter 哈希与初始一致，默认 ignored 不表示学习者已完成。
+- 两个 CLI 的关键结果已核对。十条逐题精确命令均执行到 1 项测试：7 正向通过、3
+  回调 learner 按预期失败，其中 borrow 两条为章内 aggregate 的拆分逐题命令。
+  全 20 版本教学结构、mdBook 构建及 38 页链接检查通过：**1,181 站内链接、0 broken**。
+- 新证据独立保存在 `target/teaching-v14-callbacks-2026-10-15/`：
+  `full-validation/20261015T023801836023Z/summary.json` 与 `metadata.json` 记录整套
+  命令/计数/源码哈希；`borrow-validation/20261015T023334878-summary.json` 和
+  `starter-round-trip.json` 记录套解与恢复；`chapter-command-checks/` 记录逐题命令；
+  `final-verification.json` 记录站点检查、最终输入哈希和 CI 观察。本目录为本机忽略
+  产物，不随 clone 提供，永久入口是章节与两个 README。没有覆盖上一批的
+  `target/teaching-v14-2026-10-15/` 历史证据。
+- `14ca9c0` 的 CI 与本次未提交修改分别记录。2026-10-15 10:40 CST 观察：
+  [mdBook 38671128155](https://github.com/YanqingXu/lua_rust/actions/runs/38671128155)
+  已成功；[Rust CI 38671128205](https://github.com/YanqingXu/lua_rust/actions/runs/38671128205)
+  仍运行中，GC/native Miri 与 Linux ASan 已成功，Windows quality 和另一 Miri 仍运行。
+  提交前重新查询终态：Rust CI 失败，仅 Windows quality 失败，其余三个 job 成功；
+  失败日志显示 Clippy 的 `fetch_update` deprecated 导致 3 个编译错误，Debug/Release、
+  doctest、cargo doc、audit 均通过。日志存于同证据目录的
+  `push-preflight-ci-14ca9c0.log`；该结果属于 `14ca9c0`，不代表本次尚待推送提交的 CI。
+
+下一教学包可单独从 weak key 的“只传播一轮为什么不够”构造 ephemeron 固定点反例，
+再处理模式变更与 resurrection 的清理顺序。按后续用户指令启动；原审计队列仍暂停在
+本地时间/UTC/DST。提交与推送由当次指令授权，不从上一次推送请求自动延续。
+
 ## 2026-10-15：v0.14 强引用增量 GC 问题链
 
 用户要求围绕“分步回收 → 跨调用保存进度 → write barrier”完善 v0.14，补齐可运行

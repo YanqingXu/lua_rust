@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="750" viewBox="0 0 900 750" role="img" aria-labelledby="title desc">
+  <title id="title">Finalizer 批次：事件所有权与 GC 保活分别交接</title>
+  <desc id="desc">首先 mem take 把 Heap ready 队列中的 A B 移到 VM 拥有的 batch，源队列为空。然后在调用任何事件前记录 root_base 并追加整批 callback 和 userdata 为 temporary roots。A 回调重入 GC 时取不到正在消费的旧事件，B 虽无活动调用帧仍从临时 roots 可达。A 返回后继续 B，最终 truncate 到旧长度，保留外层 roots。拥有 Vec 只保护事件内存，不保护其中 handle 指向的 GC 对象。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <marker id="purple" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#75519a"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; }
+      .label { font-size: 18px; }
+      .small { font-size: 16px; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .flow { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#arrow); }
+      .root { fill: none; stroke: #75519a; stroke-width: 2; marker-end: url(#purple); }
+    </style>
+  </defs>
+  <rect width="900" height="750" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">先交接事件所有权，再为全批对象注册 GC roots</text>
+  <text x="24" y="65" class="small">A / B 是已排好的 finalizer 事件；每项持有 callback 与 userdata 的 handle。</text>
+
+  <rect x="20" y="86" width="860" height="184" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="38" y="117" class="label">① Rust 所有权：take 返回后，Heap 借用已结束，旧批次由 VM 持有</text>
+  <rect x="40" y="143" width="244" height="65" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="162" y="170" text-anchor="middle" class="mono">Heap.ready = [A, B]</text>
+  <text x="162" y="194" text-anchor="middle" class="small">交接前</text>
+  <path d="M284 175H570" class="flow"/>
+  <text x="340" y="161" class="mono">mem::take</text>
+  <rect x="572" y="143" width="284" height="65" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="714" y="182" text-anchor="middle" class="mono">VM.batch = [A, B]</text>
+  <text x="40" y="244" class="mono">交接后 Heap.ready = []</text>
+  <text x="405" y="244" class="small">克隆会留下旧事件，重入可再次取到。</text>
+
+  <rect x="20" y="290" width="860" height="186" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="38" y="322" class="label">② GC 可达性：第一个 callback 之前，就追加全批 temporary roots</text>
+  <rect x="40" y="344" width="816" height="50" rx="6" fill="#fff" stroke="#75519a"/>
+  <text x="60" y="376" class="mono">[ 外层 roots … | A.callback, A.userdata | B.callback, B.userdata ]</text>
+  <text x="40" y="424" class="small">记录 root_base ↑ 旧前缀保留</text>
+  <text x="443" y="424" class="small">整批对象即使尚未调用，也能被 collector 找到</text>
+  <text x="40" y="455" class="small">只有当前活动帧时：A 可以存活，B 却可能在下一轮 GC 中被误收。</text>
+
+  <rect x="40" y="511" width="200" height="74" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="140" y="541" text-anchor="middle" class="label">③ 调用 A</text>
+  <text x="140" y="568" text-anchor="middle" class="small">嵌套 gc_collect</text>
+  <rect x="330" y="511" width="260" height="74" rx="6" fill="#fff" stroke="#75519a"/>
+  <text x="460" y="541" text-anchor="middle" class="label">旧事件源队列为空</text>
+  <text x="460" y="568" text-anchor="middle" class="small">B 从整批 roots 可达</text>
+  <rect x="680" y="511" width="176" height="74" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="768" y="541" text-anchor="middle" class="label">④ 继续调用 B</text>
+  <text x="768" y="568" text-anchor="middle" class="small">每项执行一次</text>
+  <path d="M240 549H329" class="flow"/>
+  <path d="M590 549H679" class="flow"/>
+  <path d="M845 394V493H460V510" class="root"/>
+
+  <rect x="40" y="623" width="816" height="50" rx="6" fill="#fff" stroke="#286047"/>
+  <text x="60" y="655" class="mono">⑤ truncate(root_base) → [ 外层 roots … ]</text>
+  <path d="M768 585V622" class="flow"/>
+  <text x="24" y="710" class="small">拥有 Vec 保证事件内存可用；显式 roots 保证 handle 指向的 GC 对象可用。两者缺一不可。</text>
+  <text x="24" y="739" class="small">finalized 防止未来周期重复发现；take 防止重复取出；全批 roots 防止回调间的 second death。</text>
+</svg>

@@ -1,26 +1,30 @@
 # v0.14 · 增量 GC、弱表与 Finalizer
 
-<div class="lesson-meta"><span>问题链：分步 → 保存进度 → 写入修复</span><span>workspace</span><span>checkpoint v0.14</span></div>
+<div class="lesson-meta"><span>分步 → 进度 → barrier → 短借用 → 事件 → 重入</span><span>workspace</span><span>checkpoint v0.14</span></div>
 
 <a id="learning-task-card"></a>
 ## 学习任务卡
 
 <div class="task-card">
-  <strong>把一次完整遍历拆成可暂停状态机</strong>
-  <p>前置：v0.13 的 roots/edges、mark/sweep 与 Heap owner。本轮先解决三个问题：怎样分步
-  回收、下一次调用怎样接着做、步骤之间写入新引用怎样避免误收。沿问题引入 enum/match、
-  持久 Vec/游标、Option 完成信号与封装写入；每个改动都由同一个反例前后对照验收。</p>
+  <strong>把一次完整遍历拆成可暂停、可回调的状态机</strong>
+  <p>前置：v0.13 的 roots/edges、mark/sweep 与 Heap owner。先解决分步、保存进度和
+  写入修复，再追问：扫描时怎样结束短借用、谁拥有待执行事件、回调重入和报错时谁负责
+  保活与收尾。产出是三个强引用 TODO、一个编译器借用实验、三个回调 TODO；每次改动
+  都用同一反例前后对照。weak/ephemeron 固定点留作扩展阅读。</p>
 </div>
 
 v0.13 的一次 `collect` 要做完本轮 mark/sweep 才返回。现在让 VM 在回收步骤之间继续
 执行 Lua，就会依次遇到三个问题：**怎样交还控制权，怎样记住进度，怎样修复扫描之后
-新增的边**。本章先讲透这条强引用问题链。快照已有的自动 checkpoint、weak table 和
-finalizer 保留在后面的扩展阅读，不作为这三个练习的前置知识。
+新增的边**。前三问讲强引用状态机，后四问沿着“扫描 → 交还事件 → 调用 Lua”继续
+追踪 Rust 借用、事件所有权、GC roots 与错误路径。自动 checkpoint、weak table 和
+resurrection 的完整语义保留在扩展阅读，不作为前半练习的前置知识。
 
-本轮配套代码有两个层次：`exercises/model.rs` 是只含强引用的可运行小模型，用来替换
+配套代码分层验证：`exercises/model.rs` 是只含强引用的可运行小模型，用来替换
 错误设计、观察确定性轨迹；真实快照仍在 `crates/` 中，另用真实 `Heap` 对照验收。
 小模型不是三份历史 VM 快照，也不支持 weak/finalizer。它复用真实 core 的
-`GcPhase`、`GcStep` 和 `GcStats`，让概念可以逐项对应，而不混淆验证范围。
+`GcPhase`、`GcStep` 和 `GcStats`。`exercises/borrow/` 用 rustc 检验真实借用冲突；
+`exercises/callbacks/` 从已排好的事件批次开始模拟重入，另以真实 Heap/VM 验证保活、
+调用次数和错误后续执行。后者不模拟 Atomic、weak 或完整 Lua VM。
 
 <a id="learning-predict"></a>
 ## 先预测再运行
@@ -51,7 +55,10 @@ CLI 在同一次运行中并列展示错误和修复后的行为；预期错误�
 3. 真实 core 的 `Heap`、`GcPhase`、`GcStep`：谁拥有跨调用状态，怎样表达未完成与完成；
 4. `Heap::step` 的 Pause/Mark/Atomic/Sweep 分支，再看 `collect` 怎样循环调用 step；
 5. `table_set → write_barrier → enqueue_value`：集中处理新增边；
-6. 最后运行 `budget=1`/完整回收对照与 late child 保活验收。
+6. 运行 `budget=1`/完整回收对照与 late child 保活验收；
+7. `mark_one` 的 record 借用 → 拥有型子边 → `enqueue_value`，对照短借用实验；
+8. `Heap::take_finalizers → Vm::gc_step_internal → invoke_callable`：先移走事件、
+   再保护全批 roots、最后调用 Lua 并收尾。
 
 ## 问题一：怎样在回收尚未完成时交还控制权？
 
@@ -293,10 +300,234 @@ cargo test --manifest-path $gcManifest -p lua_core tests::write_barrier_keeps_a_
 还覆盖 table key、metatable、upvalue、userdata 等 mutation family。三个练习只证明
 上面的强引用案例；不能把模型验收外推为全部写入路径、weak table 或 finalizer 已验收。
 
-## 扩展阅读：快照中已有的自动调度、弱表与 Finalizer
+## 问题四：借着 record，为什么不能继续修改 Heap？
 
-以下内容帮助定位最终 v0.14 已有能力。第一遍可以先完成章末的三个练习，再回来阅读；
-本次问题链没有新增 weak/ephemeron/finalizer 的实现或练习。
+### 编译通过前，先让编译器指出冲突
+
+扫描 parent 时，我们已借用 `self.records[id]`，却还要调用需要 `&mut self` 的
+`enqueue`。先预测：把以下循环写进 `mark_one`，rustc 会接受吗？
+
+```rust,ignore
+{{#include ../../code/v14-incremental-gc/exercises/borrow/before.rs:long_borrow_before}}
+```
+
+循环每轮还要读取 `record.fields`，由 Heap 派生的可变借用仍在使用；调用整个 Heap 的
+可变方法就与之重叠。这里应观察到 **E0499**，不是 GC 运行时报错。反例作为独立
+rustc 输入保存，不是 Cargo 自动编译的 target；下面两项默认验收分别检查编译失败
+的错误码，以及修复后的编译和运行结果。
+
+```powershell
+cargo test --manifest-path $gcManifest --test gc_borrow_reference -- --nocapture
+```
+
+这条命令通过表示“错误版确实被拒绝，修复版行为正确”。如果把第二次调用改成只修改
+互不相交的字段，编译器有时能拆分字段借用；本例的冲突来自 `enqueue(&mut self, …)`
+借用整个 Heap，不能概括成“借过一个字段就不能改其他任何字段”。
+
+### 先拥有待处理子边，再结束 record 借用
+
+我们需要离开 record 后仍能使用子边，所以应提取 `Vec<Value>`，而非仍指回 record
+的 `Vec<&Value>`。最小差异是把读取与队列修改分开：
+
+```diff
+- for value in &record.fields { self.enqueue(value.clone()); }
++ let children = { /* 借用 record、设置 marked */ record.fields.clone() };
++ for value in children { self.enqueue(value); }
+```
+
+可编译的完整方法如下：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/borrow/solution.rs:short_borrow_solution}}
+```
+
+Rust 的 NLL（非词法生命周期）在最后一次使用后结束借用；显式块使边界容易看见，
+不需要 `drop(&mut record)`。`clone` 复制 Value 和 handle，不复制目标 GC 对象，也
+不自动把对象加入 roots。此时只解决了“工作项离开借用后还可使用”，保活还要由后续
+入队、扫描和真实 GC roots 完成。
+
+![长借用跨过 enqueue 导致冲突；提取拥有型子边后，record 借用结束，才能重新借用 Heap。](../images/v14-short-borrow.svg)
+
+验收要求 parent 扫描后 `gray=[1, 2]`，继续排空后 parent 与两个 child 都 marked，
+不可达自环仍未标记。删掉循环虽然可能消除 E0499，却不能通过行为验收。
+
+真实 `Heap::mark_one` 将 table 条目、closure/upvalue 或 userdata 的待追踪值提取成
+本地 `values` / `references`，在 record 最后一次使用后执行 `self.gray.extend` 与
+`self.enqueue_value`。它还处理 weak 分类和访问错误；四对象借用模型没有这些合同。
+
+**完成条件：** 只改 `borrow/starter.rs::mark_one`，让显式学习者测试从 E0499 失败变为
+编译且行为通过。随后考虑：GC 扫描结束，要把 finalizer 交给能再次调用 GC 的 Lua，
+还可以借着 Heap 内部队列遍历吗？
+
+## 问题五：事件交给 VM 后，为什么必须从 Heap 队列移走？
+
+### 拥有一份 clone，原队列仍然在那里
+
+本节从已发现的两个 finalizer 事件 A/B 开始。事件只包含 userdata/callback 的 handle。
+先预测：VM 克隆事件 Vec，再执行 A；A 重入回收并再次取队列，是否还会取到 A/B？
+
+```powershell
+cargo run --quiet --manifest-path $gcManifest --example finalizer_problem_chain -- ownership
+```
+
+错误版只允许**总共一次重入**，因此不会无限递归；仍会得到 `calls=[1, 1, 2, 2]`，
+且源队列 `pending=2`。错误来自重复取到同一批事件，不能靠增加递归上限来修复。
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/callbacks/starter.rs:callback_take_starter}}
+```
+
+只替换事件交接这一处：
+
+```diff
+- pending.clone()
++ std::mem::take(pending)
+```
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/callbacks/solution.rs:callback_take_solution}}
+```
+
+`mem::take` 移走旧 Vec，并在原位置留下空 Vec；返回值拥有整批事件，函数返回后对
+Heap 的借用已经结束。执行 A 时重入只会看到空的源队列，于是本例变为 `calls=[1, 2]`、
+`pending=0`。真实 `Heap::take_finalizers` 使用相同操作，VM 随后才调用需要
+`&mut self` 的 `invoke_callable`。
+
+Atomic 在发现事件时先设 `finalized=true`，防止以后周期再次**发现**同一 userdata；
+移走 ready 队列防止当前事件再次被**取出**。两处解决不同的问题，不能互相替代。
+
+```powershell
+cargo test --manifest-path $gcManifest --test gc_callbacks_reference transferred_batch_is_invisible_to_reentry -- --exact
+```
+
+**完成条件：** 源队列在第一个 callback 前已经为空，重入不会重复执行当前批次。
+但这份拥有型 Vec 里只有 GC handle；下一问仍然必须回答它们在嵌套 GC 中怎样存活。
+
+## 问题六：拥有事件 Vec，为什么仍会误收尚未执行的兄弟事件？
+
+### 当前调用帧只能保护当前事件
+
+沿用 A/B，改回正确的 `take`，只移除“全批临时 roots”。A 正在执行时，其活动帧能
+保护 A 的 callback/参数；B 还没有调用帧。A 发起下一轮 GC，collector 不会自动扫描
+Rust 栈中所有 Vec，B 的 userdata 与 callback 便可能消失。
+
+```powershell
+cargo run --quiet --manifest-path $gcManifest --example finalizer_problem_chain -- roots
+```
+
+错误版得到 `calls=[1]` 和 `Err(Stale(2))`；它仍拥有 B 的事件，却不能继续访问 B。
+这是独立模型的错误类型，不是伪造真实 Heap 的诊断。修复必须在**第一个回调之前**
+保护整批事件：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/callbacks/starter.rs:callback_pin_starter}}
+```
+
+```diff
+- // 只依赖当前 invoke 的活动帧；没有保护尚未调用的事件
++ for event in events {
++     roots.push(event.callback);
++     roots.push(event.userdata);
++ }
+```
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/callbacks/solution.rs:callback_pin_solution}}
+```
+
+真实 VM 的 `gc_roots` 包含 `temporary_roots`。`gc_step_internal` 先记录旧长度
+`root_base`，再把整批 callback 和 userdata 的 Value 都推入，最后才逐个调用。图中
+“Rust 事件所有权”和“collector 的可达根”是两个维度：
+
+![mem::take 转移事件批次；全批临时 roots 独立保护 userdata 和 callback，使 A 重入时 B 仍可访问。](../images/v14-finalizer-batch.svg)
+
+### 用真实访问证明保活
+
+```powershell
+cargo test --manifest-path $gcManifest --test gc_callbacks_reference real_heap_owned_vec_requires_explicit_roots -- --exact
+cargo test --manifest-path $gcManifest --test gc_callbacks_reference real_vm_reentrant_finalizer_keeps_sibling_alive_and_runs_once -- --exact
+```
+
+第一项保留真实 `Heap::take_finalizers` 返回的 Vec，再启动完整下一周期。仅 root 当前
+事件时，B 的 `userdata_is_finalized` 与 `function_proto` 都访问失败；root 全批时两者
+都成功。检查 object ID 只能证明 handle 中还有数字，不能证明对象仍存在。
+
+第二项运行以下真实 VM 输入（Rust 包装只负责 compile/execute）：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/callbacks/real.rs:callback_real_pair}}
+```
+
+A 内调用两次 `gc_collect`，避免一次只完成外层剩余 Sweep 而没有真正进入下轮的
+假阳性。B 的 callback 仍能调用，并用 `setfinalizer(value, nil)` 实际访问 userdata；
+最后序列必须为 **123**，从而同时证明 A 重入返回后继续执行、B 存活且每项只调用一次。
+这是同步重入，没有涉及线程或 async。
+
+**完成条件：** 小模型从 stale 变为 `calls=[1, 2]` / `Ok(())`，真实 Heap 的两个对象
+访问都成功，真实 VM 得到 123。下一问是：已保活整批事件，如果 A 报错，B 和临时
+roots 又由谁收尾？
+
+## 问题七：第一个 callback 报错，为什么不能立即用 `?` 返回？
+
+### 提前传播错误会同时跳过事件与清理
+
+先预测 A、B、C 三个事件，A/B 都报错，C 成功。外层已有一个 root 900，drain 前
+追加全批 roots。下面的 `?` 会使调用序列、最后的 roots 分别变成什么？
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/callbacks/starter.rs:callback_drain_starter}}
+```
+
+```powershell
+cargo run --quiet --manifest-path $gcManifest --example finalizer_problem_chain -- errors
+```
+
+错误版只得到 `calls=[1]`，返回 `Callback(1)`，全批 roots 还留在 Vec 中。下一次 GC
+仍保留本应可回收的兄弟对象；只检查“返回了错误”会漏掉这两处副作用。
+
+```diff
+- vm.invoke(event)?;
++ if let Err(error) = vm.invoke(event) {
++     if first_error.is_none() { first_error = Some(error); }
++ }
+  // 遍历完剩余事件后
+  vm.truncate_roots(root_base);
+- Ok(())
++ first_error.map_or(Ok(()), Err)
+```
+
+完整修复如下，重点是先保存长度、继续 drain、恢复长度，再返回首错：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/callbacks/solution.rs:callback_drain_solution}}
+```
+
+![A 报错后保存首错，B、C 继续执行，最后恢复外层 roots 并返回 A 的错误；提前问号会跳过后续。](../images/v14-finalizer-errors.svg)
+
+修复后必须得到 `calls=[1, 2, 3]`，仍返回 `Callback(1)`，roots 精确恢复为 `[900]`。
+这里不能 `clear()`，否则会删除外层调用的 roots；也不能用 B 的错误覆盖 A。后续 GC
+可以回收无其他 roots 的兄弟对象，说明清理没有泄漏。
+
+```powershell
+cargo test --manifest-path $gcManifest --test gc_callbacks_reference callback_error_drains_and_restores_roots -- --exact
+cargo test --manifest-path $gcManifest --test gc_callbacks_reference real_vm_callback_error_still_executes_the_sibling -- --exact
+```
+
+真实 VM 对照中，A 触发 Type 错误，但 B 仍设置 `sibling_after_error=true`；随后在
+**同一个 VM** 执行探针读取该值。真实实现也在 `gc_step_internal` 中保存首错并清理
+temporary roots；但重新 `execute` 本身会清空临时 roots，所以该探针只证明错误类型
+和兄弟回调已执行，精确清理由模型合同与真实源码中的 `truncate(root_base)` 核对。
+这一协议处理这里的 `Result::Err` 路径，没有承诺 panic/abort 时也
+执行相同清理；callback 还可能推进 GC，因此外层先前捕获的 step 结果不代表回调后的
+即时 phase。
+
+**完成条件：** 调用次数、首错、外层 roots 保留、后续对象可回收四项一起成立。
+这些实验验证事件消费协议；weak/ephemeron 与 resurrection 仍需各自的具体反例。
+
+## 扩展阅读：自动调度、弱表与 resurrection
+
+以下内容帮助定位最终 v0.14 已有能力。第一遍可以先完成章末练习，再回来阅读；
+完整 weak/ephemeron 教学尚未拆成问题链。
 
 ## Allocation accounting 与自动 checkpoint
 
@@ -331,7 +562,9 @@ finalizer、重新标记相关 userdata/callback 并排空 gray，最后清理�
 
 Object ID 顺序让教学测试可重复，但不是 v1.0 要宣称的 Lua 5.1 finalizer 顺序合同。正式兼容收口时必须与官方 oracle 对照并登记差异。
 
-VM 在执行任一 callback 前，把整批 callback 和 userdata 放入 temporary roots，因此一个 finalizer 内部重入 `gc_collect` 不会让尚未执行的兄弟事件提前 second-death。某个 callback 报错时仍执行队列剩余项，随后把第一个错误交还脚本；下一次执行可以继续完成 Sweep，不会留下半周期状态。
+问题五至七已单独验收事件转移、整批保活和错误后继续执行；这里的 resurrection 则是
+callback 主动把对象发布到新的长期 root。当前 VM 中 callback 报错后允许调用者再次
+执行并继续推进 GC，不能因此认为报错时周期已经全部完成。
 
 ## Rust 知识映射与设计选择
 
@@ -371,9 +604,9 @@ type=number value=714
 ```
 
 基础快照的 84 项测试仍保留：59 个端到端测试、7 个编译器测试、15 个 core 测试和
-3 个 VM 测试。本轮新增 8 项强引用问题链参考验收，默认 workspace 合计 **92 项通过、
-3 项学习者 TODO 显式 ignored**，分别按下面的入口统计。默认通过只能说明参考合同与原有回归通过，
-不表示三个 TODO 已经完成。旧快照里的 weak/finalizer 测试也不等于本轮新增了相关微课。
+3 个 VM 测试。三个强引用问题另有 8 项参考验收；本次短借用新增 2 项、事件与重入新增
+9 项参考验收，默认 workspace 合计 **103 项通过、7 项学习者 TODO 显式 ignored**。
+默认通过说明反例检测、参考合同与原有回归通过，不表示七个 TODO 已完成。
 
 ## 本版本暂不支持
 
@@ -443,6 +676,42 @@ starter 中的错误设计能编译，因此用 ignored 将它们与默认回归
 固定，节点是简单强引用图。真实 Heap 使用任意字节 Value、typed handle 和更多对象
 种类；若要扩大到这些路径，应另建具体反例和验收，不能直接外推本轮结果。
 
+### 短借用、事件与重入的四项验收
+
+理解题：先解释 `Vec<&Value>` 为什么仍会借着 record，再只改
+`exercises/borrow/starter.rs::mark_one`，让编译与子边扫描同时通过。不要修改固定的
+`before.rs`、compiler 检测器或行为断言。
+
+实现题：只改 `exercises/callbacks/starter.rs` 的 `take_batch` 与 `pin_batch`。
+先移走源队列，再在任一 callback 前保护全批；不能靠禁止重入、增加长期全局 root 或
+直接删除事件通过验收。
+
+调试题：只改同一 starter 的 `drain_batch`。保留外层 root，继续执行报错项之后的
+事件，恢复临时 roots，再返回首错。合同分别注入一个坏 hook，其他 hook 使用参考
+实现，因此每题都可以独立修复。
+
+```powershell
+# 初始分别 1 项失败、3 项失败；完成后必须全部通过。
+cargo test --manifest-path $gcManifest --test gc_borrow_exercises -- --ignored
+cargo test --manifest-path $gcManifest --test gc_callbacks_exercises -- --ignored
+
+# 固定反例、参考改动与真实 Heap/VM 对照，合计 11 项通过。
+cargo test --manifest-path $gcManifest --test gc_borrow_reference --test gc_callbacks_reference
+```
+
+| 学习者验收 | 修改位置 | 完成后必须观察到 |
+|---|---|---|
+| `short_borrow_scans_owned_edges` | borrow 的 `mark_one` | 编译通过；两个 child 入队并扫描，不可达自环仍未标记 |
+| `transferred_batch_is_invisible_to_reentry` | callbacks 的 `take_batch` | A/B 各执行一次，源 pending 为空 |
+| `whole_batch_roots_protect_siblings` | callbacks 的 `pin_batch` | A 重入时 B 的 userdata/callback 都存活，结束恢复外层 roots |
+| `callback_error_drains_and_restores_roots` | callbacks 的 `drain_batch` | A/B 报错仍执行 C、返回 A 首错、仅保留外层 roots、后续可回收 |
+
+[短借用说明](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/exercises/borrow/README.md)
+和 [回调说明](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/exercises/callbacks/README.md)
+提供独立复现命令、可选参考解和实验边界。两个 CLI 都固定重放错误与修复，退出码 0
+只表示重放完毕；学习者完成状态由上述 `--ignored` 验收决定。短借用题在 rustc 子进程
+内编译，因此保留初始 E0499 不会让 workspace 构建失败。
+
 <a id="learning-checkpoint"></a>
 ## 完成检查点
 
@@ -451,7 +720,10 @@ starter 中的错误设计能编译，因此用 ignored 将它们与默认回归
 - 能用八次 trace 解释为什么每次重建进度无法收敛；
 - 能先扫描 A、再写入 B，复现并修复遗漏 barrier 的误回收；
 - 能区分概念颜色、真实 marked bool、待处理队列，以及 step 的完成信号；
-- 三项学习者验收显式运行通过，并能解释模型与真实 Heap 对照的范围。
+- 能让 record 借用先结束，并说明拥有型子边不等于 GC root；
+- 能分开解释 `finalized`、`mem::take`、全批 temporary roots 的作用；
+- 能手推 A 重入时源队列、B 的可达性、首错和 root_base 的变化；
+- 七项学习者验收显式运行通过，并能解释小模型、编译器和真实 Heap/VM 各自验证的范围。
 
 ## 与成熟实现和专题章节的对应
 

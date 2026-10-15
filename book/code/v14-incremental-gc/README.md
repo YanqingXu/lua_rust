@@ -24,5 +24,28 @@ cargo test --manifest-path book/code/v14-incremental-gc/Cargo.toml --test gc_exe
 ```
 
 参考验收 8 项通过；学习者三个 TODO 初始显式运行失败，修复后应有 3 项通过。
-默认 workspace 保留 84 项旧测试、新增 8 项参考验收，3 项 TODO 显式 ignored。
 CLI 固定重放前后设计，完成练习以 `gc_exercises -- --ignored` 为准。
+
+## 继续追问：短借用、事件所有权与回调重入
+
+[短借用实验](exercises/borrow/README.md) 从实际 rustc `E0499` 反例开始，提取拥有型
+子边后结束 record 借用，再重新借用 Heap 排队。它同时验收编译与扫描结果，避免通过
+删掉循环来消除错误。
+
+[事件与回调实验](exercises/callbacks/README.md) 分别替换三个设计：clone 队列改为
+`mem::take`，当前调用帧保活改为全批临时 roots，`?` 立即退出改为记录首错、继续 drain、
+恢复外层 roots 后返回。独立模型提供固定反例，真实 Heap/VM 另验证对象访问与调用行为。
+
+```powershell
+cargo test --manifest-path book/code/v14-incremental-gc/Cargo.toml --test gc_borrow_reference --test gc_callbacks_reference
+cargo run --quiet --manifest-path book/code/v14-incremental-gc/Cargo.toml --example finalizer_problem_chain
+
+# 初始分别 1 项、3 项失败；完成对应 starter 后应全部通过。
+cargo test --manifest-path book/code/v14-incremental-gc/Cargo.toml --test gc_borrow_exercises -- --ignored
+cargo test --manifest-path book/code/v14-incremental-gc/Cargo.toml --test gc_callbacks_exercises -- --ignored
+```
+
+短借用参考 2 项、回调参考 9 项。默认 workspace 合计 **103 项通过、7 项 TODO ignored**
+（84 项原测试、8 项强引用验收、11 项借用/回调验收）。ignored 不是读者已完成练习；
+显式启用时七题初始均失败。短借用反例只在 rustc 子进程中编译，保留失败输入不会
+破坏默认构建。两个 CLI 固定重放错误/修复，不读取 starter，进程退出 0 只表示重放完成。
