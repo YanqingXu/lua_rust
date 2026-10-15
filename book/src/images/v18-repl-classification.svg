@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="730" viewBox="0 0 900 730" role="img" aria-labelledby="title desc">
+<title id="title">结构化编译结果与REPL动作</title><desc id="desc">compile成功提供Proto；失败由具体词法语法位置给出NeedMoreInput或Invalid。关键词判断漏掉return40加号，EOF位置判断误收畸形数字。message用于诊断，kind用于控制。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="730" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">诊断文本和错误位置帮助人类；kind 才决定输入去留</text>
+<rect x="24" y="62" width="852" height="70" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="94" class="mono">source bytes → Lexer / Parser → Codegen → Result&lt;Proto, CompileError&gt;</text>
+<text x="44" y="122" class="small">具体语法需求遇 EOF 才给续行提示；错误 token / literal / codegen 错误为 Invalid。</text>
+<rect x="24" y="156" width="408" height="98" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="44" y="188" class="label">错误：只匹配 message</text>
+<text x="44" y="220" class="small">return 40 + 未命中关键词，被清掉。</text>
+<text x="44" y="244" class="small">追加新行 2 本来可以得到42。</text>
+<rect x="456" y="156" width="420" height="98" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="476" y="188" class="label">错误：offset 在 EOF 就续行</text>
+<text x="476" y="220" class="small">return 1e 已是非法数字 token。</text>
+<text x="476" y="244" class="small">新行 2 不会把两行粘成 1e2。</text>
+<rect x="24" y="286" width="252" height="126" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="320" class="label">Ok(Proto)</text>
+<text x="44" y="352" class="small">动作：Execute</text>
+<text x="44" y="382" class="small">完整编译后才执行。</text>
+<text x="44" y="404" class="small">分类 hook 本身不执行。</text>
+<rect x="300" y="286" width="276" height="126" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="320" y="320" class="label">Err(NeedMoreInput)</text>
+<text x="320" y="352" class="small">动作：Preserve</text>
+<text x="320" y="382" class="small">缺表达式 / end / 闭合符</text>
+<text x="320" y="404" class="small">或允许跨行的 long token。</text>
+<rect x="600" y="286" width="276" height="126" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="620" y="320" class="label">Err(Invalid)</text>
+<text x="620" y="352" class="small">动作：Reject</text>
+<text x="620" y="382" class="small">错误 token / 畸形 literal</text>
+<text x="620" y="404" class="small">短串未转义换行等。</text>
+<path d="M150 412V448" class="flow"/>
+<path d="M438 412V448" class="flow"/>
+<path d="M738 412V448" class="flow"/>
+<rect x="24" y="452" width="852" height="100" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="484" class="label">REPL 消费结果：成功 / 普通错误清 buffer，NeedMoreInput 保留</text>
+<text x="44" y="516" class="small">同一 Session 始终保留；普通行错误显示后继续，不回滚 runtime 副作用。</text>
+<text x="44" y="542" class="small">message 改写但 kind 不变，决策也不变；CompileError 的 Display 仍是位置与诊断。</text>
+<rect x="24" y="580" width="852" height="94" rx="12" fill="#fff" stroke="#286047"/>
+<text x="44" y="612" class="small">NeedMoreInput 仍是 Err：脚本 / -e 不自动等待下一行。</text>
+<text x="44" y="642" class="small">它是当前局部构造的续行提示，不证明任意前缀都有合法后缀。</text>
+<text x="44" y="668" class="small">先前确定语法错误优先，不能被后部未闭 long string/comment 遮蔽。</text>
+<text x="24" y="708" class="small">验收：真实 compiler prefix/suffix + VM 结果 + 措辞注入 + 真实 -i 字节协议。</text>
+</svg>

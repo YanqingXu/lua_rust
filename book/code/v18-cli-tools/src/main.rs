@@ -1,9 +1,8 @@
-use lua_app::{compile_and_disassemble, AppError, Session};
-use lua_core::Value;
+use lua_app::{compile_and_disassemble, run_repl, AppError, Session};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
 
 enum Action {
@@ -178,76 +177,15 @@ fn arg_entries(options: &Options) -> Vec<(i64, Vec<u8>)> {
 }
 
 fn repl(session: &mut Session, prompts: bool) -> Result<(), CliError> {
-    if prompts {
-        println!("Lua 5.1 (lua-rust teaching v0.18)");
-    }
     let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
-    let mut source = String::new();
-    loop {
-        if prompts {
-            print!("{}", if source.is_empty() { "> " } else { ">> " });
-            io::stdout()
-                .flush()
-                .map_err(|error| CliError::Runtime(error.to_string()))?;
-        }
-        let Some(line) = lines.next() else {
-            if prompts {
-                println!();
-            }
-            break;
-        };
-        let line = line.map_err(|error| CliError::Runtime(error.to_string()))?;
-        if source.is_empty() && line.trim().is_empty() {
-            continue;
-        }
-        if source.is_empty() && line.trim_start().starts_with('=') {
-            source.push_str("return ");
-            source.push_str(line.trim_start().trim_start_matches('='));
-        } else {
-            source.push_str(&line);
-        }
-        source.push('\n');
-        match session.execute_multi(source.as_bytes()) {
-            Ok(values) => {
-                print_values(&values).map_err(CliError::Runtime)?;
-                source.clear();
-            }
-            Err(AppError::Compile(error)) if is_incomplete(&error) => continue,
-            Err(error) => {
-                eprintln!("lua: {error}");
-                source.clear();
-            }
-        }
-    }
-    Ok(())
-}
-
-fn is_incomplete(error: &lua_compiler::CompileError) -> bool {
-    error.message.contains("expected 'end'")
-        || error.message.contains("unexpected end")
-        || error.message.contains("unterminated")
-}
-
-fn print_values(values: &[Value]) -> Result<(), String> {
-    if values.is_empty() {
-        return Ok(());
-    }
-    let mut stdout = io::stdout().lock();
-    for (index, value) in values.iter().enumerate() {
-        if index != 0 {
-            stdout.write_all(b"\t").map_err(|error| error.to_string())?;
-        }
-        match value {
-            Value::String(bytes) => stdout
-                .write_all(bytes.as_bytes())
-                .map_err(|error| error.to_string())?,
-            other => stdout
-                .write_all(other.to_string().as_bytes())
-                .map_err(|error| error.to_string())?,
-        }
-    }
-    stdout.write_all(b"\n").map_err(|error| error.to_string())
+    run_repl(
+        session,
+        stdin.lock(),
+        io::stdout().lock(),
+        io::stderr().lock(),
+        prompts,
+    )
+    .map_err(runtime_error)
 }
 
 fn read_stdin() -> Result<Vec<u8>, String> {

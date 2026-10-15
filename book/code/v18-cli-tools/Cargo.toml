@@ -100,3 +100,19 @@ path = "exercises/runner_evidence/acceptance.rs"
 [[test]]
 name = "runner_evidence_reference"
 path = "exercises/runner_evidence/reference.rs"
+
+[[test]]
+name = "repl_classification_exercises"
+path = "exercises/repl_classification/acceptance.rs"
+
+[[test]]
+name = "repl_classification_reference"
+path = "exercises/repl_classification/reference.rs"
+
+[[test]]
+name = "repl_eof_exercises"
+path = "exercises/repl_eof/acceptance.rs"
+
+[[test]]
+name = "repl_eof_reference"
+path = "exercises/repl_eof/reference.rs"

@@ -1,6 +1,6 @@
 # v0.18 · CLI、REPL 与字节码工具
 
-<div class="lesson-meta"><span>CLI/REPL → 观察工具 → 子进程生命周期与证据</span><span>6-crate workspace</span><span>checkpoint v0.18</span></div>
+<div class="lesson-meta"><span>CLI/REPL → 观察工具 → runner → 结构化续行与 EOF</span><span>6-crate workspace</span><span>checkpoint v0.18</span></div>
 
 <a id="learning-task-card"></a>
 ## 学习任务卡
@@ -12,7 +12,8 @@
   是 ExitCode/Result 的边界、Session 的长期可变 owner、短命 source buffer 与子进程
   stdio 协议。再解决 bytes 转文本丢信息、基本块切错、trace 时点错位三个观察问题。
   最后沿 EOF、双流读取、超时回收、证据归档解决 runner 自身的失败问题。
-  全章产出为九个练习包、十个独立 TODO、固定反例、前后差异、状态图和真实进程验收；不把观察
+  再用结构化 NeedMoreInput 替换消息判断，明确普通错误与 pending EOF 的不同终态。
+  全章产出为十一个练习包、十二个独立 TODO、固定反例、前后差异、状态图和真实进程验收；不把观察
   工具的输出当作 binary chunk 序列化、可达性裁剪或可重放的完整 Heap 快照。</p>
 </div>
 
@@ -51,7 +52,7 @@ cargo run --quiet --manifest-path $toolManifest --example repl_recovery_problem_
 1. [退出实验](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/cli_exit/README.md)：`main → run → CliError`，先读 stream/code 合同，再看固定边界反例；
 2. `parse_options → Vec<Action> → arg_entries`：先完成解析，再按顺序执行 actions；
 3. [owner 实验](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/repl_owner/README.md)：`Session::new → execute_multi → Vm::execute_multi`，找到跨 chunk 保留与每次重置的字段；
-4. [恢复实验](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/repl_recovery/README.md)：`repl → source → execute_multi → is_incomplete`，区别 Session 与 buffer 生命周期；
+4. [恢复实验](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/repl_recovery/README.md)：先读历史 `is_incomplete` 模型，再沿问题十一至十三的 `CompileError.kind → Repl::submit → finish_eof` 迁移，区别 Session 与 buffer 生命周期；
 5. 共享进程探针：spawn、写完关闭 stdin、并行 drain 两个输出、deadline、kill/wait exact child；
 6. bytecode JSON/CFG/trace：保留 bytes、控制流与 instruction-before 观察协议。
 
@@ -129,12 +130,12 @@ REPL 复用 Session，支持：
 
 - `= expression` 自动改写成 `return expression`；
 - 非空 return values 以 tab 分隔，byte string 直接写 stdout；
-- compile error 的 message 命中 `expected 'end'`、`unexpected end` 或 `unterminated`，则保留 buffer 并显示 `>> `；
+- compile error 的 kind 为 `NeedMoreInput`，保留 buffer 并显示 `>> `；
 - 普通 compile/runtime error 写 stderr、清空当前 buffer，REPL 继续；
-- EOF 干净退出。
+- 空闲 EOF 正常退出；pending EOF 消费原诊断一次并返回失败，不重编译或执行。
 
-这是当前快照的字符串启发式，不是独立的结构化 Incomplete 错误类别。问题三会实测
-它的漏判与 pending buffer 的 EOF 边界，不把这段代码描述成完整 Lua 续行 parser。
+问题三保留迁移前的字符串启发式作为可运行局部模型；问题十一至十三把真实编译器
+的结构化类别接到真实 Repl，并明确 EOF 和宿主输入错误的边界。
 
 ## 问题一：终端已经显示错误，shell 为什么仍判断成功？
 
@@ -244,6 +245,9 @@ cargo test --manifest-path $toolManifest --test repl_owner_reference submissions
 
 ## 问题三：REPL 报错后，下一行应该接着哪一份状态？
 
+这一问先完成早期 buffer 决策练习。包内模型故意保留旧 message 判断，真实进程
+对照已经迁移到本章后面的结构化协议；图中旧 EOF 行为只属于迁移前 checkpoint。
+
 ### Session 继续存在，当前输入有自己的提交与清空时点
 
 把 source 每行清空，三行 if 就再也拼不成完整 chunk；所有错误都保留 source，后续
@@ -274,7 +278,7 @@ cargo run --quiet --manifest-path $toolManifest --example repl_recovery_problem_
 {{#include ../../code/v18-cli-tools/exercises/repl_recovery/solution.rs:repl_recovery_solution}}
 ```
 
-![REPL 当前 source 与长期 Session 的两套状态；普通错误清 buffer 后继续，EOF 退出。](../images/v18-repl-recovery.svg)
+![迁移前的 REPL buffer 模型；当前结构化分类与 EOF 协议见问题十一至十三。](../images/v18-repl-recovery.svg)
 
 这个 hook 返回当前事件，外围固定循环负责显示和继续；错误不需要借一个新 Session
 来“恢复”。编译失败还没执行 chunk；runtime error 之前已经改过的 global、文件或
@@ -285,19 +289,19 @@ cargo run --quiet --manifest-path $toolManifest --example repl_recovery_problem_
 得到空 Vec，不输出结果行；显式 return nil 得到一个 Nil，仍显示 nil。空闲空行不执行
 chunk；存在 pending source 时空行按原样进入 buffer。
 
-### “还没写完”是目前启发式的判断，不是完整语法结论
+### 迁移前：“还没写完”由诊断关键词猜测
 
 ```rust
 {{#include ../../code/v18-cli-tools/exercises/repl_recovery/model.rs:repl_recovery_classifier}}
 ```
 
-当前 `is_incomplete` 只匹配 message 中的三个片段。像 `return 40 +` 本来可以追加
+历史模型的 `is_incomplete` 只匹配 message 中的三个片段。像 `return 40 +` 本来可以追加
 `2` 完成表达式，却报 expected an expression，未命中规则，source 会被当普通错误
-清掉。这是快照的可运行漏判；本题保留该边界，后续若改 parser，应单独引入结构化
-NeedMoreInput 合同并重验。不能用扩展模型的理想行为冒充当前 binary 的事实。
+清掉。这个漏判仍可在旧模型中运行；本轮真实 compiler 新增 kind，真实 Repl 已
+正确保留该输入。不能把局部历史模型的观察套在当前 binary 上。
 
-EOF 也需按当前实现观察：pending buffer 不再重试，不额外报告“未闭合”，离开函数
-时销毁 buffer 并返回正常退出。`-i` 即使接到管道仍使用 REPL/banner/prompts；没有
+迁移前 EOF 静默丢弃 pending buffer；当前真实实现改为不重试、消费原诊断一次、
+清 buffer 并失败退出。空闲 EOF 仍为0。`-i` 即使接到管道仍使用 REPL/banner/prompts；没有
 script、没有 actions 且未指定 `-i` 时，非终端 stdin 才默认一次 read_to_end，作为
 脚本执行，错误按 CLI code=1 处理。显式脚本 `-` 也读 stdin；已有 `-e` 不会再自动
 读取管道。这不是同一种
@@ -305,7 +309,7 @@ script、没有 actions 且未指定 `-i` 时，非终端 stdin 才默认一次 
 
 **完成条件：** 对照精确事件、buffer 内容、下一输入的真实值和进程 stream/code。
 共享合同检查成功/普通编译错/runtime 错清空、未完成保留；真实 `-i` 检查错误后继续，
-并单独记录 EOF pending 与续行漏判，不能只检查 stderr 含某个词。
+并区分旧模型的漏判与当前 binary 的续行/EOF 合同，不能只检查 stderr 含某个词。
 
 ```powershell
 cargo test --manifest-path $toolManifest --test repl_recovery_reference source_lifecycle_recovers_after_errors -- --exact
@@ -767,17 +771,217 @@ stderr substring。旧 `tests/cli_contract.rs` 在 child 退出后才读取两�
 隐含协议拆成四个可失败的决策，保留旧 helper 与原 CLI 测试作为回归对照。
 没有把它们偷偷替换为完整的成熟 runner，也没有扩大语言兼容验收结论。
 
+## 问题十一：同样在末尾报错，为什么有的能续行，有的必须立即拒绝？
+
+### 让产生错误的一层给出类别
+
+先预测两份输入：`return 40 +` 后追加新行 `2` 可以得到42；`return 1e` 后追加新行
+`2` 却不能把两个物理行重新粘成数字 token `1e2`。旧关键词清单漏掉前者；另一种
+错误策略把 error.position.offset 等于输入长度的所有错误都当作“还能续”，又会
+留下后者。错误位置帮助定位，不承担语法分类。
+
+```powershell
+cargo build --manifest-path $toolManifest --workspace --bins
+cargo run --quiet --manifest-path $toolManifest --example repl_classification_problem_chain
+```
+
+编译器知道自己正在等待表达式、名称、右括号或 end，也知道非法 token 已经出现。
+把这个事实交给调用者，诊断 message 就可以继续服务人类，不再兼任机器协议：
+
+```rust
+{{#include ../../code/v18-cli-tools/crates/lua_compiler/src/lib.rs:repl_compile_error}}
+```
+
+`compile(&[u8]) -> Result<Proto, CompileError>` 保留原签名。Ok 拥有可执行 Proto；
+Err 的 kind 区分 `NeedMoreInput` 与 `Invalid`，后者也包括 codegen 的语义错误和
+资源限制。NeedMoreInput 仍是编译失败，文件/`-e` 模式直接按错误处理；只有 REPL
+会选择等下一段输入。新增 kind 是本教学快照的 Rust API 变更，构造 CompileError
+的调用者要提供它；不能从 Display 文本再反向恢复这个字段。
+
+| 当前输入/情形 | 类别 | 依据 |
+| --- | --- | --- |
+| `return 40 +`、缺 end/右括号/table 结束符 | NeedMoreInput | 当前具体语法需求遇 EOF |
+| 未闭 long string/comment | NeedMoreInput | 构造允许跨物理行继续 |
+| 短字符串含未转义物理换行 | Invalid | 换行已违反短字符串规则 |
+| `return 1e`、`return 0x`、十进制 escape 超过255 | Invalid | literal 已确定非法；不跨新行修复 token |
+| EOF 之前已出现错误 token | Invalid | 不是等待缺失符号；后部 unfinished literal 不应遮蔽它 |
+
+parser 在“期待某个语法项”的具体分支标 kind；不是把所有 CompileError 的 offset
+与 source.len() 做一次总比较。lexer 的 unfinished literal 暂存给 parser，若此前
+已有确定的错误 token，应先返回该 Invalid。短字符串的 EOF、未转义换行与 escaped
+newline 也分开处理，不能只用统一的“unterminated”词条归类。
+
+练习只共享借用编译结果，决定 Execute/Preserve/Reject，不复制 Proto 或运行 VM：
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/repl_classification/starter.rs:repl_classification_starter}}
+```
+
+```diff
+  Ok(_) => Decision::Execute,
+- Err(_) => Decision::Reject,
++ Err(error) if error.kind == CompileErrorKind::NeedMoreInput => Decision::Preserve,
++ Err(_) => Decision::Reject,
+```
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/repl_classification/solution.rs:repl_classification_solution}}
+```
+
+![编译器产生结构化类别，REPL 消费类别；错误位置与诊断措辞不能替代分类。](../images/v18-repl-classification.svg)
+
+合同用真实 compiler 检查 prefix/suffix，再把完整 Proto 交给真实 VM。另故意只改
+message、保留 kind，确认控制决策不变；这属于注入的措辞反例，不冒称 parser
+自然生成了那些文本。实际 `lua_app -i` 再验表达式、指数、短串与 long comment。
+
+**完成条件：** 一个 decide TODO 能消费三种结果；七组 prefix 补全成功，六类
+确定错误立即拒绝；措辞变化不改变动作。NeedMoreInput 是本版局部词法/语法提示，
+不是“任意前缀必存在合法后缀”的证明，尚未访问的整体错误可能稍后才暴露。
+
+```powershell
+cargo test --manifest-path $toolManifest --test repl_classification_reference structured_errors_choose_the_next_repl_action -- --exact
+```
+
+## 问题十二：为了判断是否完整，先 execute 一次，会不会把副作用做两遍？
+
+### 完整 buffer 每次重编译，只有成功的 Proto 才执行
+
+预测这一组输入在收到 end 之前 effects 是否会增长：
+
+```lua
+effects=0
+effects=effects+1; if true then
+effects=effects+10
+end
+=effects
+```
+
+第一行是已完成 chunk，会执行；中间两次编译都只得到 NeedMoreInput，当前 chunk
+不会先执行 `effects=effects+1`。end 补齐后才执行整块一次，最后应是11。不能用
+“尝试执行看看”，然后成功时再 execute 相同源码的方式探测完整性。
+
+`Session::execute_multi` 已是 compile 一次 → 成功后 VM 执行一次。新的 `Repl<'a>`
+借用同一个 `&mut Session`，只拥有当前 source 与最后一份 pending CompileError。
+保留两份状态的 owner，并不要求复制 global、Heap 或上次运行的寄存器。
+
+```diff
+- match session.execute_multi(source) { Ok(_) => session.execute_multi(source), ... }
++ match session.execute_multi(source) {
++     Err(Compile(e)) if e.kind == NeedMoreInput => { save_pending(e); keep_source(); }
++     result => { clear_source_and_pending(); return result; }
++ }
+```
+
+这是反对重复执行的设计差异，完整实现的分支顺序如下：
+
+```rust
+{{#include ../../code/v18-cli-tools/src/lib.rs:repl_structured_submit}}
+```
+
+![同一 Session 与当前 buffer/pending 的所有权，编译未完成、成功与普通错误的迁移。](../images/v18-repl-submit.svg)
+
+每次追加输入会重新编译完整 buffer，这不是增量 parser。新输入可能把尚未完成的
+构造变成确定错误，此时立即丢掉当前 source 和 pending，回到主提示符；Session
+仍在，运行错误之前已发生的副作用也仍在。只有 source 空闲时，单个 `=` 前缀才
+改写为 return；pending 内的 `=` 不再二次改写，`==42` 也不作为两个 shorthand
+前缀剥离。空闲空行忽略，pending 空行属于待编译输入。
+
+公开 submit 表示提交一整物理行/回车；driver 用内部 fragment 入口保留真实末段
+是否有 LF。分类练习借用的是 `Result<Proto, CompileError>`；真实 Repl 使用的是
+Session 的运行结果，两者的层次与责任不同，不能拿分类器 Execute 动作当成已执行。
+
+**完成条件：** NeedMoreInput 没有前缀副作用，成功只执行一次；普通错误后能继续，
+global/closure owner 不重建，runtime 副作用不回滚；旧 buffer 模型仍可重放其错误。
+
+```powershell
+cargo test --manifest-path $toolManifest --test repl_input_protocol pending_chunks_execute_once_and_keep_the_same_session -- --exact
+```
+
+## 问题十三：EOF 到来时，是正常结束，还是“仍缺一行”的失败？
+
+### 消费已经保存的诊断，别在 EOF 再执行一遍
+
+先预测：`-i` 读到 `if true then` 后，stdin 关闭；与空闲时关闭 stdin 应有相同
+退出码吗？旧实现直接 break，未完成程序悄悄丢失。另一种错误 clone pending
+diagnostic 却不 take，第二次结束又报同一个错误。EOF 既不是普通空行，也不是
+新提交一次旧 source 的机会。
+
+```powershell
+cargo run --quiet --manifest-path $toolManifest --example repl_eof_problem_chain
+```
+
+练习的 PendingInput 只有 source 与最后的 CompileError，没有 Session。唯一 TODO
+负责清 buffer、消费原诊断。接口不提供现有 Session/VM；重新编译或创建另一个 VM
+仍是可写出的错误实现，练习约束禁止这样绕过 EOF 协议：
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/repl_eof/starter.rs:repl_eof_starter}}
+```
+
+```diff
+- input.source.clear();
+- input.diagnostic = None; // 静默丢失未完成输入
+- Ok(())
++ input.source.clear();
++ match input.diagnostic.take() {
++     Some(error) => Err(error),
++     None => Ok(()),
++ }
+```
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/repl_eof/solution.rs:repl_eof_solution}}
+```
+
+真实 Repl 的 finish_eof 同样先清 source，再 take pending；返回 AppError::Compile，
+由 CLI 顶层打印一次并映射 code1。它不在 EOF 分支重复写 stderr，再交顶层打印。
+普通行的 Invalid/runtime Err 则在循环内显示、清 buffer 后继续；最后闲时 EOF
+仍可为0。因此诊断非空和最终 code 非零不是同一条判据。
+
+| 读取结果/当前状态 | 行为 | CLI code |
+| --- | --- | ---:|
+| Ok(0)，空闲 | 结束，无额外诊断 | 0 |
+| Ok(0)，pending | 消费原 CompileError 一次；清 buffer；不重编译、不执行 | 1 |
+| read_line Err | 保留宿主 I/O 失败，不能伪装成 clean EOF 或旧 pending 诊断 | 1 |
+| 普通行的 Invalid/runtime Err | 显示后继续读下一行；清 source，保留 Session | 继续，闲时 EOF 可0 |
+
+![LF、最后无 LF 的片段、真正 EOF 与 I/O 错误分开；pending 诊断只转移一次。](../images/v18-repl-eof.svg)
+
+`read_line` 返回字节数大于0但没有 LF 时，已经读到最后一段数据，仍要按原片段
+提交；下一次 Ok(0) 才触发 finish_eof。不能把这种情况与用户按回车混为一谈：
+
+| 输入 bytes | 编译观察 | EOF 结果 |
+| --- | --- | --- |
+| `return 'broken`，无 LF | 短串尚未闭合，NeedMoreInput | 原 unterminated 诊断一次，code1 |
+| `return 'broken\n`，有 LF | 短串出现未转义物理换行，Invalid | 普通错误已处理，闲时 EOF code0 |
+| `=40+2`，无 LF | 完整 chunk，得到42 | 闲时 EOF code0 |
+
+driver 去掉真实 LF/CRLF 后，内部 fragment 函数按 terminated 还原换行；没有 LF
+就不合成一个。run_repl 接受 BufRead/Write，因此可注入输入失败并检查错误通道；
+Lua print 仍直接写进程 stdout，泛型 writer 只承接 REPL banner、prompt 和返回值，
+没有变成 Lua 全局输出捕获器。末段非 UTF-8 输入依然是宿主 read_line 错误。
+
+**完成条件：** 十个真实子进程检查完整 raw stdout/stderr/exit；空闲与 pending
+EOF、最后无 LF、普通错误恢复、输入 I/O Err 各归正确路径。重复 finish 没有第二
+份诊断；未完成前缀不执行，已完成 chunk 的副作用不因 EOF 重放。
+
+```powershell
+cargo test --manifest-path $toolManifest --test repl_eof_reference eof_reports_pending_once_and_releases_buffer -- --exact
+```
+
 ## Rust 知识映射与设计选择
 
 - `Action` enum 保留 option 出现顺序；
 - `Session` 封装可复用 VM，library convenience API 仍能一次性执行；
 - `IsTerminal` 区分无参数 REPL 与管道脚本；
-- `BufRead::lines` 与 source buffer 实现 continuation prompt；
+- `BufRead::read_line` 保留真实 LF/末片段信息，source/pending 决定 continuation prompt；
 - `BTreeSet` 让 CFG leaders 和 DOT 输出稳定排序；
 - 手写 JSON escape/hex 避免为教学 viewer 引入序列化依赖，同时测试其 bytes 合同；
 - 按值移动 stdin/两个 reader 与 thread join，把管道协议变成所有权和终态约束；
 - `Command + try_wait + deadline` 让有界 fixture 的阻塞成为可诊断失败，kill 后仍 wait；
 - `&mut dyn Lifecycle` 可注入系统调用竞态；`create_new + Result` 拒绝证据覆盖并传播归档错误。
+- `CompileErrorKind` 与诊断文本分工，借用同一 Session 的 Repl 管理 source/pending；
+- `Option::take` 把 EOF 诊断转移一次，BufRead 的 Ok(0)/Err 与真实 LF/末片段分开。
 
 替代方案是把 REPL 每行写到临时文件并重新启动 binary，但那会丢失 globals/coroutine/package 状态。另一个方案是让 bytecode crate侵入 Compiler/VM；只读 Proto/trace event 保持工具与执行语义解耦。
 
@@ -807,6 +1011,9 @@ cargo test --manifest-path $toolManifest --test bytecode_trace_reference
 cargo test --manifest-path $toolManifest --test runner_stdio_reference
 cargo test --manifest-path $toolManifest --test runner_timeout_reference
 cargo test --manifest-path $toolManifest --test runner_evidence_reference
+cargo test --manifest-path $toolManifest --test repl_classification_reference
+cargo test --manifest-path $toolManifest --test repl_eof_reference
+cargo test --manifest-path $toolManifest --test repl_input_protocol
 cargo run --quiet --manifest-path $toolManifest --example runner_stdio_problem_chain
 cargo run --quiet --manifest-path $toolManifest --example runner_timeout_problem_chain
 cargo run --quiet --manifest-path $toolManifest --example runner_evidence_problem_chain
@@ -826,8 +1033,9 @@ cargo test --manifest-path $toolManifest --workspace --release
 本快照原有 129 个测试：119 个原语义测试、5 个 CLI/REPL process tests、3 个 bytecode
 library tests 和 2 个 bytecode binary process tests。CLI/REPL 包增加 20 项参考
 （退出8、owner5、恢复7）；工具包再增加22项（JSON6、CFG7、trace9）；runner 包再增加
-18 项参考（stdio5、timeout6、evidence7），合计 **189 通过、10 个 learner ignored**，
-其中 stdio 包有 EOF、并行读取两个独立题。v0.17 教学练习的计数
+18 项参考（stdio5、timeout6、evidence7）；结构化续行增加 compiler6、实际协议6、
+分类7与EOF5，合计 **213 通过、12 个 learner ignored**。其中 stdio 包有 EOF、
+并行读取两个独立题，其余十包各一题。v0.17 教学练习的计数
 仍归各自版本，不把它们重复算进这个独立快照。
 
 ```powershell
@@ -840,12 +1048,14 @@ cargo test --manifest-path $toolManifest --test bytecode_trace_exercises -- --ig
 cargo test --manifest-path $toolManifest --test runner_stdio_exercises -- --ignored
 cargo test --manifest-path $toolManifest --test runner_timeout_exercises -- --ignored
 cargo test --manifest-path $toolManifest --test runner_evidence_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test repl_classification_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test repl_eof_exercises -- --ignored
 ```
 
-初始 stdio 组两项失败，其余八组各一项失败。只修改各包 starter 的指定 hook，显式 learner 全通过才完成；
+初始 stdio 组两项失败，其余十组各一项失败。只修改各包 starter 的指定 hook，显式 learner 全通过才完成；
 默认参考、ignored 和固定 CLI 退出 0 不能代替这一验收。维护者须验证失败→临时套解
 通过→原字节恢复并刷新 mtime 后再失败，防止缓存或已填答案造成假绿。精确命令、
-观察值与修改范围见九个 README。Cargo 的 `default-run = "lua_app"` 保持脚本入口；
+观察值与修改范围见十一个 README。Cargo 的 `default-run = "lua_app"` 保持脚本入口；
 新 `runner_fixture` 只是测试子程序，命令行示例先构建同 profile 的 workspace binaries。
 
 ```powershell
@@ -857,7 +1067,7 @@ node tools/check_book_links.mjs target/mdbook .
 ## 本版本暂不支持
 
 - REPL 没有 readline 历史、补全、TTY 编辑和 signal-aware Ctrl-C 恢复；
-- multiline 判断依赖 CompileError.message 子串，`return 40 +` 等可续行前缀仍会漏判，pending EOF 静默退出；
+- NeedMoreInput 只是具体语法分支的续行提示，不保证任意前缀存在合法后缀；每次重编译 buffer，尚非增量 parser；
 - argv/path 在 Windows 仍采用 lossy UTF-8 adapter；
 - JSON schema 还没有跨版本兼容承诺，v1.0 会冻结并登记版本；
 - trace 是 instruction-before snapshot，没有 allocator bytes、GC phase transition 或 host callback event；
@@ -876,10 +1086,10 @@ node tools/check_book_links.mjs target/mdbook .
 </div>
 
 <div class="exercise implementation">
-  <strong>实现题：完成十个独立 hook</strong>
+  <strong>实现题：完成十二个独立 hook</strong>
   <p>只改 cli_exit::finish、repl_owner::submit、repl_recovery::submit，再补 JSON encode_bytes、
   CFG leaders、trace dispatch 的记录时点，以及 runner send_input、start_drains、stop、
-  archive。运行上面九个 --ignored 命令，stdio 两项、其余每组一项通过才完成。不修改 faults、合同、真实 src/crates 或
+  archive，再补结构化分类 decide 和 EOF finish。运行上面十一个 --ignored 命令，stdio 两项、其余每组一项通过才完成。不修改 faults、合同、真实 src/crates 或
   ignored 标记；共享 helper 与真实 binary 对照不是 TODO。</p>
 </div>
 
@@ -887,7 +1097,7 @@ node tools/check_book_links.mjs target/mdbook .
   <strong>调试题：补一行 2，为什么没有得到 42？</strong>
   <p>运行恢复 CLI 的固定反例，比较 return 40 + 的 CompileError.message、is_incomplete
   判定、buffer 和下一行事件；再比较一次 read_to_end 的 stdin 脚本。成功条件是能
-  复现当前漏判、区分分行编译与整段编译，并指出未来结构化续行协议要改变哪一层。</p>
+  复现历史模型漏判、区分分行编译与整段编译，再解释当前 kind 如何修正真实 binary 的决策。</p>
 </div>
 
 <div class="exercise understanding">
@@ -920,6 +1130,20 @@ node tools/check_book_links.mjs target/mdbook .
   给一条证据，不能只凭 CLI exit=0 或 manifest 存在判断练习已完成。</p>
 </div>
 
+<div class="exercise understanding">
+  <strong>理解题：同一个未闭短字符串，为什么一个EOF返回0、另一个返回1？</strong>
+  <p>分别写下带LF与无LF的原始输入，沿lexer kind、Repl source/pending、driver
+  read_line结果追踪。成功条件是说明前者的换行已造成普通错误、清buffer后才闲时EOF，
+  后者仍待闭合并由pending EOF消费诊断；不是按诊断里是否有unterminated决定退出码。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题：补end之后，effects为什么不是22？</strong>
+  <p>运行结构化协议集成测试，确认未完成chunk没有执行、成功只执行一次。再运行EOF
+  CLI的静默丢诊断和clone重复诊断反例。成功条件是分别定位compile→execute和
+  pending.take两处边界，并能解释read_line Err为什么不能冒充EOF。</p>
+</div>
+
 <a id="learning-checkpoint"></a>
 ## 完成检查点
 
@@ -928,7 +1152,7 @@ node tools/check_book_links.mjs target/mdbook .
 - 能用完整 stdout/stderr 与真实 exit code 验证错误前的输出和后续 actions 中止；
 - 能用 GC 后字段读取说明 Session owner 的保留边，区分 chunk local 与 captured local；
 - 能手推 success/incomplete/普通错误的 buffer 变化，并说明 runtime 副作用不回滚；
-- 十个 TODO 显式通过，能说明模型、真实 Session/Proto/VM、进程和启发式的验证边界；
+- 十二个 TODO 显式通过，能说明模型、真实 Session/Proto/VM、进程和历史启发式的验证边界；
 - 能按严格 schema 解码 bytes、校验非有限数与 nested Proto，不把 metadata 视为同一编码；
 - 能从 pc+1+sBx 推导 leaders/半开 blocks/末指令 edges，区分结构划分与可达分析；
 - 能用 Add 输入和下一 event 解释 before 时点、开关与失败前缀，不外推 Heap 深快照；
@@ -936,6 +1160,9 @@ node tools/check_book_links.mjs target/mdbook .
 - 能解释超时后 kill 失败仍 wait、try_wait(Some) 已回收、guard 与标准 Child Drop 的区别；
 - 能从独占 run/case 目录复核实际 bytes、termination、预期与 verdict，拒绝覆盖和不完整报告；
 - 能列出本章有界 fixture 与通用进程树、无限输出、崩溃一致性之间的能力边界。
+- 能区分 NeedMoreInput/Invalid、错误位置与诊断措辞，解释跨行 token 与构造的区别；
+- 能说明未完成 chunk 零执行、完成只执行一次、pending EOF 消费原诊断一次；
+- 能从原始 bytes 区分带 LF 的短串错误、无 LF 的未完成短串、clean EOF 与 I/O Err。
 
 ## 与成熟实现和专题章节的对应
 
@@ -943,6 +1170,7 @@ node tools/check_book_links.mjs target/mdbook .
 - [Bytecode](../ch03-compiler/bytecode.md) 可对照 raw instruction fields 与 JSON；
 - [寄存器虚拟机](../ch04-vm/register-vm.md) 可解释 trace snapshot 中 base/top/register window；
 - [用测试守住兼容性](../ch05-engineering/testing.md) 可对照进程级合同为何不能只用函数单测替代；
-- 本版十问已覆盖 CLI/REPL、观察工具与单 child 生命周期；成熟 [lua_fixture_runner](https://github.com/YanqingXu/lua_rust/blob/main/tools/lua_fixture_runner/README.md) 的进程组/Windows Job Object、分类与规范化是后续独立能力，不能由本轮反例通过推定；
-- 下一项局部教学可独立完善结构化 REPL 续行协议；跨入兼容验收时，应先冻结能力矩阵与 oracle 来源；
+- 本版十三问覆盖 CLI/REPL、观察工具、单 child 生命周期与结构化续行；成熟 [lua_fixture_runner](https://github.com/YanqingXu/lua_rust/blob/main/tools/lua_fixture_runner/README.md) 的进程组/Windows Job Object、分类与规范化仍是后续独立能力；
+- 续行协议已有真实输入/EOF合同；后续 TTY 编辑、signal 恢复和增量解析须另定范围。跨入兼容验收时，先冻结能力矩阵与 oracle 来源；
+- v1.0 独立快照目前仍保留旧 `is_incomplete`；本轮只迁移 v0.18，进入下一 checkpoint 时须显式移植并重验，不能假定各快照自动继承；
 - 下一 checkpoint 是 v1.0：补齐登记差异，冻结能力矩阵，并以官方 Lua 5.1.5 与固定 C++ oracle 双差分收口。

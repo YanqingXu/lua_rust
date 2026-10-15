@@ -3,6 +3,111 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.18 结构化 REPL 续行与 EOF
+
+用户要求按问题链讲清 NeedMoreInput、普通语法错误与未完成输入，补齐可运行反例、
+前后差异、状态图和验收，完成验证并更新交接。本批教学与验证已完成，**没有恢复
+暂停的原审计整改目标**。用户随后明确要求将本批章节、状态图、练习包和交接记录
+一并提交并推送。
+
+- 起点为已推送 `main@d4850d0b73039c73f07d7be823bd93215956c2a6`（上一批 runner），
+  开始时工作区干净，本地跟踪 origin/main 同 SHA。本轮确实改了 **v0.18 快照** 的
+  compiler/src/lib.rs、src/lib.rs、src/main.rs，并新增 tests/repl_input_protocol.rs；
+  不把教学模型的理想行为冒充真实 binary。生产根 `crates/`、快照 core/VM/bytecode、
+  旧 tests、旧 process/temp helpers 和 runner/工具包均无 diff。Cargo 仅增四个 test
+  targets，没有新依赖或第二套 parser/VM。旧 recovery 仅迁移 real.rs 两个进程预期
+  与 README；其 model/starter/faults/solution/contracts 保留历史启发式。
+  提交前 fetch 确认 HEAD 与 origin/main 无分叉。本批提交号以
+  `git log -1 -- book/src/versions/v18-cli-tools.md` 为准，新提交 CI 按其 SHA 查询。
+- [主章](book/src/versions/v18-cli-tools.md) 新增问题十一至十三：关键词漏判 / EOF
+  位置误判 → 具体词法/语法位置给 kind；探测性重复执行 → compile成功才执行一次；
+  静默 pending EOF / clone重复诊断 → 清buffer、take原诊断一次。每问有预测、反例、
+  最小diff、源码include、图与exact验收。新增 classification/submit/eof 三图，旧
+  recovery图显式标“迁移前”；正文与快照README统一为11包/12TODO，旧证据不重写。
+- compiler 保留 `compile(&[u8])->Result<Proto,CompileError>`，新增公开
+  `CompileErrorKind::{Invalid,NeedMoreInput}` 与 CompileError.kind；Display仍为
+  原位置与message。构造错误的Rust调用者需提供kind，这是快照API变更。具体期待
+  表达式/名称/闭合符的EOF为NeedMoreInput；错误token、畸形数字、escape>255、短串
+  未转义换行、codegen语义/资源错误为Invalid。long string/comment与合法escaped
+  newline可以续；lexer延迟unfinished literal，让更早确定语法错误先返回。
+  新6项compiler测试覆盖18处parser缺口、六组跨行补全、数字/escape EOF、短/长串、
+  delimiter层级与错误优先级；compiler总13项。NeedMoreInput是局部构造提示，**不是
+  任意前缀都有合法后缀的证明**，每次重编译完整buffer，尚非增量parser。
+- 真实 `Repl<'a>` 借用同一 `&mut Session`，拥有source与最后一份pending诊断。
+  submit返回Blank/NeedMoreInput/Values或AppError；未完成chunk不执行前缀，成功
+  编译只执行一次并清source/pending；普通编译/runtime错误清当前输入并继续，保留
+  Session与既有副作用。空闲时只剥单个shorthand `=`，`==42`不再像旧
+  trim_start_matches那样被重复剥离；pending内不改写。新6项实际协议集成测试
+  检查零前缀执行/恰一次、错误恢复/owner、shorthand、短串、I/O Err、bytes/Nil。
+- `run_repl`泛型BufRead/Write供注入I/O错误，CLI只adapter。read_line的Ok(0)才是
+  EOF，Err保留Host错误；有数据但无LF的末片段按原bytes提交，不合成换行。公开
+  submit表示完整物理行，内部submit_fragment接terminated。实际 `return 'broken`
+  无LF为NeedMoreInput后pendingEOF=1；同bytes加LF先Invalid诊断、清buffer，闲时
+  EOF=0。完整无LF `=40+2`仍成功。普通行错误显示后继续，最终闲时EOF可0；pending
+  EOF先clear再take原CompileError，返回顶层打印一次并code1，不重编译/执行。
+  重复finish不重复报错；输入Err不是旧pending诊断。泛型writer只承接REPL输出，
+  Lua print仍走进程stdout，不作全局捕获；非UTF-8 read_line仍是Host错误。
+- [分类包](book/code/v18-cli-tools/exercises/repl_classification/README.md)：一个
+  decide TODO、7参考。共享借用真实Result<Proto,CompileError>，选择Execute/
+  Preserve/Reject；实际compiler prefix/suffix与VM结果对照，关键词/EOF位置fault，
+  只改message不改kind的措辞注入；4个真实-i子进程覆盖表达式、数字、短串、long
+  comment，21条固定关键输出。不是另做缩小版parser或从诊断反推kind。
+- [EOF包](book/code/v18-cli-tools/exercises/repl_eof/README.md)：一个finish TODO、
+  5参考。PendingInput持source+Option<CompileError>，接口不提供现有Session/VM；
+  练习约束禁止重编译/执行，不将类型说成能禁止调用任意全局函数。fixed faults
+  静默丢诊断、clone不消费，合同检查原诊断/清source/重复EOF；实际Repl探针和10个
+  CLI case另验owner、副作用与raw streams，固定all共15条关键输出。I/O故障是
+  可注入BufRead合成故障，不冒充真实控制台硬件错误。
+- 旧repl_recovery模型仍复现return40+漏判并保留原TODO；实际real.rs改为
+  structured continuation无诊断输出两次42，以及pendingEOF一次诊断/code1，stdout
+  尾换行保持。7参考重验通过；旧41条CLI marker只手写替换两条真实协议输出，其余
+  39条沿用。旧README/图说明历史归属，不再声称当前真实CLI静默EOF或message判断。
+- Windows Rust/cargo **1.96.1**：D/R workspace bins、fmt、workspace all-targets
+  Clippy `-D warnings`、workspace tests通过，两profile各 **213通过、0失败、
+  12ignored**（189+compiler6+实际协议6+分类7+EOF5）。两个新TODO已验证初始失败→
+  临时套解通过→原字节恢复并刷新mtime→再失败，交付保留TODO。旧10题套解仍归前
+  三批，本轮只回归其预期失败。11learner targets共12项预期失败，stdio两项。
+- 11个CLI每profile169条unique关键断言，D/R共 **338条**；主章+11README去重
+  **49条exact**各恰1test，37正向通过、12learner预期失败。独立直接启动lua_app的
+  **21case/profile、共42个raw case**逐byte核对完整stdin/stdout/stderr/exit，含
+  idle/pending/无LF/普通错/one-shot不续行/前缀零执行/成功恰一次/binary值；不只
+  相信example自身检查。保留工具20项strict与两profile归档strict，另加两组REPL
+  strict，共 **24组**；D/R export各6cases/36files，旧档案原bytes/metadata/SHA
+  不变。demo1818、stdlib1550；PATH `D:\lua51\lua.EXE`实测Lua5.1.5并运行本版
+  fixture1550，不把本轮REPL退出策略冒称完整官方REPL等价。136个代码输入hash
+  前后无漂移。20版本教学检查、mdBook、38页 **1,339站内链接/0broken**通过。
+- 证据独立在 `target/teaching-v18-repl-2026-10-15/`，最终
+  `full-validation/20261015T092822333723Z/summary.json`：161命令、24strict、
+  source/oracle/hash、冻结脚本副本与SHA。原run092719965834Z的26条通过命令复用；
+  验证器把已清buffer后的新未闭块诊断误按整个stdin累计成4:1，实际正确2:1，仅修
+  ignored脚本并续跑，原raw facts保留。092809878557Z是相对resume路径初始化失败，
+  无命令执行，provenance-note明确归属。局部compiler为
+  `compiler/20261015T091910851352Z/summary.json`，分类为
+  `repl_classification/20261015T092012643239Z/summary.json`；EOF最终为
+  `repl_eof/20261015T092433605192Z/summary.json`，092206994330Z属于修无LF前的
+  中间版本，不当最终证据。initial-new-repl.json为已重建的新实现观察，非旧基线
+  binary；各批历史证据没有覆盖。范围/hash/HTML/图见final-verification.json。
+  target本机ignored；永久入口是主章、两个README、contracts/real、examples和源码。
+- 图文验证：IAB隐藏预览两次webview attach超时，未声称页面视觉检查成功；改用
+  bundled sharp/libvips把三个新SVG与历史recovery图渲染PNG直接检查，文字/箭头/
+  状态框/页脚完整。Fontconfig仅有缓存目录不可写告警，渲染成功且中文实看；未改
+  全局设置。生成HTML另验源码include/图片引用，无未展开标记；不把PNG检查说成
+  浏览器页面布局验证。详情visual-review.json与render_svgs.cjs。
+- 已推送基线d4850d0的 [mdBook 38711226895](https://github.com/YanqingXu/lua_rust/actions/runs/38711226895)
+  **成功**，上一批教学helper lint修复已在该SHA验证。其 [Rust CI 38711226896](https://github.com/YanqingXu/lua_rust/actions/runs/38711226896)
+  completed/failure：两个Miri与Linux ASan成功，Windows只在M1 foundation and
+  quality gate失败。实际job日志确认生产fetch_update被新工具链弃用导致Clippy
+  失败，其他测试/文档/audit门通过；本SHA的official source三方均10/10，不能套用
+  更早883c28e的9/10。baseline-book.json、baseline-rust-final.json与真实
+  baseline-rust-job.log保留；本轮未处理生产CI弃用问题。这些旧SHA结果不代表本批
+  新提交的远端CI，须按新SHA查询，不能宣称已绿。
+
+下一任务应将结构化协议显式移植到 **v1.0独立快照** 并复用相同字节合同；当前
+v100/src/main.rs仍有旧is_incomplete，不会自动继承v18改动。其后按能力矩阵/oracle
+逐项收口；TTY编辑/signal恢复/增量parser须另立范围。生产CI弃用兼容问题亦独立。
+原审计仍暂停在os.date/os.time本地时间、UTC、DST；交接本身不表示恢复，提交推送
+按当次明确指令。
+
 ## 2026-10-15：v0.18 fixture runner 与子进程生命周期
 
 用户要求按问题链讲清 stdin EOF、stdout/stderr 并发读取、超时后 kill/wait 与证据

@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="830" viewBox="0 0 900 830" role="img" aria-labelledby="title desc">
+<title id="title">真实LF、末片段、EOF与读取失败</title><desc id="desc">read_line正数是输入，真实LF才追加换行；无LF末片段仍提交原bytes。下一次Ok0才EOF。空闲EOF正常0；pendingEOF清source并take诊断一次返回1；输入Err独立Host错误1，不重复编译和执行。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="830" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">输入数据、真正 EOF、读取错误，是三个不同事件</text>
+<rect x="24" y="64" width="852" height="62" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="102" class="mono">BufRead::read_line → Result&lt;usize, io::Error&gt;</text>
+<path d="M150 126V164" class="flow"/>
+<path d="M438 126V164" class="flow"/>
+<path d="M738 126V164" class="flow"/>
+<rect x="24" y="168" width="252" height="128" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="202" class="label">Ok(n), n &gt; 0</text>
+<text x="44" y="236" class="small">提交这一段输入。</text>
+<text x="44" y="266" class="small">有 LF 才恢复换行。</text>
+<text x="44" y="290" class="small">无 LF 不合成换行。</text>
+<rect x="300" y="168" width="276" height="128" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="320" y="202" class="label">Ok(0)</text>
+<text x="320" y="236" class="small">才触发 finish_eof。</text>
+<text x="320" y="266" class="small">不追加空行。</text>
+<text x="320" y="290" class="small">不重编译 / 执行。</text>
+<rect x="600" y="168" width="276" height="128" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="620" y="202" class="label">Err(io_error)</text>
+<text x="620" y="236" class="small">保留宿主读取错误。</text>
+<text x="620" y="266" class="small">不能伪装成 clean EOF。</text>
+<text x="620" y="290" class="small">顶层诊断，code=1。</text>
+<path d="M438 296V332" class="flow"/>
+<rect x="24" y="336" width="852" height="64" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="44" y="376" class="label">finish_eof：source.clear() + pending.take() → 转移原诊断一次</text>
+<path d="M225 400V438" class="flow"/>
+<path d="M675 400V438" class="flow"/>
+<rect x="24" y="442" width="408" height="100" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="476" class="label">没有 pending：正常结束</text>
+<text x="44" y="510" class="small">无额外诊断，code=0。</text>
+<text x="44" y="534" class="small">此前普通行错误已处理也可走此路。</text>
+<rect x="456" y="442" width="420" height="100" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="476" y="476" class="label">有 pending：原编译诊断</text>
+<text x="476" y="510" class="small">返回 Err，由顶层打印一次，code=1。</text>
+<text x="476" y="534" class="small">已取走；再 finish 不重复报错。</text>
+<rect x="24" y="576" width="852" height="152" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="610" class="label">短字符串：真实 LF 与直接 EOF 不是同一输入</text>
+<text x="44" y="644" class="mono">return 'broken + LF → Invalid → 显示后清 buffer → 闲时 EOF=0</text>
+<text x="44" y="678" class="mono">return 'broken 无 LF → NeedMoreInput → pending EOF=1</text>
+<text x="44" y="714" class="small">完整无 LF 的 =40+2 仍正常得到42；下一次 Ok(0) 正常退出。</text>
+<text x="24" y="768" class="small">泛型 writer 只承接 REPL 输出；Lua print 仍走进程 stdout，不是全局捕获。</text>
+<text x="24" y="798" class="small">验收原始 bytes、诊断、prompt、exit 与副作用；read_line 非UTF-8错误仍是Host Err。</text>
+</svg>

@@ -11,11 +11,23 @@ pub struct Position {
     pub column: usize,
 }
 
+// ANCHOR: repl_compile_error
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompileErrorKind {
+    /// A wrong token, malformed literal, semantic error, or compiler limit.
+    Invalid,
+    /// An unfinished construct at this buffer's end; no prefix is executed.
+    /// This is a continuation hint, not a proof that every prefix is extendable.
+    NeedMoreInput,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompileError {
+    pub kind: CompileErrorKind,
     pub position: Position,
     pub message: String,
 }
+// ANCHOR_END: repl_compile_error
 
 impl fmt::Display for CompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -161,10 +173,19 @@ struct Chunk {
     position: Position,
 }
 
+// ANCHOR: repl_compile_once
 pub fn compile(source: &[u8]) -> Result<Proto, CompileError> {
-    let chunk = Parser::new(Lexer::new(source).tokenize()?).parse()?;
+    let lexed = Lexer::new(source).tokenize()?;
+    let parsed = Parser::new(lexed.tokens).parse();
+    let chunk = match (parsed, lexed.incomplete) {
+        // A later unclosed literal must not hide an earlier wrong token.
+        (Err(error), _) if error.kind == CompileErrorKind::Invalid => return Err(error),
+        (_, Some(error)) => return Err(error),
+        (result, None) => result?,
+    };
     Codegen::new().compile(&chunk)
 }
+// ANCHOR_END: repl_compile_once
 
 struct Scope {
     base_register: usize,
@@ -303,6 +324,7 @@ impl Codegen {
             code: self.code,
             lines: self.lines,
             max_stack_size: u8::try_from(self.max_registers.max(1)).map_err(|_| CompileError {
+                kind: CompileErrorKind::Invalid,
                 position: chunk.position,
                 message: "chunk needs more than 255 registers".to_owned(),
             })?,
@@ -322,6 +344,7 @@ impl Codegen {
         position: Position,
     ) -> Result<Proto, CompileError> {
         let num_params = u8::try_from(parameters.len()).map_err(|_| CompileError {
+            kind: CompileErrorKind::Invalid,
             position,
             message: "function has more than 255 parameters".to_owned(),
         })?;
@@ -342,6 +365,7 @@ impl Codegen {
             code: self.code,
             lines: self.lines,
             max_stack_size: u8::try_from(self.max_registers.max(1)).map_err(|_| CompileError {
+                kind: CompileErrorKind::Invalid,
                 position,
                 message: "function needs more than 255 registers".to_owned(),
             })?,
@@ -411,6 +435,7 @@ impl Codegen {
             Stmt::Break(position) => {
                 if self.break_jumps.is_empty() {
                     return Err(CompileError {
+                        kind: CompileErrorKind::Invalid,
                         position: *position,
                         message: "break is only valid inside a loop".to_owned(),
                     });
@@ -640,6 +665,7 @@ impl Codegen {
                 call_base,
                 3,
                 u16::try_from(names.len() + 1).map_err(|_| CompileError {
+                    kind: CompileErrorKind::Invalid,
                     position,
                     message: "generic for has too many variables".to_owned(),
                 })?,
@@ -870,6 +896,7 @@ impl Codegen {
             .borrow_mut()
             .resolve_upvalue(name)
             .map_err(|()| CompileError {
+                kind: CompileErrorKind::Invalid,
                 position,
                 message: "function captures more than 255 upvalues".to_owned(),
             })
@@ -933,6 +960,7 @@ impl Codegen {
                                         table,
                                         u16::from(result_base),
                                         u16::try_from(list_index).map_err(|_| CompileError {
+                                            kind: CompileErrorKind::Invalid,
                                             position: *position,
                                             message: "table constructor has too many list fields"
                                                 .to_owned(),
@@ -998,11 +1026,13 @@ impl Codegen {
                 let proto = Codegen::with_parent(Some(self.resolver.clone()))
                     .compile_function(parameters, *is_vararg, body, *position)?;
                 let index = u32::try_from(self.protos.len()).map_err(|_| CompileError {
+                    kind: CompileErrorKind::Invalid,
                     position: *position,
                     message: "too many nested function prototypes".to_owned(),
                 })?;
                 if index > 262_143 {
                     return Err(CompileError {
+                        kind: CompileErrorKind::Invalid,
                         position: *position,
                         message: "too many nested functions for CLOSURE".to_owned(),
                     });
@@ -1050,6 +1080,7 @@ impl Codegen {
             Expr::Vararg(position) => {
                 if !self.is_vararg {
                     return Err(CompileError {
+                        kind: CompileErrorKind::Invalid,
                         position: *position,
                         message: "cannot use '...' outside a vararg function".to_owned(),
                     });
@@ -1230,6 +1261,7 @@ impl Codegen {
                     Opcode::Return,
                     base,
                     u16::try_from(values.len() + 1).map_err(|_| CompileError {
+                        kind: CompileErrorKind::Invalid,
                         position,
                         message: "return has too many values".to_owned(),
                     })?,
@@ -1277,6 +1309,7 @@ impl Codegen {
             Expr::Vararg(vararg_position) => {
                 if !self.is_vararg {
                     return Err(CompileError {
+                        kind: CompileErrorKind::Invalid,
                         position: *vararg_position,
                         message: "cannot use '...' outside a vararg function".to_owned(),
                     });
@@ -1322,6 +1355,7 @@ impl Codegen {
             position.line,
         );
         let first_argument = target.checked_add(1).ok_or_else(|| CompileError {
+            kind: CompileErrorKind::Invalid,
             position,
             message: "call needs more than 255 registers".to_owned(),
         })?;
@@ -1330,6 +1364,7 @@ impl Codegen {
             0
         } else {
             u16::try_from(arguments.len() + 1).map_err(|_| CompileError {
+                kind: CompileErrorKind::Invalid,
                 position,
                 message: "call has too many arguments".to_owned(),
             })?
@@ -1384,6 +1419,7 @@ impl Codegen {
             position.line,
         );
         let self_slot = target.checked_add(1).ok_or_else(|| CompileError {
+            kind: CompileErrorKind::Invalid,
             position,
             message: "method call needs more than 255 registers".to_owned(),
         })?;
@@ -1393,6 +1429,7 @@ impl Codegen {
             position.line,
         );
         let first_argument = target.checked_add(2).ok_or_else(|| CompileError {
+            kind: CompileErrorKind::Invalid,
             position,
             message: "method call needs more than 255 registers".to_owned(),
         })?;
@@ -1401,6 +1438,7 @@ impl Codegen {
             0
         } else {
             u16::try_from(arguments.len() + 2).map_err(|_| CompileError {
+                kind: CompileErrorKind::Invalid,
                 position,
                 message: "method call has too many arguments".to_owned(),
             })?
@@ -1435,6 +1473,7 @@ impl Codegen {
                 usize::from(first)
                     .checked_add(offset)
                     .ok_or_else(|| CompileError {
+                        kind: CompileErrorKind::Invalid,
                         position,
                         message: "call needs more than 255 registers".to_owned(),
                     })?;
@@ -1455,6 +1494,7 @@ impl Codegen {
         match wanted {
             None => Ok(0),
             Some(count) => u16::try_from(count + 1).map_err(|_| CompileError {
+                kind: CompileErrorKind::Invalid,
                 position,
                 message: "call requests too many results".to_owned(),
             }),
@@ -1492,6 +1532,7 @@ impl Codegen {
     fn register_at(&mut self, index: usize, position: Position) -> Result<u8, CompileError> {
         if index >= 255 {
             return Err(CompileError {
+                kind: CompileErrorKind::Invalid,
                 position,
                 message: "chunk needs more than 255 registers".to_owned(),
             });
@@ -1523,11 +1564,13 @@ impl Codegen {
             return Ok(index as u32);
         }
         let index = u32::try_from(self.constants.len()).map_err(|_| CompileError {
+            kind: CompileErrorKind::Invalid,
             position,
             message: "too many constants".to_owned(),
         })?;
         if index > 262_143 {
             return Err(CompileError {
+                kind: CompileErrorKind::Invalid,
                 position,
                 message: "too many constants for an ABx instruction".to_owned(),
             });
@@ -1552,6 +1595,7 @@ impl Codegen {
         let offset = target_pc as i64 - jump_pc as i64 - 1;
         if !(-i64::from(MAX_SBX)..=i64::from(MAX_SBX)).contains(&offset) {
             return Err(CompileError {
+                kind: CompileErrorKind::Invalid,
                 position,
                 message: "short-circuit jump is too far".to_owned(),
             });
@@ -1625,6 +1669,27 @@ struct Token {
     position: Position,
 }
 
+impl Token {
+    // ANCHOR: repl_expected_token
+    fn expected(&self, message: impl Into<String>) -> CompileError {
+        CompileError {
+            kind: if self.kind == TokenKind::Eof {
+                CompileErrorKind::NeedMoreInput
+            } else {
+                CompileErrorKind::Invalid
+            },
+            position: self.position,
+            message: message.into(),
+        }
+    }
+    // ANCHOR_END: repl_expected_token
+}
+
+struct Lexed {
+    tokens: Vec<Token>,
+    incomplete: Option<CompileError>,
+}
+
 struct Parser {
     tokens: Vec<Token>,
     cursor: usize,
@@ -1696,10 +1761,7 @@ impl Parser {
             self.advance();
             let token = self.advance().clone();
             let TokenKind::Name(name) = token.kind else {
-                return Err(CompileError {
-                    position: token.position,
-                    message: "expected local function name".to_owned(),
-                });
+                return Err(token.expected("expected local function name"));
             };
             let function = self.function_body(position, false)?;
             return Ok(Stmt::LocalFunction {
@@ -1741,7 +1803,9 @@ impl Parser {
             targets.push(self.assignment_target()?);
         }
         if self.current().kind != TokenKind::Equal {
-            return Err(self.error("expected '=' after assignment targets"));
+            return Err(self
+                .current()
+                .expected("expected '=' after assignment targets"));
         }
         self.advance();
         let values = self.expression_list()?;
@@ -1761,6 +1825,7 @@ impl Parser {
             Expr::Name(name, position) => Ok(LValue::Name(name, position)),
             Expr::Index(table, key, position) => Ok(LValue::Index(*table, *key, position)),
             _ => Err(CompileError {
+                kind: CompileErrorKind::Invalid,
                 position,
                 message: "expression is not assignable".to_owned(),
             }),
@@ -1770,16 +1835,14 @@ impl Parser {
     fn assignment_target(&mut self) -> Result<LValue, CompileError> {
         let token = self.advance().clone();
         let TokenKind::Name(name) = token.kind else {
-            return Err(CompileError {
-                position: token.position,
-                message: "expected assignment target".to_owned(),
-            });
+            return Err(token.expected("expected assignment target"));
         };
         let expression = self.postfix(Expr::Name(name, token.position))?;
         match expression {
             Expr::Name(name, position) => Ok(LValue::Name(name, position)),
             Expr::Index(table, key, position) => Ok(LValue::Index(*table, *key, position)),
             _ => Err(CompileError {
+                kind: CompileErrorKind::Invalid,
                 position: token.position,
                 message: "expression is not assignable".to_owned(),
             }),
@@ -1790,20 +1853,14 @@ impl Parser {
         let position = self.advance().position;
         let token = self.advance().clone();
         let TokenKind::Name(name) = token.kind else {
-            return Err(CompileError {
-                position: token.position,
-                message: "expected function name".to_owned(),
-            });
+            return Err(token.expected("expected function name"));
         };
         let mut target = Expr::Name(name, token.position);
         while self.current().kind == TokenKind::Dot {
             let dot = self.advance().position;
             let field = self.advance().clone();
             let TokenKind::Name(name) = field.kind else {
-                return Err(CompileError {
-                    position: field.position,
-                    message: "expected field name after '.'".to_owned(),
-                });
+                return Err(field.expected("expected field name after '.'"));
             };
             let key = Expr::Literal(Value::String(name), field.position);
             target = Expr::Index(Box::new(target), Box::new(key), dot);
@@ -1812,10 +1869,7 @@ impl Parser {
             let colon = self.advance().position;
             let field = self.advance().clone();
             let TokenKind::Name(name) = field.kind else {
-                return Err(CompileError {
-                    position: field.position,
-                    message: "expected method name after ':'".to_owned(),
-                });
+                return Err(field.expected("expected method name after ':'"));
             };
             let key = Expr::Literal(Value::String(name), field.position);
             target = Expr::Index(Box::new(target), Box::new(key), colon);
@@ -1848,10 +1902,7 @@ impl Parser {
                 }
                 let token = self.advance().clone();
                 let TokenKind::Name(name) = token.kind else {
-                    return Err(CompileError {
-                        position: token.position,
-                        message: "expected parameter name".to_owned(),
-                    });
+                    return Err(token.expected("expected parameter name"));
                 };
                 parameters.push((name, token.position));
                 if self.current().kind != TokenKind::Comma {
@@ -1878,7 +1929,7 @@ impl Parser {
         let position = self.advance().position;
         let body = self.block(&[TokenKind::End])?;
         if self.current().kind != TokenKind::End {
-            return Err(self.error("expected 'end' to close do block"));
+            return Err(self.current().expected("expected 'end' to close do block"));
         }
         self.advance();
         Ok(Stmt::Do { body, position })
@@ -1941,10 +1992,7 @@ impl Parser {
         let position = self.advance().position;
         let token = self.advance().clone();
         let TokenKind::Name(name) = token.kind else {
-            return Err(CompileError {
-                position: token.position,
-                message: "expected for-loop variable".to_owned(),
-            });
+            return Err(token.expected("expected for-loop variable"));
         };
         if self.current().kind != TokenKind::Equal {
             let mut names = vec![(name, token.position)];
@@ -1952,10 +2000,7 @@ impl Parser {
                 self.advance();
                 let token = self.advance().clone();
                 let TokenKind::Name(name) = token.kind else {
-                    return Err(CompileError {
-                        position: token.position,
-                        message: "expected generic for variable".to_owned(),
-                    });
+                    return Err(token.expected("expected generic for variable"));
                 };
                 names.push((name, token.position));
             }
@@ -2020,10 +2065,7 @@ impl Parser {
         loop {
             let token = self.advance().clone();
             let TokenKind::Name(name) = token.kind else {
-                return Err(CompileError {
-                    position: token.position,
-                    message: "expected a variable name".to_owned(),
-                });
+                return Err(token.expected("expected a variable name"));
             };
             names.push((name, token.position));
             if self.current().kind != TokenKind::Comma {
@@ -2035,7 +2077,7 @@ impl Parser {
 
     fn expect(&mut self, kind: TokenKind, message: &'static str) -> Result<(), CompileError> {
         if self.current().kind != kind {
-            return Err(self.error(message));
+            return Err(self.current().expected(message));
         }
         self.advance();
         Ok(())
@@ -2071,7 +2113,9 @@ impl Parser {
             TokenKind::LeftParen => {
                 let expression = self.expression(0)?;
                 if self.current().kind != TokenKind::RightParen {
-                    return Err(self.error("expected ')' to close grouped expression"));
+                    return Err(self
+                        .current()
+                        .expected("expected ')' to close grouped expression"));
                 }
                 self.advance();
                 Expr::Group(Box::new(expression), token.position)
@@ -2081,15 +2125,13 @@ impl Parser {
             TokenKind::Ellipsis => Expr::Vararg(token.position),
             TokenKind::Unsupported(spelling) => {
                 return Err(CompileError {
+                    kind: CompileErrorKind::Invalid,
                     position: token.position,
                     message: format!("{spelling} cannot start an expression"),
                 });
             }
             _ => {
-                return Err(CompileError {
-                    position: token.position,
-                    message: "expected an expression".to_owned(),
-                });
+                return Err(token.expected("expected an expression"));
             }
         };
         left = self.postfix(left)?;
@@ -2117,10 +2159,7 @@ impl Parser {
                     let position = self.advance().position;
                     let token = self.advance().clone();
                     let TokenKind::Name(name) = token.kind else {
-                        return Err(CompileError {
-                            position: token.position,
-                            message: "expected field name after '.'".to_owned(),
-                        });
+                        return Err(token.expected("expected field name after '.'"));
                     };
                     let key = Expr::Literal(Value::String(name), token.position);
                     expression = Expr::Index(Box::new(expression), Box::new(key), position);
@@ -2138,10 +2177,7 @@ impl Parser {
                     let position = self.advance().position;
                     let token = self.advance().clone();
                     let TokenKind::Name(method) = token.kind else {
-                        return Err(CompileError {
-                            position: token.position,
-                            message: "expected method name after ':'".to_owned(),
-                        });
+                        return Err(token.expected("expected method name after ':'"));
                     };
                     let arguments = self.call_arguments()?;
                     expression = Expr::MethodCall {
@@ -2171,7 +2207,9 @@ impl Parser {
         let mut fields = Vec::new();
         while self.current().kind != TokenKind::RightBrace {
             if self.current().kind == TokenKind::Eof {
-                return Err(self.error("expected '}' to close table constructor"));
+                return Err(self
+                    .current()
+                    .expected("expected '}' to close table constructor"));
             }
             let field = if self.current().kind == TokenKind::LeftBracket {
                 self.advance();
@@ -2198,7 +2236,9 @@ impl Parser {
             if matches!(self.current().kind, TokenKind::Comma | TokenKind::Semicolon) {
                 self.advance();
             } else if self.current().kind != TokenKind::RightBrace {
-                return Err(self.error("expected ',', ';' or '}' after table field"));
+                return Err(self
+                    .current()
+                    .expected("expected ',', ';' or '}' after table field"));
             }
         }
         self.advance();
@@ -2225,6 +2265,7 @@ impl Parser {
 
     fn error(&self, message: impl Into<String>) -> CompileError {
         CompileError {
+            kind: CompileErrorKind::Invalid,
             position: self.current().position,
             message: message.into(),
         }
@@ -2269,19 +2310,39 @@ impl<'source> Lexer<'source> {
         }
     }
 
-    fn tokenize(mut self) -> Result<Vec<Token>, CompileError> {
+    // ANCHOR: repl_lexical_boundary
+    fn tokenize(mut self) -> Result<Lexed, CompileError> {
         let mut tokens = Vec::new();
         loop {
-            self.skip_trivia()?;
-            let position = self.position();
-            let kind = self.token()?;
-            let finished = kind == TokenKind::Eof;
-            tokens.push(Token { kind, position });
+            let next = self.skip_trivia().and_then(|()| {
+                let position = self.position();
+                self.token().map(|kind| Token { kind, position })
+            });
+            let token = match next {
+                Ok(token) => token,
+                Err(error) if error.kind == CompileErrorKind::NeedMoreInput => {
+                    tokens.push(Token {
+                        kind: TokenKind::Eof,
+                        position: error.position,
+                    });
+                    return Ok(Lexed {
+                        tokens,
+                        incomplete: Some(error),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            let finished = token.kind == TokenKind::Eof;
+            tokens.push(token);
             if finished {
-                return Ok(tokens);
+                return Ok(Lexed {
+                    tokens,
+                    incomplete: None,
+                });
             }
         }
     }
+    // ANCHOR_END: repl_lexical_boundary
 
     fn token(&mut self) -> Result<TokenKind, CompileError> {
         let Some(byte) = self.current() else {
@@ -2447,7 +2508,7 @@ impl<'source> Lexer<'source> {
         let mut bytes = Vec::new();
         loop {
             let Some(byte) = self.current() else {
-                return Err(self.error("unterminated short string"));
+                return Err(self.incomplete("unterminated short string"));
             };
             if byte == quote {
                 self.bump();
@@ -2464,7 +2525,7 @@ impl<'source> Lexer<'source> {
             self.bump();
             let escaped = self
                 .current()
-                .ok_or_else(|| self.error("unterminated string escape"))?;
+                .ok_or_else(|| self.incomplete("unterminated string escape"))?;
             if escaped.is_ascii_digit() {
                 let mut decimal = 0_u16;
                 for _ in 0..3 {
@@ -2506,7 +2567,7 @@ impl<'source> Lexer<'source> {
         let start = self.cursor;
         loop {
             let Some(byte) = self.current() else {
-                return Err(self.error("unterminated long string or comment"));
+                return Err(self.incomplete("unterminated long string or comment"));
             };
             if byte == b']'
                 && (0..level).all(|index| self.peek(index + 1) == Some(b'='))
@@ -2577,6 +2638,15 @@ impl<'source> Lexer<'source> {
 
     fn error(&self, message: impl Into<String>) -> CompileError {
         CompileError {
+            kind: CompileErrorKind::Invalid,
+            position: self.position(),
+            message: message.into(),
+        }
+    }
+
+    fn incomplete(&self, message: impl Into<String>) -> CompileError {
+        CompileError {
+            kind: CompileErrorKind::NeedMoreInput,
             position: self.position(),
             message: message.into(),
         }
@@ -2585,8 +2655,145 @@ impl<'source> Lexer<'source> {
 
 #[cfg(test)]
 mod tests {
-    use super::compile;
+    use super::{compile, CompileErrorKind};
     use lua_core::Opcode;
+
+    // ANCHOR: repl_compile_contract
+    #[test]
+    fn parser_names_the_missing_component_without_matching_diagnostic_text() {
+        let prefixes: &[&[u8]] = &[
+            b"return 40 +\n",
+            b"local answer =\n",
+            b"return (40 +\n",
+            b"return {answer =\n",
+            b"if true then\n",
+            b"function f(\n",
+            b"local function\n",
+            b"for\n",
+            b"a,\n",
+            b"return a.\n",
+            b"return a:\n",
+            b"return a[\n",
+            b"repeat\n",
+            b"while true\n",
+            b"for i = 1,\n",
+            b"local\n",
+            b"return f(\n",
+            b"return {1\n",
+        ];
+        for source in prefixes {
+            let error = compile(source).unwrap_err();
+            assert_eq!(error.kind, CompileErrorKind::NeedMoreInput, "{source:?}");
+            assert_eq!(error.position.offset, source.len());
+        }
+        let error = compile(b"if true then )\n").unwrap_err();
+        assert_eq!(error.kind, CompileErrorKind::Invalid);
+        assert_eq!(error.position.offset, 13);
+    }
+    // ANCHOR_END: repl_compile_contract
+
+    #[test]
+    fn actual_multiline_completions_produce_one_valid_proto() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"return 40 +\n", b"2\n"),
+            (b"if true then\n", b"return 42\nend\n"),
+            (b"return [=[one\n", b"two]=]\n"),
+            (b"--[=[ comment\n", b"]=]\nreturn 42\n"),
+            (b"return {answer =\n", b"42}\n"),
+            (
+                b"function f(\n",
+                b"answer) return answer end\nreturn f(42)\n",
+            ),
+        ];
+        for (prefix, rest) in cases {
+            assert_eq!(
+                compile(prefix).unwrap_err().kind,
+                CompileErrorKind::NeedMoreInput,
+                "{prefix:?}"
+            );
+            let source = [*prefix, *rest].concat();
+            assert_eq!(compile(&source).unwrap().validate_shape(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn ordinary_errors_at_eof_are_not_a_continuation_signal() {
+        // Another physical line cannot repair the number or escape before its newline.
+        for source in [b"return 1e".as_slice(), b"return 0x", b"return '\\256"] {
+            let error = compile(source).unwrap_err();
+            assert_eq!(error.kind, CompileErrorKind::Invalid, "{source:?}");
+            assert_eq!(error.position.offset, source.len());
+        }
+        for source in [
+            b"local =\n".as_slice(),
+            b"function f(a,)\n",
+            b"return 1 2\n",
+            b"return 1; x = 2\n",
+            b"break\n",
+        ] {
+            assert_eq!(
+                compile(source).unwrap_err().kind,
+                CompileErrorKind::Invalid,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_string_newline_is_invalid_but_escaped_newline_can_continue() {
+        for source in [b"return 'open\n".as_slice(), b"return \"open\r\n"] {
+            assert_eq!(compile(source).unwrap_err().kind, CompileErrorKind::Invalid);
+        }
+        for source in [b"return 'open".as_slice(), b"return 'open\\"] {
+            assert_eq!(
+                compile(source).unwrap_err().kind,
+                CompileErrorKind::NeedMoreInput
+            );
+        }
+        let prefix = b"return 'one\\\n";
+        assert_eq!(
+            compile(prefix).unwrap_err().kind,
+            CompileErrorKind::NeedMoreInput
+        );
+        assert!(compile(&[prefix.as_slice(), b"two'\n"].concat()).is_ok());
+    }
+
+    #[test]
+    fn lexical_incomplete_never_hides_an_earlier_wrong_token() {
+        for source in [
+            b"if true then ) [[open".as_slice(),
+            b"return ) --[[open",
+            b"local = 'open",
+            b"return @ [=[open",
+        ] {
+            let error = compile(source).unwrap_err();
+            assert_eq!(error.kind, CompileErrorKind::Invalid, "{source:?}");
+            assert!(error.position.offset < source.len());
+        }
+    }
+
+    #[test]
+    fn long_literals_and_comments_need_their_matching_delimiter() {
+        for source in [
+            b"return [[open\n".as_slice(),
+            b"return [=[open]]\n",
+            b"--[==[ open ]=]\n",
+        ] {
+            assert_eq!(
+                compile(source).unwrap_err().kind,
+                CompileErrorKind::NeedMoreInput,
+                "{source:?}"
+            );
+        }
+        for source in [
+            b"return [[closed]]\n".as_slice(),
+            b"return [=[closed]]=]\n",
+            b"--[==[ closed ]=] ]==]\nreturn 42\n",
+            b"-- ordinary comment needs no continuation",
+        ] {
+            assert!(compile(source).is_ok(), "{source:?}");
+        }
+    }
 
     #[test]
     fn precedence_reaches_codegen_in_the_right_shape() {

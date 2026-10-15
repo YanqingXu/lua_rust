@@ -80,12 +80,12 @@ pub fn mode_boundaries(binary: &Path) -> Result<Vec<Case>, String> {
         )?,
         check(
             binary,
-            "incomplete EOF silently exits zero",
+            "structured pending EOF reports once and exits one",
             &["-i"],
             b"if true then\nprint('never')\n",
-            0,
+            1,
             &format!("{BANNER}> >> >> \n"),
-            &[],
+            &["expected 'end' to close if"],
         )?,
         check(
             binary,
@@ -116,15 +116,12 @@ pub fn mode_boundaries(binary: &Path) -> Result<Vec<Case>, String> {
         )?,
         check(
             binary,
-            "heuristic misses appendable expression",
+            "structured continuation completes appendable expression",
             &["-i"],
             b"return 40 +\n2\n=42\n",
             0,
-            &format!("{BANNER}> > > 42\n> \n"),
-            &[
-                "expected an expression",
-                "expected local, assignment, do block or return",
-            ],
+            &format!("{BANNER}> >> 42\n> 42\n> \n"),
+            &[],
         )?,
     ])
 }

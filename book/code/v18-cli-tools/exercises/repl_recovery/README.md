@@ -2,7 +2,9 @@
 
 前置：已理解 `Session` 为多个输入保存同一个 VM。约 20 分钟，完成一个
 `submit` TODO：编译尚未完成时保留 source，成功或普通错误后清空它，再接受下一行。
-本包使用真实 Session/编译器，不改生产 REPL 或编译器，不扩展完整续行语法。
+本包使用真实 Session/编译器，保留结构化迁移前的消息启发式作局部模型，不扩展完整
+续行语法。当前 binary 已采用结构化 kind 和显式 EOF 协议；其真实对照随实现更新，
+原因与新练习见 [分类](../repl_classification/README.md) 与 [EOF](../repl_eof/README.md)。
 
 ## 先预测，再重放固定反例
 
@@ -111,7 +113,7 @@ cargo test --manifest-path book/code/v18-cli-tools/Cargo.toml --test repl_recove
 
 初始 ignored 验收应失败：输入 if true then 后，source 实际为空，预期保留
 `"if true then\n"`。完成后同一合同通过。默认 reference 有 **7 项**：共享合同、
-三种固定故障、真实启发式漏判，以及两组真实 process 对照。reference 成功或 CLI
+三种固定故障、历史模型启发式漏判，以及两组当前 process 对照。reference 成功或 CLI
 退出 0 都不等于 starter 完成，以 ignored 验收为准。
 
 ## 错误恢复没有撤销 Session 的副作用
@@ -122,23 +124,24 @@ cargo test --manifest-path book/code/v18-cli-tools/Cargo.toml --test repl_recove
 所有 VM/GC 状态在所有错误分支均已恢复。
 
 当前多结果接口区分 `return nil` 的 `[Nil]` 和 `return` 的空 Vec。生产
-`print_values` 对空 Vec 不打印结果行，对单个 Nil 打印 `nil\n`。模型保留真实
+`write_values` 对空 Vec 不打印结果行，对单个 Nil 打印 `nil\n`。模型保留真实
 Vec，真实 process 检查完整 stdout，避免只检查最后一个数字。
 
 ## 启发式、EOF 和管道的真实边界
 
-生产 `is_incomplete` 只看 `CompileError.message.contains(...)`，匹配
+迁移前 `is_incomplete` 只看 `CompileError.message.contains(...)`，匹配
 `expected 'end'`、`unexpected end`、`unterminated` 三个片段。模型复制这三个条件，
-没有增加结构化错误类别。直接使用当前编译器，可以复现确定的**漏判**：
+仍故意不读取新增的 kind。使用当前编译器加上这个历史决策，可以复现确定的**漏判**：
 
 ```text
 heuristic: message="expected an expression" incomplete=false appended_chunk_compiles=true ordinary_error=true buffer_empty=true
 ```
 
-`return 40 +\n` 编译失败，但追加 `2\n` 后可编译成返回 42 的程序。当前 REPL
+`return 40 +\n` 编译失败，但追加 `2\n` 后可编译成返回 42 的程序。历史模型
 却将前一行当普通错误清空，下一行 2 又成为独立语法错误，最后 =42 才恢复。
-本题保留并验收这个现有边界，不把字符串判断包装成完整 Lua 续行 parser，也
-没有声称已复现所有种类的误判。若未来修编译器，应另订 NeedMoreInput 合同。
+本题保留并验收这个错误决策，不把字符串判断包装成完整 Lua 续行 parser，也
+没有声称已复现所有种类的误判。当前编译错误的 kind 已为 NeedMoreInput，真实
+Repl 因而保留输入；下一行 2 完成 chunk 并返回42，不产生两条编译 diagnostic。
 
 `real.rs` 通过共享有界 process runner 跑 **8 个真实子进程**。集成测试使用
 `env!("CARGO_BIN_EXE_lua_app")`；example 使用同 profile sibling。关键结果：
@@ -148,14 +151,14 @@ heuristic: message="expected an expression" incomplete=false appended_chunk_comp
 | `-i`，先语法错再运行错 | 继续打印 42、effects=1、原 saved=40；两条 diagnostic | 0 |
 | `-i`，return nil / return / =42 | stdout 含一次 nil 行；空 Vec 没有结果行 | 0 |
 | `-e "error('recover')"` | 无 stdout，一条 recover diagnostic | 1 |
-| `-i`，未闭合 if 后 EOF | pending 不重试、不报告错误，`never` 不执行 | 0 |
+| `-i`，未闭合 if 后 EOF | pending 不重试，报告一次原编译错误，`never` 不执行 | 1 |
 | 无 `-i` 的 pipe，运行错误 | 当一个 chunk 执行，只打印 first，不执行 after | 1 |
 | 无 `-i` 的 pipe，后行语法错 | 整段先编译，前行 print 也不执行 | 1 |
 | 同一段语法错输入加 `-i` | 前行已完整 chunk 先打印，后行报错后继续到 EOF | 0 |
-| `-i`，上述 return 40 + 漏判 | 两条编译 diagnostic，最后 =42 仍可执行 | 0 |
+| `-i`，上述 return 40 + | 新 kind 保留输入，追加2返回42，最后 =42再返回42，无 diagnostic | 0 |
 
-EOF 分支只是 break；pending source 随 `repl` 局部变量析构而丢弃，没有额外
-`source.clear()` 或最终编译。普通 Lua 输入错误在循环里处理；stdin 读取或
+旧模型没有模拟 EOF；当前真实 Repl 的 EOF 分支消费 pending 诊断并清 source，
+不会最终重编译或执行。空闲 EOF 返回0，pending EOF 报告一次并返回1。普通 Lua 输入错误在循环里处理；stdin 读取或
 stdout 写入等宿主错误仍能离开循环。`-i` 即使接到管道也有 banner/prompts；
 无参数且 stdin 非终端则 read_to_end 读取一个脚本，不走 REPL。
 
@@ -168,9 +171,10 @@ cargo run --quiet --release --manifest-path book/code/v18-cli-tools/Cargo.toml -
 ```
 
 理解题：为什么清 source 不应重建 Session，为什么 runtime error 之后 effects
-仍是 1？调试题：为什么缺少 `end` 能进入续行，return 40 + 却不能？指出判断依据
-在哪个字段，不能仅从行末字符猜测。
+仍是 1？调试题：为什么旧模型缺少 `end` 能续行，return 40 + 却不能，而当前真实
+Repl 两者都能？比较 message 与 kind，不能仅从行末字符猜测。
 
 完成检查：能预测三个 fault 的实际状态；独立完成 submit；解释 source/Session
 两种生命周期、空 Vec/Nil、EOF/pipe 的区别；指出启发式的已验证漏判。迁移时只将
-source 决策留在生产 REPL，观察 Event、故障 hooks 和子进程对照保留在教学包。
+source 决策留在真实 Repl，观察 Event、故障 hooks 和子进程对照保留在教学包；
+本包的历史 is_incomplete 仍用于说明迁移原因，不能拿它解释当前 binary 的分类。
