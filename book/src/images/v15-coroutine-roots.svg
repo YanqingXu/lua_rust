@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="900" viewBox="0 0 900 900" role="img" aria-labelledby="title desc">
+  <title id="title">暂停 continuation 的执行所有权与 GC roots 所有权</title>
+  <desc id="desc">VM的coroutine状态拥有entry和暂停帧，帧包含function、Rc寄存器槽、varargs、pc与恢复模式。sync读取其中的Value并发布到Heap thread的roots镜像。GC从可达handle追踪thread，再到function、register value、vararg、closure upvalue和槽内容。宿主scheduler和open-upvalue索引并非自动GC根。只有active帧的open upvalue直接root；其他需从可达thread或closure追踪。撤销handle根后没有外部引用的整图可回收，Sweep完成再prune状态。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; } .label { font-size: 18px; } .small { font-size: 16px; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .flow { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="900" height="900" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">VM 拥有继续执行的数据；Heap 镜像让 collector 看见其中的对象</text>
+  <text x="24" y="65" class="small">拥有 Rust Vec / Rc 不等于注册 GC root；暂停状态和可达性图需要分别维护。</text>
+
+  <rect x="20" y="86" width="860" height="133" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="38" y="119" class="label">VM scheduler：CoroutineState { entry, frames }</text>
+  <text x="38" y="153" class="mono">frame = function + Rc slots + varargs + pc + frame_id + resume_mode</text>
+  <text x="38" y="187" class="small">active_frames / open upvalue 可共享槽别名；此处保存执行数据，不自动成为 collector 根。</text>
+  <path d="M448 219V257" class="flow"/>
+  <text x="468" y="244" class="small">sync：读取当前槽内容，克隆 Value / handle</text>
+  <rect x="20" y="259" width="860" height="90" rx="12" fill="#e5f1e7" stroke="#286047"/>
+  <text x="38" y="292" class="label">Heap thread object：roots: Vec&lt;Value&gt;</text>
+  <text x="38" y="326" class="small">含 entry、每帧 function、register values、varargs；不存执行 pc，也不接管 Rc 槽。</text>
+
+  <rect x="40" y="390" width="170" height="60" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="125" y="427" text-anchor="middle" class="label">可达 handle</text>
+  <rect x="300" y="390" width="210" height="60" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="405" y="427" text-anchor="middle" class="label">thread roots 镜像</text>
+  <rect x="600" y="390" width="256" height="60" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="728" y="427" text-anchor="middle" class="label">值 / closure / upvalue</text>
+  <path d="M210 420H299" class="flow"/><path d="M510 420H599" class="flow"/>
+  <text x="40" y="485" class="small">GC 只沿可达对象的强边追踪。thread 没有外部 root 时，镜像不会自己把 thread 变成根。</text>
+
+  <rect x="20" y="516" width="420" height="121" rx="12" fill="#fff8ee" stroke="#a45a24"/>
+  <text x="38" y="549" class="label">漏镜像：暂停后只剩 Rust 容器</text>
+  <text x="38" y="580" class="small">handle 还活，但 register / vararg 目标被收。</text>
+  <text x="38" y="611" class="small">恢复时实际访问会失败；ID 数字仍在不算存活。</text>
+  <rect x="460" y="516" width="420" height="121" rx="12" fill="#fff8ee" stroke="#a45a24"/>
+  <text x="478" y="549" class="label">全索引当根：不可达暂停图仍被保活</text>
+  <text x="478" y="580" class="small">open-upvalue 宿主索引若全播种为根，</text>
+  <text x="478" y="611" class="small">upvalue → cycle → thread 的环就会泄漏。</text>
+
+  <rect x="20" y="660" width="860" height="95" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="38" y="692" class="label">正确 direct roots：只补 active frame 的 open upvalue</text>
+  <text x="38" y="725" class="small">暂停图经 thread / closure 到达；无外部 root 的图被回收，完整 Sweep 后 prune VM 状态。</text>
+  <text x="24" y="792" class="small">真实时点：保存帧 → 移除 active 视图 → unwind → sync。其间没有 GC 安全点，须在下次 GC 前同步。</text>
+  <text x="24" y="823" class="small">恢复时旧镜像暂保留，active slots 提供当前值；再次 yield 更新镜像，return / 普通错误清空镜像。</text>
+  <text x="24" y="854" class="small">模型只在已同步的稳定暂停点收集；suspended varargs 的验收不代表所有活动上下文都自动 trace。</text>
+  <text x="24" y="883" class="small">对象实际回收与 scheduler state_count 清零要分别验收；单看 Rust map 变小不足以证明无泄漏。</text>
+</svg>

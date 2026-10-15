@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="766" viewBox="0 0 900 766" role="img" aria-labelledby="title desc">
+  <title id="title">Yield 保存下一条指令，resume 从内向外写回结果</title>
+  <desc id="desc">yield以内部Yield信号返回，普通CALL依次保存内层和外层帧，pc保存next_pc，恢复模式记录结果窗口。resume参数首先成为最内层yield表达式的结果，随后从保存pc继续；内层return再成为外层CALL的结果。再yield时，新内层帧与未恢复外层帧合并。yield路径移除active索引但不close upvalue，普通return或错误才close。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; } .label { font-size: 18px; } .small { font-size: 16px; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .flow { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="900" height="766" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">保存执行位置，而非重新调用入口来“模拟继续”</text>
+  <text x="24" y="65" class="small">恢复同一帧的 pc / slots / varargs / frame_id，并按 ResumeMode 写回恢复值。</text>
+
+  <rect x="20" y="86" width="860" height="145" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="38" y="119" class="label">暂停：inner 调用 yield，信号穿过普通 Lua CALL</text>
+  <text x="38" y="153" class="mono">先 push inner，后 push caller → frames = [inner, caller, …]</text>
+  <text x="38" y="187" class="small">每帧保存 pc = next_pc；Call { base, wanted } 记住结果去哪里、要多少个。</text>
+  <text x="38" y="217" class="small">暂停时不 close open upvalue；保存的 Rc 槽仍要在恢复后继续被读写。</text>
+
+  <rect x="40" y="262" width="816" height="67" rx="6" fill="#fff" stroke="#286047"/>
+  <text x="58" y="289" class="label">再次 resume(co, values…)：目标已经停在 yield</text>
+  <text x="58" y="315" class="small">values 成为 yield 表达式的返回值，不是重新传给入口函数的初始参数。</text>
+  <rect x="40" y="364" width="816" height="67" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="58" y="391" class="label">先恢复 inner：write_results(base, values, wanted)，从保存 pc 继续</text>
+  <text x="58" y="417" class="small">固定窗口补 nil / 截断；开放窗口保留结果长度与中间 nil；top 由写回结果重建。</text>
+  <rect x="40" y="466" width="816" height="67" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="58" y="493" class="label">inner return → caller 的 CALL 结果 → 恢复 caller</text>
+  <text x="58" y="519" class="small">逐层向外返回，直到 coroutine 返回；不能先从最外层帧开始。</text>
+  <path d="M448 231V261" class="flow"/><path d="M448 329V363" class="flow"/><path d="M448 431V465" class="flow"/>
+
+  <rect x="20" y="565" width="860" height="95" rx="12" fill="#fff8ee" stroke="#a45a24"/>
+  <text x="38" y="597" class="label">再次 yield：保存新 inner frames，并接上尚未恢复的 outer frames</text>
+  <text x="38" y="629" class="small">重启入口会重复副作用；丢外层帧会丢返回链；把 pc 留在 CALL 会再次执行同一次 yield。</text>
+  <text x="24" y="698" class="small">Tail 模式没有后续普通 CALL 写回：resume_values 直接作为这一帧的 Return 结果。</text>
+  <text x="24" y="729" class="small">真实 SuspendedFrame 没有单独 top 字段；Call 模式用 write_results 的返回值重建 top。</text>
+  <text x="24" y="758" class="small">以上只跨普通 Lua 调用；元方法、finalizer 等禁止 yield 的边界返回普通错误。</text>
+</svg>

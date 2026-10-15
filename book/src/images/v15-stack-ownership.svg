@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="645" viewBox="0 0 900 645" role="img" aria-labelledby="title desc">
+  <title id="title">独立暂停帧：不能让 coroutine 共用一个保存区</title>
+  <desc id="desc">A暂停后若把帧放在全局scratch，B暂停就覆盖它，A恢复时取错寄存器与pc。正确设计把暂停帧容器放在对应coroutine状态中。真实VM在resume时临时take出entry与frames，执行或再次yield后归还新帧。registers是Rc RefCell Value槽的Vec，clone只复制Rc，active索引和upvalue可以共享同一槽，不是深复制全部对象。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; } .label { font-size: 18px; } .small { font-size: 16px; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .flow { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="900" height="645" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">A 暂停后运行 B：两份 continuation 必须各自保管</text>
+  <text x="24" y="65" class="small">只讨论暂停时的数据归属；没有创建 OS thread，也没有并发执行两条 Lua 指令。</text>
+
+  <rect x="20" y="86" width="420" height="308" rx="12" fill="#fff8ee" stroke="#a45a24"/>
+  <text x="38" y="120" class="label">错误：全局只有一个 scratch frame</text>
+  <rect x="40" y="145" width="380" height="56" rx="6" fill="#fff" stroke="#a45a24"/>
+  <text x="58" y="180" class="mono">A yield → scratch = A.frame</text>
+  <rect x="40" y="227" width="380" height="56" rx="6" fill="#f4e1c9" stroke="#a45a24"/>
+  <text x="58" y="262" class="mono">B yield → scratch = B.frame</text>
+  <path d="M230 201V226" stroke="#a45a24" stroke-width="2"/>
+  <text x="38" y="322" class="label">resume(A) 却拿到 B 的 pc / 局部值。</text>
+  <text x="38" y="355" class="small">暂停状态缺少 coroutine 对应归属，交错就污染。</text>
+
+  <rect x="460" y="86" width="420" height="308" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="478" y="120" class="label">修复：按 coroutine 身份保存</text>
+  <rect x="480" y="145" width="380" height="56" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="498" y="180" class="mono">states[A].frames = A.frames</text>
+  <rect x="480" y="227" width="380" height="56" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="498" y="262" class="mono">states[B].frames = B.frames</text>
+  <text x="478" y="322" class="label">resume(A) 只取 A 的暂停状态。</text>
+  <text x="478" y="355" class="small">A/B 的寄存器窗口来自不同帧的槽。</text>
+
+  <rect x="20" y="417" width="860" height="105" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="38" y="449" class="label">真实 VM：CoroutineState 保存 entry / frames，resume 临时取得所有权</text>
+  <text x="38" y="483" class="mono">state.frames -- mem::take → 执行局部 frames → yield 后保存新 frames</text>
+  <path d="M40 504H854" class="flow"/>
+  <text x="24" y="558" class="small">真实 registers = Vec&lt;Rc&lt;RefCell&lt;Value&gt;&gt;&gt;；Vec 的 clone 复制 Rc 别名，不是深拷贝 Lua 对象。</text>
+  <text x="24" y="588" class="small">active_frames 索引、暂停帧与 open upvalue 可引用同一槽；共享同一帧的槽不等于 A/B 共用栈。</text>
+  <text x="24" y="619" class="small">独立保存还不够：如果恢复后把 pc 重置为 0，yield 之前的副作用仍会再次发生。</text>
+</svg>

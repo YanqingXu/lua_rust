@@ -20,3 +20,19 @@ members = [
 
 [lints.clippy]
 all = "warn"
+
+[[test]]
+name = "co_continuation_exercises"
+path = "exercises/continuation/acceptance.rs"
+
+[[test]]
+name = "co_continuation_reference"
+path = "exercises/continuation/reference.rs"
+
+[[test]]
+name = "gc_coroutine_roots_exercises"
+path = "exercises/roots/acceptance.rs"
+
+[[test]]
+name = "gc_coroutine_roots_reference"
+path = "exercises/roots/reference.rs"

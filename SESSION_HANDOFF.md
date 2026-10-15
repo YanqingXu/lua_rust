@@ -3,6 +3,73 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.15 独立栈、yield/resume 与 GC roots 所有权
+
+用户要求按问题链补齐 v0.15 的反例、前后差异、状态图和验收练习，验证后更新交接。
+本次完成该教学包，**没有恢复暂停的原审计整改目标**。用户随后明确要求将本批
+章节、状态图、练习包和交接一并提交并推送。
+
+- 起点为 `main@eba1321e1ce57447877242273bd11c68ab47f46a`，工作区干净；提交前 fetch
+  再次确认与 origin/main 无分叉。这是上一批已推送的 v0.14 弱表/复活教学包，本批
+  提交号以 `git log -1 -- book/src/versions/v15-coroutine.md` 为准，新提交 CI 须按其
+  SHA 查询。本次生产 `crates/`、v0.15 快照核心与既有测试均无最终 diff，历史记录
+  保持各自版本归属。
+- [主章](book/src/versions/v15-coroutine.md) 按五问组织：共用 scratch 污染暂停帧 →
+  每 co 保存；从入口重跑副作用 → 使用 next pc；嵌套 resume 状态/通道污染 → 保存
+  并恢复 parent 与 yield 通道；Rust 仍有帧却 GC stale → thread Value 镜像；把全部
+  scheduler/upvalue 索引当根 → 仅补 active upvalue 直接根。每题有预测、可运行反例、
+  starter/solution include、差异、精确命令与完成条件。
+- [执行包](book/code/v15-coroutine/exercises/continuation/README.md) 提供三个独立
+  TODO、9 项参考和 `continuation_problem_chain` 固定 CLI。交错 A/B 的正确轨迹分别
+  10→11→14、100→102→106；重跑反例把副作用 1 变 3。owner 模型用人工外层哨兵验证
+  通道隔离，不冒充真实 Lua 内部状态；真实 VM 另验证交错局部值、三次 host execute
+  的嵌套调用/多 yield/含 nil 多值，以及 Running/Normal 与返回方向。
+- [roots 包](book/code/v15-coroutine/exercises/roots/README.md) 提供两个独立 TODO、
+  9 项参考和 `coroutine_roots_problem_chain` 固定 CLI。模型只在稳定暂停点收集，
+  分别展示漏镜像 stale、全 scheduler 伪根、仅全 open-upvalue 也会自举保活环；还检查
+  Value 镜像不随原 Rc 槽自动更新。真实 Heap 在 Rust 槽仍持有时逐项验证八个目标，
+  撤 thread root 后全部访问失败，thread `is_live==Ok(false)`，prefix 保留。真实 VM
+  验证 fresh entry 跨 GC、暂停寄存器/capture/varargs 恢复计算值 46；释放时要求
+  weak 的 cycle/getter/thread 三槽精确 nil、state count 0，而非只看 map 变小。
+- 四幅 SVG 已在浏览器核对正文 include、列对齐、文字与箭头：独立暂停帧、恢复链、
+  owner turn、执行 owner/Heap tracing 镜像分工。`resume_once.lua` 返回 true；原
+  demo 仍返回 1515。临时浏览器页与预览进程已结束。
+- 旧章表述已校准：A/B/C 均为 coroutine 时 C running 则 A/B 都 normal；非法 resume
+  Running/Normal/Dead 保持原态，只有实际普通错误使目标 dead。Rc Vec clone 只复制
+  槽别名；SuspendedFrame 没有 top 字段，恢复时由结果写回重建。Yield 不 CLOSE；实际
+  detach→unwind→sync 窗口无 GC checkpoint，要求下次收集前完成镜像。旧镜像恢复中
+  暂留，不能从稳定暂停模型外推全部 active/phase 转换安全。
+- 本地 `rustc/cargo 1.96.1`：fmt、workspace all-targets Clippy `-D warnings` 通过；
+  Debug/Release 各 **117 通过、5 ignored**（99 原测试 + 18 参考）。五个 TODO 显式
+  初始分别 3/2 项失败，已完成“失败 → 临时套解通过 → 字节恢复后再失败”，原始
+  starter 哈希一致。两个 CLI 的 21 条关键输出匹配；17 条逐题命令各执行 1 项：
+  12 正向通过、5 learner 按预期失败。ignored 不代表练习已完成。
+- 全 20 版本教学结构、mdBook 构建和 38 页链接检查通过：**1,223 个站内链接，
+  0 broken**。独立证据目录 `target/teaching-v15-2026-10-15/`：
+  `full-validation/20261015T035637338961Z/{summary,metadata}.json` 为整套验证与输入
+  哈希；`continuation/20261015T035312541414Z/` 和 `roots/starter-round-trip.json`
+  记录局部/套解恢复；`chapter-commands/` 为逐题回放；`final-verification.json` 为
+  最终站点/输入哈希/基线 CI 观察。目录是本机忽略产物，不随 clone 交付；永久入口为
+  章节、两个 README 与 examples，没有覆盖 v0.14 历史证据。
+- **独立已知功能缺口，未修复：** [active_varargs_gap.lua](book/code/v15-coroutine/examples/active_varargs_gap.lua)
+  从 Lua tail-call 向 variadic callee 传表，在 `VARARG` 搬入寄存器前 `gc_collect()`，
+  实测退出 2：`line 6 (pc 7): stale GC handle for object 7`。tail-Lua 分派绕过 invoke
+  临时参数根，`gc_roots` 又没有独立活动 varargs 根枚举。该项单独记为
+  `known-functional-failure / functionality_pass=false`，不计入 ignored 或参考成功。
+  暂停 varargs 正向验收不能证明该路径安全，也不能把默认 117 通过解释成全快照无缺口。
+- 已推送基线 `eba1321` 的 CI 于 2026-10-15 12:00 CST 观察：
+  [mdBook 38677872207](https://github.com/YanqingXu/lua_rust/actions/runs/38677872207)
+  已成功；[Rust CI 38677872181](https://github.com/YanqingXu/lua_rust/actions/runs/38677872181)
+  仍运行，GC/native Miri 与 Linux ASan 已成功，Windows quality 与另一 Miri 仍在运行。
+  提交前重新查询终态：Rust CI 失败，仅 Windows Quality Gate 失败，其余三个 job
+  成功。该次失败日志下载返回 HTTP 403（要求 repository admin 权限），未核实具体
+  原因；输出保存于同证据目录 `push-baseline-eba1321.log`。基线结果不覆盖本批
+  教学的本地验证，也不作为本批新提交的 CI 结果。
+
+下一工程工作包可从 active_varargs_gap 精确输入处理活动 varargs/尾调用参数交接 roots，
+另补正常、暂停恢复、tail-call 的对照；按后续用户指令启动。若继续教学，v0.16 可从
+“宿主适配器为什么不能继续散落在 VM 内”接续。原审计队列仍暂停在本地时间/UTC/DST。
+
 ## 2026-10-15：v0.14 弱表、ephemeron 固定点与 resurrection 清理顺序
 
 用户要求继续按问题链补齐这组反例、前后差异、状态图和练习，完成验证并交接。

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="659" viewBox="0 0 900 659" role="img" aria-labelledby="title desc">
+  <title id="title">嵌套 resume 的 owner turn 与值返回方向</title>
+  <desc id="desc">A B C都是coroutine。主线程resume A后A running；A resume B再由B resume C时A B均normal C running。C yield后C suspended，B running，A仍normal，yield值交给B的resume调用点。B返回后A running，B dead；A返回后owner为主线程None。非法resume Running Normal Dead不会执行字节码也不改变原状态。每次嵌套进入保存外层yield通道，子结果取走后恢复父owner和原通道。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; } .label { font-size: 18px; } .small { font-size: 16px; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .flow { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="900" height="659" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">只有当前 owner 在运行；等待子线程的父 coroutine 是 normal</text>
+  <text x="24" y="65" class="small">这里 A / B / C 都是 coroutine；主线程没有伪造的 handle，running() 返回 nil。</text>
+  <rect x="20" y="86" width="860" height="260" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="40" y="121" class="label">时点</text><text x="382" y="121" class="label">A</text><text x="548" y="121" class="label">B</text><text x="713" y="121" class="label">C</text>
+  <path d="M40 134H854" stroke="#d9d5c7"/>
+  <text x="40" y="166" class="small">主线程 resume A</text><text x="365" y="166" class="mono">running</text><text x="530" y="166" class="mono">suspended</text><text x="695" y="166" class="mono">suspended</text>
+  <text x="40" y="205" class="small">A resume B，B resume C</text><text x="365" y="205" class="mono">normal</text><text x="530" y="205" class="mono">normal</text><text x="695" y="205" class="mono">running</text>
+  <text x="40" y="244" class="small">C yield，回到 B 的调用点</text><text x="365" y="244" class="mono">normal</text><text x="530" y="244" class="mono">running</text><text x="695" y="244" class="mono">suspended</text>
+  <text x="40" y="283" class="small">B return，回到 A 的调用点</text><text x="365" y="283" class="mono">running</text><text x="530" y="283" class="mono">dead</text><text x="695" y="283" class="mono">suspended</text>
+  <text x="40" y="322" class="small">A return，回到主线程</text><text x="365" y="322" class="mono">dead</text><text x="530" y="322" class="mono">dead</text><text x="695" y="322" class="mono">suspended</text>
+  <rect x="20" y="369" width="860" height="144" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="38" y="402" class="label">进入子线程前：保存 parent 与外层 yield_values / yield_frames</text>
+  <text x="38" y="436" class="mono">C yield(values) → B 的 resume(C) 得到 true, values…</text>
+  <text x="38" y="470" class="small">子线程结果被取走后，再恢复父 owner、Running 状态和原通道，不能混入外层帧。</text>
+  <path d="M40 492H854" class="flow"/>
+  <text x="24" y="550" class="small">状态守卫：Running / Normal / Dead 不能 resume；返回 false，不执行字节码，也不改变原态。</text>
+  <text x="24" y="581" class="small">运行中普通错误则不同：目标成为 Dead，resume 返回 false, message；Yield 被 resume 边界消费。</text>
+  <text x="24" y="612" class="small">独立通道实验注入外层哨兵检验保存/恢复；它是局部协议探针，不冒充真实 Lua 内部状态读数。</text>
+  <text x="24" y="642" class="small">所有切换同步发生在同一个 VM 中；owner turn 不意味着宿主线程、async task 或并发所有权。</text>
+</svg>
