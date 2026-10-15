@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="780" viewBox="0 0 900 780" role="img" aria-labelledby="title desc">
+<title id="title">deadline 后的 kill wait 与状态回收</title><desc id="desc">try_wait返回Some已取得并回收状态。截止后先标记TimedOut，再尝试kill，即使kill出错也wait。wait成功才确认回收，随后reader join保留部分输出。标准Child的drop不自动kill或wait，自定义guard只是backstop。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}.bad{fill:none;stroke:#b55b48;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="780" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">deadline 是观察结果；回收仍需要明确完成</text>
+<rect x="24" y="64" width="852" height="74" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="96" class="label">Running：唯一 Child owner + 并行 reader + deadline</text>
+<text x="44" y="124" class="small">try_wait 轮询；调度 / poll / 清理耗时使返回时刻不等于精确截止毫秒。</text>
+<path d="M225 138V180" class="flow"/>
+<path d="M675 138V180" class="flow"/>
+<rect x="24" y="184" width="408" height="104" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="216" class="label">try_wait → Some(status)</text>
+<text x="44" y="250" class="small">已取得并回收 child 状态。</text>
+<text x="44" y="278" class="small">记录 Exited(status)，无需重复 wait。</text>
+<rect x="456" y="184" width="420" height="104" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="476" y="216" class="label">deadline → TimedOut</text>
+<text x="476" y="250" class="small">不是 child 普通退出码。</text>
+<text x="476" y="278" class="small">清理状态另存；不改写成 Lua code=1。</text>
+<path d="M675 288V330" class="flow"/>
+<rect x="456" y="334" width="420" height="128" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="476" y="367" class="mono">kill_result = kill()</text>
+<text x="476" y="400" class="mono">wait_result = wait()</text>
+<text x="476" y="430" class="small">kill 出错也尝试 wait：可能刚好退出。</text>
+<text x="476" y="454" class="small">wait 失败须报告清理未确认及上下文。</text>
+<rect x="24" y="334" width="408" height="128" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="44" y="367" class="label">错误 A：直接 return Timeout</text>
+<text x="44" y="400" class="label">错误 B：kill 后直接返回</text>
+<text x="44" y="430" class="small">在 hook 返回边界检查欠缺。</text>
+<text x="44" y="454" class="small">外层 guard 收尾不算 hook 已通过。</text>
+<path d="M675 462V500H450V518" class="flow"/>
+<text x="692" y="487" class="small">wait 成功</text>
+<path d="M225 288V310H12V500H450" class="flow"/>
+<rect x="24" y="522" width="852" height="96" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="555" class="label">确认回收 → reader 读到 EOF → join → 保留 partial bytes</text>
+<text x="44" y="587" class="small">真实 stall 先输出 READY / NUL / 0xff，再等待 stdin；超时仍有可归档事实。</text>
+<text x="44" y="610" class="small">测试同时用 mock Lifecycle 注入 kill 错误，证明 wait 没被 ? 跳过。</text>
+<rect x="24" y="644" width="852" height="72" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="44" y="676" class="small">std::process::Child 的 Drop 不自动 kill/wait；自定义 guard 才有 backstop。</text>
+<text x="44" y="704" class="small">只回收这个 child，不声明进程组、孙进程或 Windows Job Object 覆盖。</text>
+<text x="24" y="754" class="small">验收对象：正常状态、timeout 分类、kill/wait 顺序、错误上下文、join 与输出前缀。</text>
+</svg>

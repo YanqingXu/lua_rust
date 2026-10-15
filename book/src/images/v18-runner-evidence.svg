@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="790" viewBox="0 0 900 790" role="img" aria-labelledby="title desc">
+<title id="title">真实 capture 的独占证据归档</title><desc id="desc">Evidence分离actual Capture与expected和verdict。同次run与case独占目录，不覆盖旧run。先建INCOMPLETE标记，写stdin stdout stderr原始bytes和metadata，最后manifest，完成后移除标记。写入错误保留不完整证据并返回Err；非事务或断电恢复保证。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}.bad{fill:none;stroke:#b55b48;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="790" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">失败和超时也有事实；expected 不能替代 actual</text>
+<rect x="24" y="64" width="852" height="92" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="96" class="mono">Observed Capture：exe / argv / stdin / stdout / stderr / termination / duration</text>
+<text x="44" y="126" class="small">Expectation 独立保存 → 比较实际事实 → Verdict；非零退出不是“没有证据”。</text>
+<text x="44" y="150" class="small">原始 bytes 含 NUL / ff / fe；报告用文本展示不能替代 .bin。</text>
+<path d="M450 156V190" class="flow"/>
+<rect x="24" y="194" width="852" height="86" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="226" class="label">root / run_id / case_id：独占 create_dir + 文件 create_new</text>
+<text x="44" y="256" class="small">不同 run 的同 case 并存；同 run/case 重写拒绝；固定 latest 会毁掉历史。</text>
+<path d="M450 280V314" class="flow"/>
+<rect x="24" y="318" width="852" height="102" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="44" y="350" class="label">先建 INCOMPLETE → 写 stdin.bin / stdout.bin / stderr.bin</text>
+<text x="44" y="380" class="small">再写 metadata.tsv；manifest.tsv 最后落下，成功才撤 INCOMPLETE。</text>
+<text x="44" y="408" class="small">run/case 关联、实际终态、长度、预期和比较结论必须能一起复核。</text>
+<path d="M225 420V464" class="flow"/>
+<path d="M675 420V464" class="bad"/>
+<rect x="24" y="468" width="408" height="122" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="502" class="label">Complete：返回归档目录</text>
+<text x="44" y="534" class="small">读取时核对 marker / manifest / 长度。</text>
+<text x="44" y="564" class="small">旧 run bytes 仍在，真实失败仍可见。</text>
+<rect x="456" y="468" width="420" height="122" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="476" y="502" class="label">Err：保留不完整目录</text>
+<text x="476" y="534" class="small">不能写一个 passed 掩盖 IO 错误。</text>
+<text x="476" y="564" class="small">INCOMPLETE 残留不算成功报告。</text>
+<rect x="24" y="624" width="852" height="96" rx="12" fill="#fff" stroke="#286047"/>
+<text x="44" y="656" class="small">路径不是二进制身份：另记版本 / 构建信息 / SHA-256 才能复核构建。</text>
+<text x="44" y="686" class="small">manifest-last 是完成协议；不提供目录原子提交、fsync 或断电恢复保证。</text>
+<text x="44" y="711" class="small">export &lt;dir&gt; 显式保留；默认反例用唯一临时目录并清理。</text>
+<text x="24" y="758" class="small">本机 target 产物是这次验证的证据；README / contracts / examples 是 clone 后复现入口。</text>
+</svg>

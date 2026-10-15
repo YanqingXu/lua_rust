@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="750" viewBox="0 0 900 750" role="img" aria-labelledby="title desc">
+<title id="title">stdout stderr 并行读取解除等待环</title><desc id="desc">错误顺序读stdout到EOF，此时child向stderr写入有限缓冲并阻塞，不能结束stdout，形成等待环。两个独立reader线程在等待child前启动，最后收取原始bytes并join。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}.bad{fill:none;stroke:#b55b48;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="750" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">两条流各有有限缓冲；读取一条不能替另一条腾空间</text>
+<rect x="24" y="66" width="408" height="142" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="44" y="100" class="label">Parent: read stdout to EOF</text>
+<text x="44" y="134" class="small">尚未开始读 stderr。</text>
+<text x="44" y="166" class="small">或先 wait，打算退出后再读。</text>
+<rect x="456" y="66" width="420" height="142" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="476" y="100" class="label">Child: write stderr first</text>
+<text x="476" y="134" class="small">写满 pipe 后等待 reader 腾空间。</text>
+<text x="476" y="166" class="small">尚不能结束 stdout / 退出。</text>
+<path d="M432 110H456" class="bad"/>
+<path d="M666 208V244H224V208" class="bad"/>
+<text x="272" y="238" class="small">等待成环：EOF / exit ↔ stderr 空间</text>
+<rect x="24" y="278" width="852" height="68" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="308" class="label">参考：spawn 后先启动两个 reader，再输入 / poll deadline</text>
+<text x="44" y="334" class="small">ChildStdout 与 ChildStderr 分别 move 给一个线程，主线程保留 Child owner。</text>
+<path d="M224 346V382" class="flow"/>
+<path d="M676 346V382" class="flow"/>
+<rect x="24" y="386" width="408" height="98" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="420" class="label">reader A → stdout Vec&lt;u8&gt;</text>
+<text x="44" y="452" class="small">READY + ACK + 1 MiB pattern</text>
+<text x="44" y="476" class="small">精确 1,048,596 bytes</text>
+<rect x="456" y="386" width="420" height="98" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="476" y="420" class="label">reader B → stderr Vec&lt;u8&gt;</text>
+<text x="476" y="452" class="small">1 MiB pattern，含无效 UTF-8</text>
+<text x="476" y="476" class="small">精确 1,048,576 bytes</text>
+<path d="M224 484V522H450V538" class="flow"/>
+<path d="M676 484V522H450" class="flow"/>
+<rect x="24" y="542" width="852" height="100" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="44" y="574" class="label">主线程确认终态 / 清理 → join 两个 reader → 逐 byte 核对</text>
+<text x="44" y="606" class="small">流内顺序保留；两个 reader 的通知先后不构成跨流全局时间线。</text>
+<text x="44" y="632" class="small">错误对照先 kill/wait，再解除等待门并 join；不遗留阻塞 reader。</text>
+<text x="24" y="687" class="small">有限输出可存内存；无限输出必须另设截断 / spool / 配额，当前练习不作保证。</text>
+<text x="24" y="722" class="small">NUL 与 0xff/0xfe 是实际 bytes；不要先 lossy 转文本再比较。</text>
+</svg>

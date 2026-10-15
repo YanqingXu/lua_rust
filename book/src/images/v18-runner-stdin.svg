@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="700" viewBox="0 0 900 700" role="img" aria-labelledby="title desc">
+<title id="title">stdin EOF 由最后一个写端关闭决定</title><desc id="desc">父进程持有ChildStdin，child先READY再首次read并ACK，然后read_to_end等待EOF；空输入的首次read在EOF返回0。flush不能结束输入；交还Some保留写端造成等待，drop writer后child收到EOF并正常退出。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}.bad{fill:none;stroke:#b55b48;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="700" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">flush 推进数据；drop 写端才结束这条输入流</text>
+<rect x="24" y="62" width="852" height="84" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="94" class="mono">Parent: owns Child + ChildStdin + reader handles</text>
+<text x="44" y="126" class="mono">Child: READY → first read returns → ACK → read_to_end → EOF</text>
+<path d="M225 146V184" class="flow"/>
+<path d="M675 146V184" class="flow"/>
+<rect x="24" y="188" width="408" height="146" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="44" y="220" class="label">错误：保留 Some(stdin)</text>
+<text x="44" y="254" class="small">write_all + flush 成功</text>
+<text x="44" y="282" class="small">写端仍打开，child 可以继续等待。</text>
+<text x="44" y="312" class="small">Parent 等退出；child 等更多输入。</text>
+<rect x="456" y="188" width="420" height="146" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="476" y="220" class="label">参考：成功后 drop(stdin)</text>
+<text x="476" y="254" class="small">返回 None，不把 writer 交回等待阶段。</text>
+<text x="476" y="282" class="small">无其他写端 → child 收到 EOF。</text>
+<text x="476" y="312" class="small">空输入同样必须关闭。</text>
+<path d="M225 334V374" class="bad"/>
+<path d="M675 334V374" class="flow"/>
+<rect x="24" y="378" width="408" height="102" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="44" y="410" class="label">握手后仍存活：观察阻塞</text>
+<text x="44" y="442" class="small">非空输入：ACK 证明首 byte 已读到。</text>
+<text x="44" y="468" class="small">外层 deadline → kill/wait 安全收尾。</text>
+<rect x="456" y="378" width="420" height="102" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="476" y="410" class="label">child 读完 → 输出原 bytes</text>
+<text x="476" y="442" class="small">stdout: READY / ACK / INPUT:…</text>
+<text x="476" y="468" class="small">stderr: EOF stdin；正常 exit=0。</text>
+<rect x="24" y="516" width="852" height="110" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="44" y="548" class="label">验收：输入 bytes 完全保留 + writer 已关闭 + child 正常退出</text>
+<text x="44" y="580" class="small">关闭 stdout、延长 sleep 或强杀 child，都不能证明正常 EOF。</text>
+<text x="44" y="610" class="small">输出 reader 先启动；任意大输入的写入阻塞仍需额外预算设计。</text>
+<text x="24" y="670" class="small">范围：单一写端、有界输入、无后代 fixture；不是通用管道或进程树保证。</text>
+</svg>

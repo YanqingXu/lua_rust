@@ -43,8 +43,8 @@ cargo test --manifest-path $toolManifest --workspace --release
 ```
 
 原快照 129 项 + CLI/REPL 参考20项（8/5/7），工具包再增加22项（6/7/9），
-全快照 **171 通过、6 ignored**。六个 learner
-各初始失败一项，只改各 starter hook 完成；参考与固定 CLI 通过不等于 learner 完成。
+runner 三包另增加18项参考（5/6/7），全快照 **189 通过、10 ignored**。九包共十个 learner ignored，
+stdio 两项、其余八组各一项初始失败，只改各 starter hook 完成；参考与固定 CLI 通过不等于 learner 完成。
 维护者验证失败→临时套解通过→原字节恢复并刷新 mtime 后再失败，交付保留 TODO。
 
 模型是独立错误设计，真实 Session/进程另作证据。当前 REPL 的 incomplete 判定只是
@@ -91,3 +91,36 @@ decoder 或跨版本 schema 承诺。CFG 不是可达裁剪，不递归 nested P
 来自 events 枚举，快照只 clone Value；typed identity 既非 Heap 深拷贝也不自动保活。
 CLI trace 运行失败时不打印库中已录的前缀；Lua print 则会在成功 JSON 前混入 stdout。
 模型、public renderer/VM、真实进程和 Python 标准 JSON parser 各自承担明确证据范围。
+
+## Fixture runner 的四条问题链
+
+- [stdin 与双流](exercises/runner_stdio/README.md)：两个独立 TODO，写完关闭 stdin
+  才给 EOF；stdout/stderr 各自并行 drain，避免先读一条或先 wait 的等待环。
+- [超时回收](exercises/runner_timeout/README.md)：一个 stop TODO，deadline 后
+  kill 再 wait，kill 报错仍尝试 wait；实际 timeout 与清理 status 分开，保留 partial bytes。
+- [证据归档](exercises/runner_evidence/README.md)：一个 archive TODO，原始 bytes
+  与 expected 分开，独占 run/case 目录保留失败与超时；写档失败不能伪装为完整报告。
+
+```powershell
+cargo build --manifest-path $toolManifest --workspace --bins
+cargo run --quiet --manifest-path $toolManifest --example runner_stdio_problem_chain
+cargo run --quiet --manifest-path $toolManifest --example runner_timeout_problem_chain
+cargo run --quiet --manifest-path $toolManifest --example runner_evidence_problem_chain
+cargo test --manifest-path $toolManifest --test runner_stdio_reference
+cargo test --manifest-path $toolManifest --test runner_timeout_reference
+cargo test --manifest-path $toolManifest --test runner_evidence_reference
+cargo test --manifest-path $toolManifest --test runner_stdio_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test runner_timeout_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test runner_evidence_exercises -- --ignored
+cargo run --quiet --manifest-path $toolManifest --example runner_evidence_problem_chain -- export target/runner-evidence-review
+```
+
+默认运行固定 faults 与参考对照，故障子进程也由外层 owner 限时清理并 join readers。
+export 显式保留新的 run 目录，重复运行不覆盖旧证据。Cargo 明确设置 default-run 为
+lua_app；runner_fixture 是受控测试程序，只有有界输出且不创建后代。示例按同 profile
+定位真实 binary，不嵌套 cargo；Release 也先 build --release --workspace --bins。
+
+本章不声明任意大输出、孙进程/进程组回收、文件系统事务或断电恢复能力。
+标准 Child 的 Drop 不自动 kill/wait；教学 owner 自己实现 backstop。try_wait(Some)
+已回收正常终态，超时后则必须仍完成回收，再收集读取线程结果。两条流各保留顺序，
+不推导跨流全局时间线。完整字段、修改范围、精确验收见三包 README。

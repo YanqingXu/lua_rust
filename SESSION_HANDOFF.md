@@ -3,6 +3,107 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.18 fixture runner 与子进程生命周期
+
+用户要求按问题链讲清 stdin EOF、stdout/stderr 并发读取、超时后 kill/wait 与证据
+归档，补齐反例、前后差异、状态图和验收，完成验证并更新交接。本批教学与验证已
+完成，**没有恢复暂停的原审计整改目标**。用户随后明确要求将本批章节、状态图、
+练习包和交接记录一并提交并推送。
+
+- 起点为已推送 `main@883c28eaf9f08dd6fd6f738661469906c24c1a7d`（上一批 v0.18
+  JSON/CFG/trace），开始时工作区干净，origin/main 跟踪同 SHA。本批生产 `crates/`、
+  v0.18 `src/`、`crates/`、既有 `tests/` 与旧 `exercises/support/` 均无 diff。
+  Cargo 增六个 test targets 与受控 runner_fixture bin，显式 default-run=lua_app
+  保持旧脚本入口，没有新增依赖。旧 JSON 教学 helper 另有下述已核实的 CI lint 修复。
+  提交前 fetch 确认 HEAD 与 origin/main 无分叉。本批提交号以
+  `git log -1 -- book/src/versions/v18-cli-tools.md` 为准，新提交 CI 按其 SHA 查询。
+- [主章](book/src/versions/v18-cli-tools.md) 新增问题七至十：write/flush 不等于 EOF
+  → 关闭最后写端；先 wait / 顺序读 stdout 到 EOF → 两条输出同时 drain；返回超时 /
+  kill-only → kill 后仍 wait；只写 bool / expected 污染 actual / latest 覆盖 → 原始
+  capture 与预期分开、run/case 独占归档。每问含预测、真实固定反例、starter/solution
+  include、最小 diff、状态图与精确合同。新增四幅 SVG 经浏览器检查文字、箭头与页脚；
+  正文八段新 hook 展开，十种图片正常加载，无 unresolved include。
+- [stdio 包](book/code/v18-cli-tools/exercises/runner_stdio/README.md)：两道独立 TODO
+  send_input/start_drains、5 项参考。非空请求用 READY/ACK 证明首 byte 已读，再观察
+  保留 writer 导致等待 EOF；空请求首次 read 在 EOF 返回0也会发 ACK，不能把 ACK
+  一概说成非空消费。参考 write/flush/drop，完整 echo bytes 含 NUL/0xff，空输入
+  同样验收。dual 子程序先写 1MiB stderr、后写 stdout，顺序读取/等 wait 后读取
+  在握手后阻塞；参考逐 byte 匹配 stdout **1,048,596**、stderr **1,048,576** bytes。
+  故障大块写被 kill 后可捕获空前缀；合同要求未完整且为精确前缀，不虚构固定部分量。
+  主线程先 kill/wait，finish 再解除等待门并 join，固定故障不会遗留阻塞 reader。
+- [timeout 包](book/code/v18-cli-tools/exercises/runner_timeout/README.md)：一个 stop
+  TODO、6 项参考。窄 `&mut dyn Lifecycle` 注入 kill 竞态与一次 wait 失败，证明
+  kill Err 仍尝试 wait，wait Err 保留 kill 上下文与 owner。两个 faults 在 hook
+  返回边界观察，随后 backstop 安全收尾，不能以最终清理成功冒充 hook 正确。
+  真实 stall READY 后 try_wait(None)，100ms 主 deadline 后终止回收，stdout22 /
+  stderr17 原 bytes 保留；普通 exit0/7 属于 Exited，无 timeout hook/cleanup_status。
+  try_wait(Some) 已回收，不再重复 wait；标准 Child Drop 不会自动 kill/wait。
+  自定义 Guard 才有 backstop，writer lease 覆盖启动5秒+主timeout+清理5秒。
+- [evidence 包](book/code/v18-cli-tools/exercises/runner_evidence/README.md)：一个
+  archive TODO、7 项参考。真实 version、exit7、exit9、stall 四个子进程组成三份
+  capture；判定分别 false/true/false，预期非零可以通过，timeout 的 cleanup code0
+  仍不能当作普通成功退出。请求 stdin.bin、实际 stdout.bin/stderr.bin、另次探针的
+  binary-version.bin、metadata.tsv、最后的 manifest.tsv 共六文件；path/argv/
+  expected/status 文本用 hex，实测 elapsed.ns，actual termination 与 cleanup.* 分开。
+  stdin 请求保存不证明全部消费；executable 路径/version 文本不等于二进制内容身份。
+  run/case 用安全 ASCII，case create_dir、文件 create_new 拒绝覆盖；INCOMPLETE
+  在最后成功才移除，I/O 错误保留不完整现场并返回 Err。reader 检查重复 key、完整行、
+  schema/引用、跨文件/目录身份与长度，完整合同另对原 Capture 验实际 bytes；同长度
+  篡改不能仅凭结构检查发现。明确非 atomic/fsync/断电恢复/身份认证协议。
+- 新 fixture 无后代、输入输出有界；旧 helpers 保持原接口。三 CLI 不调用 learner，
+  集成测试用 CARGO_BIN_EXE_runner_fixture，示例从 current_exe 找同 profile sibling；
+  先 build --workspace --bins，Release 也先构建，不嵌套 cargo。并发读取保留各流
+  顺序，不提供跨流全局时间线；deadline 不保证精确毫秒返回，且不声明孙进程/
+  进程组/无限 I/O 的通用回收能力。成熟 tools/lua_fixture_runner 的 Job Object/
+  process group、分类与规范化仍属独立能力。旧 GC 与 REPL 续行漏判归属不变。
+- 本地 Windows Rust/cargo **1.96.1**：D/R workspace bins、fmt、workspace all-targets
+  Clippy `-D warnings` 通过；两 profile 各 **189通过、0失败、10ignored**（原171+
+  新18=stdio5/timeout6/evidence7）。四个新 TODO 完成初始失败→临时套解通过→原字节
+  恢复并刷新 mtime 后再失败；保留 TODO。九 learner 显式运行共10项预期失败，stdio
+  两项、其余各一项。此前六题套解证据仍归前两节，本轮只回归其初始失败。
+- 九 CLI 每 profile133条 unique 关键断言，D/R共 **266条**；主章与九 README 去重
+  **37条 exact** 各恰运行1项，27正向通过、10learner预期失败。保留旧工具20项 strict
+  JSON/CFG/trace 检查，新增两 profile 的独立 Python 归档检查，共 **22项**：每个
+  profile 各两次 export，共6cases/36files，核对完整 TSV、原 bytes、version、
+  argv、请求stdin、elapsed、exit/timeout/cleanup、expected/verdict，旧文件哈希
+  不变，另保存实际 runner_fixture SHA-256。demo1818、stdlib_diff1550；PATH
+  `D:\lua51\lua.EXE` 实测 Lua5.1.5 并独立执行本版 fixture1550，未外推工具协议的
+  官方等价性。117个代码输入验证前后 hash 无漂移；20版本教学检查、mdBook 与38页
+  **1,327站内链接、0broken** 通过；生产核心/旧测试/helper 的无 diff 另作范围核对。
+- 证据独立在 `target/teaching-v18-runner-2026-10-15/`。最终集成
+  `full-validation/20261015T085746059881Z/summary.json` 含101项命令检查、22项 strict、
+  oracle/hash；原始 `20261015T085611559102Z` 的19条通过命令复用，因验证器把 Windows
+  扩展 canonical 路径 `\\?\G:\...` 与普通路径按字面比前缀而中断。仅修 ignored
+  Python 路径规范化并续跑，原命令/交付代码未变、既有 export 未覆盖，summary、
+  run_validation.used.py、脚本 SHA 与 provenance-note 保留来源。stdio 局部证据为
+  `runner_stdio/20261015T085028265569Z/summary.json`（此前验证脚本把健康 stdout35
+  误记45，保留旧证据并修正计数后续跑）；timeout 为 `runner_timeout/` 下 scoped-
+  verification/starter-round-trip.json；evidence 为 `runner_evidence/20261015T085455070Z/`。
+  最终范围/hash/站点/视觉汇总 `final-verification.json`。target 是本机ignored产物，
+  clone 后永久入口是主章、九 README、contracts/real、examples 和 fixture 源码。
+- 基线 SHA883c28e 的 [mdBook 38706177295](https://github.com/YanqingXu/lua_rust/actions/runs/38706177295)
+  失败日志已通过 job connector 核实：CI Rust/Clippy **1.99.0** 在旧
+  exercises/bytecode_json/model.rs 报 chunks-exact-to-as-chunks。已将经偶数长度校验
+  的 chunks_exact(2) 换成 as_chunks::<2>().0.iter()，作为本批唯一旧教学代码修复。
+  全 v18 D/R 回归通过，现有 **1.98.0** 工具链另定向 Clippy 通过（独立 target-dir，
+  `ci-lint/20261015T085648458Z/summary.json`）；不声称本机运行过1.99或远端已绿。
+  日志/状态为 baseline-book.json、baseline-book-job.log；先前 gh 下载403与实际
+  connector 日志来源均保留。不要把旧节未知原因回填成这个新 SHA 的原因。
+- 同一旧 SHA 的 [Rust CI 38706177480](https://github.com/YanqingXu/lua_rust/actions/runs/38706177480)
+  已 completed/failure：两个 Miri 与 Linux ASan job成功；Windows失败步骤为 Enforce
+  verified official source cases 和 M1 foundation and quality gate。真实 job log
+  中 official source 为 Lua Rust9/10、官方Lua与固定C++各10/10；具体失败case本轮未
+  进一步定位。quality gate 的 Clippy 因生产代码 fetch_update 被新工具链弃用而失败，
+  其他测试/文档/audit门通过。该生产CI问题未在本轮教学包整改。终态与原日志分别
+  baseline-rust-final.json、baseline-rust-job.log，早期 intermediate 另保留；这是
+  已推送旧 SHA 的结果，不代表本批新提交的远端 CI；须按新 SHA 查询，不能宣称已绿。
+
+下一教学工作包可单独推进结构化 REPL NeedMoreInput/EOF 合同；若进入 v1.0，先冻结
+能力矩阵与 oracle 来源，再逐项收口差异。若优先恢复远端 CI，应另立范围处理生产
+fetch_update 兼容性与 official source 失败case，不能用本章 runner 通过替代。原审计
+仍暂停在 os.date/os.time 本地时间、UTC、DST；交接本身不表示恢复，提交推送按当次
+明确指令执行。
+
 ## 2026-10-15：v0.18 字节码 JSON、CFG 与执行前 trace
 
 用户要求继续按问题链讲清 bytes 常量编码、基本块 leader 划分、执行前状态记录，

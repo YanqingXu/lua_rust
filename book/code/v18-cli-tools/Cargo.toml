@@ -3,6 +3,11 @@ name = "lua_app"
 version = "0.18.0"
 edition = "2021"
 publish = false
+default-run = "lua_app"
+
+[[bin]]
+name = "runner_fixture"
+path = "exercises/runner_support/fixture.rs"
 
 [dependencies]
 lua_compiler = { path = "crates/lua_compiler" }
@@ -71,3 +76,27 @@ path = "exercises/bytecode_trace/acceptance.rs"
 [[test]]
 name = "bytecode_trace_reference"
 path = "exercises/bytecode_trace/reference.rs"
+
+[[test]]
+name = "runner_stdio_exercises"
+path = "exercises/runner_stdio/acceptance.rs"
+
+[[test]]
+name = "runner_stdio_reference"
+path = "exercises/runner_stdio/reference.rs"
+
+[[test]]
+name = "runner_timeout_exercises"
+path = "exercises/runner_timeout/acceptance.rs"
+
+[[test]]
+name = "runner_timeout_reference"
+path = "exercises/runner_timeout/reference.rs"
+
+[[test]]
+name = "runner_evidence_exercises"
+path = "exercises/runner_evidence/acceptance.rs"
+
+[[test]]
+name = "runner_evidence_reference"
+path = "exercises/runner_evidence/reference.rs"

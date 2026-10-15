@@ -1,6 +1,6 @@
 # v0.18 · CLI、REPL 与字节码工具
 
-<div class="lesson-meta"><span>CLI/REPL 状态 → bytes JSON → CFG leader → 执行前 trace</span><span>6-crate workspace</span><span>checkpoint v0.18</span></div>
+<div class="lesson-meta"><span>CLI/REPL → 观察工具 → 子进程生命周期与证据</span><span>6-crate workspace</span><span>checkpoint v0.18</span></div>
 
 <a id="learning-task-card"></a>
 ## 学习任务卡
@@ -11,7 +11,8 @@
   0；每行重新 execute 为什么丢失 global；报错后该清源码还是重建 VM。新增 Rust 概念
   是 ExitCode/Result 的边界、Session 的长期可变 owner、短命 source buffer 与子进程
   stdio 协议。再解决 bytes 转文本丢信息、基本块切错、trace 时点错位三个观察问题。
-  全章产出为六个独立 TODO、固定反例、前后差异、状态图和真实进程验收；不把观察
+  最后沿 EOF、双流读取、超时回收、证据归档解决 runner 自身的失败问题。
+  全章产出为九个练习包、十个独立 TODO、固定反例、前后差异、状态图和真实进程验收；不把观察
   工具的输出当作 binary chunk 序列化、可达性裁剪或可重放的完整 Heap 快照。</p>
 </div>
 
@@ -60,9 +61,16 @@ cargo run --quiet --manifest-path $toolManifest --example repl_recovery_problem_
 阅读；分别回到 `value_json`、`basic_blocks/cfg_dot`、`run_frame_state/trace_json`，不要
 一次把整个工具文件读完才寻找规则。
 
-一次进程执行也是资源协议：stdin 必须及时关闭，stdout/stderr 必须都被 drain，
-timeout 后必须 kill 并 wait。本轮三个局部模型各隔离一个决策，再由真实 Session 或
-真实 binary 兑现对应合同；边界模型不假装捕获 Lua print，也不实现第二套 parser/VM。
+runner 部分依次读 [stdio](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/runner_stdio/README.md)
+的 `send_input/start_drains` → [timeout](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/runner_timeout/README.md)
+的 `Lifecycle/stop` → [evidence](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/runner_evidence/README.md)
+的 `archive/CaseWriter`。前两问用真实 pipe/Child，回收问再用可注入 kill/wait 错误的
+窄 trait 检查调用顺序，最后把实际 Capture 写到独占目录。共享 `runner_support/fixture.rs`
+是无后代、输出有界的受控子程序，既不是另一套 Lua VM，也不是通用进程树测试。
+
+一次进程执行也是资源协议：stdin 的写端必须及时关闭，stdout/stderr 必须都被读取，
+timeout 后仍要回收 child。各局部练习隔离决策，再由真实 Session/Proto/VM 或真实
+binary 兑现对应合同；边界模型不假装捕获 Lua print，也不实现第二套 parser/VM。
 
 ## CLI 是动作序列，不是一个脚本参数
 
@@ -528,24 +536,236 @@ Lua 自己 print，会先污染 stdout，再写 JSON array；纯 JSON 验收使�
 cargo test --manifest-path $toolManifest --test bytecode_trace_reference records_current_registers_before_dispatch -- --exact
 ```
 
-## Fixture manifest 与超时 runner
+## 问题七：write_all 和 flush 都成功，子进程为什么还不退出？
 
-`tests/fixtures/manifest.tsv` 为每个 CLI case 声明 script、args、expected exit、完整 stdout 和 stderr substring。Runner 启动真实 `lua_app` binary，连接三个 stdio stream，并轮询 `try_wait`：
+### 字节送到了，输入却还没结束
 
-```text
-spawn ──> write/close stdin ──> poll until deadline
-                              ├── exited: drain stdout/stderr
-                              └── timeout: kill exact child, wait, fail test
+先预测：child 的 `read_to_end` 收到 `abc` 后会返回吗？`flush` 只推进已写数据，
+不发送“后面没有输入”的通知。只要父进程仍持有 pipe 写端，child 就能继续等待。
+`ChildStdin` 的所有权因此也是协议的一部分：本练习没有克隆写端，写完后 drop
+这个 owner 才让 child 读到 EOF；空输入也必须关闭。
+
+```powershell
+cargo build --manifest-path $toolManifest --workspace --bins
+cargo run --quiet --manifest-path $toolManifest --example runner_stdio_problem_chain
 ```
 
-旧 `tests/cli_contract.rs` 的 runner 在 child 退出后才读 stdout/stderr，现有小 fixture
-使用五秒 deadline；它不证明大输出管道安全。本轮练习另用共享
-[process helper](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/support/process.rs)：
-reader 线程并发 drain 两个输出，writer 写完关闭 stdin，主线程检查 deadline；超时
-只 kill/wait 当前 child。没有按进程名批量终止，也不在示例中嵌套执行 cargo。
+固定 fixture 先写 READY，首次 read 返回后写 ACK，再继续 `read_to_end`。错误版本
+保留 stdin，框架在握手后确认 child 仍存活；参考版关闭后，完整 stdout 含原输入，
+stderr 才出现 `EOF stdin`。非空输入的 ACK 证明首 byte 已被读取；空输入会在 EOF
+后完成零字节 read，也输出 ACK。ACK 不宣称整个非空 payload 已经读完。
+所有错误对照都有期限和外层 kill/wait，复现阻塞不会把练习永久挂住。
 
-本轮真实子进程输入有界，helper 不扩展为通用进程树管理器。除 manifest 外，原测试
-继续覆盖 `-e/-l/--`、stdin、REPL、错误分类、文件副作用和四种 bytecode format。
+```rust
+{{#include ../../code/v18-cli-tools/exercises/runner_stdio/starter.rs:runner_stdin_starter}}
+```
+
+```diff
+  stdin.write_all(input)?;
+  stdin.flush()?;
+- Ok(Some(stdin)) // 留住写端，再等 child 结束
++ drop(stdin);   // 结束这次输入流
++ Ok(None)
+```
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/runner_stdio/solution.rs:runner_stdin_solution}}
+```
+
+![stdin 写端所有权、ACK 后继续等待、drop 后观察 EOF。](../images/v18-runner-stdin.svg)
+
+函数按值接收 `ChildStdin`，成功时不把 writer 交回等待阶段；返回 None 是可观察的
+所有权结果。更一般的输入可能写满 pipe，所以输出 reader 应先启动，输入写入也须
+受 runner 的截止与清理协议覆盖。这里的有界 payload 不证明任意大小输入都安全。
+
+**完成条件：** 只补 send_input，精确保留输入 bytes，关闭写端，child 正常结束；
+不能用“多等一会儿”、关闭 stdout 或杀掉 child 冒充正常 EOF。
+
+```powershell
+cargo test --manifest-path $toolManifest --test runner_stdio_reference stdin_send_then_close_delivers_eof -- --exact
+```
+
+## 问题八：先 read stdout 到 EOF，再读 stderr，为什么仍会挂住？
+
+### 两根管道，必须同时有人消费
+
+先画等待关系：parent 正等 stdout EOF；child 先向 stderr 写 1 MiB 有界字节，
+pipe 的有限缓冲可能写满，child 卡在 write，尚不能写完 stdout 或退出。关闭 stdin
+不能拆掉这个环。“先 wait，退出后再读”也可能卡在同一处。不能依赖某个 OS 的
+pipe 容量或用很大的固定 sleep 掩盖问题。
+
+同一 stdio CLI 的 dual 场景先完成 READY/ACK，再先写 stderr、后写 stdout。
+固定 faults 分别采用顺序读取、等主线程结束后才读取；参考版在等待之前把
+`ChildStdout` 和 `ChildStderr` 各移动给一个 reader thread，最后 join 两个结果。
+教学框架在错误路径先 kill/wait child，finish 再解除等待门并 join，避免遗留阻塞线程。
+被 kill 打断的大块 write 不保证已经提交多少 bytes：错误路径只能要求实际捕获是
+未完整的精确前缀，允许为空；完整双流合同由健康路径验证。
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/runner_stdio/starter.rs:runner_drains_starter}}
+```
+
+```diff
+- stdout.read_to_end(&mut out)?;
+- stderr.read_to_end(&mut err)?;
++ let out = spawn(move || read_all(stdout));
++ let err = spawn(move || read_all(stderr));
+  // 主线程输入、检查 deadline 与 child 状态
++ let out_result = out.join();
++ let err_result = err.join(); // 两个 join 都完成，再传播任一错误
+```
+
+这段 diff 表示消费顺序的迁移；实际 `join_pair` 先 join 两个 handle，再传播 panic/
+读取错误，防止第一个 `?` 提前返回而遗漏另一条 reader。通知 channel 只用于握手
+和定位等待点：
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/runner_stdio/solution.rs:runner_drains_solution}}
+```
+
+![顺序读取形成 parent/child 等待环，并行 reader 解除双管道阻塞。](../images/v18-runner-drains.svg)
+
+每个 reader 独占一个读端，返回 `Vec<u8>`；主线程拥有 child、deadline 和 join
+handles。不要把输出先转成 lossy String 再比较：本 fixture 含 NUL 和无效 UTF-8，
+stdout/stderr 要逐 byte 完整核对。每条流内部保持原顺序，两条 reader 的通知先后
+不是 stdout/stderr 的全局时间线。捕获进内存也只适用于本章的有界 fixture。
+
+**完成条件：** 同时消费两个 stream，正常退出，stdout 恰为 1,048,596 bytes、
+stderr 恰为 1,048,576 bytes，且内容完全匹配。只有长度或某段文字都不足以验收。
+
+```powershell
+cargo test --manifest-path $toolManifest --test runner_stdio_reference parallel_readers_capture_both_streams -- --exact
+```
+
+## 问题九：deadline 到了，返回 Timeout 就算回收完成了吗？
+
+### kill 是请求，wait 才完成这条回收路径
+
+预测三个实现的返回时状态：直接返回 timeout；只 kill；kill 后 wait。deadline 是
+runner 的观察结果，不是 child 主动返回的 exit code。直接返回可能遗留运行中的
+child；kill 成功也不能代替 wait。Rust 的 `std::process::Child` drop 本身不会
+自动 kill/wait；本章自定义 owner 的 Drop backstop 是另写的保护逻辑。
+
+```powershell
+cargo run --quiet --manifest-path $toolManifest --example runner_timeout_problem_chain
+```
+
+真实 stall fixture 先输出包含 NUL/0xff 的前缀，再等待仍打开的 stdin。握手后确认
+child 存活，deadline 后才执行超时清理；读取线程继续取完已输出的 bytes。固定
+faults 的状态在 hook 返回处检查，再由外层安全 guard 收尾。不能因 guard 最终
+帮忙回收，就说只 kill 的 hook 已满足合同。
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/runner_timeout/starter.rs:timeout_starter}}
+```
+
+```diff
+- child.kill()?;
+- Ok(())
++ let killed = child.kill();
++ child.wait().map_err(|error| format!("wait after kill ({killed:?}): {error}"))?;
++ Ok(())
+```
+
+`&mut dyn Lifecycle` 借用唯一 child owner，窄 trait 让测试能注入 kill 错误，并验证
+wait 仍被调用。child 可能刚好自然退出而导致 kill 失败；若随后 wait 成功，owner
+已经回收，不能跳过 wait 或把竞态武断解释成泄漏。wait 失败则保留清理错误和 kill
+上下文，让调用者看见回收尚未确认。
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/runner_timeout/solution.rs:timeout_solution}}
+```
+
+![正常 try_wait(Some) 与 deadline 后 kill/wait 的不同终态及 reader join。](../images/v18-runner-timeout.svg)
+
+正常路径 `try_wait` 返回 Some 已取得并回收 child 状态，无需为图示再强行 wait
+一次。超时路径保存 `TimedOut`，另存清理 status；被终止进程的系统状态不能冒充
+Lua 的普通 code=1。计时受调度、poll 粒度和清理耗时影响，deadline 不是函数严格
+在同一毫秒返回的保证。所有清理只作用于这个 child；孙进程、进程组/Windows Job
+Object 和无限输出限额属于另一个 runner 能力范围。
+
+**完成条件：** 正常退出与 timeout 分开；kill 错误仍尝试 wait；fault 返回边界与
+外层 backstop 分开；真实 timeout 回收后 reader join 成功，保留两个 stream 的前缀。
+
+```powershell
+cargo test --manifest-path $toolManifest --test runner_timeout_reference timeout_cleanup_always_attempts_wait_and_releases_exact_owner -- --exact
+```
+
+## 问题十：报告只写一个 false，下次还能知道这次到底跑了什么吗？
+
+### 先保留事实，再计算预期是否满足
+
+先预测：同一个 case 连跑两次，第二次覆盖 `latest/stdout`，旧失败还能复核吗？
+如果写档函数误把 expected 当 stdout 保存，即使报告 false，原始失败也已经丢失。
+进程证据要能对应同一次运行：executable/argv、stdin bytes、实际 termination、
+耗时与实际 stdout/stderr；expected 和 verdict 是比较层的数据。
+
+```powershell
+cargo run --quiet --manifest-path $toolManifest --example runner_evidence_problem_chain
+```
+
+固定错误一用 expected 污染 actual，另一用固定 latest 目录覆盖前次结果。参考版
+接收已经捕获的 `&Evidence`，只借用数据，把真实 stdin/stdout/stderr 写入独占的
+run/case 目录；期望成功但真实 exit=7 的 case 也必须保存 raw bytes 和失败结论。
+timeout 同样有证据，不能因为没有普通 exit code 就跳过归档。
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/runner_evidence/starter.rs:runner_evidence_starter}}
+```
+
+```diff
+  let writer = CaseWriter::begin(root, evidence)?;
+- writer.write_new("summary.txt", evidence.verdict().passed.to_string().as_bytes())?;
++ writer.write_new("stdin.bin", &evidence.stdin)?;
++ writer.write_new("stdout.bin", &evidence.capture.stdout)?;
++ writer.write_new("stderr.bin", &evidence.capture.stderr)?;
+  writer.complete(evidence)
+```
+
+独占目录用 `create_dir` 拒绝重复 owner，文件用 `create_new` 拒绝覆盖。框架先留下
+INCOMPLETE 标记，写 bytes、metadata 后最后写 manifest，成功才撤标记；中途错误
+通过 Result 返回，残留目录说明未完成，不能把它当作一个绿色报告。
+`stdin.bin` 是父进程提交的请求 bytes，不证明 child 已全部消费；消费进度仍要靠
+fixture 的 ACK/EOF 协议观察。`binary-version.bin` 保存另一次 version 探针的原输出。
+metadata.tsv 使用唯一 key、TAB、value、换行；path/argv/expected/status 文本用 hex
+避免换行或 TAB 破坏字段，elapsed.ns 保留实测耗时；manifest 固定列出同 run/case 的文件。
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/runner_evidence/solution.rs:runner_evidence_solution}}
+```
+
+![一次真实 Capture 到独占归档、完成标记、比较结论与失败残留的状态变化。](../images/v18-runner-evidence.svg)
+
+读取合同同时核对元数据、实际 bytes、长度和完成标记。同 case 不同 run 的目录
+并存；同 run/case 重写必须失败。run_id 是关联键，不因叫 timestamp 就自动唯一。
+executable 路径记录“从哪里启动”，不证明其内容未变；复核某个构建还需保留版本、
+构建信息或二进制哈希。本轮外部验证另记 SHA-256，没有把路径当作二进制身份。
+manifest-last 是本地完成协议，不是整个目录 atomic rename、fsync 或断电恢复保证。
+
+要保留可检查的产物，给 export 指定目录；每次产生新 run，不覆盖历史：
+
+```powershell
+cargo run --quiet --manifest-path $toolManifest --example runner_evidence_problem_chain -- export target/runner-evidence-review
+```
+
+默认反例 CLI 用独占临时目录并清理。仓库 target 下的本机报告可用于本次复核，
+clone 后的永久复现入口是各 README、contracts、真实 capture 和这些 examples。
+
+**完成条件：** 验实际 NUL/0xff/0xfe、真实非零退出与 timeout；保存预期失败事实；
+重复运行不覆盖；写档错误不能伪装完成；从同一 run/case 的 manifest 找到全部证据。
+
+```powershell
+cargo test --manifest-path $toolManifest --test runner_evidence_reference archives_observed_bytes_and_same_run_metadata -- --exact
+```
+
+### 把新协议带回原 fixture tests
+
+原 `tests/fixtures/manifest.tsv` 声明 script、args、expected exit、完整 stdout 和
+stderr substring。旧 `tests/cli_contract.rs` 在 child 退出后才读取两条流，小 fixture
+通过不证明大输出安全。此前练习的 [process helper](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/support/process.rs)
+已采用并发 reader、写完关闭 stdin、deadline、exact child kill/wait；本轮把这些
+隐含协议拆成四个可失败的决策，保留旧 helper 与原 CLI 测试作为回归对照。
+没有把它们偷偷替换为完整的成熟 runner，也没有扩大语言兼容验收结论。
 
 ## Rust 知识映射与设计选择
 
@@ -555,7 +775,9 @@ reader 线程并发 drain 两个输出，writer 写完关闭 stdin，主线程�
 - `BufRead::lines` 与 source buffer 实现 continuation prompt；
 - `BTreeSet` 让 CFG leaders 和 DOT 输出稳定排序；
 - 手写 JSON escape/hex 避免为教学 viewer 引入序列化依赖，同时测试其 bytes 合同；
-- `Command + try_wait + deadline` 在本轮无后代的有界 fixture 中把 hangs 变成确定性失败。
+- 按值移动 stdin/两个 reader 与 thread join，把管道协议变成所有权和终态约束；
+- `Command + try_wait + deadline` 让有界 fixture 的阻塞成为可诊断失败，kill 后仍 wait；
+- `&mut dyn Lifecycle` 可注入系统调用竞态；`create_new + Result` 拒绝证据覆盖并传播归档错误。
 
 替代方案是把 REPL 每行写到临时文件并重新启动 binary，但那会丢失 globals/coroutine/package 状态。另一个方案是让 bytecode crate侵入 Compiler/VM；只读 Proto/trace event 保持工具与执行语义解耦。
 
@@ -582,6 +804,12 @@ cargo test --manifest-path $toolManifest --test repl_recovery_reference
 cargo test --manifest-path $toolManifest --test bytecode_json_reference
 cargo test --manifest-path $toolManifest --test bytecode_cfg_reference
 cargo test --manifest-path $toolManifest --test bytecode_trace_reference
+cargo test --manifest-path $toolManifest --test runner_stdio_reference
+cargo test --manifest-path $toolManifest --test runner_timeout_reference
+cargo test --manifest-path $toolManifest --test runner_evidence_reference
+cargo run --quiet --manifest-path $toolManifest --example runner_stdio_problem_chain
+cargo run --quiet --manifest-path $toolManifest --example runner_timeout_problem_chain
+cargo run --quiet --manifest-path $toolManifest --example runner_evidence_problem_chain
 cargo fmt --manifest-path $toolManifest --all -- --check
 cargo clippy --manifest-path $toolManifest --workspace --all-targets -- -D warnings
 cargo test --manifest-path $toolManifest --workspace
@@ -597,8 +825,9 @@ cargo test --manifest-path $toolManifest --workspace --release
 
 本快照原有 129 个测试：119 个原语义测试、5 个 CLI/REPL process tests、3 个 bytecode
 library tests 和 2 个 bytecode binary process tests。CLI/REPL 包增加 20 项参考
-（退出8、owner5、恢复7）；工具包再增加22项（JSON6、CFG7、trace9），合计
-**171 通过、6 个 learner ignored**。v0.17 教学练习的计数
+（退出8、owner5、恢复7）；工具包再增加22项（JSON6、CFG7、trace9）；runner 包再增加
+18 项参考（stdio5、timeout6、evidence7），合计 **189 通过、10 个 learner ignored**，
+其中 stdio 包有 EOF、并行读取两个独立题。v0.17 教学练习的计数
 仍归各自版本，不把它们重复算进这个独立快照。
 
 ```powershell
@@ -608,12 +837,16 @@ cargo test --manifest-path $toolManifest --test repl_recovery_exercises -- --ign
 cargo test --manifest-path $toolManifest --test bytecode_json_exercises -- --ignored
 cargo test --manifest-path $toolManifest --test bytecode_cfg_exercises -- --ignored
 cargo test --manifest-path $toolManifest --test bytecode_trace_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test runner_stdio_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test runner_timeout_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test runner_evidence_exercises -- --ignored
 ```
 
-初始每组恰好一项失败。只修改各包 starter 的指定 hook，显式 learner 全通过才完成；
+初始 stdio 组两项失败，其余八组各一项失败。只修改各包 starter 的指定 hook，显式 learner 全通过才完成；
 默认参考、ignored 和固定 CLI 退出 0 不能代替这一验收。维护者须验证失败→临时套解
 通过→原字节恢复并刷新 mtime 后再失败，防止缓存或已填答案造成假绿。精确命令、
-观察值与修改范围见六个 README。
+观察值与修改范围见九个 README。Cargo 的 `default-run = "lua_app"` 保持脚本入口；
+新 `runner_fixture` 只是测试子程序，命令行示例先构建同 profile 的 workspace binaries。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/check_book_teaching.ps1
@@ -643,10 +876,10 @@ node tools/check_book_links.mjs target/mdbook .
 </div>
 
 <div class="exercise implementation">
-  <strong>实现题：完成六个独立 hook</strong>
+  <strong>实现题：完成十个独立 hook</strong>
   <p>只改 cli_exit::finish、repl_owner::submit、repl_recovery::submit，再补 JSON encode_bytes、
-  CFG leaders、trace dispatch 的记录时点。运行上面六个
-  --ignored 命令，每组恰好一项通过才完成。不修改 faults、合同、真实 src/crates 或
+  CFG leaders、trace dispatch 的记录时点，以及 runner send_input、start_drains、stop、
+  archive。运行上面九个 --ignored 命令，stdio 两项、其余每组一项通过才完成。不修改 faults、合同、真实 src/crates 或
   ignored 标记；共享 helper 与真实 binary 对照不是 TODO。</p>
 </div>
 
@@ -672,6 +905,21 @@ node tools/check_book_links.mjs target/mdbook .
   各指出一条失败证据；不能只用 JSON 可解析、DOT 含 jump 或 trace 含42验收。</p>
 </div>
 
+<div class="exercise understanding">
+  <strong>理解题：这次是谁在等谁？</strong>
+  <p>沿四幅 runner 图标出 Child、stdin writer、两条 reader、join handle、run/case
+  目录的 owner。成功条件是解释 flush 与 EOF、读到 EOF 与 child 已回收、kill 与
+  wait、TimedOut 与清理 status 各自的区别，并说明两条流为什么没有共同顺序。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题：有超时、有报告，为什么现场仍可能丢了？</strong>
+  <p>运行三个 runner CLI，分别定位等待 EOF、stderr 写满、kill-only 返回、expected
+  覆盖 actual 与 latest 覆盖历史。用 export 连跑两次，检查旧目录字节不变，实际
+  exit=7 的失败仍留有 NUL/ff/fe。成功条件是从等待图、hook 返回边界、原始文件各
+  给一条证据，不能只凭 CLI exit=0 或 manifest 存在判断练习已完成。</p>
+</div>
+
 <a id="learning-checkpoint"></a>
 ## 完成检查点
 
@@ -680,11 +928,14 @@ node tools/check_book_links.mjs target/mdbook .
 - 能用完整 stdout/stderr 与真实 exit code 验证错误前的输出和后续 actions 中止；
 - 能用 GC 后字段读取说明 Session owner 的保留边，区分 chunk local 与 captured local；
 - 能手推 success/incomplete/普通错误的 buffer 变化，并说明 runtime 副作用不回滚；
-- 六个 TODO 显式通过，能说明模型、真实 Session/Proto/VM、进程和启发式的验证边界；
+- 十个 TODO 显式通过，能说明模型、真实 Session/Proto/VM、进程和启发式的验证边界；
 - 能按严格 schema 解码 bytes、校验非有限数与 nested Proto，不把 metadata 视为同一编码；
 - 能从 pc+1+sBx 推导 leaders/半开 blocks/末指令 edges，区分结构划分与可达分析；
 - 能用 Add 输入和下一 event 解释 before 时点、开关与失败前缀，不外推 Heap 深快照；
-- 能列出可靠子进程 runner 的完整生命周期。
+- 能用握手后的真实反例画出 EOF 与双流阻塞的等待关系，并说明 reader 的所有权；
+- 能解释超时后 kill 失败仍 wait、try_wait(Some) 已回收、guard 与标准 Child Drop 的区别；
+- 能从独占 run/case 目录复核实际 bytes、termination、预期与 verdict，拒绝覆盖和不完整报告；
+- 能列出本章有界 fixture 与通用进程树、无限输出、崩溃一致性之间的能力边界。
 
 ## 与成熟实现和专题章节的对应
 
@@ -692,5 +943,6 @@ node tools/check_book_links.mjs target/mdbook .
 - [Bytecode](../ch03-compiler/bytecode.md) 可对照 raw instruction fields 与 JSON；
 - [寄存器虚拟机](../ch04-vm/register-vm.md) 可解释 trace snapshot 中 base/top/register window；
 - [用测试守住兼容性](../ch05-engineering/testing.md) 可对照进程级合同为何不能只用函数单测替代；
-- 本版六组问题链已覆盖 CLI/REPL 与观察工具；若继续工具教学，可从 fixture 的阻塞/超时与证据归档推进进程生命周期，或单独完善结构化 REPL 续行协议；
+- 本版十问已覆盖 CLI/REPL、观察工具与单 child 生命周期；成熟 [lua_fixture_runner](https://github.com/YanqingXu/lua_rust/blob/main/tools/lua_fixture_runner/README.md) 的进程组/Windows Job Object、分类与规范化是后续独立能力，不能由本轮反例通过推定；
+- 下一项局部教学可独立完善结构化 REPL 续行协议；跨入兼容验收时，应先冻结能力矩阵与 oracle 来源；
 - 下一 checkpoint 是 v1.0：补齐登记差异，冻结能力矩阵，并以官方 Lua 5.1.5 与固定 C++ oracle 双差分收口。
