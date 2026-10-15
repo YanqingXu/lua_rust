@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="684" viewBox="0 0 900 684" role="img" aria-labelledby="title desc">
+  <title id="title">sort 临时快照与回调收集期间的 roots</title>
+  <desc id="desc">sort把源表对象读入Rust Vec。comparator删除源表全部元素后，当前比较A B由invoke参数根保活，但快照中未参加本次比较的C只剩Rust句柄不会自动保活。教学改进先保存temporary roots前缀base并注册整个快照，取得排序Result后清理本层roots，再交付Result；callback自己的表修改不会回滚。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:18px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="684" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">Rust 拥有排序快照，不等于 Heap 会追踪快照中的所有对象</text>
+  <rect x="20" y="62" width="860" height="94" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="40" y="96" class="label">sort 读取源表 → values = [A, B, C, …]（Rust Vec&lt;Value&gt;）</text>
+  <text x="40" y="132" class="small">comparator 可能修改源表，还可能主动 collectgarbage；回调期间不能假设源边一直存在。</text>
+  <rect x="20" y="182" width="380" height="126" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="40" y="215" class="label">删除源表元素后，再触发 GC</text>
+  <text x="40" y="250" class="small">源表仍活着，A / B / C 的字段边已断</text>
+  <text x="40" y="284" class="small">仅剩 Vec 中的 handle，不构成隐式根</text>
+  <rect x="500" y="182" width="380" height="126" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="520" y="215" class="label">本次 invoke 的 callable / 参数根</text>
+  <text x="520" y="250" class="mono">A、B：正在比较 → 可达</text>
+  <text x="520" y="284" class="mono">C：未参加本次比较 → 可能失效</text>
+  <path d="M400 246H494" class="flow"/>
+  <rect x="20" y="334" width="860" height="164" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="40" y="367" class="label">教学改进：让临时快照拥有明确的 root 区间</text>
+  <text x="40" y="402" class="mono">base = roots.len() → roots.extend(snapshot)</text>
+  <text x="40" y="437" class="mono">保存排序 Result → roots.truncate(base) → 交付 Result</text>
+  <text x="40" y="475" class="small">Ok / Err 都回到原前缀；clear() 会删外层根，? 提前返回会留下本层根。</text>
+  <text x="24" y="537" class="small">精确验收：回调 GC 时 A/B/C 均可访问；退出后本层根消失，外层前缀仍保留。</text>
+  <text x="24" y="572" class="small">成功写回通过 Heap mutation；错误返回不回滚 callback 对源表的修改。</text>
+  <text x="24" y="607" class="small">上方改进是独立教学实验的参考方案。真实快照是否覆盖整份 values，须用源码和故障探针核对。</text>
+  <text x="24" y="646" class="small">稳定对象图实验不证明任意增量阶段、回调结果发布窗口或 panic 路径的完整 GC 安全性。</text>
+</svg>

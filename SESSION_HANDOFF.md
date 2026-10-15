@@ -3,6 +3,90 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.16 pcall/xpcall、sort comparator 与禁止 yield 边界
+
+用户要求继续按问题链讲清 callback 返回/报错后的状态恢复与临时对象保活，补齐反例、
+差异、图与验收并更新交接。本次完成该教学包，**没有恢复暂停的原审计整改目标**。
+用户随后明确要求将本批章节、状态图、练习包与交接记录一并提交并推送。
+
+- 起点为 `main@467a4d15d542c137468c11eab0d666a8f46c75fb`，开始时工作区干净，
+  本地跟踪的 origin/main 同 SHA；这是上一批统一参数/集中注册/全局环境教学包。
+  本次生产 `crates/`、v0.16 快照核心与既有 tests 均无 diff；Cargo 只增加六个
+  test targets，未增加依赖。之前的验证与已知缺口保留各自版本归属。
+  提交前 fetch 再次确认 HEAD 与 origin/main 无分叉。本批提交号以
+  `git log -1 -- book/src/versions/v16-core-stdlib.md` 为准，新提交 CI 须按其 SHA 查询。
+- [主章](book/src/versions/v16-core-stdlib.md) 接续问题四至六：pcall 只取首值丢掉
+  成功窗口 → 消费完整 Vec；xpcall 无条件 handler/展开全部 handler 输出 → 只处理
+  Err 并选择首值；`?` 越过恢复/内层清零 → 保存 Result、恢复 depth 后交付；sort
+  仅保当前 pair → 全 snapshot roots 作用域。每段有预测、运行入口、前后 include/
+  diff、图和验收。新增 callback_contracts.lua 在同一 coroutine 内捕获禁止 yield，
+  后续合法 yield 41,nil，resume 输入 42 后返回 43，主 chunk 返回 true。
+- [保护结果包](book/code/v16-core-stdlib/exercises/protected/README.md)：两个独立
+  TODO、9 项默认参考。区分空窗口/一个 nil/false，pcall 保留 7,nil,9,nil 的五值
+  结果；xpcall 成功不调用 handler，失败恰好一次，首 nil 不过滤、空结果补 nil、
+  handler Err 转其文本。模型只消费已取得的 Result；真实 VM 另验同 execute 内
+  报错后继续、参数弱槽精确 nil、handler 返回 table 写回后 GC 仍能读取 answer=42。
+  本快照 error payload 已字符串化，不能宣称保存任意原始 Lua 错误对象。
+- [边界包](book/code/v16-core-stdlib/exercises/boundary/README.md)：一个 TODO、
+  8 项默认参考。固定 `?` 泄 depth 与无条件设 1/0 的反例分别导致过度拒绝/提前
+  放行并发布 pending99；合同检查初始 depth 0/3、Ok/Err/禁止 yield、嵌套
+  1→2→1→0、拒绝时无 pending、退出后新 yield 17 不混旧值。五个真实 VM probe
+  分别覆盖 pcall、xpcall body/handler、sort、callable __call、nested pcall，均
+  在同一次 execute 的同一 coroutine 内继续合法 yield，再 resume 到 Dead。
+  实际源码为配对 +=1/-=1，模型用 baseline 表达合同；普通 Result 不外推 panic/abort。
+- [排序 roots 包](book/code/v16-core-stdlib/exercises/sort_roots/README.md)：一个
+  TODO、5 项默认参考。使用真实 Heap 的独立快照算法实验：四项 rank 4/3/2/1，
+  comparator 清源后 GC，当前 pair 仍可读而另两项访问失败；proposal 全组入根后
+  排序回写成功。成功后清源撤根，四对象均实际失效；Err 场景第二次比较写 source[1]=99，
+  恢复精确 prefix 后旧第 1 项回收，其他三项仍由 source 保活。prefix 仍可读 900，
+  callback 数据修改不回滚。真实 VM 正向只验源边保持时 GC、两元素 false/nil/0
+  truthiness 与 error mutation，不能据此称清源缺口已修复。
+- 三幅新 SVG（保护结果分支、嵌套 depth、快照/pair roots）及正文 include 已在
+  浏览器核对文字、框线、箭头与页脚。源码边界明确：handler 结果到 caller 写回之间
+  现有路径无额外 GC checkpoint，测试在写回后才收集；通常 invoke 路径有 roots
+  truncate，但 CoroutineWrapper 的 `resume_coroutine(...)?` 仍可能跳过该收尾，
+  本包未修复或证明该分支。v0.15 active_varargs_gap 的功能缺口也没有被覆盖。
+- **新增独立已知功能缺口，未修复：** [sort_snapshot_roots_gap.lua](book/code/v16-core-stdlib/examples/sort_snapshot_roots_gap.lua)
+  从已结束的构造帧取得四个表，首 comparator 清空源表后 GC，后续比较实际报
+  `line 14 (pc 27): stale GC handle for object 13`。Debug/Release 均退出 2；
+  单列 `known-functional-failure / functionality_pass=false`，不进默认参考或 ignored。
+  健康 proposal 只改教学实验，没有改 VM 的局部 values roots。本节要求来自所选
+  Rust snapshot 算法的内部所有权合同，不承诺官方 Lua 对 comparator 修改源表时的
+  最终排序结果，也不以此输入做 oracle 等价证明。
+- 本地 Rust/cargo **1.96.1**：fmt、workspace all-targets Clippy `-D warnings` 通过；
+  Debug/Release 各 **155 通过、0 失败、8 ignored**（前批 133 + 本批 22 参考）。
+  六组 learner 显式初始分别 2/1/1/2/1/1 失败；本批四题均完成“失败 → 临时套解
+  通过 → 原字节恢复后再失败”，starter 哈希一致且 mtime 刷新。默认 ignored 不代表
+  学习者完成，CLI 也不读 starter。73 个代码输入前后哈希无漂移。
+- 六个 CLI 共 **75 条关键输出**匹配（原三包 37、本批 38）；demo 1616、两个正常
+  contracts Lua 探针 true。主章与六个 README 去重后 **28 条 exact 命令各执行 1 项**，
+  20 正向通过、8 learner 按预期失败。PATH 的 Lua **5.1.5** 实际运行 stdlib_diff，
+  退出 0、输出 1550；只代表该确定性 fixture 的外部对照。全 20 版本教学结构、mdBook
+  构建、38 页链接检查通过：**1,247 个站内链接、0 broken**。
+- 新证据独立在 `target/teaching-v16-callbacks-2026-10-15/`：
+  `full-validation/20261015T062503047334Z/{summary,metadata}.json` 记录 48 项验证/
+  计数/源码哈希/oracle，复用同输入 `20261015T062339879420Z/` 已通过的七项；早期
+  protected CLI 检查器的两条引号 marker 失配保留原记录，校准显示格式后符合预期，
+  没有改源或重新把已过 workspace 当作新一轮验证。`exact-command-sources.json`
+  记录逐题来源。局部与套解证据为 `protected/20261015T062030978Z/`、
+  `boundary/20261015T061914452186Z/`、`sort_roots/{scoped-verification,starter-round-trip,known-failure}.json`；
+  `final-verification.json` 为最终文档/站点/交付哈希核对。这些是本机忽略产物，
+  不随 clone 交付；永久入口是主章、三个 README、contracts/real 与 examples，
+  没有覆盖前一批 `target/teaching-v16-2026-10-15/` 证据。
+- 已推送基线 `467a4d1` 的 [mdBook 38690972897](https://github.com/YanqingXu/lua_rust/actions/runs/38690972897)
+  已成功；本轮观察 [Rust CI 38690972904](https://github.com/YanqingXu/lua_rust/actions/runs/38690972904)
+  仍运行，GC/native Miri 和 Linux ASan 成功，Windows quality 与另一 Miri 仍运行。
+  明细保存于 `baseline-rust.json`；不把旧提交失败原因套用到这次，也不把基线 CI
+  作为本批新提交的 CI 结果。提交前再查终态：仅 Windows Quality Gate 的
+  `M1 foundation and quality gate` 失败，其余三个 Miri/ASan job 成功。此次失败日志
+  下载仍返回 HTTP 403 / API rate limit exceeded，未核实具体失败原因；明细与输出
+  分别见同证据目录 `push-baseline-rust.json`、`push-baseline-failed.log`。
+
+若继续教学，下一包建议 v0.17 从 require 重复执行 → 缓存 → 循环加载 → 失败后的
+缓存/资源恢复推进。若选择工程整改，先从上述 sort snapshot 实际失败增加回归，再修
+roots 作用域，并保留成功/错误/清源/嵌套对照；另处理 v0.15 活动 varargs 缺口。
+后续按用户指令启动；原审计仍暂停在本地时间/UTC/DST，提交推送由当次指令授权。
+
 ## 2026-10-15：v0.16 统一参数规则、集中注册与唯一全局环境
 
 用户要求继续按问题链完善这三部分，补齐可运行反例、前后差异、状态图和验收练习，

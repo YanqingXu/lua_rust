@@ -48,3 +48,27 @@ path = "exercises/globals/acceptance.rs"
 [[test]]
 name = "globals_reference"
 path = "exercises/globals/reference.rs"
+
+[[test]]
+name = "protected_exercises"
+path = "exercises/protected/acceptance.rs"
+
+[[test]]
+name = "protected_reference"
+path = "exercises/protected/reference.rs"
+
+[[test]]
+name = "boundary_exercises"
+path = "exercises/boundary/acceptance.rs"
+
+[[test]]
+name = "boundary_reference"
+path = "exercises/boundary/reference.rs"
+
+[[test]]
+name = "sort_roots_exercises"
+path = "exercises/sort_roots/acceptance.rs"
+
+[[test]]
+name = "sort_roots_reference"
+path = "exercises/sort_roots/reference.rs"

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="650" viewBox="0 0 900 650" role="img" aria-labelledby="title desc">
+  <title id="title">保护调用把执行结果转换成 Lua 返回值</title>
+  <desc id="desc">pcall和xpcall在禁止yield的边界调用body。成功时保留所有返回值包括nil并在前面加true。pcall失败返回false和格式化错误文本。xpcall失败后才运行handler，给它格式化错误文本，返回false和handler的首个值，无值时为nil；handler失败则转为文本。调用结果包装不等于状态恢复或GC保活。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:18px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="650" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">先取得 Result，再决定向 Lua 交付什么值</text>
+  <rect x="20" y="62" width="860" height="76" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="40" y="94" class="label">body 在禁止 yield 的边界内执行；返回后先恢复边界状态</text>
+  <text x="40" y="123" class="small">正常返回 Ok(Vec&lt;Value&gt;)；普通报错或被拒绝的 yield 返回 Err(VmError)。</text>
+  <path d="M230 138V168" class="flow"/><path d="M665 138V168" class="flow"/>
+  <rect x="20" y="172" width="410" height="110" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="40" y="205" class="label">成功：pcall / xpcall 相同</text>
+  <text x="40" y="240" class="mono">Ok([7, nil, 9, nil])</text><text x="40" y="268" class="mono">→ [true, 7, nil, 9, nil]</text>
+  <rect x="450" y="172" width="430" height="110" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="470" y="205" class="label">失败：保存格式化的错误文本</text>
+  <text x="470" y="240" class="mono">Err(error) → text(error)</text><text x="470" y="268" class="small">本快照没有任意 Lua Value 的错误载荷协议。</text>
+  <path d="M575 282V313" class="flow"/><path d="M775 282V417" class="flow"/>
+  <rect x="20" y="317" width="650" height="76" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="40" y="349" class="label">pcall：不再向外传播这个普通执行错误</text>
+  <text x="40" y="379" class="mono">→ [false, text(error)]</text>
+  <rect x="20" y="421" width="860" height="136" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="40" y="454" class="label">xpcall：body 失败后，才在禁止 yield 的边界调用 handler(text)</text>
+  <text x="40" y="489" class="mono">Ok([42, 99]) → [false, 42]　　Ok([]) → [false, nil]</text>
+  <text x="40" y="524" class="mono">Err(handler_error) → [false, text(handler_error)]</text>
+  <text x="24" y="595" class="small">body 成功时不调用 handler；空结果与一个 nil 的长度不同，不能用 filter 丢弃 nil。</text>
+  <text x="24" y="626" class="small">包装结果、恢复 depth、保活临时对象是三个独立合同，必须分别观察。</text>
+</svg>

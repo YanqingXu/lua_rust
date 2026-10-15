@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="640" viewBox="0 0 900 640" role="img" aria-labelledby="title desc">
+  <title id="title">嵌套禁止 yield 深度的进入与恢复</title>
+  <desc id="desc">外层进入将depth从0变1，内层从1变2，内层返回或普通报错先恢复到1，外层仍禁止yield；外层返回或报错恢复到0，此时同一coroutine稍后可正常yield。若在call?之后清理则错误跳过恢复；若清零则内层提前解除外层保护。yield检查先于写入yield_values。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:18px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="640" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">恢复到进入前的深度；每一层只结束自己的保护</text>
+  <rect x="20" y="62" width="860" height="274" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="40" y="96" class="label">时点</text><text x="560" y="96" class="label">depth</text><text x="690" y="96" class="label">yield 条件</text>
+  <path d="M40 110H855" stroke="#d9d5c7"/>
+  <text x="40" y="142" class="small">普通 coroutine 代码</text><text x="580" y="142" class="mono">0</text><text x="700" y="142" class="small">可暂停</text>
+  <text x="40" y="180" class="small">进入外层 pcall / comparator 边界</text><text x="580" y="180" class="mono">1</text><text x="700" y="180" class="small">拒绝</text>
+  <text x="40" y="218" class="small">再进入内层受保护调用</text><text x="580" y="218" class="mono">2</text><text x="700" y="218" class="small">拒绝</text>
+  <text x="40" y="256" class="small">内层 Ok / Err → 先恢复，后交付结果</text><text x="580" y="256" class="mono">1</text><text x="700" y="256" class="small">仍拒绝</text>
+  <text x="40" y="294" class="small">外层 Ok / Err → 先恢复，后交付结果</text><text x="580" y="294" class="mono">0</text><text x="700" y="294" class="small">再次可暂停</text>
+  <path d="M590 153V166" class="flow"/><path d="M590 191V204" class="flow"/><path d="M590 229V242" class="flow"/><path d="M590 267V280" class="flow"/>
+  <rect x="20" y="360" width="860" height="100" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="40" y="393" class="label">两个固定错误</text><text x="40" y="428" class="mono">call()?; restore　→ Err 跳过恢复　　depth = 0　→ 提前解除外层保护</text>
+  <rect x="20" y="484" width="860" height="86" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="40" y="517" class="label">实际 CoroutineYield：先检查 current_coroutine 与 depth</text>
+  <text x="40" y="549" class="small">depth 非零返回 Type 错误，不设置 yield_values，不保存可恢复 continuation。</text>
+  <text x="24" y="607" class="small">这是普通 Result 路径的恢复合同；不承诺 panic / abort 展开或任意宿主重入都安全。</text>
+</svg>

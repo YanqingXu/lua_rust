@@ -51,6 +51,47 @@ cargo test --manifest-path book/code/v16-core-stdlib/Cargo.toml --workspace --re
 ```
 
 正向合同只说明上述范围。v0.15 交接中已记录活动 varargs/tail-call 漏根，本教学包没有
-修复该工程问题，也不宣称全部 GC 路径正确；受保护 callback/排序资源保活另作下一包。
+修复该工程问题，也不宣称全部 GC 路径正确。
+
+## 保护调用、禁止 yield 与排序临时 roots
+
+后续三包把结果交付、执行状态与可达性分开验收：
+
+- [保护结果](exercises/protected/README.md)：两个 TODO，保留 pcall 多值/nil，xpcall 仅错误时调用 handler 并取首结果。
+- [边界恢复](exercises/boundary/README.md)：一个 TODO，普通 Ok/Err 后恢复进入前 depth，内层不能清除外层禁止状态。
+- [排序 roots](exercises/sort_roots/README.md)：一个 TODO，以真实 Heap 验证全快照保活、错误后截断及外层 prefix 保留。
+
+```powershell
+cargo run --quiet --manifest-path book/code/v16-core-stdlib/Cargo.toml -- book/code/v16-core-stdlib/examples/callback_contracts.lua
+cargo run --quiet --manifest-path book/code/v16-core-stdlib/Cargo.toml --example protected_problem_chain
+cargo run --quiet --manifest-path book/code/v16-core-stdlib/Cargo.toml --example boundary_problem_chain
+cargo run --quiet --manifest-path book/code/v16-core-stdlib/Cargo.toml --example sort_roots_problem_chain
+cargo test --manifest-path book/code/v16-core-stdlib/Cargo.toml --test protected_reference
+cargo test --manifest-path book/code/v16-core-stdlib/Cargo.toml --test boundary_reference
+cargo test --manifest-path book/code/v16-core-stdlib/Cargo.toml --test sort_roots_reference
+cargo test --manifest-path book/code/v16-core-stdlib/Cargo.toml --test protected_exercises -- --ignored
+cargo test --manifest-path book/code/v16-core-stdlib/Cargo.toml --test boundary_exercises -- --ignored
+cargo test --manifest-path book/code/v16-core-stdlib/Cargo.toml --test sort_roots_exercises -- --ignored
+```
+
+Lua 探针最终返回 true：被保护调用拒绝的 yield 之后，同一 coroutine 仍可合法 yield
+41,nil，再恢复返回 43。精确 roots/depth 前缀由局部合同验收；同一 execute 的正向行为
+不作为整个 VM 私有状态清理的证明。三包 learner 初始分别 2/1/1 项失败，均为普通
+Result 协议练习，不承诺 panic/abort 安全。固定 CLI 不读取 starter。
+
+本轮增加 protected 9、boundary 8、sort_roots 5 项参考，与前一批 133 项合计
+**155 通过、8 ignored**。八项 learner 均为显式待完成练习，独立已知失败输入不在计数中。
+
+**当前真实功能缺口，未修复：**
+
+```powershell
+# 预期当前失败，退出 2，错误包含 stale GC handle。
+cargo run --quiet --manifest-path book/code/v16-core-stdlib/Cargo.toml -- book/code/v16-core-stdlib/examples/sort_snapshot_roots_gap.lua
+```
+
+该输入结束构造帧后对四个 rank table 排序，comparator 清空源表并收集，未参与当前
+比较的对象只剩 Rust snapshot handle，后续访问 stale。此项单独记为 known-functional-failure，
+不计入默认参考成功或 ignored；sort_roots 的健康方案是独立 Heap 实验，真实 VM 的
+snapshot 尚未登记全根。原 v0.15 活动 varargs 缺口亦未修复。
 
 Lua pattern、完整 `string.format`、chunk loader、function environment 和部分 collector tuning 仍留待后续兼容收口；io/os/package/debug 属于 v0.17。
