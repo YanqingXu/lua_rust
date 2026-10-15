@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="950" viewBox="0 0 900 950" role="img" aria-labelledby="title desc">
+  <title id="title">分步回收：把进度留在 Heap，下一次才能接着走</title>
+  <desc id="desc">初始对象图只有 root 到 A、A 到 B、B 到 C 的强引用，D 不可达，四个对象按 A、B、C、D 顺序分配。预算为一时，八次调用分别返回 Mark、Mark、Atomic、Sweep、Sweep、Sweep、Sweep、Pause。gray 是 Vec，右端为下一次 pop 的位置；Atomic 结束时才建立排序后的 sweep ID 快照，接下来的四次调用将 cursor 从零推进到四。错误的对照写法每次调用都重建周期，只会反复扫描 A，无法报告 completed。预算限制 pop 或 sweep ID 的工作计数，不保证单次耗时恒定。</desc>
+  <defs>
+    <marker id="edge" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <marker id="reset" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#a45a24"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; }
+      .label { font-size: 18px; }
+      .small { font-size: 16px; }
+      .strong { font-weight: 700; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .trace { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#edge); }
+      .white { fill: #fff; stroke: #68766c; stroke-width: 2; }
+      .green { fill: #e5f1e7; stroke: #286047; stroke-width: 2; }
+    </style>
+  </defs>
+  <rect width="900" height="950" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">每次只做一份工作，进度由 Heap 跨调用持有</text>
+  <text x="24" y="65" class="small">固定输入：只把 A 传入 roots；先按 A、B、C、D 分配，再连边；budget = 1。</text>
+
+  <rect x="20" y="86" width="860" height="122" rx="12" fill="#f2efe5" stroke="#d9d5c7"/>
+  <text x="38" y="112" class="small strong">开始周期前</text>
+  <rect x="40" y="136" width="100" height="42" rx="6" class="green"/>
+  <text x="90" y="163" text-anchor="middle" class="label">root</text>
+  <rect x="210" y="136" width="90" height="42" rx="6" class="white"/>
+  <text x="255" y="163" text-anchor="middle" class="label">A</text>
+  <rect x="380" y="136" width="90" height="42" rx="6" class="white"/>
+  <text x="425" y="163" text-anchor="middle" class="label">B</text>
+  <rect x="550" y="136" width="90" height="42" rx="6" class="white"/>
+  <text x="595" y="163" text-anchor="middle" class="label">C</text>
+  <rect x="740" y="136" width="90" height="42" rx="6" class="white"/>
+  <text x="785" y="163" text-anchor="middle" class="label">D</text>
+  <path d="M140 157H209" class="trace"/>
+  <path d="M300 157H379" class="trace"/>
+  <path d="M470 157H549" class="trace"/>
+  <path d="M830 146H850V126H785V135" class="trace"/>
+  <text x="710" y="198" class="small">无 root 路径</text>
+
+  <rect x="20" y="228" width="560" height="581" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="38" y="258" class="heading">正确：只在 Pause 启动新周期</text>
+  <text x="38" y="284" class="small">每行是一次 step 返回后，Heap 中留下的状态。</text>
+  <rect x="21" y="300" width="558" height="40" fill="#e5f1e7"/>
+  <text x="38" y="326" class="small strong">调用</text>
+  <text x="108" y="326" class="small strong">phase</text>
+  <text x="226" y="326" class="small strong">gray / 本步检查</text>
+  <text x="435" y="326" class="small strong">cursor</text>
+
+  <path d="M20 390H580M20 440H580M20 490H580M20 550H580M20 600H580M20 650H580M20 700H580M20 750H580" stroke="#e0e6df"/>
+  <text x="48" y="372" class="mono">1</text><text x="108" y="372" class="mono">Mark</text><text x="240" y="372" class="mono">[B] → pop</text><text x="451" y="372" class="mono">0</text>
+  <text x="48" y="422" class="mono">2</text><text x="108" y="422" class="mono">Mark</text><text x="240" y="422" class="mono">[C] → pop</text><text x="451" y="422" class="mono">0</text>
+  <text x="48" y="472" class="mono">3</text><text x="108" y="472" class="mono">Atomic</text><text x="240" y="472" class="mono">[]</text><text x="451" y="472" class="mono">0</text>
+  <rect x="21" y="491" width="558" height="58" fill="#f1ebf7"/>
+  <text x="48" y="516" class="mono">4</text><text x="108" y="516" class="mono">Sweep</text><text x="240" y="516" class="mono">[]</text><text x="451" y="516" class="mono">0</text>
+  <text x="108" y="540" class="small">Atomic 结束：sweep_ids = [A, B, C, D]</text>
+  <text x="48" y="582" class="mono">5</text><text x="108" y="582" class="mono">Sweep</text><text x="226" y="582" class="small">[]；检查 A，保留</text><text x="451" y="582" class="mono">1</text>
+  <text x="48" y="632" class="mono">6</text><text x="108" y="632" class="mono">Sweep</text><text x="226" y="632" class="small">[]；检查 B，保留</text><text x="451" y="632" class="mono">2</text>
+  <text x="48" y="682" class="mono">7</text><text x="108" y="682" class="mono">Sweep</text><text x="226" y="682" class="small">[]；检查 C，保留</text><text x="451" y="682" class="mono">3</text>
+  <rect x="21" y="701" width="558" height="48" fill="#e5f1e7"/>
+  <text x="48" y="732" class="mono">8</text><text x="108" y="732" class="mono">Pause</text><text x="226" y="732" class="small">[]；检查 D，删除</text><text x="451" y="732" class="mono">4</text>
+  <text x="38" y="778" class="mono">completed = Some({ collected: 1, remaining: 3 })</text>
+
+  <rect x="600" y="228" width="280" height="581" rx="12" fill="#fff8ee" stroke="#a45a24"/>
+  <text x="618" y="258" class="heading">错误：每次都 reset</text>
+  <text x="618" y="284" class="small">从 collect 直接截出一小段，</text>
+  <text x="618" y="309" class="small">却仍在函数入口重建状态。</text>
+  <rect x="623" y="339" width="234" height="72" rx="8" fill="#fff" stroke="#a45a24"/>
+  <text x="640" y="367" class="mono">start_cycle()</text>
+  <text x="640" y="393" class="small">清 marks / gray / cursor</text>
+  <path d="M740 412V450" fill="none" stroke="#a45a24" stroke-width="2" marker-end="url(#reset)"/>
+  <rect x="623" y="451" width="234" height="72" rx="8" fill="#fff" stroke="#a45a24"/>
+  <text x="640" y="480" class="small">扫描 root A → 排入 B</text>
+  <text x="640" y="505" class="mono">Mark, gray = [B]</text>
+  <path d="M740 524V562" fill="none" stroke="#a45a24" stroke-width="2" marker-end="url(#reset)"/>
+  <rect x="623" y="563" width="234" height="64" rx="8" fill="#fff" stroke="#a45a24"/>
+  <text x="640" y="589" class="small">返回；下一次又重建</text>
+  <text x="640" y="613" class="small">B 的待处理进度丢失</text>
+  <path d="M858 594H866V376H859" fill="none" stroke="#a45a24" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#reset)"/>
+  <text x="618" y="675" class="small strong">有限次数内无法完成：</text>
+  <text x="618" y="705" class="mono">completed = None</text>
+  <text x="618" y="747" class="small">验收不能只看 work = 1，</text>
+  <text x="618" y="774" class="small">还要看同一周期是否前进。</text>
+
+  <text x="24" y="844" class="small">gray 是待处理引用栈，marked 是对象记录的 bool；pop 扫描时才将该对象 marked 设为 true。</text>
+  <text x="24" y="873" class="small">每次 Mark / Atomic 调用会重新提交 roots，但已标记的 A 不会重新入队。</text>
+  <text x="24" y="902" class="small">work 在 Mark 计 pop、在 Sweep 计 ID；Atomic 记 1，却可能排空大量工作，不是耗时硬上限。</text>
+  <text x="24" y="931" class="small">此图只含普通强引用表；最终 Pause 会清除存活对象的 marked，供下一周期重新判断。</text>
+</svg>

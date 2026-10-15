@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="850" viewBox="0 0 900 850" role="img" aria-labelledby="title desc">
+  <title id="title">write barrier：补上两次 step 之间新接入的强引用</title>
+  <desc id="desc">先分配普通表 A 和 B，只将 A 作为 root。第一次预算一的 step 已扫描 A，返回 Atomic，A marked 为真、gray 为空，B marked 为假。此时写入 A.x 等于 B。漏掉 barrier 时，A 不会因重复提交 root 而重新扫描，B 仍未标记，Sweep 错误删除 B。正确的 table_set 在写入前对 value 执行 write_barrier，将 B 放入 gray 的右端。下一次 Atomic 调用排空 gray，扫描 B 后建立 sweep 快照，最终保留 A 和 B。black、gray、white 只是教学概念，实际实现使用 marked 布尔值与 gray 引用栈，没有 Color 枚举。</desc>
+  <defs>
+    <marker id="edge" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <marker id="late" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#a45a24"/></marker>
+    <marker id="queue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#75519a"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; }
+      .label { font-size: 18px; }
+      .small { font-size: 16px; }
+      .strong { font-weight: 700; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .node { fill: #e5f1e7; stroke: #286047; stroke-width: 2; }
+      .white { fill: #fff; stroke: #68766c; stroke-width: 2; }
+      .trace { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#edge); }
+      .late { fill: none; stroke: #a45a24; stroke-width: 2; stroke-dasharray: 6 4; marker-end: url(#late); }
+      .enqueue { fill: none; stroke: #75519a; stroke-width: 2; marker-end: url(#queue); }
+    </style>
+  </defs>
+  <rect width="900" height="850" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">A 已扫描后才接入 B：靠下一次 roots 扫描还不够</text>
+  <text x="24" y="65" class="small">A / B 都在周期开始前分配；只有 A 是 root；第一次 step(…, 1) 返回 Atomic。</text>
+
+  <rect x="20" y="86" width="860" height="188" rx="12" fill="#f2efe5" stroke="#d9d5c7"/>
+  <text x="38" y="115" class="label strong">共同起点：gray = []，A.marked = true，B.marked = false</text>
+  <rect x="40" y="151" width="100" height="52" rx="6" class="node"/>
+  <text x="90" y="184" text-anchor="middle" class="label">root</text>
+  <rect x="220" y="143" width="170" height="68" rx="6" class="node"/>
+  <text x="305" y="169" text-anchor="middle" class="label strong">A：已扫描</text>
+  <text x="305" y="195" text-anchor="middle" class="small">概念 black</text>
+  <rect x="620" y="143" width="170" height="68" rx="6" class="white"/>
+  <text x="705" y="169" text-anchor="middle" class="label strong">B：未标记</text>
+  <text x="705" y="195" text-anchor="middle" class="small">概念 white</text>
+  <path d="M140 177H219" class="trace"/>
+  <path d="M390 177H619" class="late"/>
+  <text x="430" y="163" class="mono">A.x = B</text>
+  <text x="38" y="245" class="small">虚线表示本次 mutator 新写入的边；旧扫描已结束，必须显式补交这份标记工作。</text>
+
+  <g transform="translate(20 294)">
+    <rect width="420" height="424" rx="12" fill="#fff8ee" stroke="#a45a24"/>
+    <text x="18" y="32" class="heading">漏 barrier：引用存在，工作丢失</text>
+    <text x="18" y="65" class="mono">gray = []</text>
+    <text x="18" y="97" class="small">① table_set 只写入 A.x。</text>
+    <text x="18" y="129" class="small">② Atomic 再提交 root A，因 marked</text>
+    <text x="38" y="155" class="small">已为 true，不会重新扫描它。</text>
+    <text x="18" y="187" class="small">③ 队列仍空，B 仍未标记。</text>
+    <text x="18" y="219" class="small">④ Sweep 删除 B，尽管 A.x 仍指向它。</text>
+
+    <rect x="30" y="249" width="120" height="62" rx="6" class="node"/>
+    <text x="90" y="287" text-anchor="middle" class="label">A 存活</text>
+    <rect x="255" y="249" width="130" height="62" rx="6" fill="#fff" stroke="#a43f22" stroke-width="2" stroke-dasharray="5 4"/>
+    <text x="320" y="287" text-anchor="middle" class="label">B 被误收</text>
+    <path d="M150 280H254" class="late"/>
+    <text x="18" y="352" class="mono">collected = 1</text>
+    <text x="18" y="384" class="small">读取 A.x 得到旧 handle，继续访问 B</text>
+    <text x="18" y="409" class="small">就会遇到 StaleHandle。</text>
+  </g>
+
+  <g transform="translate(460 294)">
+    <rect width="420" height="424" rx="12" fill="#fff" stroke="#286047"/>
+    <text x="18" y="32" class="heading">有 barrier：把 B 排入 gray</text>
+    <text x="18" y="65" class="mono">gray = [B]     右端 pop →</text>
+    <text x="18" y="97" class="small">① owner 已 marked，且正处于 Atomic：</text>
+    <text x="38" y="123" class="mono">enqueue_value(B)</text>
+    <text x="18" y="155" class="small">② 下一次 Atomic 排空 gray，pop B，</text>
+    <text x="38" y="181" class="small">扫描其边并将 marked 设为 true。</text>
+    <text x="18" y="213" class="small">③ Atomic 结束才建立 sweep ID 快照。</text>
+
+    <rect x="30" y="249" width="120" height="62" rx="6" class="node"/>
+    <text x="90" y="287" text-anchor="middle" class="label">A 存活</text>
+    <rect x="255" y="249" width="130" height="62" rx="6" class="node"/>
+    <text x="320" y="287" text-anchor="middle" class="label">B 存活</text>
+    <path d="M150 280H254" class="trace"/>
+    <text x="18" y="352" class="mono">collected = 0</text>
+    <text x="18" y="384" class="small">整轮结束后，两者均存活，A.x 可访问。</text>
+    <text x="18" y="409" class="small">A 无需重扫，B 获得自己的扫描机会。</text>
+  </g>
+
+  <text x="24" y="754" class="small">“三色”是理解不变量的概念：black = marked；gray = 待 pop；white = 未标记且未排队。</text>
+  <text x="24" y="783" class="small">本版实际字段只有 marked: bool 与 gray: Vec&lt;TraceRef&gt;，没有 Color 枚举；排队尚不等于标记。</text>
+  <text x="24" y="812" class="small">必须预先分配 B：若在 Mark / Atomic 新分配，barrier_new 已将它排队，会掩盖漏写入屏障。</text>
+  <text x="24" y="841" class="small">此图仅讨论普通强引用表；验收同时检查 collected、B 的存活与字段可用性。</text>
+</svg>

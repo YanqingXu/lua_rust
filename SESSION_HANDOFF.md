@@ -3,6 +3,48 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.14 强引用增量 GC 问题链
+
+用户要求围绕“分步回收 → 跨调用保存进度 → write barrier”完善 v0.14，补齐可运行
+反例、前后代码差异、状态图和验收练习，验证后更新交接。此次只推进该教学工作包，
+**没有恢复原主线审计整改目标，也没有扩展 weak/finalizer 教学工作包**。
+
+- 起点为 `main@fdb77ad517a91e9d5b1762b7d5a9a40f45efae6c`，工作区干净。用户随后明确
+  要求将本批章节、状态图、练习包和交接一并提交并推送；提交号以
+  `git log -1 -- book/src/versions/v14-incremental-gc.md` 为准，新提交的 CI 须按其 SHA
+  单独查询。生产 `crates/`、v0.14 快照核心 GC 和既有测试均没有最终 diff。
+- [v0.14 章节](book/src/versions/v14-incremental-gc.md) 按三个反例组织：一次做完导致
+  没有中间返回点；每次重启导致预算 1 不前进；漏 barrier 导致新接入的 child 被回收。
+  每题附可编译 starter/reference include、最小 diff、精确命令与完成条件。
+- [实验包](book/code/v14-incremental-gc/exercises/README.md) 的独立强引用小模型提供
+  错误/修复行为，`gc_problem_chain` example 固定重放；模型不是历史 VM 快照，
+  不支持周期中分配、weak/finalizer 或完整 Lua 对象合同。真实 Heap 另验证同一四对象
+  八次轨迹、full/step 统计及实际存活分类，以及预分配 child 的 table_set 保活。
+- 两幅 SVG 解释持久队列/游标和 late-edge barrier。已核对实际网页显示、图中文字和箭头。
+  Mark/Atomic 重扫 roots、Atomic 末建立 sweep snapshot、marked bool 与 gray Vec 的
+  区别均已校准；budget 是工作计数，不能外推恒定暂停时间。
+- 本地 `rustc/cargo 1.96.1`：v0.14 fmt、all-targets Clippy `-D warnings` 通过；
+  Debug/Release workspace 各 **92 通过、3 ignored**（84 项原测试 + 8 项参考验收）。
+  显式启用三题初始全部失败；临时套用参考解后三题通过，恢复 starter 后再次验证三题
+  失败。默认 ignored 不表示学习者已完成，也不是隐藏未修复的原有回归。
+- 四条章节精确命令已回放：三条正向各执行到 1 项通过，一条学习者单题按预期失败。
+  CLI 的文中关键输出已核对。全 20 版本教学结构、mdBook 构建、38 页链接检查通过：
+  1,159 个站内链接，0 broken。本机日志、工具链、基线 SHA 与输入哈希保存到
+  `target/teaching-v14-2026-10-15/final-verification.json` 及同目录日志；该目录为忽略
+  产物，不随 clone 提供，永久复现入口为章节和实验 README。
+- 上一个已推送教学提交 `fdb77ad` 的远程终态已重新核对：
+  [mdBook 38666400522](https://github.com/YanqingXu/lua_rust/actions/runs/38666400522) 成功；
+  [Rust CI 38666400608](https://github.com/YanqingXu/lua_rust/actions/runs/38666400608) 失败。
+  Windows 官方 required lane 的 Rust `constructs.lua` 约 30 秒超时（其余 9 项与双
+  oracle 各 10 项通过）；M1 Clippy 在远端 Rust 1.99.0 因生产代码的
+  `AtomicU64::fetch_update` deprecated 失败，位置是 `state_handle.rs:134`、
+  `gc/object_id.rs:38`、`heap.rs:26`。其余三个 job 成功；该提交没有修改生产 crates，
+  不把日志写成 v0.13 教学回归，也不把超时称作已修复或确定的 flaky。
+
+下一教学工作包可从“借用对象时还要修改工作队列”的最小 Rust 反例继续，再讲 finalizer
+事件所有权与重入；weak/ephemeron 固定点单独安排。后续按新用户指令启动。原审计
+队列仍从本地时间/UTC/DST 接续，历史验证与本次教学验证保持各自版本归属。
+
 ## 2026-10-15：v0.13 GC 教学工作包
 
 本次用户要求参考《用 Rust 实现 Lua 解释器》，优先完善 v0.13 的小步迁移、对象状态图

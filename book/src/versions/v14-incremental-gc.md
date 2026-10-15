@@ -1,87 +1,302 @@
 # v0.14 · 增量 GC、弱表与 Finalizer
 
-<div class="lesson-meta"><span>核心增量：可暂停且可重入的回收状态机</span><span>workspace</span><span>checkpoint v0.14</span></div>
+<div class="lesson-meta"><span>问题链：分步 → 保存进度 → 写入修复</span><span>workspace</span><span>checkpoint v0.14</span></div>
 
 <a id="learning-task-card"></a>
 ## 学习任务卡
 
 <div class="task-card">
   <strong>把一次完整遍历拆成可暂停状态机</strong>
-  <p>前置：v0.13 的 roots/edges、mark/sweep 与 Heap owner。新知识：三色不变量、持久 gray
-  queue、write barrier、ephemeron 固定点、finalizer 重入。完成后你应能解释任意 mutation
-  怎样保持黑对象不遗漏白 child。</p>
+  <p>前置：v0.13 的 roots/edges、mark/sweep 与 Heap owner。本轮先解决三个问题：怎样分步
+  回收、下一次调用怎样接着做、步骤之间写入新引用怎样避免误收。沿问题引入 enum/match、
+  持久 Vec/游标、Option 完成信号与封装写入；每个改动都由同一个反例前后对照验收。</p>
 </div>
 
-v0.13 每次 `collect` 都会一次扫描整个对象图。正确性已经成立，但暂停时间随 heap 增长；mutator 若在扫描中修改黑对象，还会破坏“黑对象不指向白对象”的不变量。本版增加一个核心能力：**完整 GC 可以在多个 VM checkpoint 之间暂停和恢复，同时保持弱引用与 finalizer 的可验证语义**。
+v0.13 的一次 `collect` 要做完本轮 mark/sweep 才返回。现在让 VM 在回收步骤之间继续
+执行 Lua，就会依次遇到三个问题：**怎样交还控制权，怎样记住进度，怎样修复扫描之后
+新增的边**。本章先讲透这条强引用问题链。快照已有的自动 checkpoint、weak table 和
+finalizer 保留在后面的扩展阅读，不作为这三个练习的前置知识。
+
+本轮配套代码有两个层次：`exercises/model.rs` 是只含强引用的可运行小模型，用来替换
+错误设计、观察确定性轨迹；真实快照仍在 `crates/` 中，另用真实 `Heap` 对照验收。
+小模型不是三份历史 VM 快照，也不支持 weak/finalizer。它复用真实 core 的
+`GcPhase`、`GcStep` 和 `GcStats`，让概念可以逐项对应，而不混淆验证范围。
 
 <a id="learning-predict"></a>
 ## 先预测再运行
 
-设 parent 已被扫描成 black，child 仍是 white，此时脚本执行 `parent.x=child`。若没有 barrier，
-gray queue 已不会重访 parent，child 将被错误 sweep。先画出错误路径，再选择修复：把 child
-染 gray，或把 parent 重新染 gray。本版采用前者。
+先画 `root → A → B → C`，旁边还有一个不可达对象 D，所有对象都在周期开始前分配。
+预测下面三个输出，再运行命令：
+
+1. 给 `step` 传预算 1，但内部直接调用完整 `collect`，第一次调用是否已经完成？
+2. 每次调用重新建 gray stack、重置游标，能否最终扫到 B/C 并回收 D？
+3. 另起一张只有 A/B 的图，root 只指向 A。扫描 A 后才加入 `A.x = B`，B 会不会存活？
+
+```powershell
+$gcManifest = 'book/code/v14-incremental-gc/Cargo.toml'
+cargo run --quiet --manifest-path $gcManifest --example gc_problem_chain
+```
+
+CLI 在同一次运行中并列展示错误和修复后的行为；预期错误被记录为实验结果，进程正常
+退出表示重放执行完毕，不表示错误设计通过。章末行为验收单独检查正确性，学习者的
+三个 TODO 初始会以非零退出码失败。CLI 固定重放前后设计，不读取 starter 的修改；
+完成练习后它仍会展示原反例，练习完成以 `gc_exercises -- --ignored` 为准。
+所有命令都从仓库根目录运行。
 
 <a id="learning-code-map"></a>
 ## 代码阅读地图
 
-1. `GcPhase`：Pause/Mark/Atomic/Sweep 的合法迁移；
-2. collector state：跨 step 保存 gray stack、sweep IDs、cursor 和统计；
-3. `step(budget, roots)`：消费有限 work unit；
-4. Heap mutation API：集中执行 insertion barrier；
-5. allocation checkpoint：指令写回后按 debt 推进 step；
-6. Atomic：ephemeron 固定点、weak 清理、finalizer 发现；
-7. VM finalizer drain：释放 Heap 借用后回调，允许重入；
-8. budget=1 与 full collect 对照测试：证明两种调度结果一致。
+1. [小模型](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/exercises/model.rs)：先只看对象边、step 和写入；
+2. [三个错误入口](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/exercises/starter.rs) 与 [参考改动](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/exercises/reference/solution.rs)：每次替换一处设计；
+3. 真实 core 的 `Heap`、`GcPhase`、`GcStep`：谁拥有跨调用状态，怎样表达未完成与完成；
+4. `Heap::step` 的 Pause/Mark/Atomic/Sweep 分支，再看 `collect` 怎样循环调用 step；
+5. `table_set → write_barrier → enqueue_value`：集中处理新增边；
+6. 最后运行 `budget=1`/完整回收对照与 late child 保活验收。
 
-先只掌握强引用和三色不变量，再读 weak/finalizer。后两者不是独立算法，而是在普通 mark
-无法直接决定生死时，把决定延迟到 Atomic 一致性边界。
+## 问题一：怎样在回收尚未完成时交还控制权？
 
-## 四个阶段
+### 先让旧设计暴露问题
 
-```text
-Pause ──开始周期──> Mark ──gray 为空──> Atomic ──固定点──> Sweep
-  ^                                                        │
-  └──────────────────── 周期完成、重置 debt ────────────────┘
+预算为 1，但入口只是给完整回收换了个名字：
+
+```diff
+- heap.collect(roots)       // 一次做完；调用者没有机会在中途继续执行
++ heap.step(roots, budget) // 返回本步结果，下次还能继续
 ```
 
-| Phase | 本阶段工作 | 是否按普通预算暂停 |
+这是实验中 `split_step` 的核心替换，完整函数见 starter/reference。错误版本的第一次
+调用已经回收 D；修复后第一次只扫描 A，`completed` 仍为 None。
+
+错误入口（可以直接编译运行）：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/starter.rs:exercise_split}}
+```
+
+修复后的同一入口：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/reference/solution.rs:solution_split}}
+```
+
+```powershell
+cargo run --quiet --manifest-path $gcManifest --example gc_problem_chain -- split
+```
+
+预期关键输出中，`completed` 的三个数字依次是 before/collected/remaining：
+
+```text
+before collect-as-step: phase=Pause work=8 completed=4/1/3
+after one step: phase=Mark work=1 completed=none
+```
+
+这里 work=8 是小模型 `collect` 汇总的整轮工作量；真实 `Heap::collect` 返回 GcStats，
+没有这个 work 汇总字段。比较的是“一次做完”与“一次交还控制权”的可观察差别。
+
+问题不在函数名。只要内部仍循环到周期结束，就仍没有交还控制权的中间点。真实快照中，
+`Heap::step` 一次只执行一个 phase 分支，而完整 `collect` 是它的驱动者：
+
+```rust,ignore
+loop {
+    let step = self.step(roots, upvalue_roots, usize::MAX)?;
+    if let Some(stats) = step.completed {
+        return Ok(stats);
+    }
+}
+```
+
+这段与真实 `collect` 对应。Rust 的 `Result` 表达操作是否失败，`completed: Option<GcStats>`
+表达本步成功后整个周期是否完成：`Ok + None` 是正常进度，不应被当作失败。
+
+### 给每个返回点定义状态
+
+| Phase | 本阶段工作 | 本次调用可能返回什么 |
 |---|---|---|
-| `Pause` | 等待 allocation debt 达阈值 | 是 |
-| `Mark` | 从 gray stack 每次处理至多 `budget` 个对象 | 是 |
-| `Atomic` | ephemeron 固定点、finalizer 发现、弱引用清理 | 否，作为一致性边界完成 |
-| `Sweep` | 按 object ID 列表删除 white record | 是 |
+| `Pause` | 显式 step 开始新周期；自动调度则先判断是否到 checkpoint | 同一次调用进入 Mark，开始处理 |
+| `Mark` | 至多弹出 budget 个 gray 条目，枚举它们的边 | 仍为 Mark，或 gray 为空后变 Atomic；未完成 |
+| `Atomic` | 完成一致性边界，最后生成排序的 sweep IDs | 变为 Sweep；未完成 |
+| `Sweep` | 至多检查 budget 个 snapshot ID，删除其中 white 对象 | 仍为 Sweep，或回到 Pause 并返回 Some(stats) |
 
-`step` 的核心控制流可以先压缩为：
+`GcStep.phase` 是执行后的阶段。Mark 返回 Atomic 不表示 Atomic 已经执行；Atomic
+返回 Sweep 时，才刚准备好清扫快照。
 
-```text
-Pause:  seed roots, enter Mark
-Mark:   pop at most budget gray objects and trace edges
-Atomic: repeat ephemerons to fixed point; queue finalizers; clear weak entries
-Sweep:  delete at most budget white snapshot IDs; finish cycle
+**预算边界：** 本快照把 `budget=0` 归一为 1；Mark 的重复队列条目也计一次 work，
+Sweep 的存活 ID 也计一次 work。启动周期的全堆重置、roots 扫描、单个大表的边遍历、
+整个 Atomic 和结束时重置 marks 都可能做额外工作。因此预算是对象/条目的工作计数，
+不能解释成每次最多 1 毫秒或恒定暂停时间。小模型保留这个接口含义，不提供延迟保证。
+
+```powershell
+cargo test --manifest-path $gcManifest --test pipeline explicit_gc_step_reports_completion_without_auto_step_stealing_it -- --exact
 ```
 
-[查看完整 incremental step](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/crates/lua_core/src/lib.rs)
+**完成条件：** 能区分“本次 step 返回”和“本轮 GC 完成”，指出完整驱动循环该放在哪里。
+接着会遇到下一问：函数已经返回，gray stack 和游标由谁保管？
 
-每一步都会重新播种当前 roots，但只把 white root 加入 gray stack。若反复把已经 black 的 root 压到 LIFO 顶部，预算为 1 时真正的 child 会永远饥饿；对应回归测试正是从这个边界产生的。
+## 问题二：下一次调用怎样接着上次的位置做？
 
-`collect` 不再维护另一份算法，而是以无限预算反复调用同一个 `step` 直到周期结束。完整与预算为 1 的增量模式在相同对象图上必须得到相同 `GcStats`。
+### 每次重新开始，预算越小反而越做不完
 
-## Write barrier
+`resume_step` 的错误版本在每次调用前都重启周期。局部工作队列随调用结束而丢失，
+下一次又把 A 当成未访问对象。给循环加“最多 8 次”的边界，观察它反复停在相同位置：
 
-Mark 期间若已经 black 的 table 写入尚未标记的 child，只依靠旧扫描结果会让 child 在 Sweep 中消失：
+```powershell
+cargo run --quiet --manifest-path $gcManifest --example gc_problem_chain -- progress
+```
+
+```diff
+- heap.step_restarting(roots, budget) // helper 内部无条件重置周期
++ heap.step(roots, budget)            // 只有 Pause 才启动新周期
+```
+
+这两个调用来自以下可运行入口，改动无需碰模型的 mark/sweep 实现：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/starter.rs:exercise_resume}}
+```
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/reference/solution.rs:solution_resume}}
+```
+
+删除无条件 restart 的理由是“进度必须属于一个持续存在的 owner”。不是永远不重置，
+而是只在 Pause 开始新周期时重置。真实快照将需要跨调用的局部状态移进 `Heap`：
+
+```rust,ignore
+pub struct Heap {
+    // objects、heap_id 等已有字段省略
+    phase: GcPhase,
+    gray: Vec<TraceRef>,
+    sweep_ids: Vec<u64>,
+    sweep_cursor: usize,
+    cycle_before: usize,
+    cycle_collected: usize,
+    // allocation / finalizer 等扩展字段省略
+}
+```
+
+`Vec` 拥有队列，`usize` 游标记录已检查多少 ID；它们都由 Heap 保存，不需要持有上一
+次函数调用的局部引用。`GcPhase` 让 `match` 明确选择本步工作，但这些字段仍需靠运行时
+不变量共同维护，enum 本身不会自动排除“错误游标配上错误 phase”的全部组合。
+
+![A 到 B 到 C 的回收进度跨调用保存；错误版本每次重启只扫描 A，正确版本最终清扫 D。](../images/v14-step-progress.svg)
+
+### 在同一张图上手推八次调用
+
+gray 是 LIFO stack，下表右端是下一次 pop；A/B/C/D 按分配顺序取 ID。
+
+| 返回次数 | 执行后的 phase | gray | sweep cursor | 本次效果 |
+|---|---|---|---|---|
+| 1 | Mark | [B] | 0 | A 已扫描，返回调用者 |
+| 2 | Mark | [C] | 0 | 接着扫描 B |
+| 3 | Atomic | [] | 0 | C 已扫描，等待下一次执行 Atomic |
+| 4 | Sweep | [] | 0 | Atomic 完成，生成 [A,B,C,D] 清扫快照 |
+| 5 | Sweep | [] | 1 | 检查并保留 A |
+| 6 | Sweep | [] | 2 | 检查并保留 B |
+| 7 | Sweep | [] | 3 | 检查并保留 C |
+| 8 | Pause | [] | 4 | 删除 D；返回 before=4、collected=1、remaining=3 |
+
+模型与真实 Heap 使用相同的四对象图作对照。真实 `Heap::step` 的 Mark/Atomic 会
+重新播种当前 roots，但只 enqueue 尚未扫描的 root；Sweep 不重扫 roots。若把已扫描的
+A 反复压回 LIFO 顶部，预算 1 也会被重复工作耗尽。跨调用保存队列与正确播种根两件事
+都要满足。
+
+CLI 的错误分支只打印前 3 次重复状态，独立验收会检查完整的 8 次上界。修复分支的
+末行应为 `after call=8: phase=Pause work=1 completed=4/1/3`。Pause 中保留的对象已
+清掉 mark，诊断输出会重新显示 white；这表示准备下一周期，不表示本轮误删了存活对象。
+
+```powershell
+cargo run --quiet --manifest-path $gcManifest --example gc_problem_chain -- real
+cargo test --manifest-path $gcManifest -p lua_core tests::incremental_and_full_collection_reach_the_same_result -- --exact
+```
+
+**完成条件：** 修复版在有界调用次数内完成；与完整回收得到相同统计，而且 A/B/C
+实际可访问、D 实际被删除。只比较一个完成布尔值不够，也不能用无限 while 掩盖无进展。
+一旦 VM 能在这些返回点继续执行，第三个问题就出现了：对象边会在两步之间改变。
+
+## 问题三：已经扫描的 parent 又指向白对象，怎样修复？
+
+### 固定“先扫描，再写入”的交错顺序
+
+另建一张只有 A/B 的图，root 只指向 A，B 在周期开始前已经分配。第一次 step 扫描 A
+并返回 Atomic，此时 A 已扫描、B 未扫描。然后才写入 `A.x = B`。
+
+```powershell
+cargo run --quiet --manifest-path $gcManifest --example gc_problem_chain -- barrier
+```
+
+遗漏 barrier 的版本只更新容器。Atomic 重扫 root A 时发现 A 已扫描，便不重新遍历
+它的字段；B 没有进入待处理队列，Sweep 随后删除 B。对象图里留下指向已回收 B 的边。
+
+```diff
+- heap.set_edge_without_barrier(parent, child);
++ heap.set_edge(parent, child);
+```
+
+完整的前后入口分别是：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/starter.rs:exercise_barrier}}
+```
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/reference/solution.rs:solution_barrier}}
+```
+
+以上是小模型中 `connect` 的替换；真实 `Heap::table_set` 在写入前校验 key/value，
+分别调用 `write_barrier`，随后修改 table。核心判断是：owner 已扫描，且 phase 仍为
+Mark/Atomic，就把尚未扫描的 child 放入 gray。B 在本例的 Atomic 内被扫描，然后才能
+建立 Sweep 快照。
 
 ```text
-black parent ──新写入──> white child   ✗
-             barrier ──> gray child    ✓
+before raw-write: phase=Pause work=3 completed=2/1/1
+before raw-write child_live=false
+after barrier: phase=Pause work=3 completed=2/0/2
+after barrier child_live=true
 ```
+
+`table_get(parent, key)` 返回一个 handle 本身不能证明 child 存活；真实 Heap 验收还要
+用 `is_live(child)` 或实际访问 child 检查。模型中 `child_live=false` 明确指出误回收，
+它不会伪装成真实 Heap 返回的 `StaleHandle` 错误类型。
+
+![扫描 A 后插入到 B 的新边：遗漏 barrier 会误收 B，集中写入时 enqueue B 则能保留。](../images/v14-write-barrier.svg)
 
 ```rust
 {{#include ../../code/v14-incremental-gc/crates/lua_core/src/lib.rs:write_barrier}}
 ```
 
-本版把 barrier 集中在 Heap mutation API：table key/value、metatable、closed/open upvalue 与 userdata finalizer 写入都不能绕过。Mark/Atomic 中新分配对象进入 gray；Sweep 中新对象直接标记为存活，因为它不属于该周期开始时的 sweep snapshot。
+图中的 white/gray/black 是教学上的三种角色。真实对象只有 `marked: bool`，并用
+`gray: Vec<TraceRef>` 记录待处理工作：`mark_one` 在 pop 后才设置 marked。B 入 gray
+时并没有变成一个名为 Gray 的 Rust enum variant。用“加入待处理队列”解释操作，才能
+把图与源码对应起来。
 
-Stack 与 global 不经过 Heap 容器写入，所以每个 step 重扫 root handles，等价于 root barrier。测试会先把 parent 标黑，再把预先存在的 white child 写入，随后完成 GC 并验证 child 仍可访问。
+本例选择周期前已分配的 B，是为了确保测到写入 barrier。Mark/Atomic 中**新分配**
+对象会经过 `barrier_new`，可能掩盖遗漏写入 barrier 的故障；Sweep 中的新对象则标记
+为存活，且不属于 **Atomic 结束时** 已建立的 sweep snapshot。
+
+```powershell
+cargo test --manifest-path $gcManifest -p lua_core tests::write_barrier_keeps_a_white_child_added_to_a_marked_table -- --exact
+```
+
+**完成条件：** 同一交错顺序下，错误版让 B 不可访问，修复版保留 B；根集合中始终
+只有 A，不能把 B 偷偷添加为直接 root 来通过测试。说明这条补丁修复的是新增引用的
+追踪，不是增加一次分配，也不是每步重新扫描所有已标记对象。
+
+## 三个问题怎样映射到真实快照？
+
+| 小模型中的改动 | 真实 Rust 实现 | 保持的不变量 |
+|---|---|---|
+| 完整 collect 驱动与 step 分开 | `Heap::collect` 循环调用 `Heap::step` | 成功返回可未完成，只有 Some(stats) 表示周期结束 |
+| 只在新周期重置，保存队列和游标 | `Heap` 字段与 `start_cycle`，由 `GcPhase` 决定调用时机 | 每步从上次进度继续，不丢工作、不无限重启 |
+| 集中写入并 enqueue 新 child | `table_set → write_barrier → enqueue_value` | Mark/Atomic 中已扫描 owner 的新引用不会漏扫 |
+
+[完整 core 源码](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/crates/lua_core/src/lib.rs)
+还覆盖 table key、metatable、upvalue、userdata 等 mutation family。三个练习只证明
+上面的强引用案例；不能把模型验收外推为全部写入路径、weak table 或 finalizer 已验收。
+
+## 扩展阅读：快照中已有的自动调度、弱表与 Finalizer
+
+以下内容帮助定位最终 v0.14 已有能力。第一遍可以先完成章末的三个练习，再回来阅读；
+本次问题链没有新增 weak/ephemeron/finalizer 的实现或练习。
 
 ## Allocation accounting 与自动 checkpoint
 
@@ -99,8 +314,8 @@ Weak value 可以在 Atomic 直接依据 mark bit 删除。Weak key 更微妙：
 key 已标记 → 标记 value → 传播新 edges → 再检查 ephemeron
 ```
 
-Atomic 反复执行“已标记 key → 标记 value → 传播 edges”，直到没有新对象被标记，再清理
-未标记弱边并生成 finalizer 事件。
+Atomic 先反复执行“已标记 key → 标记 value → 传播 edges”到固定点，再发现并排队
+finalizer、重新标记相关 userdata/callback 并排空 gray，最后清理弱边并建立 Sweep 快照。
 [查看完整 Atomic/weak/finalizer 实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/crates/lua_core/src/lib.rs)
 
 固定点完成后，weak key/value 中指向未标记 heap object 的 entry 被删除。Primitive key/value 不由 GC 管理，因此视为存活。数组部分在 weak-value 模式下把死亡元素改为 nil，再执行尾部收缩。
@@ -155,7 +370,10 @@ cargo test --manifest-path book/code/v14-incremental-gc/Cargo.toml --workspace
 type=number value=714
 ```
 
-本快照共有 84 个测试：59 个端到端测试、7 个编译器测试、15 个 core 测试和 3 个 VM 测试。增量新增覆盖完整/单步一致性、显式 step 完成信号、phase 经过、barrier、自动阈值、三种 weak mode、ephemeron、finalizer 顺序、错误 drain、重入、resurrection 与 second death。
+基础快照的 84 项测试仍保留：59 个端到端测试、7 个编译器测试、15 个 core 测试和
+3 个 VM 测试。本轮新增 8 项强引用问题链参考验收，默认 workspace 合计 **92 项通过、
+3 项学习者 TODO 显式 ignored**，分别按下面的入口统计。默认通过只能说明参考合同与原有回归通过，
+不表示三个 TODO 已经完成。旧快照里的 weak/finalizer 测试也不等于本轮新增了相关微课。
 
 ## 本版本暂不支持
 
@@ -171,29 +389,69 @@ type=number value=714
 
 <div class="exercise understanding">
   <strong>理解题</strong>
-  <p>构造两层 ephemeron，让第一个 value 使第二个 key 可达；逐轮写出 Atomic 新增的 mark，
-  说明为什么必须迭代到固定点。</p>
+  <p>预测预算 1 的首次调用是否完成、A/B/C/D 仍有哪些存活；修复 starter.rs 的
+  <code>split_step</code>，让首次调用只做一步。解释为什么把函数改名为 step
+  不会自动产生交还控制权的中间点。</p>
 </div>
 
 <div class="exercise implementation">
   <strong>实现题</strong>
-  <p>把 gray stack 改成 queue，记录 budget=1 的遍历顺序和最大容器大小；要求最终 GcStats
-  与 full collect 保持一致。</p>
+  <p>修复 <code>resume_step</code>，让同一个 Heap 在至多 8 次 budget=1 调用中完成
+  A→B→C、D 自环的周期。打印每次阶段、队列与游标，并与 full collect 对照；
+  不要增大预算或循环上界来隐藏重启错误。</p>
 </div>
 
 <div class="exercise debugging">
   <strong>调试题</strong>
-  <p>删除 table value barrier，复现 black→white 边导致的 stale handle；在恢复 barrier 后
-  增加一条只覆盖该 mutation family 的回归测试。</p>
+  <p>修复 <code>connect</code>，让已扫描 A 在两步之间新接入的 B 存活。保持唯一 root
+  为 A、保持 B 在周期前分配；比较遗漏 barrier 与正确写入的结果，再验证解除所有 roots
+  后两者都能被回收。</p>
 </div>
+
+### 修改范围、运行命令和成功条件
+
+只修改 [starter.rs](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/exercises/starter.rs)
+的三个 TODO。[实验说明](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/exercises/README.md)
+提供逐步提示与运行输出；[共享合同](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/exercises/contracts.rs)
+固定验收条件。不要修改合同断言，也不要更改真实 GC 来配合错误输出。
+
+```powershell
+# 初始 3 项失败；修复三个 TODO 后应有 3 项通过。
+cargo test --manifest-path $gcManifest --test gc_exercises -- --ignored
+
+# 可选参考解、故障有效性与真实 Heap 对照。
+cargo test --manifest-path $gcManifest --test gc_reference
+```
+
+| 验收名 | 初始反例 | 修复后必须观察到 |
+|---|---|---|
+| `first_step_yields_before_collection_finishes` | 首次就完成，work 超过 1，D 已回收 | Mark/work=1/completed=None，A 已扫描，D 仍存在 |
+| `saved_progress_finishes_the_same_cycle` | 每次重启后停在相同 Mark，8 次仍未完成 | 经 Atomic/Sweep 完成；统计 4/1/3，A/B/C 存活、D 消失 |
+| `barrier_preserves_a_late_white_child` | A 新引用的 B 没有入队，被 sweep | B 存活；随后移除所有 roots，A/B 都能回收 |
+
+每个验收可以独立执行，例如：
+
+```powershell
+cargo test --manifest-path $gcManifest --test gc_exercises saved_progress_finishes_the_same_cycle -- --ignored --exact
+```
+
+starter 中的错误设计能编译，因此用 ignored 将它们与默认回归分开；显式启用时必须
+看到失败，不能把“0 failed、3 ignored”作为练习完成证据。参考 target 也专门检查这三种
+故障确实发生，并另测真实 Heap 的相同四对象轨迹和真实 table 写入保活。
+
+模型不进行周期中分配，不提供 Lua 标准库、并发或可恢复 OOM 合同。其根集合在示例中
+固定，节点是简单强引用图。真实 Heap 使用任意字节 Value、typed handle 和更多对象
+种类；若要扩大到这些路径，应另建具体反例和验收，不能直接外推本轮结果。
 
 <a id="learning-checkpoint"></a>
 ## 完成检查点
 
-- 能写出四个 phase 的状态迁移和持久字段；
-- 能为每类 Heap mutation 判断是否需要 barrier；
-- 能解释 weak key/value 与 ephemeron 的差别；
-- 能说明 finalizer 为什么必须在释放 Heap 借用后执行。
+- 能从“首次做太多”推导出 collect 驱动与 step 的分工；
+- 能指出每个返回点之后，phase、gray、sweep IDs、cursor 分别由谁保存；
+- 能用八次 trace 解释为什么每次重建进度无法收敛；
+- 能先扫描 A、再写入 B，复现并修复遗漏 barrier 的误回收；
+- 能区分概念颜色、真实 marked bool、待处理队列，以及 step 的完成信号；
+- 三项学习者验收显式运行通过，并能解释模型与真实 Heap 对照的范围。
 
 ## 与成熟实现和专题章节的对应
 
