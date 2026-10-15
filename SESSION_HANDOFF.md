@@ -96,6 +96,32 @@ diff、状态图、练习和官方Lua5.1.5字节对照。本批实现、教学�
 原审计仍暂停在os.date/os.time本地时间、UTC、DST。本交接不表示恢复；本批按用户
 明确指令提交推送，保留同期VS Code工作包，最终提交SHA的CI状态需另行查询。
 
+## 2026-10-15：book/code 的 VS Code Rust 调试入口
+
+本包响应用户的教学快照调试配置问题，**没有恢复暂停的原审计目标**，未提交或推送。
+开始核对 HEAD 与本地 origin/main 均为 `5347c60ee5176054a792265b2c098298e8a7dd79`；
+该 SHA 的 [mdBook 38728934980](https://github.com/YanqingXu/lua_rust/actions/runs/38728934980)
+成功，[Rust CI 38728935001](https://github.com/YanqingXu/lua_rust/actions/runs/38728935001)
+失败于 Windows 的 M1 foundation and quality gate，三个 Miri/ASan job 成功；本包未整改 CI。
+
+- 仅新增 `.vscode/launch.json` 的四类入口、`book/code/README.md` 调试说明及本检查点。
+  原三个根工程入口保留；现有 v100 string_find 实现/合同/教学未提交工作未纳入本包。
+- v00–v04 使用 lua-step，v05–v100 使用 lua_app；选择器覆盖全部20版本。通过独立
+  manifest 和 bin/example/lib 目标由 Cargo 返回产物，避免启动根工程同名 exe。
+  cwd 保留仓库根目录，以适配 v17 demo 的 package.path；Rust example 默认 all，
+  更改参数需编辑 args 数组。单元测试默认 v100 lua_vm 的 formatter parser 测试。
+- 本地已有 rust-analyzer 0.3.3081、CodeLLDB 1.12.3。四类默认入口均实际完成
+  offline/locked Debug 构建、唯一 artifact/PDB 检查、运行及 bundled LLDB 22.1.8
+  源码断点命中，继续后均 exit0；单元测试恰1项，example 恰12条 ok。
+  校验期间已有 v100 未提交文件 SHA 未变；这是当前工作区的定向调试验证。
+- 本机 ignored 证据：`target/book-code-debug-2026-10-15/20261015T121927309368Z/summary.json`
+  及各入口 build/run/lldb 原始双流。前两次校验因验证脚本对 PDB 文件命名的假设
+  停止，修正验证器后上述完整运行通过；未把前两次记成配置失败或完整通过。
+  未驱动 VS Code UI/输入对话框，不把 CLI 断点验证冒称编辑器 UI 实测。
+
+下一入口：按 `book/code/README.md` 从仓库根目录打开 VS Code，设置所选快照 `.rs`
+断点并按 F5。需要编辑器分析时，仅关联当前学习版本的 linkedProjects；无需恢复审计。
+
 ## 2026-10-15：v1.0 string.format 有界兼容问题链
 
 用户要求先收口已有转换项的默认精度、flags/宽度/精度、参数类型与错误边界，补齐

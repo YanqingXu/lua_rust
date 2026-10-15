@@ -52,6 +52,134 @@
             "sourceLanguages": [
                 "rust"
             ]
+        },
+        {
+            "name": "Debug book/code (v00-v04 demo.lua)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--manifest-path", "${workspaceFolder}/book/code/${input:bookEarlySnapshot}/Cargo.toml",
+                    "--bin", "lua-step"
+                ],
+                "cwd": "${workspaceFolder}",
+                "filter": { "name": "lua-step", "kind": "bin" }
+            },
+            "args": ["${workspaceFolder}/book/code/${input:bookEarlySnapshot}/examples/demo.lua"],
+            "cwd": "${workspaceFolder}",
+            "env": { "RUST_BACKTRACE": "1" },
+            "terminal": "integrated",
+            "sourceLanguages": ["rust"]
+        },
+        {
+            "name": "Debug book/code (v05-v100 demo.lua)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--manifest-path", "${workspaceFolder}/book/code/${input:bookSnapshot}/Cargo.toml",
+                    "--bin", "lua_app"
+                ],
+                "cwd": "${workspaceFolder}",
+                "filter": { "name": "lua_app", "kind": "bin" }
+            },
+            "args": ["${workspaceFolder}/book/code/${input:bookSnapshot}/examples/demo.lua"],
+            "cwd": "${workspaceFolder}",
+            "env": { "RUST_BACKTRACE": "1" },
+            "terminal": "integrated",
+            "sourceLanguages": ["rust"]
+        },
+        {
+            "name": "Debug book/code (Rust example)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--manifest-path", "${workspaceFolder}/book/code/${input:bookSnapshot}/Cargo.toml",
+                    "--package", "lua_app",
+                    "--example", "${input:bookExample}"
+                ],
+                "cwd": "${workspaceFolder}",
+                "filter": { "name": "${input:bookExample}", "kind": "example" }
+            },
+            "args": ["all"],
+            "cwd": "${workspaceFolder}",
+            "env": { "RUST_BACKTRACE": "1" },
+            "terminal": "integrated",
+            "sourceLanguages": ["rust"]
+        },
+        {
+            "name": "Debug book/code (Rust unit test)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test", "--no-run",
+                    "--manifest-path", "${workspaceFolder}/book/code/${input:bookSnapshot}/Cargo.toml",
+                    "--package", "${input:bookTestPackage}",
+                    "--lib"
+                ],
+                "cwd": "${workspaceFolder}",
+                "filter": { "kind": "lib" }
+            },
+            "args": ["${input:bookUnitTest}", "--exact", "--nocapture"],
+            "cwd": "${workspaceFolder}",
+            "env": { "RUST_BACKTRACE": "1" },
+            "terminal": "integrated",
+            "sourceLanguages": ["rust"]
+        }
+    ],
+    "inputs": [
+        {
+            "id": "bookEarlySnapshot",
+            "type": "pickString",
+            "description": "选择 v00-v04 教学快照（lua-step）",
+            "options": ["v00-skeleton", "v01-value", "v02-lexer", "v03-parser", "v04-expressions"],
+            "default": "v00-skeleton"
+        },
+        {
+            "id": "bookSnapshot",
+            "type": "pickString",
+            "description": "选择 v05-v100 教学快照（lua_app）",
+            "options": [
+                "v05-bytecode-vm",
+                "v06-variables-scope",
+                "v07-control-flow",
+                "v08-table",
+                "v09-functions",
+                "v10-multi-return-vararg",
+                "v11-closure-upvalue",
+                "v12-metatable",
+                "v13-runtime-gc",
+                "v14-incremental-gc",
+                "v15-coroutine",
+                "v16-core-stdlib",
+                "v17-host-stdlib-modules",
+                "v18-cli-tools",
+                "v100-lua51-runtime"
+            ],
+            "default": "v100-lua51-runtime"
+        },
+        {
+            "id": "bookExample",
+            "type": "promptString",
+            "description": "该版本 examples/ 下的 Rust 示例名（不含 .rs）",
+            "default": "string_format_problem_chain"
+        },
+        {
+            "id": "bookTestPackage",
+            "type": "promptString",
+            "description": "包含单元测试的 Cargo package 名称",
+            "default": "lua_vm"
+        },
+        {
+            "id": "bookUnitTest",
+            "type": "promptString",
+            "description": "单元测试完整名称（使用 --exact 精确匹配）",
+            "default": "string_format::tests::spec_cursor_and_empty_precision_are_explicit"
         }
     ]
 }
