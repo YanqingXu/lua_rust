@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="686" viewBox="0 0 900 686" role="img" aria-labelledby="title desc">
+  <title id="title">require 的缓存命中与成功提交</title>
+  <desc id="desc">require先读取已存的loaded项，只有Lua真值才命中。nil和false会重新定位执行loader，0和空串则直接返回。定位loader后先写true再调用。首返回值非nil就提交该值，包括false；首值nil或无返回则读取当前loaded项，若仍nil只返回true而不写回。这是本快照的精确边界。VM存储的package_loaded和package_preload句柄进入roots。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:18px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="686" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">缓存命中看真值；成功提交只看 loader 的第一个结果</text>
+  <rect x="20" y="62" width="860" height="118" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="40" y="95" class="label">读取 loaded[name]</text>
+  <text x="40" y="131" class="mono">nil / false → miss</text><text x="430" y="131" class="mono">table / true / 0 / "" → hit</text>
+  <text x="40" y="164" class="small">hit 原样返回；没有“键存在就算命中”，也不把 0 / 空串当 false。</text>
+  <path d="M225 180V211" class="flow"/>
+  <rect x="20" y="215" width="860" height="76" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="40" y="247" class="label">miss：定位 loader → loaded[name] = true → loader(name)</text>
+  <text x="40" y="277" class="small">返回 Vec&lt;Value&gt;；后续结果不参与 require 的单值协议。</text>
+  <path d="M225 291V321" class="flow"/><path d="M665 291V321" class="flow"/>
+  <rect x="20" y="325" width="410" height="138" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="40" y="358" class="label">首结果非 nil</text>
+  <text x="40" y="392" class="mono">loaded[name] = returned</text><text x="40" y="423" class="mono">return returned</text>
+  <text x="40" y="450" class="small">false 也提交，但下次仍 miss。</text>
+  <rect x="450" y="325" width="430" height="138" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="470" y="358" class="label">首结果 nil / 无结果</text>
+  <text x="470" y="392" class="small">重读 loaded[name]，保留 loader 自发布的值。</text>
+  <text x="470" y="423" class="small">通常仍为 sentinel true，直接返回。</text>
+  <text x="470" y="450" class="small">若 loader 已清为 nil：仅返回 true，不写回。</text>
+  <rect x="20" y="488" width="860" height="90" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="40" y="520" class="label">需单独观察的边界</text>
+  <text x="40" y="553" class="small">首值 nil、第二值 99：不会选 99。清空本项后返回 nil：下次会再次加载。</text>
+  <text x="24" y="614" class="small">VM 保管初始 package_loaded / package_preload 句柄并枚举为 roots，collector 再追踪字段。</text>
+  <text x="24" y="647" class="small">Lua table 身份决定缓存对象共享；Rust handle 的复制本身不是 root 注册。</text>
+  <text x="24" y="674" class="small">图描述 v0.17 checkpoint 的规则，不宣称所有 Lua 版本的 require 行为相同。</text>
+</svg>

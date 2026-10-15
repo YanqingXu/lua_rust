@@ -1,37 +1,60 @@
 # v0.17 · 宿主标准库与 Lua 模块
 
-<div class="lesson-meta"><span>核心增量：可失败、需清理的宿主资源</span><span>5-crate workspace</span><span>checkpoint v0.17</span></div>
+<div class="lesson-meta"><span>重复执行 → 真值缓存 → 循环可见性 → 失败重试</span><span>5-crate workspace</span><span>checkpoint v0.17</span></div>
 
 <a id="learning-task-card"></a>
 ## 学习任务卡
 
 <div class="task-card">
-  <strong>让 Runtime 明确拥有宿主资源与加载事务</strong>
-  <p>前置：v0.16 的 catalog/adapter、v0.13 的 Heap owner。新知识：typed userdata、
-  Option&lt;File&gt; 状态、确定性 drain、loader cache/sentinel/rollback、平台失败协议。完成后
-  你应能追踪文件和 require 从创建到关闭或回滚的生命期。</p>
+  <strong>让 require 的副作用、缓存和失败状态都有可观察的边界</strong>
+  <p>前置：v0.16 的 callback Result/禁止 yield、v0.13 的 Heap owner。依次解决：
+  重复 require 为什么又执行；缓存为什么要看真值；A→B→A 怎样停下；首次报错为何
+  让修复后的重试假成功。产出是四个独立 TODO、固定反例、状态图和真实 VM/文件对照。
+  文件、os、debug 仍属于本 checkpoint 的背景能力，本轮不扩展这些宿主 API。</p>
 </div>
 
 v0.16 的 math/string/table 函数主要处理内存中的 `Value`。文件、环境、时钟和模块加载不同：它们会接触平台状态，可能部分成功，且离开 Lua 作用域后仍需要关闭资源。本版增加一个核心能力：**让 Runtime 对宿主资源、加载缓存和调试视图拥有明确的生命周期与失败协议**。
 
+本轮把 require 拆成缓存、循环、重试三个局部实验。`faults.rs` 是人为写坏的设计，
+不是历史中间 VM；CLI 固定并列错误版与参考，不读取学习者 `starter.rs`。每包另用
+真实 v0.17 验证对应行为。练习模型互相独立，不拼接成另一个完整解释器。
+
 <a id="learning-predict"></a>
 ## 先预测再运行
 
-为一个 file userdata 画两条边：Heap identity/metatable edge 和 VM map 中的 OS-handle owner
-edge。`file:close()` 后 userdata 仍存在，但 map value 变成 closed tombstone。再手推 require
-第一次失败：循环 sentinel 必须删除，否则修复文件后的第二次调用会错误命中缓存。
+先预测下面三件事：两次 require 是否得到同一个表、B 在循环里能看到 A 的什么值、
+第一次失败后修复重试会不会再运行副作用。
+
+```lua
+{{#include ../../code/v17-host-stdlib-modules/examples/require_contracts.lua}}
+```
+
+从仓库根目录运行；后面的命令继续使用同一 manifest 变量：
+
+```powershell
+$moduleManifest = 'book/code/v17-host-stdlib-modules/Cargo.toml'
+cargo run --quiet --manifest-path $moduleManifest -- book/code/v17-host-stdlib-modules/examples/require_contracts.lua
+cargo run --quiet --manifest-path $moduleManifest --example require_cache_problem_chain
+cargo run --quiet --manifest-path $moduleManifest --example require_cycle_problem_chain
+cargo run --quiet --manifest-path $moduleManifest --example require_retry_problem_chain
+```
+
+Lua 探针应返回 `type=boolean value=true`：lesson 只执行一次；循环内层看到的是 true；
+retry 两次实际执行，effects 最终也是 2。CLI 退出 0 只说明固定对照重放完成，不能
+代替显式 `--ignored` 的 learner 验收。接着再预测：loader 返回 false 是否只加载一次？
 
 <a id="learning-code-map"></a>
 ## 代码阅读地图
 
-1. UserdataRef：Lua/GC 身份与 per-object metatable；
-2. VM file map：`UserdataRef → Option<File>`，唯一拥有 OS handle；
-3. close/prune/drop：显式关闭、GC 后清理、VM shutdown 三条 drain 路径；
-4. byte-oriented read/write：内容保持 bytes，路径另走平台 adapter；
-5. loader：复用当前 compiler/VM/global/registry；
-6. `package.loaded`：truthy cache、循环 sentinel、成功 commit、失败 rollback；
-7. path search：模板替换与候选诊断累积；
-8. debug views：只暴露真实存在的 Proto/upvalue/registry/call-info 数据。
+1. [缓存实验](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v17-host-stdlib-modules/exercises/cache/README.md)：重复执行 → `Value::is_truthy` → loader 首结果与自发布；
+2. [循环实验](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v17-host-stdlib-modules/exercises/cycles/README.md)：发布标记的时点 → A/B trace → 临时 true 与最终结果；
+3. [重试实验](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v17-host-stdlib-modules/exercises/retry/README.md)：保存 Result → 清当前 key → 保留依赖与副作用；
+4. `invoke_package::Require`：缓存读取、preload/path 定位、标记、`invoke_yield_forbidden`、提交/失败清理；
+5. `compile_source → compile → Heap::allocate_function`：复用 compiler，随后在当前 VM 执行；
+6. `Vm::new / gc_roots`：保存初始 loaded/preload 句柄并作为根；
+7. UserdataRef 与 VM file map：Lua 身份和 `Option<File>` 宿主 owner；
+8. close/prune/drop：显式关闭、GC 后清理、VM shutdown 的资源 drain；
+9. byte-oriented IO 与 debug views：内容保留 bytes，只暴露真实存在的调试数据。
 
 这里有两套不同的生命周期：Heap 决定 Lua userdata identity 是否可达；VM map 决定宿主 File
 何时关闭。它们通过 typed handle 关联，但不能互相替代。只删除 Heap record 而不 prune map
@@ -106,33 +129,248 @@ VM 在 v0.17 依赖 `lua_compiler`，但编译器仍只依赖 core，不形成�
 
 这也确保动态 chunk 与主脚本共享 `_G`、registry、GC 和 coroutine scheduler，而不是启动第二个 VM。
 
-## `require` 的状态机
+## 问题一：同一模块 require 两次，为什么初始化又运行了一次？
 
-package table 暴露 `path`、`preload` 和 `loaded`。require 的顺序是：
+### 找到 loader 只解决“怎样执行”，没有决定“是否还应执行”
 
-```text
-package.loaded[name] truthy? ──是──> 直接返回缓存
-            │否
-            ▼
-package.preload[name]? ──否──> path 模板替换 ? ──> 读文件并编译
-            │                         │失败
-            ▼                         └──> 汇总所有候选诊断
- loaded[name] = true  （循环 sentinel）
-            │
-            ▼
-       loader(name)
-        │成功                         │失败
-        ▼                             ▼
-非 nil 结果写缓存；nil 保留/读取缓存    删除 sentinel，允许修复后重试
+让 loader 增加计数并返回一张表。忽略缓存的错误版每次都会进入 loader，计数变成 2，
+两次得到的表身份也不同；文件路径正确、编译成功，都不能修复这个错误。
+CLI 先重放完全不查缓存的故障，再重放“只要存在就命中”的中间设计；starter 保留
+第二种故障，让读者继续发现 false 也应重新加载。
+CLI 的局部模型固定返回 42，通过 calls 的 2→1 隔离重复执行问题；上面的表身份是
+动机场景，另由真实 VM 的 normal/self-publication probe 检查，不能从这个数值模型推出。
+
+```powershell
+cargo run --quiet --manifest-path $moduleManifest --example require_cache_problem_chain -- lookup
 ```
 
-require 是一个带回滚的事务：检查 cache → 定位 loader → 写循环 sentinel → 调 loader →
-提交非 nil 结果；任一步失败都删除本次 sentinel，保留未来重试能力。
-[查看完整 module loader](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v17-host-stdlib-modules/crates/lua_vm/src/lib.rs)
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/cache/starter.rs:require_cache_lookup_starter}}
+```
 
-模块名中的 `.` 转成 `/`，每个以分号分隔的 path template 都替换 `?`。测试包含 preload、同一模块只执行一次、A/B 循环依赖、缺失模块诊断，以及“第一次 loader 报错、修改文件后同一 VM 重试成功”。
+先检查已加载项，再决定要不要定位 loader。`Cache::get` 已把缺项转换为 Nil，检查必须
+复用 Lua 的 truthiness：
 
-动态 native module 没有被悄悄接受：`package.loadlib` 属于 v1.3，v1.0 只要求 Lua 文件模块。
+```diff
+  let loaded = cache.get(name);
+- (loaded != Value::Nil).then_some(loaded)
++ loaded.is_truthy().then_some(loaded)
+```
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/cache/solution.rs:require_cache_lookup_solution}}
+```
+
+`lookup` 共享借用缓存，只复制返回的 Value，不复制模块表。真实 VM 通过 Heap table
+保存 loaded，命中后同样复制句柄返回，所以两次访问同一 table 身份与字段内容。
+nil 和 false 是 miss；0、空串、true、table 都是 hit。用 Rust 的“键存在”或数值/文本
+是否为空替代 `is_truthy`，会改变重新加载的条件。
+
+```powershell
+cargo test --manifest-path $moduleManifest --test cache_reference cache_hit_requires_a_truthy_value -- --exact
+```
+
+### loader 成功了，究竟把什么写进缓存？
+
+require 只交付 loader 的第一个结果。第二个结果不是备用值：`return nil,99` 不会
+取 99。loader 也可能自己写入 loaded 再不返回值；无条件用 true 覆盖它，会丢掉它
+已经发布的模块表。
+starter 无条件用首值覆盖本项，空窗口则写 true：首值 nil 会删除自发布值，空窗口
+又会覆盖它。这两种成功返回都需要保留 loader 的显式发布。
+
+```powershell
+cargo run --quiet --manifest-path $moduleManifest --example require_cache_problem_chain -- finish
+```
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/cache/starter.rs:require_cache_finish_starter}}
+```
+
+协议差异是先消费首结果，再决定是否写入；不是寻找第一个非 nil：
+
+```diff
+- loader 成功就返回 true，忽略已发布值；或扫描第一个非 nil 结果
++ 首结果非 nil：写 loaded[name] 并返回它（包括 false）
++ 首结果 nil / 无结果：重读 loaded[name]，有值就返回该值
+```
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/cache/solution.rs:require_cache_finish_solution}}
+```
+
+![缓存命中、首返回值提交与 loader 自发布值的分支。](../images/v17-require-cache.svg)
+
+| loader 行为 | 本次结果 / cache | 下次 require |
+| --- | --- | --- |
+| 返回 table,99 | 只提交并返回该 table | 命中同一对象 |
+| 返回 false | 提交 false，返回 false | miss，再执行 |
+| 返回 0 或空串 | 提交对应值 | 命中 |
+| 不返回 / 首值 nil，未改 slot | 调用前 true 标记仍在 | 命中 true |
+| 自写模块表，首值 nil | 保留并返回自发布表 | 命中同一对象 |
+| 清空本项，再返回 nil | **仅返回 true，slot 仍是 nil** | miss，再执行 |
+
+最后一行是这个 checkpoint 的精确边界：真实源码没有在 nil fallback 时把 true
+写回。模型与真实探针都保留这一行为，不能悄悄修成“任何 nil 返回都缓存 true”，再
+声称讲解的是现有源码；本章也不宣称与所有 Lua 版本的 require 规则相同。
+
+**完成条件：** 两个 hook 分别通过命中与提交合同；真实 VM 检查 loader 次数、表身份、
+原始值、首 nil/后值和自发布行为。跨 execute 的 GC 检查要求实际读取缓存对象字段，
+不能只比较句柄显示文本或 map 长度。精确命令见缓存包 README。
+
+```powershell
+cargo test --manifest-path $moduleManifest --test cache_reference require_success_commits_only_the_first_result -- --exact
+```
+
+这个真实探针特意替换公开的 `package.loaded` 字段并结束执行帧，再从宿主触发 GC。
+随后 require 仍命中 VM 保存的初始 owner，实际读取 answer=42；新公开表里没有这项。
+它证明字段重绑与内部 owner 不同，不把 Rust handle 的保存本身说成保活。
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/cache/real.rs:require_cache_real_owner}}
+```
+
+缓存现在能挡住重复执行。但第一次执行还没返回时，另一模块已经回来 require 它了。
+
+## 问题二：A 要 B，B 又要 A，第一次加载应该何时变得可见？
+
+### 在 loader 返回后才发布，阻挡不了重入
+
+错误版把“完成后提交”当成唯一发布时点。A 的 loader 进入 B，B 又进入 A，因为双方
+都还没返回，cache 一直未命中，产生 A→B→A→B 的重复进入。实验用固定有限预算让
+错误版停下，避免用真实 stack overflow 教学；这个预算不是生产循环协议。
+
+```powershell
+cargo run --quiet --manifest-path $moduleManifest --example require_cycle_problem_chain
+```
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/cycles/starter.rs:cycle_publish_starter}}
+```
+
+最小改变是把加载标记的写入移到调用前。此时要发布的是 true，还不是最终模块表：
+
+```diff
++ vm.publish(name, Value::Boolean(true))?;
+  let returned = loader(vm, name)?;
+- vm.publish(name, Value::Boolean(true))?;
+  vm.publish(name, returned.clone())?;
+  Ok(returned)
+```
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/cycles/solution.rs:cycle_publish_solution}}
+```
+
+![A/B 加载前先发布 true，B 重入 A 时命中标记，最终分别提交 B/A 的结果。](../images/v17-require-cycle.svg)
+
+真实顺序是：缓存 miss → 定位 loader → 写 true → `loader(name)`。A→B→A 的内层
+require(A) 得到 Boolean(true)，不会重新运行 A；B 返回表后提交 B，A 随后再提交 A。
+这能终止固定循环，却不能让 B 在此时访问尚未完成的 `A.answer`。
+
+### true 代表“完成”还是“进行中”？
+
+本快照没有独立 `Loading` enum，也没有不能伪造的内部 sentinel。加载标记和模块
+最终返回的 true 走同一个 truthy 分支，因此单看值不能判断初始化阶段。若 loader
+自行提前发布 table，内层可以读到它，但那是 loader 明确建立的边，不是 require
+自动创建完整模块对象。
+
+**完成条件：** 模型自循环/A-B 循环的 trace 与次数正确；真实 preload 和 Lua 文件
+分别验证内层看到 true、最终缓存是实际表。固定预算耗尽只证明晚发布的反例会重复
+进入，不应被当作真实 VM 的循环错误类型。本包循环成功路径的模型不承担失败恢复，
+只处理固定单结果 loader；nil/false 提交矩阵由缓存包负责，下一问再单独检查失败恢复。
+
+```powershell
+cargo test --manifest-path $moduleManifest --test cycles_reference loading_sentinel_is_visible_before_recursive_loader_call -- --exact
+```
+
+## 问题三：第一次 loader 报错，为什么修好之后却得到 true？
+
+### `?` 把普通错误交回了，却把加载标记留下了
+
+先让 loader 增加副作用计数，再返回 Err；修复 loader 后用同一个 VM 再 require。
+错误版若直接 `loader(...)?`，会跳过删除，第二次命中残留 true，不再运行修复后的
+loader。看起来“没有再报错”，实际上连修复代码也没执行。
+
+```powershell
+cargo run --quiet --manifest-path $moduleManifest --example require_retry_problem_chain
+```
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/retry/starter.rs:retry_attempt_starter}}
+```
+
+把 Result 留在局部变量中，明确匹配 Err，再决定删除与返回的顺序：
+
+```diff
+- let results = loader(vm, name)?;
+- Ok(vm.finish(name, results))
++ let result = loader(vm, name);
++ match result {
++     Ok(results) => Ok(vm.finish(name, results)),
++     Err(error) => { vm.loaded.remove(name); Err(error) }
++ }
+```
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/retry/solution.rs:retry_attempt_solution}}
+```
+
+模型保留原 VmError 验证种类、位置和消息，清理只删除当前 key。真实 VM 使用
+`Heap::table_set(name, Nil)` 删除本项；若这个 Heap 清理本身失败，源码会用 cleanup
+错误替换原错误，所以“总能返回原错误”只适用于删除成功的普通路径。
+
+![发布前错误与发布后错误的差别；只删当前模块，保留依赖缓存与已发生副作用。](../images/v17-require-retry.svg)
+
+### 为什么不能直接清空整个 package.loaded？
+
+A 加载 B 成功后，A 自己报错。清空整个 loaded 会连 B 和原有 prefix 模块都删掉，
+导致重试 A 时 B 被无故再执行。正确清理只令 A=nil，B 继续命中；A 的副作用则已经
+发生，第二次运行会再次发生。这是当前缓存项的失败清理，**不是回滚整个依赖图或
+Lua 全局副作用**。
+
+它也不是“恢复进入前的旧值”：原项为 false 时，运行阶段失败后变 nil；loader 先
+自发布 table 又报错，当前项同样删掉。这个固定合同要与文件定位失败区分。
+
+### 所有失败都发生在标记写入之后吗？
+
+| 阶段 | 发生的错误 | 当前 loaded 项 |
+| --- | --- | --- |
+| 查缓存后、定位 loader 时 | 缺文件、package.path 无效 | 尚未写新标记，原值不因本阶段失败被删 |
+| 读到首个文件后编译 | 语法错误 | 同样发生在标记之前；不会继续试后一个模板 |
+| 写 true 后执行 loader | 普通运行错误、不可调用 preload、禁止 yield | 删除当前 key，再返回错误 |
+| 正常提交/清理时 | Heap API 本身失败 | 遵循实际错误分支，模型不注入分配/清理失败 |
+
+文件 probe 使用同一 VM 和独立临时目录，先分别复现 missing/compile/runtime，再
+修复文件后重试；preload probe 则在同一次 execute 内替换 loader 并重试。另一个
+coroutine 在 require 拒绝 loader yield 后继续运行，修好 loader 后加载成功，再在
+同一 coroutine 合法 yield/resume，避免用新 VM 的初始化掩盖禁止状态泄漏。
+
+**完成条件：** 不只要求第二次不报错，还要检查新 loader 的次数/结果、旧错误的保留、
+当前项精确 nil、依赖 B 与 prefix 保留，以及副作用没有被伪造回滚。这个 Result
+模型不承诺 panic/abort、任意 callback 资源或全部 GC 阶段都能恢复。
+
+```powershell
+cargo test --manifest-path $moduleManifest --test retry_reference failure_removes_only_the_current_loading_entry -- --exact
+```
+
+## 从真实 require 源码读出边界
+
+[完整 module loader](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v17-host-stdlib-modules/crates/lua_vm/src/lib.rs)
+从 `invoke_package::Require` 开始。不要一次 include 全函数；依次沿三个练习中的局部
+合同回到源码的 lookup、publication、invoke 和 cleanup/commit 分支。
+
+- 先查初始 loaded 表；preload 非 nil 就按 callable 路径尝试，false 也不是“没有 preload”。
+- 文件搜索把模块名的 `.` 换成 `/`，把每个分号模板中的 `?` 替换为该路径；空模板忽略。
+  读取失败累积候选诊断，首个可读文件编译失败则立即返回，不继续搜索。
+- 当前 compiler 产生 Proto 并分配 Heap Function，loader 在同一 VM/global/registry
+  执行，参数是模块名字；不是再启动一个隔离 VM。
+- VM 保存初始 `package_loaded/package_preload` 句柄并直接枚举为 roots；只替换
+  `package.loaded` 或 `package.preload` 字段不会换掉这两个内部 owner。文件 path
+  则从当前 global `package` 表读取。模型的缓存容器不证明这些 Heap/GC 行为，须看 real 对照。
+- 从 loader 结果返回到缓存提交的现有同步路径没有新增 GC checkpoint。不能因为局部
+  Vec 拥有 Value 就说任意时点都安全；v0.15/v0.16 已记录的 GC 缺口不由本章覆盖。
+
+`package.loadlib`、原生动态模块及完整 package searcher 协议不在本 checkpoint 内。
 
 ## Debug 视图
 
@@ -152,7 +390,7 @@ debug 库公开本阶段能由真实 Runtime 数据支撑的入口：getinfo、g
 - file metatable 是 Heap graph edge，宿主资源 map 是 Runtime ownership edge，两者职责不混淆；
 - `OpenOptions` 把 Lua mode string 翻译为显式权限组合；
 - `Result<Vec<Value>, VmError>` 表达 Lua error，`Vec<Value>{nil,message}` 表达普通平台失败；
-- `package.loaded = true` 是事务进行中的 sentinel，错误时 rollback；
+- `loaded[name] = true` 在 loader 调用前发布；调用后的普通错误只删当前 key，定位失败时还没有新标记；
 - loader callback 在禁止 yield 的宿主边界执行，避免暂停一半的 require transaction；
 - VM Drop 先 drain 宿主资源，保证确定性 shutdown。
 
@@ -175,7 +413,13 @@ debug 库公开本阶段能由真实 Runtime 数据支撑的入口：getinfo、g
 ```powershell
 cargo run --manifest-path book/code/v17-host-stdlib-modules/Cargo.toml -- `
   book/code/v17-host-stdlib-modules/examples/demo.lua
-cargo test --manifest-path book/code/v17-host-stdlib-modules/Cargo.toml --workspace
+cargo test --manifest-path $moduleManifest --test cache_reference
+cargo test --manifest-path $moduleManifest --test cycles_reference
+cargo test --manifest-path $moduleManifest --test retry_reference
+cargo fmt --manifest-path $moduleManifest --all -- --check
+cargo clippy --manifest-path $moduleManifest --workspace --all-targets -- -D warnings
+cargo test --manifest-path $moduleManifest --workspace
+cargo test --manifest-path $moduleManifest --workspace --release
 ```
 
 示例 require 一个只加载一次的 Lua module，写入并重读临时文件，再用 debug.getinfo 检查 module function：
@@ -184,7 +428,27 @@ cargo test --manifest-path book/code/v17-host-stdlib-modules/Cargo.toml --worksp
 type=number value=1717
 ```
 
-本快照共有 119 个测试：74 个主线端到端、7 个核心标准库/差分、10 个宿主标准库与模块测试、7 个编译器、15 个 core、3 个 stdlib 合同和 3 个 VM 测试。新增测试使用进程唯一临时目录，并在成功路径后逐项清理。
+原快照基线有 119 项：74 个主线端到端、7 个核心标准库/差分、10 个宿主标准库与模块、
+7 个编译器、15 个 core、3 个 stdlib 合同与 3 个 VM。本轮增加 24 项参考（cache 9、
+cycles 6、retry 9），合计 **143 通过、4 个 learner ignored**。不把 ignored 当作
+完成；文件探针使用进程唯一临时目录，不改变工作目录。
+
+```powershell
+cargo test --manifest-path $moduleManifest --test cache_exercises -- --ignored
+cargo test --manifest-path $moduleManifest --test cycles_exercises -- --ignored
+cargo test --manifest-path $moduleManifest --test retry_exercises -- --ignored
+```
+
+初始三组分别有 2/1/1 项失败。只修改各包 `starter.rs` 指定 hook，完成后同一合同通过。
+各题可独立完成；固定 CLI 和默认参考不读取 starter，不需要先完成上一包。
+维护者需验证“初始失败 → 临时套解通过 → 原字节恢复后再失败”，防止假绿或交付已填答案。
+逐题命令、成功观察和模型范围见各包 README。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/check_book_teaching.ps1
+mdbook build book
+node tools/check_book_links.mjs target/mdbook .
+```
 
 ## 本版本暂不支持
 
@@ -200,21 +464,24 @@ type=number value=1717
 ## 章末练习
 
 <div class="exercise understanding">
-  <strong>理解题</strong>
-  <p>分别列出 Lua error 与普通平台失败的返回形状，并解释 file userdata identity 与 OS
-  handle owner 为什么放在不同容器。</p>
+  <strong>理解题：同一个 true 为什么可能处在不同阶段？</strong>
+  <p>沿循环图说明发布标记、重入命中、最终提交的先后；再沿缓存表说明 nil、false、0
+  和空串分别何时再次执行。运行 cache/cycles CLI 对照；成功条件是能解释循环中拿到
+  true 为什么不能读取完整模块字段，以及它为何不等于已完成初始化。</p>
 </div>
 
 <div class="exercise implementation">
-  <strong>实现题</strong>
-  <p>实现 file:lines iterator，明确 iterator 对 file 的引用、EOF 自动关闭条件和显式关闭后
-  的错误；增加实际文件删除测试验证 handle 释放。</p>
+  <strong>实现题：完成四个独立 hook</strong>
+  <p>只修改 cache 的 lookup/finish、cycles 的 publication、retry 的 attempt。
+  运行上面三个 --ignored 命令；2/1/1 项全部通过才完成。不要改固定故障、合同、
+  真实核心或默认 ignored 标记来取得通过。</p>
 </div>
 
 <div class="exercise debugging">
-  <strong>调试题</strong>
-  <p>临时删除 require 失败 rollback，制造“首次报错、修复后重试”测试；观察 sentinel 如何
-  伪装成成功 cache，再恢复事务回滚。</p>
+  <strong>调试题：重试不报错，是否真的执行了修复代码？</strong>
+  <p>运行 retry CLI，对照漏删当前项与清空全部缓存两种故障。检查第二次 loader 的次数
+  和结果、B 的执行次数、当前 key 与 prefix；成功条件是能解释“假命中 true”和
+  “无故重跑成功依赖”的不同原因，并说明副作用为何仍存在。</p>
 </div>
 
 <a id="learning-checkpoint"></a>
@@ -222,7 +489,10 @@ type=number value=1717
 
 - 能画出 userdata、VM resource map 和 OS handle 的 owner 图；
 - 能解释三条资源 drain 路径；
-- 能手推 require cache/sentinel/commit/rollback；
+- 能用真实值与执行次数解释缓存命中和首结果提交，而不是只看 key 是否存在；
+- 能手推 A→B→A 的缓存轨迹，区分循环中的 true 与最终模块表；
+- 能区分标记发布前后的错误，并验证当前项清理、依赖保留与同 VM 重试；
+- 四个独立 TODO 显式通过，能分清模型、真实快照、GC/禁止 yield 的验证范围；
 - 能区分 Lua error 与 `nil,message` 平台失败。
 
 ## 与成熟实现和专题章节的对应
@@ -231,4 +501,5 @@ type=number value=1717
 - [Runtime 所有权与 GC](v13-runtime-gc.md) 可回看为什么 registry/package/file metatable 必须进入 root inventory；
 - [Coroutine](v15-coroutine.md) 可对照 require/file callback 为什么属于禁止 yield 的宿主边界；
 - [核心标准库](v16-core-stdlib.md) 可回看 catalog 和 HostError 如何扩展到平台失败；
+- 若继续本版教学，可从 file userdata 已失去 Lua 可达性但 OS handle 仍被 map 拥有的问题，继续展开显式 close、GC prune 与 Drop 的状态迁移；本轮没有完成这组练习。
 - 下一 checkpoint 是 v0.18：完成 CLI/REPL 合同，并新增 `lua_bytecode` crate 提供 text/JSON、CFG、trace、fixture manifest 与超时 runner。

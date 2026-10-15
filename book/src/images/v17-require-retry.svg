@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="680" viewBox="0 0 900 680" role="img" aria-labelledby="title desc">
+  <title id="title">require 失败阶段与当前缓存项的清理范围</title>
+  <desc id="desc">定位文件或编译失败在发布sentinel之前，因此不清理原缓存项。调用loader前发布true，正常完成交付结果；运行时错误或禁止yield的错误删除当前name，清理成功时返回原错误，Heap清理自身失败会替换错误。成功加载的依赖B、其他缓存项和副作用不回滚。漏删当前true会令重试假命中，清空全部缓存则破坏依赖。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:18px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="680" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">失败后允许重试，需要清理当前项；不是撤销整个加载世界</text>
+  <rect x="20" y="62" width="860" height="94" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="40" y="95" class="label">阶段 1：查缓存 → 找 preload 或文件 → 读文件并编译</text>
+  <text x="40" y="132" class="small">此时尚未发布标记。缺文件 / 编译错误直接返回；原 false 项不会因本阶段失败被删除。</text>
+  <path d="M450 156V188" class="flow"/>
+  <rect x="20" y="192" width="860" height="64" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="40" y="231" class="label">阶段 2：loaded[name] = true → invoke_yield_forbidden(loader, [name])</text>
+  <path d="M230 256V288" class="flow"/><path d="M665 256V288" class="flow"/>
+  <rect x="20" y="292" width="410" height="98" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="40" y="326" class="label">Ok：按首结果/当前 slot 交付结果</text><text x="40" y="363" class="small">之后再次 require 按 truthy 规则查缓存。</text>
+  <rect x="450" y="292" width="430" height="98" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="470" y="326" class="label">Err：删除当前项，清理成功交回原错</text><text x="470" y="363" class="mono">loaded[name] = nil → Err(error)</text>
+  <rect x="20" y="414" width="860" height="100" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="40" y="447" class="label">两个反例：漏删当前项 / 清空整个 loaded 表</text>
+  <text x="40" y="484" class="small">漏删：修复后重试命中 true，不运行新 loader。清空：已成功的依赖 B 也被无故重跑。</text>
+  <rect x="20" y="538" width="860" height="82" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="40" y="570" class="label">A 加载 B 成功后报错：删除 A，保留 B 与原有 prefix 缓存</text>
+  <text x="40" y="602" class="small">A / B 的副作用已经发生；当前 key 被设为 nil，不是恢复它进入前的 false 或自发布值。</text>
+  <text x="24" y="657" class="small">只说明普通 Result 的阶段与清理范围；不保证 panic、任意 GC / 宿主重入或文件副作用回滚。</text>
+</svg>

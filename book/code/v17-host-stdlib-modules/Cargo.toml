@@ -21,3 +21,27 @@ members = [
 
 [lints.clippy]
 all = "warn"
+
+[[test]]
+name = "cache_exercises"
+path = "exercises/cache/acceptance.rs"
+
+[[test]]
+name = "cache_reference"
+path = "exercises/cache/reference.rs"
+
+[[test]]
+name = "cycles_exercises"
+path = "exercises/cycles/acceptance.rs"
+
+[[test]]
+name = "cycles_reference"
+path = "exercises/cycles/reference.rs"
+
+[[test]]
+name = "retry_exercises"
+path = "exercises/retry/acceptance.rs"
+
+[[test]]
+name = "retry_reference"
+path = "exercises/retry/reference.rs"

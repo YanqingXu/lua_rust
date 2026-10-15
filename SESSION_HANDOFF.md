@@ -3,6 +3,87 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.17 require 缓存、循环加载与失败恢复
+
+用户要求继续按问题链补齐这三部分的可运行反例、代码差异、状态图与验收，完成验证
+并更新交接。本次完成该教学包，**没有恢复暂停的原审计整改目标**。用户随后明确
+要求将本批章节、状态图、练习包和交接记录一并提交并推送。
+
+- 起点为 `main@93bfbfef5ff4a92d87fac2b61b098475709f61d1`，开始时工作区干净，
+  本地跟踪的 origin/main 同 SHA；这是上一批已推送的 v0.16 callbacks 教学包。
+  本次生产 `crates/`、v0.17 快照核心与既有 tests 均无 diff；Cargo 仅增加六个
+  test targets，未增加依赖。历史证据与功能缺口保持各自版本归属。
+  提交前 fetch 再次确认 HEAD 与 origin/main 无分叉。本批提交号以
+  `git log -1 -- book/src/versions/v17-host-stdlib-modules.md` 为准，新提交 CI 须按其 SHA 查询。
+- [主章](book/src/versions/v17-host-stdlib-modules.md) 按三问组织：每次执行/存在性
+  判断 → truthy cache 与首结果提交；晚发布导致 A→B→A 重入 → 调 loader 前发布
+  true；`?` 留下假缓存/清全部破坏依赖 → 保存 Result、失败只删当前 key。每问有
+  预测、固定运行入口、starter/solution include、最小 diff、图与验收。原文件/io/os/
+  debug 能力保留为 checkpoint 背景，没有把本轮扩展为宿主 API 或原审计整改。
+- [缓存包](book/code/v17-host-stdlib-modules/exercises/cache/README.md)：两个独立
+  TODO、9 项默认参考。模型使用真实 Value 的 BTreeMap，不包含 Heap/GC 或文件定位；
+  检查 nil/false miss、0/空串 hit、只消费首结果、loader 自发布与 false 再加载。
+  真实 VM 另核对 15 行矩阵、正常/自发布表的身份与字段；跨 execute 只保留 bool，
+  公开 package.loaded 字段重绑后 host GC，再 require 实读 answer=42、calls=1，
+  新公开表仍无本项，验证 VM 初始私有 loaded owner 与字段不同。
+- [循环包](book/code/v17-host-stdlib-modules/exercises/cycles/README.md)：一个
+  publication TODO、6 项默认参考。真实 Heap 的局部模型使用有限 loader 进入预算，
+  晚发布自循环进入六次，A/B 各三次后终止；健康各一次并验精确 trace/最终表字段与
+  身份。预算只为反例有界，不是正式循环错误。真实 preload 与临时文件都验证内层
+  看到 true，最终 A/B 为表；显式 partial table 与完成 true 也沿相同缓存分支。
+  循环模型只处理固定单结果成功路径，不承担完整提交矩阵或失败恢复。
+- [重试包](book/code/v17-host-stdlib-modules/exercises/retry/README.md)：一个
+  attempt TODO、9 项默认参考。固定 `?` 故障使修复后返回旧 true、loader 不再运行；
+  clear-all 故障使成功 dependency 与 prefix 丢失。合同检查原 VmError 种类/位置/
+  消息、当前项精确 nil、依赖与 prefix 保留、副作用不回滚；原 false/自发布值在
+  loader 失败后都被删，不恢复旧值。真实 preload 同 execute 修 loader 重试，另验
+  A 失败保留成功 B、require 拒绝 yield 后同 coroutine 修 loader 再合法 yield/resume。
+  文件探针在各自同一 VM 中验证 missing/compile/runtime 三阶段修文件重试：标记前
+  错误保留 false，运行错误后变 nil；首可读文件编译失败不会继续后模板。
+- 三幅 SVG（命中/提交矩阵、A/B 时序、分阶段失败清理）与正文 include 已浏览器
+  核对文字、箭头、列对齐和页脚。新增 `require_contracts.lua` 返回 true：正常模块
+  只执行一次、循环内层见 true、失败重试实际执行两次且 effects=2；原 demo 返回 1717。
+  临时文件 probe 使用唯一目录、范围验证与显式清理；retry helper 的旧记录
+  `retry/20261015T064657490Z/` 属于清理校准前，保留但不作为最终 helper 的验证。
+- 源码边界已校准：首结果非 nil 才写缓存（包括 false）；nil/无结果重读当前 slot，
+  若 loader 已清 slot，仅返回 true 而**不写回**，下次仍会加载。true sentinel 没有
+  独立 Loading 身份，不等于完整模块对象或初始化完成，也不冒充官方循环报错行为。
+  VM 保存初始 loaded/preload 句柄为 roots，path 则从当前 global package 读取；
+  结果到提交的现有同步路径没有额外 GC checkpoint。普通 loader Err 删除当前 key；
+  若 Heap 清理本身失败，真实源码可用 cleanup 错误覆盖原错。模型不证明 panic/abort、
+  所有 GC 阶段或整个依赖图/OS 副作用回滚，v0.15/v0.16 既有缺口未在本轮整改。
+- 本地 Rust/cargo **1.96.1**：fmt、workspace all-targets Clippy `-D warnings` 通过；
+  Debug/Release 各 **143 通过、0 失败、4 ignored**（119 原测试 + 24 新参考）。
+  learner 三组显式初始分别 2/1/1 失败，四题均完成“失败 → 临时套解通过 → 原字节
+  恢复后再失败”，starter 哈希一致并刷新 mtime。ignored 与固定 CLI 退出 0 均不代表
+  学习者完成。46 个代码输入前后哈希无漂移。
+- 三个 CLI 共 **55 条关键断言**匹配；主章和三个 README 去重后 **22 条 exact
+  命令各执行 1 项**，18 正向通过、4 learner 按预期失败。PATH `D:\lua51\lua.EXE`
+  确认为 **Lua 5.1.5**，实际执行本版 stdlib_diff 输出 1550，不借用旧版本外部证据。
+  全 20 版本教学检查、mdBook 构建、38 页链接检查通过：**1,267 站内链接、0 broken**。
+- 新证据独立在 `target/teaching-v17-2026-10-15/`：
+  `full-validation/20261015T065334031787Z/{summary,metadata}.json` 记录 40 项验证/
+  计数/源码哈希/oracle；`exact-command-sources.json` 记录逐题来源。局部与套解为
+  `cache/20261015T064807075236Z/`、`cycles/{scoped-verification,starter-round-trip}.json`、
+  `retry/20261015T064950743Z/`；`final-verification.json` 为最终文档、站点与交付
+  文件哈希。目录为本机忽略产物，不随 clone 交付；永久入口是主章、三个 README、
+  contracts/real 与 examples，没有覆盖以前版本证据。
+- 已推送基线 `93bfbfe` 的 [mdBook 38693555628](https://github.com/YanqingXu/lua_rust/actions/runs/38693555628)
+  成功；本轮观察 [Rust CI 38693555655](https://github.com/YanqingXu/lua_rust/actions/runs/38693555655)
+  仍在运行。三个 Miri/ASan job 成功，Windows Quality Gate 尚未终态，其
+  `Enforce verified official source cases` 步骤已失败，具体原因未核实。明细保存于
+  `baseline-rust.json`。提交前再查终态：仅 Windows Quality Gate 失败，失败步骤为
+  `Enforce verified official source cases` 和 `M1 foundation and quality gate`，
+  其余三个 Miri/ASan job 成功。失败日志下载返回 HTTP 403 / API rate limit exceeded，
+  未核实具体原因；明细和输出分别见同证据目录 `push-baseline-rust.json`、
+  `push-baseline-failed.log`。不套用以前提交的原因，也不作为本批新提交 CI 结果。
+
+若继续本版教学，可从 file userdata 不可达但宿主 map 仍拥有 OS handle 的问题，
+拆解显式 close/tombstone、GC prune 与 Drop drain；若进入下一 checkpoint，v0.18
+可按 CLI 错误退出与 REPL 跨输入状态推进。工程整改仍可独立处理 v0.15 活动 varargs、
+v0.16 sort snapshot roots 等已记录缺口。后续按用户指令启动；原审计仍暂停在本地
+时间/UTC/DST，提交推送由当次指令授权。
+
 ## 2026-10-15：v0.16 pcall/xpcall、sort comparator 与禁止 yield 边界
 
 用户要求继续按问题链讲清 callback 返回/报错后的状态恢复与临时对象保活，补齐反例、

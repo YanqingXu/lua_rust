@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="652" viewBox="0 0 900 652" role="img" aria-labelledby="title desc">
+  <title id="title">A 到 B 再到 A 的循环加载时序</title>
+  <desc id="desc">A miss后先发布loadedA为true再进入loaderA，A加载B，B miss也先发布true。B再requireA时命中true而不是重跑A，也不是拿到A最终表。B提交B表，A再提交A表。快照没有独立Loading枚举状态，true既可能是进行中标记也可能是最终模块值。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:18px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="652" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">在调用 loader 之前发布，内层 require 才能看见“正在加载”</text>
+  <rect x="20" y="62" width="860" height="294" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="40" y="96" class="label">调用与观察</text><text x="571" y="96" class="label">loaded[A]</text><text x="724" y="96" class="label">loaded[B]</text>
+  <path d="M40 110H854" stroke="#d9d5c7"/>
+  <text x="40" y="143" class="small">require(A)：先写 true，再进入 loader A</text><text x="595" y="143" class="mono">true</text><text x="750" y="143" class="mono">nil</text>
+  <text x="40" y="183" class="small">A → require(B)：先写 true，再进入 loader B</text><text x="595" y="183" class="mono">true</text><text x="750" y="183" class="mono">true</text>
+  <text x="40" y="223" class="small">B → require(A)：命中 true，不重复执行 A</text><text x="595" y="223" class="mono">true</text><text x="750" y="223" class="mono">true</text>
+  <text x="40" y="263" class="small">B 返回 B 表，提交本项</text><text x="595" y="263" class="mono">true</text><text x="750" y="263" class="mono">B 表</text>
+  <text x="40" y="303" class="small">A 取得 B 表，再返回 A 表并提交</text><text x="595" y="303" class="mono">A 表</text><text x="750" y="303" class="mono">B 表</text>
+  <path d="M505 132V303" class="flow"/>
+  <rect x="20" y="380" width="860" height="90" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="40" y="413" class="label">晚发布的错误设计：A → B → A → B …</text>
+  <text x="40" y="448" class="small">实验用有限进入预算停下反例；预算是测试保护，不是正式循环处理协议。</text>
+  <rect x="20" y="494" width="860" height="90" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="40" y="526" class="label">循环中的 true 不是 A 已初始化完成的证明</text>
+  <text x="40" y="559" class="small">没有独立 Loading 枚举；加载中 sentinel、最终返回 true，都会走相同 truthy cache 分支。</text>
+  <text x="24" y="622" class="small">这是本快照的简化合同；不冒充循环报错或自动返回完整 partial module table 的实现。</text>
+</svg>
