@@ -44,7 +44,7 @@ cargo test --manifest-path $toolManifest --workspace --release
 
 原快照 129 项 + CLI/REPL 参考20项（8/5/7），工具包再增加22项（6/7/9），
 runner 三包另增加18项参考（5/6/7）；结构化续行增加compiler6、实际协议6、分类7、
-EOF5，全快照 **213 通过、12 ignored**。十一包共十二个 learner ignored，
+EOF5；共享字节合同另加2项，全快照 **215 通过、12 ignored**。十一包共十二个 learner ignored，
 stdio 两项、其余十组各一项初始失败，只改各 starter hook 完成；参考与固定 CLI 通过不等于 learner 完成。
 维护者验证失败→临时套解通过→原字节恢复并刷新 mtime 后再失败，交付保留 TODO。
 
@@ -155,3 +155,18 @@ EOF空闲=0，pending只消费已保存的编译诊断并返回1，I/O Err独立
 只有空闲时移除单个shorthand `=`，`==42`不再被当成两次shorthand剥离。泛型writer
 承接REPL自身输出，不捕获Lua print。旧 recovery 的模型/图标为历史迁移前设计，
 其真实process对照按新协议更新，上一批证据仍归各自提交。
+
+## 跨快照共享字节合同
+
+v1.0 已显式迁移本协议。两版各带相同的26场景 fixture、测试与安全 runner，
+独立 binary 分别对固定 oracle 核对完整 stdout/stderr bytes 与退出码，只显式
+参数化版本 banner。前21条沿用上一批合同，另5条约束 CRLF 与无 LF 末片段。
+本目录可独立复制构建；仓库身份 gate 检查副本漂移，不改旧模型或 learner：
+
+```powershell
+cargo test --manifest-path book/code/v18-cli-tools/Cargo.toml --test repl_byte_contract real_binary_matches_all_shared_raw_byte_cases -- --exact
+py -3 tools/check_repl_byte_contracts.py --check
+```
+
+覆盖与独立 Python 归档命令见[共享合同说明](../../../tools/repl_byte_contracts/README.md)。
+不做通用 normalize，不只比较两份可能同时出错的实际输出；26条不等于官方完整 TTY REPL。

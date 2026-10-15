@@ -1172,5 +1172,5 @@ node tools/check_book_links.mjs target/mdbook .
 - [用测试守住兼容性](../ch05-engineering/testing.md) 可对照进程级合同为何不能只用函数单测替代；
 - 本版十三问覆盖 CLI/REPL、观察工具、单 child 生命周期与结构化续行；成熟 [lua_fixture_runner](https://github.com/YanqingXu/lua_rust/blob/main/tools/lua_fixture_runner/README.md) 的进程组/Windows Job Object、分类与规范化仍是后续独立能力；
 - 续行协议已有真实输入/EOF合同；后续 TTY 编辑、signal 恢复和增量解析须另定范围。跨入兼容验收时，先冻结能力矩阵与 oracle 来源；
-- v1.0 独立快照目前仍保留旧 `is_incomplete`；本轮只迁移 v0.18，进入下一 checkpoint 时须显式移植并重验，不能假定各快照自动继承；
+- [v1.0 下一章](v100-lua51-runtime.md)显式移植本协议，保留本版调用语法糖与 Help action，并让两个独立快照各自通过同一份26场景字节合同；快照不会自动继承，不能整目录覆盖迁移；
 - 下一 checkpoint 是 v1.0：补齐登记差异，冻结能力矩阵，并以官方 Lua 5.1.5 与固定 C++ oracle 双差分收口。

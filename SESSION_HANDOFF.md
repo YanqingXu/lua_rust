@@ -3,6 +3,90 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：结构化 REPL 协议迁入 v1.0 独立快照
+
+用户要求将 v0.18 的结构化续行与 EOF 协议显式迁入 v1.0，复用字节验收合同，补齐
+反例、前后差异、状态图和练习。本批教学、真实实现与验证已完成，**没有恢复
+暂停的原审计目标**。用户随后明确要求将本批协议迁移、共享字节合同、章节、状态图、
+练习包和交接记录一并提交并推送。
+
+- 起点为已推送 `main@7776fd4f88ed9f2222545a5ece8375c0f9836aa4`，开始时工作区
+  干净、origin/main 跟踪同 SHA。本批只修改 v100 本地 compiler、Repl library、
+  main adapter、Cargo 两个 test target 与一行 capability evidence；新练习/示例/
+  集成合同随快照自含，无新依赖。v18 只增三份共享测试文件并更新 README 计数；
+  原 compiler/src/旧 exercises 不改。生产根 crates、两快照 core/VM/bytecode、
+  v100 原兼容偏差、oracle manifest、2026-08-21 differential baseline 保持原样。
+  提交前fetch确认HEAD与origin/main无分叉。本批提交号以
+  `git log -1 -- book/src/versions/v100-lua51-runtime.md` 为准，新提交CI按其SHA查询。
+- [主章](book/src/versions/v100-lua51-runtime.md) 新增三问：独立快照不会继承修复
+  → 分类/controller/adapter 小步迁移；谁保存 source/诊断与 VM → EOF take一次；
+  两边相同仍可都错 → 固定 byte oracle、独立执行与身份检查。每问有预测、固定反例、
+  最小diff、源码include、exact验收；两幅新SVG对应 owner/输入状态与合同/证据链。
+  v18 章末改为已迁移的下一章入口，历史批次的证据和完成计数不重写。
+- 本地 CompileErrorKind/lexer/parser 与 Repl/run_repl 显式移植，保留 v1.0 括号
+  prefix expression、string/table call sugar、Action::Help 正常顺序、arg/actions、
+  v1.0 banner 及 JSON/trace v1。compiler 从7项到15项：共享分类6项、本版前缀与
+  语法糖2项；分类仍是局部提示，每次重编译完整buffer，不证明任意前缀可补全。
+- Repl 借用同一 Session，拥有 source 与最近一次 pending 诊断。未完成前缀零执行，
+  成功编译后执行一次；执行返回/普通错误后清当前输入，不重建 VM 或回滚副作用。
+  idle EOF=0；pending EOF clear/take原诊断一次、顶层打印并exit1，不重编译/执行。
+  read_line正数提交实际片段，有LF才补LF；读取Err独立Host错误。非UTF-8 read_line
+  仍失败；泛型writer只接REPL输出，Lua print走进程stdout，TTY/signal未扩展。
+- [迁移练习包](book/code/v100-lua51-runtime/exercises/repl_migration/README.md)：
+  一个finish TODO，6参考、6真实controller/I/O回归；固定faults为关键词漏判、静默
+  EOF、clone重复诊断，example all有12条unique关键输出。PendingInput由本地真实
+  compiler生成原诊断，教学投影不接Session；约束禁止重编译/执行，不宣称类型能
+  禁止任意全局调用。TODO已验D/R初始失败→临时套解通过→原字节恢复并刷新mtime→
+  再失败，交付仍保留TODO。原v18的十二题仍按历史版本归属，不另称本次套解。
+- 永久[字节合同](tools/repl_byte_contracts/README.md)：canonical cases.tsv与两版
+  本地fixture逐byte相同；前21条与上一批oracle程序逐byte继承，新增5条CRLF/无LF。
+  两版wrapper/安全runner也相同，各自符合固定expected双流/exit，仅显式映射版本
+  banner，不trim、不有损解码、不normalize。root Python gate检查schema/副本并可
+  独立运行、独占归档stdin、actual/expected双流、metadata与SHA；永久入口随clone
+  交付，本机target仅为本次证据。该26条不宣称官方完整TTY或任意进程树治理。
+- 旧行为不是猜测：从HEAD7776 git archive提取独立旧v100、全workspace **136通过**
+  并build后捕获3个真实case。表达式续行漏判造成两诊断；pending EOF静默exit0；
+  无LF `return 'broken` 被旧adapter合成换行，实际newline in short string后exit0，
+  不能误写成静默pending。证据baseline-capture.json保留原stdin/双流。初版验证器
+  误猜第三条旧行为，仅修ignored预期并复用已通过build/test日志，原事实没有覆盖。
+- Windows Rust/cargo **1.96.1**，v100本地release_gate一次运行通过fmt、all-targets
+  Clippy `-D warnings`、D/R workspace，各 **158通过/0失败/1ignored**；v18 fmt、
+  严格Clippy和D/R各 **215通过/0失败/12ignored**。v100=旧136+compiler8+协议6+
+  参考6+共享2；v18=旧213+共享2。example每profile12条unique关键断言，共24次，demo各100；
+  Help顺序/后续非法参数(code2)、v1.0文字、38opcode、JSON bytes/schema、CFG边端、
+  trace schema与执行前时点均另核。官方双oracle本轮明确skipped，未冒充新差分。
+- 两版D/R的Rust集成合同共104个真实case；独立Python另跑 **104个raw case**
+  （52/profile），全部对固定oracle并回收。负控：副本漂移、同改三份为非法大写hex
+  都被永久CLI拒绝；两个正确版本banner但固定idle输出的fake binary共52场景仅2条
+  idle通过、50条拒绝，和真实104条分开；synthetic timeout已kill/reap且判失败。
+  全workspace自然再跑集成case，未把重复执行包装成新增覆盖。
+- 新v100独立copy只有本地源码，6packages全部path依赖闭合；全新target不共享产物，
+  offline/locked build workspace bins、本地2项byte测试/26cases及demo100通过。
+  继承祖先Rust linker配置，未复制v18或根tools源码。全量197输入SHA前后无漂移；
+  文档去重17条exact，D/R共34命令，32正向通过/2learner预期失败，全部恰1test。
+- 证据独立在 `target/teaching-v100-repl-2026-10-15/`：全量
+  `full-validation/20261015T095858499820Z/summary.json`（30commands、冻结脚本SHA）；
+  compiler局部 `compiler/20261015T094956108997Z/summary.json`；练习套解
+  `repl_migration/20261015T095303694663Z/summary.json`；合同
+  `contracts/20261015T095410846258Z/summary.json`，永久CLI负控
+  `contracts/negative-controls-20261015T095526391391Z/summary.json`；文档exact
+  `doc-exact/20261015T100230475936Z/summary.json`。最终范围/HTML/hash/图见
+  final-verification.json。各层证据引用真实路径，不覆盖v18历史批次。
+- 20版本教学检查、mdBook、38页 **1,363站内链接/0broken**通过。两幅SVG经bundled
+  sharp/libvips渲染PNG实看文字/箭头/页脚；Fontconfig缓存不可写告警未影响中文。
+  HTML另验include展开/两图引用；没有把PNG检查声称为浏览器页面视觉验证。
+- 基线7776的 [mdBook 38714986340](https://github.com/YanqingXu/lua_rust/actions/runs/38714986340)
+  成功；[Rust 38714986294](https://github.com/YanqingXu/lua_rust/actions/runs/38714986294)
+  completed/failure，两个Miri和Linux ASan成功，Windows仅M1质量门失败。实际job
+  日志确认生产fetch_update弃用触发严格Clippy失败，其余测试/文档/audit门通过，
+  本SHA official source三方均10/10。baseline-rust-final.json与baseline-rust-job.log
+  保留；未修改生产CI，此结果不代表本批新提交的远端CI。
+
+下一任务应从v1.0 capability/deviation的具体失败fixture推进兼容收口，让每条差异
+有反例、最小改动与oracle证据；TTY编辑、signal恢复、增量parser与生产CI工具链
+弃用兼容另立范围。原审计仍暂停在os.date/os.time本地时间、UTC、DST，交接不代表
+恢复；本批按用户明确指令提交推送，新提交CI须按其SHA另查。
+
 ## 2026-10-15：v0.18 结构化 REPL 续行与 EOF
 
 用户要求按问题链讲清 NeedMoreInput、普通语法错误与未完成输入，补齐可运行反例、

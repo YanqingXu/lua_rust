@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="950" viewBox="0 0 900 950" role="img" aria-labelledby="title desc">
+<title id="title">v1.0 独立迁移的所有权与输入状态</title><desc id="desc">三个本地边界：compiler给结构化分类；Repl借用同一Session并拥有source与pending；main及driver识别真实输入事件。NeedMoreInput保留不执行；完成或普通错误清输入；pending EOF取走原诊断一次，idle EOF成功；输入Err保留宿主错误。保留本版调用语法糖和Help action。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="950" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">版本快照不会自动继承：三个本地边界逐步迁移</text>
+<rect x="24" y="64" width="852" height="90" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="98" class="label">① compiler：语法构造点决定 kind，Display 继续给人看</text>
+<text x="44" y="132" class="small">保留 v1.0 括号 prefix 与 string/table call sugar；错误 token 不因 EOF 变合法。</text>
+<path d="M450 154V188" class="flow"/>
+<rect x="24" y="192" width="852" height="90" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="226" class="label">② Repl&lt;'a&gt;：拥有 source + Option&lt;CompileError&gt;</text>
+<text x="44" y="260" class="small">借用唯一 &amp;mut Session → Session 拥有 VM；不随 chunk 或错误重建。</text>
+<path d="M170 282V316" class="flow"/><path d="M450 282V316" class="flow"/><path d="M730 282V316" class="flow"/>
+<rect x="24" y="320" width="268" height="128" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="44" y="354" class="label">NeedMoreInput</text><text x="44" y="388" class="small">保留 source + 原诊断。</text><text x="44" y="418" class="small">前缀零执行，等待下一行。</text><text x="44" y="442" class="small">再编译完整 buffer。</text>
+<rect x="316" y="320" width="268" height="128" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="336" y="354" class="label">编译成功</text><text x="336" y="388" class="small">Proto 执行恰一次。</text><text x="336" y="418" class="small">随后清 source / pending。</text><text x="336" y="442" class="small">返回值后继续读新 chunk。</text>
+<rect x="608" y="320" width="268" height="128" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="628" y="354" class="label">普通编译 / runtime 错</text><text x="628" y="388" class="small">清 source / pending。</text><text x="628" y="418" class="small">显示后继续，同一 Session。</text><text x="628" y="442" class="small">既有副作用不回滚。</text>
+<rect x="24" y="482" width="852" height="84" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="516" class="label">③ driver / main：传输事件与退出码</text><text x="44" y="548" class="small">保留 v1.0 banner、Action::Help 顺序、arg 表；真实 LF 才恢复换行。</text>
+<path d="M170 566V600" class="flow"/><path d="M450 566V600" class="flow"/><path d="M730 566V600" class="flow"/>
+<rect x="24" y="604" width="268" height="122" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="638" class="label">Ok(n), n &gt; 0</text><text x="44" y="672" class="small">提交原片段；有 LF 才追加。</text><text x="44" y="702" class="small">无 LF 末片段不合成换行。</text>
+<rect x="316" y="604" width="268" height="122" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="336" y="638" class="label">Ok(0)：真正 EOF</text><text x="336" y="672" class="small">清 source，pending.take()。</text><text x="336" y="702" class="small">不重编译，不执行。</text>
+<rect x="608" y="604" width="268" height="122" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="628" y="638" class="label">Err：读取失败</text><text x="628" y="672" class="small">Host 错误 → code1。</text><text x="628" y="702" class="small">不换成旧 pending 诊断。</text>
+<path d="M450 726V760H240V784" class="flow"/><path d="M450 760H660V784" class="flow"/>
+<rect x="24" y="788" width="408" height="80" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="822" class="label">None：idle EOF → code0</text><text x="44" y="852" class="small">此前普通行错误已处理也可走此路。</text>
+<rect x="456" y="788" width="420" height="80" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="476" y="822" class="label">Some：原诊断一次 → code1</text><text x="476" y="852" class="small">已移出为 None；再次 finish 不重复。</text>
+<text x="24" y="910" class="small">每次提交重新编译整个 buffer；NeedMoreInput 是局部提示，不是任意前缀可扩展证明。</text>
+<text x="24" y="936" class="small">验收：编译分类 + controller 状态 + 真实双流 bytes / exit，三层分别观察。</text>
+</svg>

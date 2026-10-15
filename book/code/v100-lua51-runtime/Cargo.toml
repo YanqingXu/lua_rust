@@ -23,3 +23,11 @@ members = [
 
 [lints.clippy]
 all = "warn"
+
+[[test]]
+name = "repl_migration_exercises"
+path = "exercises/repl_migration/acceptance.rs"
+
+[[test]]
+name = "repl_migration_reference"
+path = "exercises/repl_migration/reference.rs"

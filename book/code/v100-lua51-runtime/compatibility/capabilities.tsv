@@ -17,7 +17,7 @@ stdlib	os library	partial	tests/host_stdlib.rs	LUA51-D007
 stdlib	Lua file modules require preload path and cache	partial	tests/host_stdlib.rs	LUA51-D008
 stdlib	debug inspection library	partial	tests/host_stdlib.rs	LUA51-D009
 tooling	script stdin -e -l -i -- arg and exit codes	complete	tests/cli_contract.rs	-
-tooling	persistent multiline REPL	complete	tests/cli_contract.rs	-
+tooling	persistent multiline REPL and explicit EOF policy	complete	tests/repl_byte_contract.rs	-
 tooling	versioned bytecode JSON CFG opcode audit and VM trace	complete	crates/lua_bytecode/tests/tool_contract.rs	-
 distribution	official 38-opcode binary instruction encoding	excluded	crates/lua_bytecode/src/compatibility.rs	LUA51-D012
 distribution	Lua 5.1 binary chunks	excluded	compatibility/deviations.tsv	LUA51-D001

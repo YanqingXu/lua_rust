@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="900" viewBox="0 0 900 900" role="img" aria-labelledby="title desc">
+<title id="title">一个固定字节合同，两份独立快照</title><desc id="desc">canonical corpus有26条固定oracle，镜像到两个快照本地。身份gate逐byte比较三份corpus与两份wrapper和runner。两个本地binary各自对固定expected验stdout、stderr和exit，banner只有显式版本参数。独立Python runner存原始证据和hash，拒绝覆盖。不比较两个可能同时出错的实际输出。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="900" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">复用固定规格，分别验证行为；快照仍能独立构建</text>
+<rect x="24" y="64" width="852" height="104" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="98" class="mono">tools/repl_byte_contracts/cases.tsv</text><text x="44" y="130" class="label">26 个固定 oracle：21 条原合同 + 5 条 CRLF / 无 LF</text><text x="44" y="156" class="small">argv | stdin bytes | exit | banner policy | stdout body bytes | stderr bytes</text>
+<path d="M240 168V208" class="flow"/><path d="M660 168V208" class="flow"/>
+<rect x="24" y="212" width="408" height="118" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="246" class="label">v0.18 本地副本</text><text x="44" y="278" class="small">fixture + wrapper + 安全 runner</text><text x="44" y="310" class="small">本地 compiler / controller / binary</text>
+<rect x="456" y="212" width="420" height="118" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="476" y="246" class="label">v1.0 本地副本</text><text x="476" y="278" class="small">fixture + wrapper + 安全 runner</text><text x="476" y="310" class="small">本地 compiler / controller / binary</text>
+<rect x="24" y="354" width="852" height="88" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="44" y="388" class="label">仓库 identity gate：副本逐 byte 相同，schema 合法</text><text x="44" y="420" class="small">不代替执行验收；快照本地测试无需读取相邻版本源码、target 或仓库工具。</text>
+<path d="M240 330V354" class="flow"/><path d="M660 330V354" class="flow"/>
+<path d="M240 442V482" class="flow"/><path d="M660 442V482" class="flow"/>
+<rect x="24" y="486" width="408" height="140" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="520" class="label">actual v0.18 vs 固定 expected</text><text x="44" y="554" class="small">完整 stdout、stderr 与 exit。</text><text x="44" y="584" class="small">显式 v0.18 banner 前缀。</text><text x="44" y="614" class="small">不 trim / normalize / 有损解码。</text>
+<rect x="456" y="486" width="420" height="140" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="476" y="520" class="label">actual v1.0 vs 固定 expected</text><text x="476" y="554" class="small">完整 stdout、stderr 与 exit。</text><text x="476" y="584" class="small">显式 v1.0 banner 前缀。</text><text x="476" y="614" class="small">NUL、0xff、prompt、尾 LF 都验。</text>
+<path d="M240 626V662H450V682" class="flow"/><path d="M660 626V662H450" class="flow"/>
+<rect x="24" y="686" width="852" height="112" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="720" class="label">独立 Python runner：再运行并归档原始事实</text><text x="44" y="752" class="small">每 case 保存 stdin、actual/expected 双流、metadata；汇总 corpus / binary SHA。</text><text x="44" y="784" class="small">run 目录独占；超时 kill 后仍 wait，实际与预期分开，不覆盖旧证据。</text>
+<text x="24" y="840" class="small">负控：副本漂移应拒绝；两边都只回 idle 提示符，即便相互一致，也应被 oracle 拒绝。</text>
+<text x="24" y="870" class="small">这26条证明列明的本地 REPL 合同；不外推官方完整 TTY、signal 或任意进程树治理。</text>
+</svg>
