@@ -42,7 +42,8 @@ cargo build --release --manifest-path $toolManifest --bins
 cargo test --manifest-path $toolManifest --workspace --release
 ```
 
-原快照 129 项 + 新参考 20 项（8/5/7），合计 **149 通过、3 ignored**。三个 learner
+原快照 129 项 + CLI/REPL 参考20项（8/5/7），工具包再增加22项（6/7/9），
+全快照 **171 通过、6 ignored**。六个 learner
 各初始失败一项，只改各 starter hook 完成；参考与固定 CLI 通过不等于 learner 完成。
 维护者验证失败→临时套解通过→原字节恢复并刷新 mtime 后再失败，交付保留 TODO。
 
@@ -56,3 +57,37 @@ CompileError.message 三段子串匹配：`return 40 +` 会漏判；pending buff
 共享进程 helper 并发 drain stdout/stderr，写完关闭 stdin，五秒 deadline 后只
 kill/wait 当前 child；旧 tests 的小 fixture runner 仍先 wait 后读输出，不证明大输出
 安全。永久复现入口是各包合同、real 与 examples；本机 target 证据不随 clone 交付。
+
+## 字节码 JSON / CFG / trace 的三条问题链
+
+- [bytes JSON](exercises/bytecode_json/README.md)：一个 encode_bytes TODO；raw JSON 与 lossy 碰撞反例，严格 schema/小写hex 解码回原 bytes；真实 Proto/嵌套/指令字段与工具文档对照。
+- [CFG leaders](exercises/bytecode_cfg/README.md)：一个 leaders TODO；补齐 target 和分支/终止后 pc+1，按半开块及末指令生成 jump/next；保留不可达块，只处理当前 Proto。
+- [执行前 trace](exercises/bytecode_trace/README.md)：一个 dispatch TODO；先复制当前 Value 再执行，比较 after/StackSlot alias 故障；真实 VM 验 before/分支/开关/失败边界及 identity 非深快照/GC root。
+
+工具 binaries 属于 workspace 的不同 package，需先显式构建整个 workspace。示例
+使用同 profile sibling，缺失时给出 build 入口，不嵌套 cargo，不从 PATH 另找工具。
+
+```powershell
+cargo build --manifest-path $toolManifest --workspace --bins
+cargo run --quiet --manifest-path $toolManifest --example bytecode_json_problem_chain
+cargo run --quiet --manifest-path $toolManifest --example bytecode_cfg_problem_chain
+cargo run --quiet --manifest-path $toolManifest --example bytecode_trace_problem_chain
+cargo test --manifest-path $toolManifest --test bytecode_json_reference
+cargo test --manifest-path $toolManifest --test bytecode_cfg_reference
+cargo test --manifest-path $toolManifest --test bytecode_trace_reference
+cargo test --manifest-path $toolManifest --test bytecode_json_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test bytecode_cfg_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test bytecode_trace_exercises -- --ignored
+cargo build --release --manifest-path $toolManifest --workspace --bins
+cargo test --manifest-path $toolManifest --workspace --release
+```
+
+三个新 learner 各初始失败一项；默认参考分别 JSON6、CFG7、trace9，通过参考不等于
+完成 TODO。`examples/bytecode_views.lua` 可直接交给四个 --format：它返回42与含
+NUL/0xff/引号/反斜线/换行的 bytes，不 print，便于独立解析 JSON/trace。
+
+JSON 非有限 number 当前为字符串 NaN/inf/-inf，metadata 另按字节 escape；没有 Proto
+decoder 或跨版本 schema 承诺。CFG 不是可达裁剪，不递归 nested Proto。trace step
+来自 events 枚举，快照只 clone Value；typed identity 既非 Heap 深拷贝也不自动保活。
+CLI trace 运行失败时不打印库中已录的前缀；Lua print 则会在成功 JSON 前混入 stdout。
+模型、public renderer/VM、真实进程和 Python 标准 JSON parser 各自承担明确证据范围。

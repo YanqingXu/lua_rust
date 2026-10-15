@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="740" viewBox="0 0 900 740" role="img" aria-labelledby="title desc">
+  <title id="title">执行前 trace 的寄存器状态与记录生命周期</title>
+  <desc id="desc">手写四指令Proto先加载40、2，再Add到r0，最后Return。before事件寄存器依次为nil nil、40 nil、40 2、42 2，顶层depth为零。先记录Value副本再dispatch，after故障提前显示效果，保存StackSlot别名则历史变末态。默认关闭、enable清旧并开启、take关闭并转移。寄存器快照不是Heap深拷贝或GC root。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="740" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">event 标注当前指令，registers 保存它开始前的 Value</text>
+  <rect x="24" y="62" width="852" height="72" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="44" y="94" class="mono">预算检查 / opcode 解码 → clone 当前 registers → event → dispatch</text><text x="44" y="121" class="small">前置检查失败可无 event；合法指令执行报错时，可保留它的 before event。</text>
+  <path d="M450 134V166" class="flow"/>
+  <rect x="24" y="170" width="852" height="190" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="44" y="201" class="label">手写 4-op Proto；顶层 depth=0；line=10..13</text>
+  <text x="44" y="233" class="mono">pc0 LoadK r0=40     before [nil,nil] → 下一 event [40,nil]</text><text x="44" y="264" class="mono">pc1 LoadK r1=2      before [40,nil]  → 下一 event [40,2]</text><text x="44" y="295" class="mono">pc2 Add r0=r0+r1    before [40,2]    → 下一 event [42,2]</text><text x="44" y="326" class="mono">pc3 Return          before [42,2]    → 最终结果 42</text><text x="44" y="351" class="small">源码 return 40+2 由 compiler 多生成一条 Move，真实 binary 对照是 5 个 events。</text>
+  <rect x="24" y="384" width="852" height="82" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="44" y="416" class="label">错误 A：先执行再记录；错误 B：保存可变 StackSlot 的 Rc 别名</text><text x="44" y="447" class="small">A 把 Add 结果当输入；B 让四份“历史”最后全变 [42,2]。应复制当前 Value 向量。</text>
+  <rect x="24" y="490" width="852" height="72" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="44" y="521" class="mono">默认 off → enable: 清旧 / on → take: 转移 Vec / off</text><text x="44" y="548" class="small">step 由 trace_json 对 events 枚举；pc 是函数内位置；分支没执行的 pc 不出现。</text>
+  <rect x="24" y="586" width="852" height="96" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="44" y="616" class="small">clone Value 不是 Heap 深拷贝；对象仍是 typed identity，events 不自动登记 GC roots。</text><text x="44" y="644" class="small">library 可 take 错误前缀；CLI Err 先返回 code1，不打印 partial trace JSON。</text><text x="44" y="671" class="small">Lua print 会先写 stdout，再跟 JSON array；纯 JSON 验收使用不打印的输入。</text>
+  <text x="24" y="720" class="small">验收当前输入、相邻效果、开关/分支/失败边界；不把 trace 当 undo 或完整可回放状态。</text>
+</svg>

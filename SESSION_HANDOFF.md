@@ -3,6 +3,108 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.18 字节码 JSON、CFG 与执行前 trace
+
+用户要求继续按问题链讲清 bytes 常量编码、基本块 leader 划分、执行前状态记录，
+补齐反例、差异、图与练习，完成验证并更新交接。本次完成该教学包，**没有恢复
+暂停的原审计整改目标**。用户随后明确要求将本批章节、状态图、练习包和交接记录
+一并提交并推送。
+
+- 起点为 `main@af675e074231d9e0a1dd59ceede6521b36f1309e`（上一批 v0.18 CLI/REPL
+  已推送），开始时工作区干净，本地跟踪 origin/main 同 SHA。本批生产 `crates/`、
+  v0.18 `src/`、`crates/`、既有 `tests/` 与旧 support/process/temp helper 均无 diff。
+  Cargo 仅增加六个 test targets，无新依赖。新增三个工具练习/CLI、一个 Lua fixture、
+  一个定位 bytecode binary 的 wrapper；旧 CLI/REPL 包只回归，没有重新修改其实现。
+  提交前 fetch 确认 HEAD 与 origin/main 无分叉。本批提交号以
+  `git log -1 -- book/src/versions/v18-cli-tools.md` 为准，新提交 CI 按其 SHA 查询。
+- [主章](book/src/versions/v18-cli-tools.md) 问题四至六按三条原因/效果链推进：raw
+  JSON 不合法 / lossy 碰撞 → lower hex 保留 bytes；漏 leader 把 jump 藏进块内 /
+  offset 基准错 / 按源码行分块 → entry、target、控制流后继；after trace 时点错 /
+  StackSlot alias 污染历史 → 先 clone 当前 Value 再 dispatch。每问有预测、固定反例、
+  starter/solution include、最小 diff、图与精确验收。全章六包共六个独立 TODO；
+  固定 faults 是人为错误设计，不冒充历史 VM，也不拼成第二套解释器。
+- [JSON 包](book/code/v18-cli-tools/exercises/bytecode_json/README.md)：一个
+  encode_bytes TODO、6项参考。借用 bytes 输出 string/hex schema；合同精确检查
+  字段、小写 hex/偶数长度、解码等于原字节，覆盖空串、NUL、0xff、引号、反斜线、
+  换行/UTF-8与lossy碰撞。真实手造 Proto 整文档核对13个 constants、nested Proto、
+  code所有字段、NaN/inf/-inf字符串、metadata bytes escape；真实 binary stdin/file
+  编译 nested fixture，完整 stdout 与 public renderer 比对，独立 Python strict
+  JSON 再解码 nested bytes=00ff225c2f0a。没有新增 JSON parser 或序列化依赖。
+- [CFG 包](book/code/v18-cli-tools/exercises/bytecode_cfg/README.md)：一个 leaders
+  TODO、7项参考。使用真实 Proto/Instruction，框架固定半开块与末指令 edges；
+  entry0、jump target=pc+1+sBx、jump或无fallthrough后pc+1，经 BTreeSet 排序去重。
+  合同手写 starts/ranges/edges，完整 DOT 对照 public cfg_dot；forward/back、三种
+  conditional、ForPrep/ForLoop、Return/TailCall、empty、invalid opcode、负/越界
+  target均覆盖。固定漏切分/pc+sBx/按line分块可运行；真实compiler if精确6块4边、
+  for精确5块4边，binary完整DOT一致。图中独立7指令示意经算法核对，五块四边；
+  无入边的 B4 仍保留。只分析当前 Proto，不递归 nested，不做可达裁剪或执行保证。
+- [trace 包](book/code/v18-cli-tools/exercises/bytecode_trace/README.md)：一个
+  dispatch TODO、9项参考。极小3-op模型用真实 Instruction/StackSlot，四指令手造
+  Proto 的 before 为 [nil,nil]→[40,nil]→[40,2]→[42,2]、top depth0/lines10..13；
+  after把目的值提前，alias让历史全成[42,2]。真实VM另验手造/分支pc跳号但JSONstep
+  连续、开关计数[0,8,0,4,0]、坏LoadK已录1event、非法opcode无event、预算2只录pc0/1。
+  编译 return40+2 额外生成Move，为5events/3registers，与手造4events范围明确区分。
+  真实CLI纯JSON五项用独立literal核对；runtime Err code1/stdout空而库前缀有7项；
+  print成功则先写Lua输出再JSON。typed identity探针实证较早event不保留对象旧字段，
+  仅由VM内部events持有的transient撤合法roots后GC，重新发布精确拒绝 StaleHandle。
+- 编码/观察边界：bytes hex可逆不等于metadata文本保真；debug name/function按
+  UTF-8 bytes转\u00xx，实际é解析成Ã©，未修renderer。非有限number是字符串
+  NaN/inf/-inf，不保留NaN payload bits；没有Proto decoder/binary chunk或跨版本
+  schema保证。CFG使用静态指令结构，不等于本次经过的路径。VmTraceEvent无step
+  字段，trace_json对传入events枚举；budget/decode检查和快照borrow失败可先于event。
+  enable清旧并开启，take转移Vec并关闭；clone Value不是Heap深拷贝或自动GC root。
+  trace不能当undo/完整回放，CLI也不会在Err分支render partial JSON；纯JSON输入须
+  避免Lua print污染。v0.15/v0.16 GC缺口与REPL续行漏判仍独立归属，未在本轮整改。
+- 新 `examples/bytecode_views.lua` 返回42与bytes 00ff225c0a（NUL/0xff/引号/反斜线/
+  换行），含if分支且无print；四format Debug/Release均实际运行，JSON精确解码，
+  trace纯JSON有Add，DOT按工具发出的语法子集解析、指令pc全覆盖并校验edges存在。
+  三幅新SVG经浏览器核对文字、箭头、半开范围/边标签与页脚，正文六段新hook正确
+  展开、Lua fixture可见、三图加载，无 unresolved include。
+- 复用旧进程runner（并发drain/EOF/五秒deadline/exact child kill-wait）和temp清理，
+  新wrapper仅定位同profile的lua_bytecode。工具属于不同package，先运行
+  `cargo build --manifest-path book/code/v18-cli-tools/Cargo.toml --workspace --bins`，
+  Release同样先构建；不嵌套cargo，不从PATH选择其他工具。集成test从本次lua_app
+  的CARGO_BIN_EXE路径找sibling。fixture有界无后代，旧进程树/大输出边界没有扩张。
+- 本地Windows Rust/cargo **1.96.1**：D/R workspace bins、fmt、workspace all-targets
+  Clippy `-D warnings`通过；两profile各 **171通过、0失败、6ignored**（既有149+
+  新JSON6/CFG7/trace9）。三个新TODO各完成“初始1失败→临时套解1通过→原字节/哈希
+  恢复并刷新mtime→再1失败”；旧三题套解证据仍归上一节，本次只重跑初始失败。
+  六learner各1预期失败，交付保留TODO；默认ignored/固定CLI退出0不代表学习者完成。
+- 六CLI每profile **112条unique关键断言**（旧74+JSON12+CFG10+trace16），D/R共
+  **224条**；trace实际17行含一条重复Return观察，计数按去重marker。主章+六README
+  去重 **26条exact** 各执行1项，20正向通过、6learner按预期失败。独立Python对
+  **20项严格JSON/trace/CFG检查**拒绝重复key/裸非有限值，检查syntax/schema/原bytes/
+  完整before与错误/print输出边界。demo stdout1818、stdlib_diff stdout1550；PATH
+  `D:\lua51\lua.EXE`确认为Lua5.1.5，独立实际执行本版fixture1550，不冒充工具格式
+  与官方Lua输出等价。85个代码输入前后哈希无漂移；20版本教学检查、mdBook构建、
+  38页链接检查通过：**1,311站内链接、0broken**。
+- 证据独立在 `target/teaching-v18-tools-2026-10-15/`：最终集成为
+  `full-validation/20261015T082238632969Z/summary.json`，记录来源、计数、strict
+  artifacts、oracle与hash。首段 `full-validation/20261015T082125709319Z/` 完成的
+  9项build/fmt/clippy/workspace检查保留；脚本把17行trace误当17个unique marker时
+  停止，随后修正target脚本去重计数，核对85源码hash一致后复用已通过检查继续，
+  没有重跑这些检查或修改交付代码。最终summary的continued_from记录该归属。
+  局部/套解为 `bytecode_json/20261015T081605406219Z/summary.json`、
+  `bytecode_cfg/{scoped-verification,starter-round-trip}.json`、
+  `bytecode_trace/20261015T081741036Z/summary.json`；最终范围/hash/站点/视觉见
+  `final-verification.json`。这些为本机ignored产物；clone后永久入口是主章、各包
+  README/contracts/real、examples及wrapper，没有覆盖以前版本证据。
+- 已推送基线 `af675e0` 的 [mdBook 38703020482](https://github.com/YanqingXu/lua_rust/actions/runs/38703020482)
+  成功；本轮末次观察 [Rust CI 38703020508](https://github.com/YanqingXu/lua_rust/actions/runs/38703020508)
+  仍in_progress：三个Miri/ASan job成功，Windows job未终态，其M1 foundation and
+  quality gate步骤已失败，具体原因未核实。明细为本证据目录
+  `baseline-rust.json`/`baseline-rust-final.json`与`baseline-book.json`。这是旧SHA
+  的CI，不是本批改动的远端结果，不套用上一提交的失败原因。提交前查终态：仅
+  Windows Quality Gate 失败，失败步骤为 `M1 foundation and quality gate`，其余
+  三个Miri/ASan job成功。失败日志下载返回HTTP 403 / API rate limit exceeded，
+  具体原因仍未核实；明细与输出分别保存于 `push-baseline-rust.json`、
+  `push-baseline-failed.log`。
+
+本版六组问题链已完成；若继续教学，可从fixture阻塞/超时与证据归档推进进程
+生命周期，或独立修订结构化REPL续行协议。若进入v1.0，按登记差异/能力矩阵与
+oracle证据逐项推进，不以工具能输出JSON替代兼容验收。原审计仍暂停在
+os.date/os.time本地时间、UTC、DST；交接本身不表示恢复，提交推送按当次明确指令。
+
 ## 2026-10-15：v0.18 CLI 错误退出与 REPL 跨输入状态
 
 用户要求继续按问题链补齐 CLI 错误退出、REPL 跨输入状态的反例、差异、状态图和

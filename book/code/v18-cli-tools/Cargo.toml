@@ -47,3 +47,27 @@ path = "exercises/repl_recovery/acceptance.rs"
 [[test]]
 name = "repl_recovery_reference"
 path = "exercises/repl_recovery/reference.rs"
+
+[[test]]
+name = "bytecode_json_exercises"
+path = "exercises/bytecode_json/acceptance.rs"
+
+[[test]]
+name = "bytecode_json_reference"
+path = "exercises/bytecode_json/reference.rs"
+
+[[test]]
+name = "bytecode_cfg_exercises"
+path = "exercises/bytecode_cfg/acceptance.rs"
+
+[[test]]
+name = "bytecode_cfg_reference"
+path = "exercises/bytecode_cfg/reference.rs"
+
+[[test]]
+name = "bytecode_trace_exercises"
+path = "exercises/bytecode_trace/acceptance.rs"
+
+[[test]]
+name = "bytecode_trace_reference"
+path = "exercises/bytecode_trace/reference.rs"

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="812" viewBox="0 0 900 812" role="img" aria-labelledby="title desc">
+  <title id="title">按指令确定 CFG leaders、半开块与边</title>
+  <desc id="desc">七条手造指令示意：条件跳转1到4，普通跳转3到5，Return5之后还有Return6。leaders为0,2,4,5,6，形成五个半开块。B0到B2是jump，到B1是next，B1到B3是jump，B2到B3是next。B4无入边仍保留。跳转目标以pc加一加sBx计算，Return后划块不代表可达。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="812" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">先找入口，再切 [start,end)，最后只看块末指令发边</text>
+  <rect x="24" y="62" width="852" height="76" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="44" y="94" class="mono">leader = entry 0 + jump target (pc + 1 + sBx) + 分支/终止后的 pc+1</text><text x="44" y="123" class="small">校验 opcode 和 target 范围；BTreeSet 排序去重。后继 pc 只在 code 范围内插入。</text>
+  <rect x="24" y="162" width="420" height="218" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="44" y="194" class="label">独立手造示意，只分析 CFG</text>
+  <text x="44" y="224" class="mono">0 LoadK</text><text x="44" y="249" class="mono">1 JumpIfFalse +2 → 4</text><text x="44" y="274" class="mono">2 LoadK</text><text x="44" y="299" class="mono">3 Jump +1 → 5</text><text x="44" y="324" class="mono">4 LoadK</text><text x="44" y="349" class="mono">5 Return；6 Return</text>
+  <rect x="468" y="162" width="408" height="218" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="488" y="194" class="mono">starts = [0,2,4,5,6]</text><text x="488" y="228" class="mono">B0 [0,2)   B1 [2,4)</text><text x="488" y="262" class="mono">B2 [4,5)   B3 [5,6)</text><text x="488" y="296" class="mono">B4 [6,7)</text><text x="488" y="332" class="small">只插 target 会漏掉 2；只按源码行号</text><text x="488" y="357" class="small">会忽略同一行中的多条控制流指令。</text>
+  <rect x="344" y="406" width="212" height="62" rx="10" fill="#edf6ed" stroke="#286047"/><text x="365" y="432" class="label">B0 [0,2)</text><text x="365" y="455" class="small">末指令：条件跳转</text>
+  <rect x="110" y="514" width="212" height="62" rx="10" fill="#edf6ed" stroke="#286047"/><text x="130" y="540" class="label">B1 [2,4)</text><text x="130" y="563" class="small">末指令：Jump</text>
+  <rect x="578" y="514" width="212" height="62" rx="10" fill="#edf6ed" stroke="#286047"/><text x="598" y="540" class="label">B2 [4,5)</text><text x="598" y="563" class="small">末指令：LoadK</text>
+  <rect x="344" y="622" width="212" height="62" rx="10" fill="#edf6ed" stroke="#286047"/><text x="365" y="648" class="label">B3 [5,6)</text><text x="365" y="671" class="small">Return：无出边</text>
+  <rect x="642" y="622" width="212" height="62" rx="10" fill="#fff1ee" stroke="#b55b48"/><text x="662" y="648" class="label">B4 [6,7)</text><text x="662" y="671" class="small">无入边，仍然保留</text>
+  <path d="M394 468L260 510" class="flow"/><text x="268" y="488" class="small">next</text>
+  <path d="M506 468L640 510" class="flow"/><text x="600" y="488" class="small">jump</text>
+  <path d="M260 576L394 618" class="flow"/><text x="268" y="610" class="small">jump</text>
+  <path d="M640 576L506 618" class="flow"/><text x="600" y="610" class="small">next</text>
+  <rect x="24" y="710" width="852" height="64" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="44" y="737" class="small">Jump / ForPrep 只有 jump；条件跳转 / ForLoop 有 jump 和 next；Return / TailCall 无出边。</text><text x="44" y="762" class="small">next 需存在后继。这里只画当前 Proto，不递归 nested function，也不做可达性裁剪。</text>
+  <text x="24" y="798" class="small">验收 starts、半开 ranges 和精确 edges；再与真实 compiler / cfg_dot / binary 整图核对。</text>
+</svg>

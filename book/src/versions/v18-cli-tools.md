@@ -1,6 +1,6 @@
 # v0.18 · CLI、REPL 与字节码工具
 
-<div class="lesson-meta"><span>错误退出 → Session owner → 输入 buffer 与恢复</span><span>6-crate workspace</span><span>checkpoint v0.18</span></div>
+<div class="lesson-meta"><span>CLI/REPL 状态 → bytes JSON → CFG leader → 执行前 trace</span><span>6-crate workspace</span><span>checkpoint v0.18</span></div>
 
 <a id="learning-task-card"></a>
 ## 学习任务卡
@@ -10,8 +10,9 @@
   <p>前置：v0.17 的 VM owner、loader 与宿主 I/O。依次解决：打印错误为什么仍是退出
   0；每行重新 execute 为什么丢失 global；报错后该清源码还是重建 VM。新增 Rust 概念
   是 ExitCode/Result 的边界、Session 的长期可变 owner、短命 source buffer 与子进程
-  stdio 协议。产出为三个独立 TODO、固定反例、前后差异、状态图和真实进程验收。
-  bytecode 工具保留本 checkpoint 的阅读入口，本轮不扩展其 JSON/CFG/trace 协议。</p>
+  stdio 协议。再解决 bytes 转文本丢信息、基本块切错、trace 时点错位三个观察问题。
+  全章产出为六个独立 TODO、固定反例、前后差异、状态图和真实进程验收；不把观察
+  工具的输出当作 binary chunk 序列化、可达性裁剪或可重放的完整 Heap 快照。</p>
 </div>
 
 到 v0.17 为止，binary 只执行单份文件/stdin 源码并总是打印 Rust 风格的最终 Value。本版增加一个核心能力：**把脚本、交互和诊断都变成有明确 stdout/stderr/exit-code 合同的工具，并用真实子进程测试守住它们**。
@@ -52,6 +53,12 @@ cargo run --quiet --manifest-path $toolManifest --example repl_recovery_problem_
 4. [恢复实验](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/repl_recovery/README.md)：`repl → source → execute_multi → is_incomplete`，区别 Session 与 buffer 生命周期；
 5. 共享进程探针：spawn、写完关闭 stdin、并行 drain 两个输出、deadline、kill/wait exact child；
 6. bytecode JSON/CFG/trace：保留 bytes、控制流与 instruction-before 观察协议。
+
+工具部分按 [bytes JSON](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/bytecode_json/README.md)
+→ [CFG leaders](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/bytecode_cfg/README.md)
+→ [执行前 trace](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/exercises/bytecode_trace/README.md)
+阅读；分别回到 `value_json`、`basic_blocks/cfg_dot`、`run_frame_state/trace_json`，不要
+一次把整个工具文件读完才寻找规则。
 
 一次进程执行也是资源协议：stdin 必须及时关闭，stdout/stderr 必须都被 drain，
 timeout 后必须 kill 并 wait。本轮三个局部模型各隔离一个决策，再由真实 Session 或
@@ -296,46 +303,230 @@ script、没有 actions 且未指定 `-i` 时，非终端 stdin 才默认一次 
 cargo test --manifest-path $toolManifest --test repl_recovery_reference source_lifecycle_recovers_after_errors -- --exact
 ```
 
-## `lua_bytecode` crate
+## `lua_bytecode` 的四种观察入口
 
-v0.18 新增第六个 crate。它不修改 Proto，只提供四种观察视图：
+text 复用 core disassembler；JSON/CFG 只读取 Proto。trace 另外真实执行 Proto，
+因此可能产生 Lua 副作用和运行错误。先从仓库根目录构建两种 binaries，随后三组
+问题链用同 profile 的真实工具对照；只 build 根 package 的 --bins 不会构建依赖
+crate 的 binary，所以这里要显式加 --workspace：
+
+```powershell
+cargo build --manifest-path $toolManifest --workspace --bins
+cargo run --quiet --manifest-path $toolManifest --example bytecode_json_problem_chain
+cargo run --quiet --manifest-path $toolManifest --example bytecode_cfg_problem_chain
+cargo run --quiet --manifest-path $toolManifest --example bytecode_trace_problem_chain
+```
+
+以下是直接观察同一输入的四条入口。先预测：payload 编码成什么？if 的两个分支
+都会出现在 CFG 吗？同次 trace 会执行两边吗？Add 的 event 中目的寄存器已经是
+42 了吗？
+
+```lua
+{{#include ../../code/v18-cli-tools/examples/bytecode_views.lua}}
+```
 
 ```powershell
 cargo run --manifest-path book/code/v18-cli-tools/crates/lua_bytecode/Cargo.toml -- `
-  --format text script.lua
+  --format text book/code/v18-cli-tools/examples/bytecode_views.lua
 cargo run --manifest-path book/code/v18-cli-tools/crates/lua_bytecode/Cargo.toml -- `
-  --format json script.lua
+  --format json book/code/v18-cli-tools/examples/bytecode_views.lua
 cargo run --manifest-path book/code/v18-cli-tools/crates/lua_bytecode/Cargo.toml -- `
-  --format cfg script.lua
+  --format cfg book/code/v18-cli-tools/examples/bytecode_views.lua
 cargo run --manifest-path book/code/v18-cli-tools/crates/lua_bytecode/Cargo.toml -- `
-  --format trace script.lua
+  --format trace book/code/v18-cli-tools/examples/bytecode_views.lua
 ```
 
-### Text 与稳定 JSON
+此输入不 print，JSON/trace 才能独立解析；原 demo 会 print，trace stdout 会混入
+Lua 输出。固定 CLI 对照不读取 starter，不代表学习者已完成。
 
-text 复用 core disassembler。JSON 递归输出 Proto name、stack/params/vararg、constants、每条指令的 raw/pc/line/op/a/b/c/bx/sbx 和 nested protos。
+## 问题四：JSON 能显示这段字符串，为什么仍然丢了原来的 bytes？
+
+### JSON 字符串承载 Unicode 文本，Lua string 承载任意字节
+
+先预测 `00 ff 22 5c 0a` 的两个错误编码：直接拼到 JSON 引号里，会带入 NUL、
+无效 UTF-8、未转义引号/反斜线/换行；先 `from_utf8_lossy` 再 escape 虽可能生成
+合法 JSON，却已经把不同的无效字节替换成同一个字符，不能恢复原数据。合法语法
+与信息保真是两个验收条件。
+
+```powershell
+cargo run --quiet --manifest-path $toolManifest --example bytecode_json_problem_chain
+```
 
 ```rust
-{{#include ../../code/v18-cli-tools/crates/lua_bytecode/src/lib.rs:bytecode_json}}
+{{#include ../../code/v18-cli-tools/exercises/bytecode_json/starter.rs:bytecode_json_starter}}
 ```
 
-Lua string constant 可能包含 NUL 或无效 UTF-8，所以 JSON 不把它伪装成 Unicode text，而是输出 `{"type":"string","hex":"..."}`。NaN/Infinity 也编码为 string，避免生成非法 JSON number。
+实现题只补 bytes 常量对象的编码。输入借用 `&[u8]`，不修改源数据；输出拥有一段
+ASCII JSON。把每个 byte 变成两个小写 hex 字符，JSON 层就不用猜原始编码：
 
-### CFG
+```diff
+- {"type":"string","value":"<raw 或 lossy text>"}
++ {"type":"string","hex":"00ff225c0a"}
+```
 
-CFG builder 先找 basic-block leaders：入口、jump target、jump/return 后的下一条指令；再为每个 block 输出 DOT node 和 jump/next edge。
+```rust
+{{#include ../../code/v18-cli-tools/exercises/bytecode_json/solution.rs:bytecode_json_solution}}
+```
 
-CFG 构建分两遍：第一遍收集入口、jump target、终止指令后继作为 leaders；第二遍切分 block
-并按 opcode 添加 jump/fallthrough edge。
-[查看完整 CFG builder](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v18-cli-tools/crates/lua_bytecode/src/lib.rs)
+![raw/lossy 的失败与 hex schema 的编码、解码合同。](../images/v18-bytecode-json.svg)
 
-Jump target 必须落在 code 范围并恰好对应 leader，否则返回 bytecode error。ForPrep/ForLoop 和条件跳转分别建模，不根据源码缩进猜控制流。
+合同精确核对对象字段、偶数长度、小写 hex，再解码回原始 bytes；空串也必须有
+`hex:""`。不是只查输出中含有 ff。固定 lossy 对照使不同输入产生相同文本，明确
+解释为什么转义不能补救在转码时丢掉的信息。
 
-### Trace
+### bytes 常量正确，不等于整个 Proto 可以反序列化恢复
 
-VM 默认不记录 trace。调用 `enable_trace` 后，dispatch 在每条指令执行前保存：step 顺序、Lua call depth、Proto name、pc、line、opcode 和 register snapshot；`take_trace` 关闭记录并转移 events。
+真实 `proto_json` 递归输出 name、stack/params/vararg、constants、每条指令的
+raw/pc/line/op/a/b/c/bx/sbx 与 nested protos。real 对照用真实 ByteString/Proto，
+逐项核对整份文档与 binary 输出，再用 Python 标准 JSON parser 独立检查语法与
+bytes 还原；不会让局部 encode hook 冒充完整 renderer。
 
-trace tool 先编译并执行 Proto，runtime error 仍以 exit 1 报告；成功时输出 JSON array。这样可以区分“字节码是什么”和“这次输入实际走了哪些状态”，为 v1.0 的 oracle VM trace gate 准备稳定数据形状。
+有限 number 保留 JSON number；NaN、正负 infinity 当前编码为字符串 `"NaN"`、
+`"inf"`、`"-inf"`，避免非 JSON 的裸 token。它不保留所有 NaN payload bit。metadata
+的 name/function 走另一条 escape 路径：按 UTF-8 bytes 输出非 ASCII 的 `\u00xx`，
+不能从 bytes 常量的可逆性推断所有元数据都做了 Unicode 保真。本版也没有 Proto
+decoder、binary chunk 或跨版本 schema 保证。
+
+**完成条件：** raw 无法满足 JSON/UTF-8 合同，lossy 确实碰撞；参考的每个 bytes
+输入都能从严格 schema 解码回原值。真实工具同时覆盖 nested protos、指令字段和
+非有限数的实际表示。精确 learner/reference 命令见 JSON 包 README。
+
+```powershell
+cargo test --manifest-path $toolManifest --test bytecode_json_reference bytes_constants_preserve_exact_bytes_as_lower_hex -- --exact
+```
+
+## 问题五：跳转目标在一段指令中间，为什么原来的块边界不够？
+
+### 一个基本块内不能藏着另一个入口或提前结束的控制流
+
+把所有指令当一块，就无法从块末发出中间 Jump 的边；只把 target 设为 leader，
+又会把跳转后或 Return 后的指令混入前块，导致用错块末指令。按源码 line 分块
+同样不成立：一行 Lua 可编译出多条跳转，debug line 只是来源信息。
+
+```powershell
+cargo run --quiet --manifest-path $toolManifest --example bytecode_cfg_problem_chain
+```
+
+实现题只补有序 leader 集合。输入借用真实 Proto/Instruction，框架已经提供半开
+切片和 edge 生成，TODO 只负责 leader 发现：
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/bytecode_cfg/starter.rs:cfg_leaders_starter}}
+```
+
+```diff
+  leaders.insert(0);
+- target = pc + sBx;
++ target = pc + 1 + sBx; // VM 的基准是当前指令的下一条
+  leaders.insert(target);
++ jump 或没有 fallthrough 的指令后，若还有指令，插入 pc + 1；
++ 校验 opcode/target，再按 BTreeSet 排序、去重；
+```
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/bytecode_cfg/solution.rs:cfg_leaders_solution}}
+```
+
+![从真实指令找到 leader，切半开基本块，再由块末生成边。](../images/v18-bytecode-cfg.svg)
+
+入口是 0；所有跳转目标必须满足 `0 <= target < code.len()`。使用带符号计算后再
+检查范围，避免负 offset 被提前转 usize。升序 starts 的相邻值形成 `[start,end)`，
+最后一个 end 是 code.len；空 code 得到空块列表。之后只看块末指令生成边：
+
+| 块末 opcode | jump 边 | next 边（存在后继块时） |
+| --- | --- | --- |
+| Jump / ForPrep | 有 | 无 |
+| JumpIfFalse / JumpIfTrue / JumpIfNil / ForLoop | 有 | 有 |
+| Return / TailCall | 无 | 无 |
+| 其他有效指令 | 无 | 有 |
+
+### 后面不可达，为什么仍然划一个块？
+
+leader 划分不是可达性分析。Jump/Return 后即使暂时没有入边，仍要保留独立 block，
+这样不会把它们的指令错误地当成前块末尾。本版也只给**当前 Proto** 输出 CFG，
+不自动递归生成 nested function 的图。JSON 会递归 Proto，不能据此推断 CFG 也会。
+
+固定错误分别漏掉 `pc+1`、把 offset 基准写成当前 pc、按 line 切块；合同手写
+expected starts、半开 ranges 和带 jump/next 标签的 edges，再与 public `cfg_dot`
+完整 DOT 比对。forward/back、三种条件跳转、ForPrep/ForLoop、Return/TailCall、
+空 code、invalid opcode、负/越界 target 都有独立观察。真实 compiler 的 if/for
+再走同一规则，binary 输出也与当前 Proto 的精确图对照。
+
+**完成条件：** 能从指令手推 starts → blocks → edges，解释为什么 conditional 有
+两条边而 Jump 没有 next；不能只看到 DOT 里存在 jump/next 两个单词就算完成。
+
+```powershell
+cargo test --manifest-path $toolManifest --test bytecode_cfg_reference leaders_split_control_flow_and_validate_instruction_targets -- --exact
+```
+
+## 问题六：Add 的 trace 里已经是 42，还能看出它读取了什么吗？
+
+### 先拍当前状态，再执行当前 opcode
+
+最小输入把 r0 设成 40、r1 设成 2，再 `Add r0,r0,r1`。如果在 match dispatch 后
+才记录，名为 Add 的 event 里 r0 已是 42；再把它当作 Add 的输入，就会把执行效果
+提前一拍。另一个错误保存可变 StackSlot 的 Rc 别名，所有历史行最后都会显示末态。
+
+```powershell
+cargo run --quiet --manifest-path $toolManifest --example bytecode_trace_problem_chain
+```
+
+局部模型只支持 LoadK/Add/Return，使用真实 Instruction/StackSlot；唯一 TODO 调整
+dispatch 的记录时点。完整 VM 的控制流、错误与开关由真实对照负责：
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/bytecode_trace/starter.rs:bytecode_trace_starter}}
+```
+
+```diff
+- execute(instruction)?;
+- record(instruction)?;
++ record(instruction)?; // 复制当前寄存器 Value
++ execute(instruction)?;
+```
+
+```rust
+{{#include ../../code/v18-cli-tools/exercises/bytecode_trace/solution.rs:bytecode_trace_solution}}
+```
+
+![LoadK/Add/Return 的执行前寄存器、相邻 event 与记录开关生命周期。](../images/v18-bytecode-trace.svg)
+
+同一输入应产生以下当前指令的 before 值；不是给每个 opcode 画一张 after 表：
+
+| pc / 当前指令 | r0 | r1 | 效果在哪观察 |
+| --- | --- | --- | --- |
+| 0 LoadK r0=40 | nil | nil | 下一 event 的 r0=40 |
+| 1 LoadK r1=2 | 40 | nil | 下一 event 的 r1=2 |
+| 2 Add r0=r0+r1 | 40 | 2 | 下一 Return event 的 r0=42 |
+| 3 Return | 42 | 2 | 最终返回值 42 |
+
+这张表使用练习手写的四指令 Proto；真实编译 `return 40+2` 还生成一条 Move，
+binary 对照因此是五个 events。不能把手写寄存器窗口当作 compiler 的固定输出。
+
+真实 VM 的顺序是检查预算、递减、解码 opcode → clone 当前寄存器 Value 向量 →
+保存 event → dispatch；所以执行时出错的合法指令也可有 before event，但预算
+耗尽、非法 opcode 或记录时借用失败可能发生在 event 之前。分支没有执行的 pc
+不会凭空出现。trace_json 的 step 是对传入 events 的枚举索引，VmTraceEvent 本身
+没有全局 step 字段；pc 是函数内部位置，line 可重复，depth 是实际调用栈长度。
+
+### 拿走历史不等于持续录制，复制 Value 不等于深拷贝 Heap
+
+默认关闭；enable_trace 清旧 events 再开启；take_trace 关闭并转移 Vec。要再次录制，
+必须重新 enable。保存当前 Value 防止后续 slot 写入改掉历史数值；table/function/
+userdata 仍只是 typed identity，不包含当时的完整对象内容，trace events 也没有
+自动加入 gc_roots。不能把这个快照当作 Heap 保活保证、可回放状态或 undo 日志。
+
+真实 library 可在 execute Err 后 take 已记录的前缀；CLI 则先用 `?` 传播错误，
+runtime error 时 code=1、stderr 有诊断，不会打印这个 partial JSON。成功路径若
+Lua 自己 print，会先污染 stdout，再写 JSON array；纯 JSON 验收使用不打印的输入。
+这是工具当前输出边界，没有偷偷把 Lua 输出重定向到 stderr。
+
+**完成条件：** 模型 before/after/alias 对照清晰；真实 VM 核对寄存器、PC/line/depth、
+开关、分支与失败边界；binary 对照纯输出、错误前缀不导出及 print 混合输出。
+
+```powershell
+cargo test --manifest-path $toolManifest --test bytecode_trace_reference records_current_registers_before_dispatch -- --exact
+```
 
 ## Fixture manifest 与超时 runner
 
@@ -388,10 +579,13 @@ cargo run --manifest-path book/code/v18-cli-tools/Cargo.toml -- `
 cargo test --manifest-path $toolManifest --test cli_exit_reference
 cargo test --manifest-path $toolManifest --test repl_owner_reference
 cargo test --manifest-path $toolManifest --test repl_recovery_reference
+cargo test --manifest-path $toolManifest --test bytecode_json_reference
+cargo test --manifest-path $toolManifest --test bytecode_cfg_reference
+cargo test --manifest-path $toolManifest --test bytecode_trace_reference
 cargo fmt --manifest-path $toolManifest --all -- --check
 cargo clippy --manifest-path $toolManifest --workspace --all-targets -- -D warnings
 cargo test --manifest-path $toolManifest --workspace
-cargo build --release --manifest-path $toolManifest --bins
+cargo build --release --manifest-path $toolManifest --workspace --bins
 cargo test --manifest-path $toolManifest --workspace --release
 ```
 
@@ -402,20 +596,24 @@ cargo test --manifest-path $toolManifest --workspace --release
 ```
 
 本快照原有 129 个测试：119 个原语义测试、5 个 CLI/REPL process tests、3 个 bytecode
-library tests 和 2 个 bytecode binary process tests。本轮增加 20 项参考（退出 8、
-owner 5、恢复 7），合计 **149 通过、3 个 learner ignored**。v0.17 教学练习的计数
+library tests 和 2 个 bytecode binary process tests。CLI/REPL 包增加 20 项参考
+（退出8、owner5、恢复7）；工具包再增加22项（JSON6、CFG7、trace9），合计
+**171 通过、6 个 learner ignored**。v0.17 教学练习的计数
 仍归各自版本，不把它们重复算进这个独立快照。
 
 ```powershell
 cargo test --manifest-path $toolManifest --test cli_exit_exercises -- --ignored
 cargo test --manifest-path $toolManifest --test repl_owner_exercises -- --ignored
 cargo test --manifest-path $toolManifest --test repl_recovery_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test bytecode_json_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test bytecode_cfg_exercises -- --ignored
+cargo test --manifest-path $toolManifest --test bytecode_trace_exercises -- --ignored
 ```
 
 初始每组恰好一项失败。只修改各包 starter 的指定 hook，显式 learner 全通过才完成；
 默认参考、ignored 和固定 CLI 退出 0 不能代替这一验收。维护者须验证失败→临时套解
 通过→原字节恢复并刷新 mtime 后再失败，防止缓存或已填答案造成假绿。精确命令、
-观察值与修改范围见三个 README。
+观察值与修改范围见六个 README。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/check_book_teaching.ps1
@@ -445,8 +643,9 @@ node tools/check_book_links.mjs target/mdbook .
 </div>
 
 <div class="exercise implementation">
-  <strong>实现题：完成三个独立 hook</strong>
-  <p>只改 cli_exit::finish、repl_owner::submit、repl_recovery::submit。运行上面三个
+  <strong>实现题：完成六个独立 hook</strong>
+  <p>只改 cli_exit::finish、repl_owner::submit、repl_recovery::submit，再补 JSON encode_bytes、
+  CFG leaders、trace dispatch 的记录时点。运行上面六个
   --ignored 命令，每组恰好一项通过才完成。不修改 faults、合同、真实 src/crates 或
   ignored 标记；共享 helper 与真实 binary 对照不是 TODO。</p>
 </div>
@@ -458,6 +657,21 @@ node tools/check_book_links.mjs target/mdbook .
   复现当前漏判、区分分行编译与整段编译，并指出未来结构化续行协议要改变哪一层。</p>
 </div>
 
+<div class="exercise understanding">
+  <strong>理解题：一份输入，三种输出各保留什么？</strong>
+  <p>运行 bytecode_views.lua 的 JSON/CFG/trace，分别还原 payload bytes、手推跳转
+  target 与块边、找 Add 前后相邻 event。成功条件是能解释 nested JSON 与当前 Proto
+  CFG 的范围差异、不可达 block 与未执行 pc 的区别，以及 register identity 为什么
+  不是对象内容的深快照。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题：能解析、有 jump、看见42，为什么仍可能是错的？</strong>
+  <p>运行三个工具 CLI，检查 lossy 碰撞、漏 pc+1 使 jump 藏进块内、after/alias 历史
+  错位。成功条件是从完整 bytes/schema、精确 blocks/edges、当前指令 before 值
+  各指出一条失败证据；不能只用 JSON 可解析、DOT 含 jump 或 trace 含42验收。</p>
+</div>
+
 <a id="learning-checkpoint"></a>
 ## 完成检查点
 
@@ -466,8 +680,10 @@ node tools/check_book_links.mjs target/mdbook .
 - 能用完整 stdout/stderr 与真实 exit code 验证错误前的输出和后续 actions 中止；
 - 能用 GC 后字段读取说明 Session owner 的保留边，区分 chunk local 与 captured local；
 - 能手推 success/incomplete/普通错误的 buffer 变化，并说明 runtime 副作用不回滚；
-- 三个 TODO 显式通过，能说明模型、真实 Session、真实进程和启发式的验证边界；
-- 能解释 JSON、CFG 与 trace 各自回答的问题；
+- 六个 TODO 显式通过，能说明模型、真实 Session/Proto/VM、进程和启发式的验证边界；
+- 能按严格 schema 解码 bytes、校验非有限数与 nested Proto，不把 metadata 视为同一编码；
+- 能从 pc+1+sBx 推导 leaders/半开 blocks/末指令 edges，区分结构划分与可达分析；
+- 能用 Add 输入和下一 event 解释 before 时点、开关与失败前缀，不外推 Heap 深快照；
 - 能列出可靠子进程 runner 的完整生命周期。
 
 ## 与成熟实现和专题章节的对应
@@ -476,5 +692,5 @@ node tools/check_book_links.mjs target/mdbook .
 - [Bytecode](../ch03-compiler/bytecode.md) 可对照 raw instruction fields 与 JSON；
 - [寄存器虚拟机](../ch04-vm/register-vm.md) 可解释 trace snapshot 中 base/top/register window；
 - [用测试守住兼容性](../ch05-engineering/testing.md) 可对照进程级合同为何不能只用函数单测替代；
-- 若继续本版教学，可按“字节串为何不能直接做 JSON 文本 → CFG 为何要按指令找 leader → trace 为何记录执行前状态”推进观察工具问题链；本轮只保留这些工具的入口与既有验收；
+- 本版六组问题链已覆盖 CLI/REPL 与观察工具；若继续工具教学，可从 fixture 的阻塞/超时与证据归档推进进程生命周期，或单独完善结构化 REPL 续行协议；
 - 下一 checkpoint 是 v1.0：补齐登记差异，冻结能力矩阵，并以官方 Lua 5.1.5 与固定 C++ oracle 双差分收口。

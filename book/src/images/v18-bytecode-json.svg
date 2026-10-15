@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="700" viewBox="0 0 900 700" role="img" aria-labelledby="title desc">
+  <title id="title">bytes 常量的 JSON 编码与精确还原</title>
+  <desc id="desc">原始字节00 ff 22 5c 0a不能直接塞进JSON文本。raw注入破坏UTF8或转义，lossy转换可让不同字节碰撞。正确字符串常量使用type string和lower hex字段，标准JSON解析后把hex解码回完全相同的bytes。number与metadata另有规则，不等于完整Proto序列化。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="700" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">合法 JSON 与原始 bytes 不丢失，必须分别验收</text>
+  <rect x="24" y="62" width="852" height="72" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="44" y="93" class="mono">Lua ByteString: 00 ff 22 5c 0a</text><text x="44" y="120" class="small">NUL / 无效 UTF-8 / 引号 / 反斜线 / 换行，都属于字符串值本身。</text>
+  <path d="M220 134V166" class="flow"/><path d="M670 134V166" class="flow"/>
+  <rect x="24" y="170" width="408" height="98" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="44" y="203" class="label">错误 A：raw 拼进 JSON 引号</text><text x="44" y="236" class="small">UTF-8 或 JSON 转义不合法。</text><text x="44" y="258" class="small">“看起来有字符串”不能代替语法检查。</text>
+  <rect x="456" y="170" width="420" height="98" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="476" y="203" class="label">错误 B：先 lossy，再 escape</text><text x="476" y="236" class="small">不同无效字节可变成相同替换字符。</text><text x="476" y="258" class="small">JSON 即使合法，也已丢掉原数据。</text>
+  <rect x="24" y="294" width="852" height="100" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="44" y="327" class="label">参考：每 byte → 两个小写 hex 字符；输出拥有 ASCII JSON</text><text x="44" y="362" class="mono">{"type":"string","hex":"00ff225c0a"}</text><text x="44" y="385" class="small">空串的 hex 是 ""；借用输入 bytes，不修改原值。</text>
+  <path d="M450 394V426" class="flow"/>
+  <rect x="24" y="430" width="852" height="94" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="44" y="462" class="label">验收两步：标准 JSON parser → 严格 schema → hex decode</text><text x="44" y="496" class="mono">decoded bytes == 00 ff 22 5c 0a</text><text x="44" y="517" class="small">检查字段、大小写、偶数长度和完整还原；不只找输出里有没有 ff。</text>
+  <rect x="24" y="550" width="852" height="98" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="44" y="582" class="small">真实 Proto：nested protos + 全部指令字段，与真实 binary 整文档对照。</text><text x="44" y="610" class="small">非有限 number 使用 "NaN" / "inf" / "-inf" 字符串；不是 NaN payload bit 编码。</text><text x="44" y="637" class="small">metadata 按 bytes escape 是另一条路径；本版没有 Proto decoder 或 binary chunk。</text>
+  <text x="24" y="682" class="small">模型只完成 bytes 常量对象；真实 renderer、进程和 Python JSON 解析另作独立证据。</text>
+</svg>
