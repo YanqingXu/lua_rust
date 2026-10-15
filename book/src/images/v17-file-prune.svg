@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="732" viewBox="0 0 900 732" role="img" aria-labelledby="title desc">
+  <title id="title">完成 GC 周期后的宿主文件四格清理</title>
+  <desc id="desc">Heap step 之后先处理 finalizer，再于 completed 周期后按 is_live 保留文件 map。Heap live 且 Some 或 None 都保留，stale 且 Some 则删除并释放 File，stale 且 None 则删除 tombstone。map key 不作 root，Some 不是可达性判断。未完成步骤不提交清理，is_live 检查对象记录，finalizer 和 resurrection 可能令对象继续 live。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="732" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">Heap 回收 userdata 后，还要对齐另一个容器中的 File owner</text>
+  <rect x="24" y="62" width="852" height="100" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="44" y="95" class="label">Heap::step → 保活并调用 finalizer events → 检查 completed</text>
+  <text x="44" y="128" class="mono">completed.is_some() → files.retain(is_live == Ok(true))</text>
+  <text x="44" y="151" class="small">之后释放临时 roots，再返回首个 callback 错误。budget 用尽不等于整个周期完成。</text>
+  <path d="M450 162V196" class="flow"/>
+  <text x="134" y="224" class="label">完成周期后的 Heap 状态</text>
+  <text x="428" y="224" class="mono">Some(File)</text><text x="678" y="224" class="mono">None</text>
+  <rect x="24" y="244" width="852" height="106" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="44" y="285" class="label">live：对象记录仍存在</text>
+  <text x="44" y="320" class="small">普通 reachable / finalizable 等</text>
+  <text x="390" y="285" class="label">保留 File owner</text><text x="390" y="320" class="small">仍可 read / write</text>
+  <text x="654" y="285" class="label">保留 tombstone</text><text x="654" y="320" class="small">仍是 closed file</text>
+  <path d="M362 244V350M626 244V350" stroke="#a8c4ad"/>
+  <rect x="24" y="368" width="852" height="106" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="44" y="409" class="label">stale：对象记录已删除</text>
+  <text x="44" y="444" class="small">宿主 map 仍可能保留旧 key</text>
+  <text x="390" y="409" class="label">删 entry，drop File</text><text x="390" y="444" class="small">结束残留宿主所有权</text>
+  <text x="654" y="409" class="label">删 tombstone</text><text x="654" y="444" class="small">不产生额外关闭</text>
+  <path d="M362 368V474M626 368V474" stroke="#baa6ce"/>
+  <rect x="24" y="498" width="852" height="94" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="44" y="531" class="label">错误判据：所有 key 加 roots / 只保留 Some</text>
+  <text x="44" y="565" class="small">前者让 map 自己保活对象；后者删掉 live None，却继续持有 stale Some。</text>
+  <rect x="24" y="616" width="852" height="72" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="44" y="647" class="small">is_live 表示记录存在，不是瞬时可达性判定；白对象在 Sweep 前仍可能为 true。</text>
+  <text x="44" y="674" class="small">离开作用域 ≠ 已回收。finalizer / resurrection 可能使 userdata 继续 live，不能强删。</text>
+  <text x="24" y="716" class="small">验收：四格 + incomplete 边界 + 真实多 execute 后弱槽 nil；Windows 再独占重开。</text>
+</svg>

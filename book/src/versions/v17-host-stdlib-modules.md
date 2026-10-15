@@ -1,21 +1,22 @@
 # v0.17 · 宿主标准库与 Lua 模块
 
-<div class="lesson-meta"><span>重复执行 → 真值缓存 → 循环可见性 → 失败重试</span><span>5-crate workspace</span><span>checkpoint v0.17</span></div>
+<div class="lesson-meta"><span>缓存与重试 → 文件 owner → close → GC prune → Drop drain</span><span>5-crate workspace</span><span>checkpoint v0.17</span></div>
 
 <a id="learning-task-card"></a>
 ## 学习任务卡
 
 <div class="task-card">
-  <strong>让 require 的副作用、缓存和失败状态都有可观察的边界</strong>
+  <strong>让 require 的加载状态与文件的宿主所有权都有可观察的边界</strong>
   <p>前置：v0.16 的 callback Result/禁止 yield、v0.13 的 Heap owner。依次解决：
   重复 require 为什么又执行；缓存为什么要看真值；A→B→A 怎样停下；首次报错为何
-  让修复后的重试假成功。产出是四个独立 TODO、固定反例、状态图和真实 VM/文件对照。
-  文件、os、debug 仍属于本 checkpoint 的背景能力，本轮不扩展这些宿主 API。</p>
+  让修复后的重试假成功；再区分文件已关闭、userdata 已回收、VM 已退出三个时点。
+  产出是七个独立 TODO、固定反例、状态图和真实 VM/文件对照。文件部分只补所有权协议，
+  os/debug API 与原有 IO 支持范围保持本 checkpoint 的边界。</p>
 </div>
 
 v0.16 的 math/string/table 函数主要处理内存中的 `Value`。文件、环境、时钟和模块加载不同：它们会接触平台状态，可能部分成功，且离开 Lua 作用域后仍需要关闭资源。本版增加一个核心能力：**让 Runtime 对宿主资源、加载缓存和调试视图拥有明确的生命周期与失败协议**。
 
-本轮把 require 拆成缓存、循环、重试三个局部实验。`faults.rs` 是人为写坏的设计，
+本章把 require 拆成缓存、循环、重试，把文件拆成 close、prune、drain 六个局部实验。`faults.rs` 是人为写坏的设计，
 不是历史中间 VM；CLI 固定并列错误版与参考，不读取学习者 `starter.rs`。每包另用
 真实 v0.17 验证对应行为。练习模型互相独立，不拼接成另一个完整解释器。
 
@@ -43,6 +44,23 @@ Lua 探针应返回 `type=boolean value=true`：lesson 只执行一次；循环�
 retry 两次实际执行，effects 最终也是 2。CLI 退出 0 只说明固定对照重放完成，不能
 代替显式 `--ignored` 的 learner 验收。接着再预测：loader 返回 false 是否只加载一次？
 
+文件部分先预测：两个 Lua 变量指向同一个文件，关闭一个后另一个的 `type`、`io.type`
+和 `read` 分别怎样变化？把两者都设为 nil，是否已经执行了宿主 File 的析构？
+
+```lua
+{{#include ../../code/v17-host-stdlib-modules/examples/file_lifecycle_contracts.lua}}
+```
+
+```powershell
+cargo run --quiet --manifest-path $moduleManifest -- book/code/v17-host-stdlib-modules/examples/file_lifecycle_contracts.lua
+cargo run --quiet --manifest-path $moduleManifest --example file_close_problem_chain
+cargo run --quiet --manifest-path $moduleManifest --example file_prune_problem_chain
+cargo run --quiet --manifest-path $moduleManifest --example file_drain_problem_chain
+```
+
+Lua 脚本应返回 true，覆盖显式 close 与别名合同；GC/Drop 的宿主释放时点另由 Rust
+实验验证。脚本末尾删除文件是清理，不是证明 OS 句柄已经关闭的独立证据。
+
 <a id="learning-code-map"></a>
 ## 代码阅读地图
 
@@ -52,24 +70,22 @@ retry 两次实际执行，effects 最终也是 2。CLI 退出 0 只说明固定
 4. `invoke_package::Require`：缓存读取、preload/path 定位、标记、`invoke_yield_forbidden`、提交/失败清理；
 5. `compile_source → compile → Heap::allocate_function`：复用 compiler，随后在当前 VM 执行；
 6. `Vm::new / gc_roots`：保存初始 loaded/preload 句柄并作为根；
-7. UserdataRef 与 VM file map：Lua 身份和 `Option<File>` 宿主 owner；
-8. close/prune/drop：显式关闭、GC 后清理、VM shutdown 的资源 drain；
-9. byte-oriented IO 与 debug views：内容保留 bytes，只暴露真实存在的调试数据。
+7. [close 实验](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v17-host-stdlib-modules/exercises/file_close/README.md)：`invoke_io::Open → files.insert → close_file`，移动 File 与保留 tombstone；
+8. [prune 实验](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v17-host-stdlib-modules/exercises/file_prune/README.md)：`gc_roots → Heap::step → finalizers → files.retain`，完成周期后对齐两种生命周期；
+9. [drain 实验](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v17-host-stdlib-modules/exercises/file_drain/README.md)：`Vm::drop → files.clear → Heap::shutdown`，观察显式释放顺序与自动字段 Drop；
+10. byte-oriented IO 与 debug views：内容保留 bytes，只暴露真实存在的调试数据。
 
 这里有两套不同的生命周期：Heap 决定 Lua userdata identity 是否可达；VM map 决定宿主 File
-何时关闭。它们通过 typed handle 关联，但不能互相替代。只删除 Heap record 而不 prune map
-会泄漏 OS handle，只关闭 File 而不保留 tombstone又无法实现 `io.type`。
+何时关闭。它们通过 typed handle 关联，但不能互相替代。只删除 Heap record 而不 prune map，
+宿主仍会持有 File，直到其他释放路径生效；只关闭 File 而不保留 tombstone，又无法实现 `io.type`。
 
 ## 文件不是普通 userdata 标签
 
 文件值使用 `UserdataRef` 参加 Lua identity、metatable 和 GC；真正的 `std::fs::File` 保存在唯一 VM owner 的 `HashMap<UserdataRef, Option<File>>`：
 
-```text
-Lua userdata ──identity──> Runtime file entry ──owns──> OS handle
-      │                           │
-      └── per-object metatable    ├── Some(File): open
-                                  └── None: closed tombstone
-```
+Lua roots 指向 Heap userdata；VM 的 map 用同一个 typed handle 关联资源，但 **map 的 key
+不是 GC root**。`Some(File)` 拥有宿主句柄，`None` 是已关闭状态，map 中没有 key 才是
+“不属于这个文件 owner”。后面的三问将分别改变这三种状态。
 
 Heap userdata 新增独立 metatable edge，collector 会追踪它。共享 file metatable 的 `__index` 指回自身，安装 read/write/close/flush/seek；因此 `file:read()` 使用 v0.12 已实现的方法调用语义，不需要在 Parser 中添加特殊语法。
 
@@ -90,7 +106,11 @@ drop:   clear map before Heap shutdown
 2. 完整或增量 Sweep 完成后，VM 移除已经 stale 的 userdata entry；
 3. `Vm::drop` 先 clear 所有文件，再执行 Heap shutdown。
 
-测试在 Windows 上实际删除对应文件，证明 handle 已释放，而不只检查 Rust flag。closed tombstone 让 `io.type(file)` 返回 `"closed file"`，并使再次 read/write/close 产生结构化错误。
+closed tombstone 让 `io.type(file)` 返回 `"closed file"`，并使再次 read/write/close
+产生结构化错误。删除成功不足以单独证明关闭：Unix 可 unlink 仍打开的文件，Windows
+默认共享方式也可能允许删除。本章用真实 File 的 Drop 记录观察 owner 释放，并在
+Windows 用 `share_mode(0)` 独占重开作补充：释放前报 sharing violation，释放后成功。
+非 Windows 明示没有同等 OS 探针；不把 Drop 计数或删除当成通用内核句柄检测器。
 
 ## Byte-oriented io
 
@@ -372,6 +392,201 @@ cargo test --manifest-path $moduleManifest --test retry_reference failure_remove
 
 `package.loadlib`、原生动态模块及完整 package searcher 协议不在本 checkpoint 内。
 
+## 问题四：文件已经 close，为什么 userdata 还应存在？
+
+### 先画出谁真正拥有 File
+
+`io.open` 先由 Rust 局部变量拥有 `File`，成功分配 userdata 并安装 metatable 后，
+才将它移动进 `files[id] = Some(file)`。若此前的 Heap 操作返回 Err，局部 File 会随
+返回析构。Lua 值只携带 `UserdataRef`；复制给 alias 只复制身份，不复制 File 或 OS
+句柄。方法调用短暂借用 map 中的 File，不能从这次借用获得新的长期 owner。
+
+![Lua 可达性、userdata 身份与宿主 File 所有权，以及 close 保留 tombstone 的迁移。](../images/v17-file-ownership.svg)
+
+现在预测两个错误设计：只写 closed flag、仍保留 `Some(File)`；或者直接删除整个
+map entry。前者声称 `claimed=true`，但 `io.type` 仍读到 open，File 仍由 map 拥有；后者确实会析构 File，
+但 `io.type(alias)` 变成 nil，重复 close 也从“已关闭文件”变成“不属于文件 owner”。
+
+```powershell
+cargo run --quiet --manifest-path $moduleManifest --example file_close_problem_chain -- close
+cargo run --quiet --manifest-path $moduleManifest --example file_close_problem_chain -- identity
+```
+
+### `take` 改变 owner，tombstone 保留协议身份
+
+实现题只改 `close(vm, handle)`。输入是 typed identity 与对 VM 的短暂可变借用；
+要同时完成释放和状态迁移，不能只让一个 Boolean 变真。
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/file_close/starter.rs:file_close_starter}}
+```
+
+```diff
+- files.remove(&handle)  // File 会 drop，但已关闭身份也丢失
++ let slot = files.get_mut(&handle).ok_or(NotFile)?;
++ let file = slot.take().ok_or(Closed)?; // map 留下 None
++ drop(file);                           // 移出的 owner 在此释放
+```
+
+这是协议差异示意，错误类型和完整接口以参考代码为准：
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/file_close/solution.rs:file_close_solution}}
+```
+
+`Option::take` 把值移动出来并留下 None；**不是调用 take 就必然关闭**。若把取出的
+File 存入另一个 owner，句柄还会继续存在。参考把它立即 drop；真实 `close_file`
+在 `file.take().is_none()` 条件表达式结束时销毁这个临时 Option，因此成功返回前
+已释放 File。`None` 仍是 map 中的条目，Heap userdata、metatable 与 Lua alias 都不变。
+
+| 输入身份 / 状态 | `io.type` | close | read/write/seek/flush |
+| --- | --- | --- | --- |
+| 已登记且 Some(File) | `"file"` | 释放 File，留下 None | 借用同一 File 执行 |
+| 已登记且 None | `"closed file"` | Runtime：重复关闭 | Runtime：使用已关闭文件 |
+| 不属于 files 的 userdata | nil | Type：not a file handle | Type：not a file handle |
+
+这不是重复 close 也成功的幂等 API。`type(alias)` 仍是 userdata，`io.type(alias)`
+却成为 closed file；两个观察回答不同的问题。真实 VM 对照先用 `io.close(f)`，再经
+另一个别名调用 `:close()`，并在 GC 后读 metatable/别名状态，避免只检查模型 flag。
+
+```powershell
+cargo test --manifest-path $moduleManifest --test file_close_reference close_releases_owner_but_keeps_closed_identity -- --exact
+```
+
+**完成条件：** File 的 Drop 记录增加一次，reachable userdata 与 None 条目仍在，
+别名语义和错误分类一致；Windows 探针先证明同一文件仍被占用，再证明独占重开成功。
+仅有 `io.type == "closed file"`、map 长度变化或 CLI 退出 0 都不够。
+
+## 问题五：Lua 已经不再引用文件，宿主 map 为什么还占着句柄？
+
+### GC 只认识 Heap graph，不会替另一个容器执行 retain
+
+把局部变量设成 nil，只是移除一条 Lua edge。真正回收还要等 collector 运行；即使
+Heap 已经删除 userdata，`HashMap<UserdataRef, Option<File>>` 仍可能保留原条目。
+typed handle 在这里是可复制的标识，不会自动成为强引用，也不会自动同步两个容器。
+错误版完全不 prune，可以观测到 **Heap 已 stale、File owner 仍在** 的间隙。
+
+```powershell
+cargo run --quiet --manifest-path $moduleManifest --example file_prune_problem_chain
+```
+
+![GC 完成后的四格清理：保留两个 live 状态，移除两个 stale 状态；map key 不作 roots。](../images/v17-file-prune.svg)
+
+练习用真实 Heap 和实际 File，先观察 Sweep 已结束而宿主 prune 尚未运行，再执行一段
+很小的清理。实现题只补 `prune`，不会改 collector 或 IO 实现：
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/file_prune/starter.rs:file_prune_starter}}
+```
+
+```diff
+- // 只推进 Heap，不对齐 files
++ if step.completed.is_some() {
++     files.retain(|id, _| matches!(heap.is_live(*id), Ok(true)));
++ }
+```
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/file_prune/solution.rs:file_prune_solution}}
+```
+
+`retain` 在原 map 上逐项判定；删除 Some 条目时，File 随 value 析构。判据是该 typed
+userdata 在 Heap 中仍存在，而不是 slot 是否 Some。四格规格如下：
+
+| GC 完成时的 Heap 状态 | files slot | prune 后 | 可观察结果 |
+| --- | --- | --- | --- |
+| live | Some(File) | 保留 Some | 文件仍可使用 |
+| live | None | 保留 None | 仍能辨认 closed file |
+| stale | Some(File) | 删除条目并 drop File | 不可达文件的宿主 owner 被释放 |
+| stale | None | 删除 tombstone | 不再保留无用途的登记项，不重复关闭 |
+
+### 为什么既不能保留所有 key，也不能只保留 Some？
+
+把 files 的所有 key 加进 `gc_roots`，会让这些 userdata 因 map 自己而永久可达，
+prune 永远等不到 stale。反过来按 `Option::is_some` retain，会删掉仍可达的 closed
+身份，同时保留已经 stale 的 open owner。两种错误都可能让 map 看起来“更整齐”，
+却破坏上述四格合同；固定 CLI 分别重放它们。
+
+真实 `gc_step_internal` 的顺序是 `Heap::step` → 取出并保活 finalizer events → 调
+callback → 若 `step.completed` 则 prune → 释放临时 roots → 返回首个 callback 错误。
+所以不应把任意一次 budget 耗尽当作整个周期完成。`is_live` 检查对象记录是否存在，
+白对象在 Sweep 前仍可能返回 true；本章不制造“提前 retain 必然立刻误删”的结论，
+而是按当前源码的完成周期边界提交清理。
+
+带 finalizer 的 userdata 也可能在本周期被保留，并因 resurrection 延续可达性。
+“变量离开作用域”“完成一次 GC”“宿主 File 已 drop”不能画等号。参考四格不包含
+任意 finalizer 组合；真实对照用普通文件、多个 execute 与宿主 GC，先结束旧执行帧，
+再检查弱槽精确为 nil 和 Windows 独占重开，避免隐藏的帧值保活掩盖问题。
+
+```powershell
+cargo test --manifest-path $moduleManifest --test file_prune_reference completed_cycle_prunes_dead_userdata_and_keeps_live_tombstones -- --exact
+```
+
+**完成条件：** 完成前不做协议清理，完成后四格结果与文件 owner 状态准确；live None
+仍可查询，stale Some 真正释放，所有 key 不因宿主登记被重新加入 roots。
+
+## 问题六：VM 退出时还全局可达的文件，要等下一次 GC 吗？
+
+### Drop drain 是 owner 结束，不是再运行一次 Lua 回收
+
+脚本可以把打开的文件留在全局表；只要 VM 还活着，这就是正确的 reachable open。
+但 VM owner 结束后，不能依赖再一次 Lua 调用来关闭它。真实 `Vm::drop` 明确先清空
+文件 map，再 shutdown Heap：打开项析构 File，None tombstone 直接移除。
+
+```powershell
+cargo run --quiet --manifest-path $moduleManifest --example file_drain_problem_chain -- before
+cargo run --quiet --manifest-path $moduleManifest --example file_drain_problem_chain -- after
+```
+
+![Vm Drop 先 drain 文件再 shutdown Heap；错误顺序的字段仍会在 Drop body 后自动析构。](../images/v17-file-drain.svg)
+
+先预测固定故障：自定义 Drop body 只调用 `heap.shutdown()`，会永久泄漏所有 File 吗？
+**普通 Rust 字段仍会在自定义 Drop body 结束后自动析构。** 因而这个故障的可验证差异
+是 shutdown 观察点仍持有 File，不是整个 owner 销毁后必然泄漏。实验记录释放次数
+与事件顺序，在两种路径完全结束后都要求资源释放。
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/file_drain/starter.rs:file_drain_starter}}
+```
+
+```diff
+  fn drop(&mut self) {
++     self.files.clear(); // 先结束宿主资源所有权
+      self.heap.shutdown();
+  }
+  // 自定义 Drop body 结束后，Rust 仍会继续析构字段
+```
+
+```rust
+{{#include ../../code/v17-host-stdlib-modules/exercises/file_drain/solution.rs:file_drain_solution}}
+```
+
+实现题只补 shutdown hook 的 drain 顺序。`clear` 对全部 entries 生效，不看 Lua 是否
+仍可达；两个别名不产生两次 File 释放，已关闭的 None 也不产生额外关闭。Heap 的
+`shutdown` 清空 objects、collector 队列和 ready finalizers，并标记 shutdown；它不
+等价于完整 collect，不会执行 Lua 或补跑 pending finalizer。
+
+```powershell
+cargo test --manifest-path $moduleManifest --test file_drain_reference solution_drains_some_and_none_before_heap_shutdown -- --exact
+```
+
+**完成条件：** 正确版的事件记录显示所有 Some 已在 Heap shutdown 前释放；错误版
+准确显示 body 内仍持有、字段自动 Drop 后归零。Windows 真实 Vm 的全局文件在 owner
+作用域内阻挡独占重开，离开作用域后可独占重开并实读内容。这个 Drop 合同不返回关闭错误，
+不保证 flush/fsync 持久化，也不延伸为 process exit/abort 的清理承诺。
+
+### 三问合并后的最小迁移路线
+
+1. 保持 userdata、metatable 与 methods 不动，先用 `take + None` 补齐显式 close；
+   以 aliases、重复操作分类和 File 释放验收。
+2. 保持 files 不作为 roots，在完成周期后按 `is_live` retain；用四格和真实跨 execute
+   probe 验收，不能以“对象不再有局部变量”代替完成 GC。
+3. 在 VM owner 退出路径先 clear files 再 shutdown Heap；用 body 内的顺序观察点和
+   owner 完全销毁后的真实重开分别验收。
+
+这三个局部模型不拼成另一份 VM；每个只引入一个 TODO，并用固定错误版、参考、真实
+快照三层证据说明哪些关系是模型合同，哪些已经由现有实现兑现。
+
 ## Debug 视图
 
 debug 库公开本阶段能由真实 Runtime 数据支撑的入口：getinfo、getmetatable、setmetatable、getregistry、getupvalue、setupvalue 和 traceback。
@@ -392,7 +607,7 @@ debug 库公开本阶段能由真实 Runtime 数据支撑的入口：getinfo、g
 - `Result<Vec<Value>, VmError>` 表达 Lua error，`Vec<Value>{nil,message}` 表达普通平台失败；
 - `loaded[name] = true` 在 loader 调用前发布；调用后的普通错误只删当前 key，定位失败时还没有新标记；
 - loader callback 在禁止 yield 的宿主边界执行，避免暂停一半的 require transaction；
-- VM Drop 先 drain 宿主资源，保证确定性 shutdown。
+- VM Drop 先 drain 宿主资源，再 shutdown Heap；字段随后仍按 Rust 规则自动析构。
 
 替代方案是把 `File` 直接塞进 Heap object，但会迫使 core 依赖 `std::fs`，破坏 runtime value 与宿主能力的边界。另一个方案是全局 integer fd；typed userdata identity 更自然地复用 metatable、GC 和错误分类。
 
@@ -416,6 +631,9 @@ cargo run --manifest-path book/code/v17-host-stdlib-modules/Cargo.toml -- `
 cargo test --manifest-path $moduleManifest --test cache_reference
 cargo test --manifest-path $moduleManifest --test cycles_reference
 cargo test --manifest-path $moduleManifest --test retry_reference
+cargo test --manifest-path $moduleManifest --test file_close_reference
+cargo test --manifest-path $moduleManifest --test file_prune_reference
+cargo test --manifest-path $moduleManifest --test file_drain_reference
 cargo fmt --manifest-path $moduleManifest --all -- --check
 cargo clippy --manifest-path $moduleManifest --workspace --all-targets -- -D warnings
 cargo test --manifest-path $moduleManifest --workspace
@@ -429,17 +647,21 @@ type=number value=1717
 ```
 
 原快照基线有 119 项：74 个主线端到端、7 个核心标准库/差分、10 个宿主标准库与模块、
-7 个编译器、15 个 core、3 个 stdlib 合同与 3 个 VM。本轮增加 24 项参考（cache 9、
-cycles 6、retry 9），合计 **143 通过、4 个 learner ignored**。不把 ignored 当作
-完成；文件探针使用进程唯一临时目录，不改变工作目录。
+7 个编译器、15 个 core、3 个 stdlib 合同与 3 个 VM。require 包增加 24 项参考
+（cache 9、cycles 6、retry 9）；文件包增加 18 项（close 8、prune 6、drain 4），
+合计 **161 通过、7 个 learner ignored**。不把 ignored 当作完成；文件探针使用唯一
+临时目录、核对路径范围并显式清理，不改变工作目录。
 
 ```powershell
 cargo test --manifest-path $moduleManifest --test cache_exercises -- --ignored
 cargo test --manifest-path $moduleManifest --test cycles_exercises -- --ignored
 cargo test --manifest-path $moduleManifest --test retry_exercises -- --ignored
+cargo test --manifest-path $moduleManifest --test file_close_exercises -- --ignored
+cargo test --manifest-path $moduleManifest --test file_prune_exercises -- --ignored
+cargo test --manifest-path $moduleManifest --test file_drain_exercises -- --ignored
 ```
 
-初始三组分别有 2/1/1 项失败。只修改各包 `starter.rs` 指定 hook，完成后同一合同通过。
+初始六组分别有 2/1/1/1/1/1 项失败。只修改各包 `starter.rs` 指定 hook，完成后同一合同通过。
 各题可独立完成；固定 CLI 和默认参考不读取 starter，不需要先完成上一包。
 维护者需验证“初始失败 → 临时套解通过 → 原字节恢复后再失败”，防止假绿或交付已填答案。
 逐题命令、成功观察和模型范围见各包 README。
@@ -471,9 +693,10 @@ node tools/check_book_links.mjs target/mdbook .
 </div>
 
 <div class="exercise implementation">
-  <strong>实现题：完成四个独立 hook</strong>
+  <strong>实现题：完成七个独立 hook</strong>
   <p>只修改 cache 的 lookup/finish、cycles 的 publication、retry 的 attempt。
-  运行上面三个 --ignored 命令；2/1/1 项全部通过才完成。不要改固定故障、合同、
+  文件部分再补 close 的 take、prune 的完成周期 retain、drain 的 shutdown 顺序。
+  运行上面六个 --ignored 命令；2/1/1/1/1/1 项全部通过才完成。不要改固定故障、合同、
   真实核心或默认 ignored 标记来取得通过。</p>
 </div>
 
@@ -484,15 +707,32 @@ node tools/check_book_links.mjs target/mdbook .
   “无故重跑成功依赖”的不同原因，并说明副作用为何仍存在。</p>
 </div>
 
+<div class="exercise understanding">
+  <strong>理解题：closed、stale 和 owner 结束能否互换？</strong>
+  <p>沿三幅文件状态图说明 f 与 alias、Heap userdata、map key、Some(File) 分别由谁
+  保活。用 close/prune/drain CLI 核对四格与事件顺序；成功条件是能解释 live None
+  为什么必须保留，以及为何 map 的 key 不能反过来成为全部文件的 GC roots。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题：删除成功、最终归零，是否已经证明顺序正确？</strong>
+  <p>只读固定 faults，对比 flag-only、remove、漏 prune、按 Some prune、只 shutdown。
+  先列每项错误会在哪个观察点暴露，再运行对应 CLI；成功条件是能分清 Lua 语义、
+  Rust owner Drop 和 Windows 独占重开三层证据，并解释错误 drain 为何仍会在字段
+  自动析构后释放，而不能据此声称其 shutdown 前的顺序正确。</p>
+</div>
+
 <a id="learning-checkpoint"></a>
 ## 完成检查点
 
 - 能画出 userdata、VM resource map 和 OS handle 的 owner 图；
-- 能解释三条资源 drain 路径；
+- 能解释 take 移动 owner、None 保留身份和 not-file/closed-file 的错误分类；
+- 能按四格验收 completed 周期后的 prune，并说明 finalizer/resurrection 的保留边界；
+- 能解释 shutdown 前 drain 与 Drop body 后字段析构的区别，不把删除成功当关闭证明；
 - 能用真实值与执行次数解释缓存命中和首结果提交，而不是只看 key 是否存在；
 - 能手推 A→B→A 的缓存轨迹，区分循环中的 true 与最终模块表；
 - 能区分标记发布前后的错误，并验证当前项清理、依赖保留与同 VM 重试；
-- 四个独立 TODO 显式通过，能分清模型、真实快照、GC/禁止 yield 的验证范围；
+- 七个独立 TODO 显式通过，能分清模型、真实快照、GC/禁止 yield 与 OS 探针的验证范围；
 - 能区分 Lua error 与 `nil,message` 平台失败。
 
 ## 与成熟实现和专题章节的对应
@@ -501,5 +741,5 @@ node tools/check_book_links.mjs target/mdbook .
 - [Runtime 所有权与 GC](v13-runtime-gc.md) 可回看为什么 registry/package/file metatable 必须进入 root inventory；
 - [Coroutine](v15-coroutine.md) 可对照 require/file callback 为什么属于禁止 yield 的宿主边界；
 - [核心标准库](v16-core-stdlib.md) 可回看 catalog 和 HostError 如何扩展到平台失败；
-- 若继续本版教学，可从 file userdata 已失去 Lua 可达性但 OS handle 仍被 map 拥有的问题，继续展开显式 close、GC prune 与 Drop 的状态迁移；本轮没有完成这组练习。
+- 本版六组问题链已覆盖 require 与文件 owner；若继续补 IO，可从“读到空字节串、EOF 与读取失败如何区分”推进 bytes/Result 协议，独立于本章资源生命周期验收。
 - 下一 checkpoint 是 v0.18：完成 CLI/REPL 合同，并新增 `lua_bytecode` crate 提供 text/JSON、CFG、trace、fixture manifest 与超时 runner。

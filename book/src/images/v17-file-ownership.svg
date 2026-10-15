@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="710" viewBox="0 0 900 710" role="img" aria-labelledby="title desc">
+  <title id="title">Lua userdata 身份与宿主文件所有权</title>
+  <desc id="desc">Lua roots 指向 Heap userdata，userdata 追踪 metatable。VM files map 以 typed handle 关联 Some File 并拥有 OS 句柄，其 key 不属于 GC roots。显式 close 取出并销毁 File，map 保留 None tombstone，Lua userdata 与别名仍在。只改 flag 不释放 File，直接 remove 则丢失 closed 身份。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}.lookup{fill:none;stroke:#75519a;stroke-width:2;stroke-dasharray:6 5}
+  </style></defs>
+  <rect width="900" height="710" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">close 结束 File 的所有权，userdata 身份继续存在</text>
+  <rect x="24" y="64" width="210" height="88" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="44" y="98" class="label">Lua roots</text><text x="44" y="132" class="mono">f / alias → 同一 id</text>
+  <path d="M234 108H286" class="flow"/>
+  <rect x="290" y="64" width="248" height="88" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="310" y="98" class="label">Heap userdata</text><text x="310" y="132" class="mono">UserdataRef(id)</text>
+  <path d="M414 152V192" class="flow"/>
+  <rect x="290" y="196" width="248" height="70" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="310" y="225" class="label">共享 file metatable</text><text x="310" y="251" class="small">每个 userdata 的 Heap edge</text>
+  <path d="M538 107H610V192" class="lookup"/>
+  <text x="563" y="139" class="small">按 id 关联</text><text x="563" y="164" class="small">不作为 root</text>
+  <rect x="566" y="196" width="310" height="70" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="586" y="225" class="mono">VM files[id] = Some(File)</text><text x="586" y="251" class="small">map 拥有 File；File 拥有 OS 句柄</text>
+  <rect x="24" y="292" width="852" height="104" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="44" y="325" class="label">io.open 的 owner 迁移</text>
+  <text x="44" y="357" class="mono">Rust 局部 File → allocate userdata / set metatable → insert Some(File)</text>
+  <text x="44" y="382" class="small">insert 前的 Heap 错误返回时，局部 File 自动析构；Lua 复制别名不会复制 File。</text>
+  <path d="M450 396V428" class="flow"/>
+  <rect x="24" y="432" width="852" height="106" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="44" y="465" class="label">close：get_mut → take → 销毁移出的 File</text>
+  <text x="44" y="497" class="mono">files[id] = None；type(alias) = userdata；io.type(alias) = closed file</text>
+  <text x="44" y="523" class="small">take 只移动 owner；若移出的 File 被另存，句柄仍在。此处要求成功返回前 drop。</text>
+  <rect x="24" y="562" width="414" height="94" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="44" y="594" class="label">错误 A：只改 closed flag</text><text x="44" y="626" class="small">claimed flag 改变，Some(File) 仍在。</text>
+  <rect x="462" y="562" width="414" height="94" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="482" y="594" class="label">错误 B：remove 整个 entry</text><text x="482" y="626" class="small">File 释放，但 closed 变成 not a file。</text>
+  <text x="24" y="687" class="small">证据：Drop 记录观察 owner；Windows 独占重开先失败后成功。删除文件只是清理。</text>
+</svg>

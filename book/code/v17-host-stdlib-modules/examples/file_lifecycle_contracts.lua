@@ -1,0 +1,20 @@
+local path = os.tmpname()
+local file = assert(io.open(path, "w+"))
+local alias = file
+assert(type(file) == "userdata" and io.type(alias) == "file")
+assert(file:write("owned") == alias)
+assert(io.close(file))
+assert(alias == file and type(alias) == "userdata")
+assert(io.type(file) == "closed file" and io.type(alias) == "closed file")
+assert(not pcall(function() alias:close() end))
+assert(not pcall(function() alias:read("*a") end))
+assert(not pcall(function() alias:write("again") end))
+assert(not pcall(function() alias:seek("set", 0) end))
+assert(not pcall(function() alias:flush() end))
+collectgarbage("collect")
+assert(io.type(alias) == "closed file")
+local reader = assert(io.open(path, "r"))
+assert(reader:read("*a") == "owned")
+assert(reader:close())
+assert(os.remove(path)) -- cleanup; removal alone is not an OS-close proof
+return true

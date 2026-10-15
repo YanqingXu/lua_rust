@@ -3,6 +3,97 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.17 文件 userdata、close/tombstone、GC prune 与 Drop drain
+
+用户要求继续按问题链讲清 Lua 对象可达性与宿主句柄释放，补齐反例、差异、状态图、
+验收并更新交接。本次完成该教学包，**没有恢复暂停的原审计整改目标**。用户随后
+明确要求将本批章节、状态图、练习包和交接记录一并提交并推送。
+
+- 起点为 `main@9171980d4913cd65b60436d67f83496915a55e1e`（上一批 require 教学包），
+  开始时工作区干净，本地跟踪 origin/main 同 SHA。生产 `crates/`、v0.17 快照核心
+  与既有 `tests/` 无 diff；Cargo 仅增加六个 test targets，无新依赖。本批新增代码
+  位于三个 exercises、三个 Rust CLI 与一个 Lua smoke，旧 require 包仅回归验证。
+  提交前 fetch 确认 HEAD 与 origin/main 无分叉。本批提交号以
+  `git log -1 -- book/src/versions/v17-host-stdlib-modules.md` 为准，新提交 CI 按其 SHA 查询。
+- [主章](book/src/versions/v17-host-stdlib-modules.md) 新增问题四至六：flag-only
+  仍持有 File / remove 丢失 closed 身份 → take 留 None；Heap 已 stale 而 map 仍
+  持有 File → completed 周期后按 is_live retain；全局仍可达的文件在 VM owner
+  结束时 → files.clear 先于 Heap shutdown。每问有预测、固定反例、starter/solution
+  include、最小 diff、图、精确验收与迁移。现在六包共七个 TODO，互相独立，不拼接
+  成第二套完整 VM；固定 faults 是人为设计，不冒充历史中间版本。
+- [close 包](book/code/v17-host-stdlib-modules/exercises/file_close/README.md)：一个
+  TODO、8 项参考。真实 Heap + `HashMap<UserdataRef, Option<OwnedFile>>`，内部实际
+  File，登记消费 owner，无 handle clone。合同读写 `A\0\xff`，验一次释放、None、
+  alias、foreign userdata 的 NotFile/Type 与 closed 的 Runtime。真实 VM 单独验
+  io.close/方法 close 两方向别名、12 项错误矩阵、关闭后独有 metatable metadata
+  跨 execute/host GC 实读 42，以及 VM/closed userdata 仍活着时 OS File 已释放。
+  模型 foreign userdata 与真实 table 误传的错误消息路径已明确分开。
+- [prune 包](book/code/v17-host-stdlib-modules/exercises/file_prune/README.md)：一个
+  TODO、6 项参考。真实 Heap/File 四格（live Some/live None/stale Some/stale None）；
+  budget=1 的 incomplete Sweep 已删第三项但尚未 completed 时，map 仍完整；完成
+  Sweep 后先观察 stale userdata 与残留 File，再 retain。错误版漏 prune、按 Some
+  retain、把全部 map key 加 roots 分别暴露宿主残留、身份丢失、自举保活。真实 VM
+  多 execute 只向宿主返回 bool，再 host GC，弱槽精确 nil；活 open 实做 write/flush，
+  活 tombstone 实做方法查找/closed error，撤全局 roots 后再验四项全部释放。
+- [drain 包](book/code/v17-host-stdlib-modules/exercises/file_drain/README.md)：一个
+  TODO、4 项参考。实际 Owner Drop 记录 mixed Some/None 在 shutdown 边界的状态：
+  健康版先清空，boundary open=0；故障只 shutdown，body 内 open=2，但自定义 Drop
+  返回后 Rust 仍自动析构字段，最终两版都是 drops=[1,1,1]。**故障证明顺序不同，
+  不声称整个 owner 销毁后永久泄漏。** 真实 Heap 探针覆盖 reachable userdata 与
+  pending finalizer 队列被 shutdown 清空，getter/分配精确拒绝为 Shutdown；真实 VM
+  全局 open file 跨 execute/host GC 实读 owned，VM 作用域结束后重开仍读 owned。
+- 修正原章“Windows 删除成功即证明关闭”的过强表述：Unix 可 unlink 打开文件，
+  Rust Windows 默认共享方式也可能允许删除。三个新包用 Windows `share_mode(0)`
+  实际独占重开，先验证仍持有时被阻挡，再验证 close/prune/Drop 后成功；prune/drain
+  严格检查错误码 32，close 接受 sharing/lock 32/33，其他错误失败。非 Windows 明示
+  无同等 OS 证据，普通重开、删除与 Drop 计数均不冒充通用内核句柄检测。清理用唯一
+  临时目录、canonical 范围核对、显式 finish 与不 panic 的 Drop fallback。
+- 源码边界：take 只移动 owner，移出值析构才释放；真实 close 的临时 Option 在成功
+  返回前 drop。files keys 不属于 gc_roots，file metatable 则是 root/Heap tracing
+  edge。prune 根据**先捕获的 step.completed**，在 finalizer events 保活/调用后、
+  临时 roots truncate 与首 callback 错误返回前运行。is_live 检查记录是否存在，
+  未 Sweep 的白对象仍可能为 true；不声称提前 retain 必然误删。pending finalizer/
+  resurrection 可使 userdata 继续 live，四格无任意 finalizer 组合覆盖。Heap shutdown
+  不执行 Lua finalizer；File Drop 不报告关闭错误、不承诺 fsync 或 exit/abort 清理。
+  v0.15 active varargs、v0.16 sort snapshot roots 等历史缺口仍未在本轮修复。
+- 三幅 SVG（ownership、prune 四格、drain 顺序）经浏览器检查文字、列、箭头和页脚；
+  正文六段新 starter/solution 都正确展开，三幅图均加载，无 unresolved include。
+  新 `file_lifecycle_contracts.lua` 返回 true，验证显式 close 与别名；末尾删除仅清理。
+  原 demo=1717、require_contracts=true、快照 stdlib_diff=1550。
+- 本地 Windows Rust/cargo **1.96.1**：fmt、workspace all-targets Clippy `-D warnings`
+  通过；Debug/Release 各 **161 通过、0 失败、7 ignored**（既有 143 + 文件参考 18）。
+  六 learner 初始分别 2/1/1/1/1/1 失败；三个新 TODO 各完成“失败 → 临时套解通过 →
+  原字节恢复后再失败”，starter 哈希一致并刷新 mtime。旧四题闭环证据仍归上一节，
+  本轮只重跑其初始失败，未伪称重新套解。ignored 或 CLI 退出 0 不等于 learner 完成。
+- 六 CLI 共 **98 条关键断言**（旧 55 + close 19/prune 8/drain 16）；主章与六个
+  README 去重 **33 条 exact** 各执行 1 项，26 正向通过、7 learner 按预期失败。
+  PATH `D:\lua51\lua.EXE` 确认为 **Lua 5.1.5**，独立实际执行本版 stdlib_diff=1550；
+  77 个代码输入验证前后哈希无漂移。20 版本教学检查、mdBook 构建、38 页链接检查
+  通过：**1,285 站内链接、0 broken**。
+- 证据独立保存在 `target/teaching-v17-files-2026-10-15/`：集成验证为
+  `full-validation/20261015T071748258547Z/summary.json`（58 项检查、计数、oracle、
+  哈希），同目录 exact 来源与日志；局部/套解为
+  `file_close/20261015T071242118965Z/summary.json`、
+  `file_prune/{scoped-verification,starter-round-trip}.json`、
+  `file_drain/20261015T071539870Z/summary.json`。`final-verification.json` 记录最终
+  交付哈希、范围、站点和视觉核对。这些是本机 ignored 产物，clone 后以主章、各包
+  README/合同/real 和 examples 为永久复现入口；未覆盖以前证据。
+- 已推送基线 `9171980` 的 [mdBook 38696072191](https://github.com/YanqingXu/lua_rust/actions/runs/38696072191)
+  成功；本轮末次观察 [Rust CI 38696072267](https://github.com/YanqingXu/lua_rust/actions/runs/38696072267)
+  仍 in_progress：ASan 与 GC/Native Stack Miri 成功，Unsafe Durability Miri 和 Windows
+  job 尚在运行；Windows 的 `Enforce verified official source cases` 步骤已失败，具体
+  原因未核实。保存于本证据目录 `baseline-{rust,book}.json`；这是旧提交的 CI，不是
+  本批教学改动的远端结果，不套用上一 SHA 的失败原因。提交前再查终态：仅 Windows
+  Quality Gate 失败，失败步骤为 `Enforce verified official source cases` 和
+  `M1 foundation and quality gate`，其余三个 Miri/ASan job 成功。失败日志下载返回
+  HTTP 403 / API rate limit exceeded，具体原因仍未核实；明细与输出分别保存于
+  `push-baseline-rust.json`、`push-baseline-failed.log`。
+
+若继续本版教学，可从 IO 的空字节串/EOF/读取失败区别推进 bytes 与 Result 协议；
+若进入下一 checkpoint，v0.18 可按 CLI 错误退出与 REPL 跨输入状态推进。文件 owner
+三问已完成，后续不要重复生成同一包。工程 GC 缺口可按独立指令整改；原审计仍暂停
+在 os.date/os.time 本地时间、UTC、DST，交接本身不表示恢复该目标。
+
 ## 2026-10-15：v0.17 require 缓存、循环加载与失败恢复
 
 用户要求继续按问题链补齐这三部分的可运行反例、代码差异、状态图与验收，完成验证

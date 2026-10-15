@@ -45,3 +45,27 @@ path = "exercises/retry/acceptance.rs"
 [[test]]
 name = "retry_reference"
 path = "exercises/retry/reference.rs"
+
+[[test]]
+name = "file_close_exercises"
+path = "exercises/file_close/acceptance.rs"
+
+[[test]]
+name = "file_close_reference"
+path = "exercises/file_close/reference.rs"
+
+[[test]]
+name = "file_prune_exercises"
+path = "exercises/file_prune/acceptance.rs"
+
+[[test]]
+name = "file_prune_reference"
+path = "exercises/file_prune/reference.rs"
+
+[[test]]
+name = "file_drain_exercises"
+path = "exercises/file_drain/acceptance.rs"
+
+[[test]]
+name = "file_drain_reference"
+path = "exercises/file_drain/reference.rs"
