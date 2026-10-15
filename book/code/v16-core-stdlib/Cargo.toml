@@ -21,3 +21,30 @@ members = [
 
 [lints.clippy]
 all = "warn"
+
+[dev-dependencies]
+lua_stdlib = { path = "crates/lua_stdlib" }
+
+[[test]]
+name = "args_exercises"
+path = "exercises/args/acceptance.rs"
+
+[[test]]
+name = "args_reference"
+path = "exercises/args/reference.rs"
+
+[[test]]
+name = "catalog_exercises"
+path = "exercises/catalog/acceptance.rs"
+
+[[test]]
+name = "catalog_reference"
+path = "exercises/catalog/reference.rs"
+
+[[test]]
+name = "globals_exercises"
+path = "exercises/globals/acceptance.rs"
+
+[[test]]
+name = "globals_reference"
+path = "exercises/globals/reference.rs"

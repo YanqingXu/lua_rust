@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="636" viewBox="0 0 900 636" role="img" aria-labelledby="title desc">
+  <title id="title">声明、安装与调用的三个步骤</title>
+  <desc id="desc">有函数体不等于已经注册。core定义稳定ID，stdlib声明名字和ID，VM读取catalog把NativeFunction安装到Heap表。Lua查表得到ID后VM分派执行函数体。stdlib依赖core，VM依赖core和stdlib；stdlib不反向依赖VM。独立合同检查遗漏和错ID。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:18px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="636" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">实现了函数体，Lua 还需要从表中找到它</text>
+  <rect x="20" y="62" width="860" height="74" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="40" y="93" class="label">固定漏注册：dispatch 已有 sqrt，安装表仅漏掉 sqrt</text>
+  <text x="40" y="120" class="small">math.sqrt → nil；错误发生在查找入口，尚未到达函数体。</text>
+  <rect x="20" y="160" width="260" height="118" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="38" y="192" class="label">① lua_core</text><text x="38" y="226" class="mono">NativeFunction::Math</text><text x="38" y="258" class="small">跨层传递的稳定 ID</text>
+  <rect x="320" y="160" width="260" height="118" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="338" y="188" class="label">② lua_stdlib</text><text x="338" y="216" class="mono">FunctionSpec</text><text x="338" y="241" class="mono">LibrarySpec</text><text x="338" y="267" class="small">公开名字 → ID 的声明</text>
+  <rect x="620" y="160" width="260" height="118" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="638" y="192" class="label">③ lua_vm</text><text x="638" y="226" class="mono">Vm::new / adapter</text><text x="638" y="258" class="small">持有 Heap，安装并执行</text>
+  <path d="M280 218H316" class="flow"/><path d="M580 218H616" class="flow"/>
+  <text x="24" y="309" class="small">上方箭头表示数据流。crate 依赖方向：stdlib → core；VM → stdlib 和 core。</text>
+  <path d="M750 278V342" class="flow"/>
+  <rect x="20" y="346" width="860" height="118" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="40" y="379" class="label">安装后：Heap 中 math["sqrt"] = NativeFunction::Math(Sqrt)</text>
+  <text x="40" y="414" class="mono">Lua 查表 → 得到稳定 ID → VM 穷尽分派 → Args → 函数体</text>
+  <text x="40" y="445" class="small">目录保存名字与身份，不保存函数体，不把 Heap 或 &amp;mut Vm 交给 stdlib。</text>
+  <rect x="20" y="488" width="860" height="76" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="40" y="520" class="label">验收：独立期望名字 / ID + 实际调用结果</text>
+  <text x="40" y="549" class="small">删掉一项、换错一个 ID、重复同库名字，都要能被合同发现；跨库同名允许。</text>
+  <text x="24" y="600" class="small">gc_* 等教学诊断另行安装。重复名 preflight 是练习保护，不冒充 Vm::new 已有运行时检查。</text>
+</svg>

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="610" viewBox="0 0 900 610" role="img" aria-labelledby="title desc">
+  <title id="title">从分散取参到共享参数合同</title>
+  <desc id="desc">分散的函数各自决定字符串转换和错误编号，会产生不一致。共享Args借用调用者的Value切片，通过required、类型和转换检查，返回拥有的数值或字节，或者HostError。VM边界为HostError附加函数名，回调和Heap错误仍走各自路径。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:18px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="610" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">同一类参数，先经过同一条规则</text>
+  <rect x="20" y="60" width="860" height="120" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="40" y="92" class="label">同一输入 " 42.5 "：分散取参与共享规则的对照</text>
+  <text x="40" y="127" class="mono">strict-number → error</text><text x="450" y="127" class="mono">Args::number → 42.5</text>
+  <text x="40" y="158" class="small">规则分叉发生在取参阶段；Rust 编译成功并不能保证两个入口遵循同一合同。</text>
+  <rect x="20" y="204" width="860" height="96" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="40" y="236" class="label">调用者拥有参数 Vec / array　→　Args&lt;'a&gt; 临时借用 &amp;'a [Value]</text>
+  <text x="40" y="270" class="small">Args 不存执行状态，也不借用整个 VM；借用不能比原参数切片活得更久。</text>
+  <path d="M450 300V326" class="flow"/>
+  <rect x="100" y="328" width="700" height="64" rx="10" fill="#fff" stroke="#286047"/>
+  <text x="128" y="366" class="label">required(index) → 类型检查 → coercion / 范围检查</text>
+  <path d="M270 392V423" class="flow"/><path d="M630 392V423" class="flow"/>
+  <rect x="20" y="425" width="410" height="98" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="40" y="458" class="label">Ok：交给 builtin 所需的 Rust 值</text>
+  <text x="40" y="492" class="mono">f64 / Vec&lt;u8&gt;（保留 NUL / 0xff）</text>
+  <rect x="450" y="425" width="430" height="98" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="470" y="458" class="label">Err：HostError 保留一基参数编号</text>
+  <text x="470" y="492" class="small">VM 附加函数名 → VmErrorKind::Type</text>
+  <text x="24" y="558" class="small">bytes() 复制为拥有的字节；它不把任意 Lua string 当成 UTF-8 文本。</text>
+  <text x="24" y="588" class="small">这里只转换 HostError。Heap / metamethod / callback 的错误不应被一律改写为参数错误。</text>
+</svg>

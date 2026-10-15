@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="680" viewBox="0 0 900 680" role="img" aria-labelledby="title desc">
+  <title id="title">唯一全局环境与可替换的_G字段</title>
+  <desc id="desc">错误设计中裸global写Rust HashMap，_G访问Heap快照，两个值分叉。正确设计里VM保存环境句柄E并在gc_roots枚举E，裸global访问E的字段，初始E的_G字段指回E。替换_G为新表R只改变E的一条边，VM仍以E为环境；无外部根的自环仍可回收。</desc>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>
+    text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:18px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}
+  </style></defs>
+  <rect width="900" height="680" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="38" class="head">“唯一环境”指同一个表身份，不是永远不能给 _G 赋值</text>
+  <rect x="20" y="62" width="860" height="100" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+  <text x="40" y="96" class="label">错误版：裸 global → Rust HashMap　　_G → 独立 Heap 快照</text>
+  <text x="40" y="132" class="mono">answer = 42　只改左边；_G.answer 仍保留快照中的旧值。</text>
+  <rect x="20" y="190" width="250" height="110" rx="12" fill="#eef5ff" stroke="#52769f"/>
+  <text x="38" y="224" class="label">Vm.global_env = E</text><text x="38" y="259" class="small">gc_roots 显式枚举 E</text><text x="38" y="285" class="small">GET/SETGLOBAL 访问 E</text>
+  <rect x="410" y="190" width="350" height="110" rx="12" fill="#edf6ed" stroke="#286047"/>
+  <text x="430" y="223" class="label">Heap 表 E</text><text x="430" y="255" class="mono">answer: 42</text><text x="430" y="285" class="mono">_G: E</text>
+  <path d="M270 237H405" class="flow"/><text x="294" y="220" class="small">根 / 访问</text>
+  <path d="M760 273H832V207H765" class="flow"/><text x="777" y="190" class="small">自引用</text>
+  <text x="24" y="334" class="small">初始：answer 与 _G.answer 都到 E；写 nil 则从同一个表删除该键。</text>
+  <rect x="20" y="360" width="860" height="206" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="40" y="394" class="label">执行 _G = { answer = 99 } 后</text>
+  <text x="40" y="445" class="mono">Vm.global_env</text><path d="M205 440H300" class="flow"/>
+  <rect x="306" y="416" width="220" height="100" rx="10" fill="#edf6ed" stroke="#286047"/>
+  <text x="325" y="447" class="mono">E: answer = 42</text><text x="325" y="482" class="mono">   _G = R</text>
+  <path d="M526 480H618" class="flow"/>
+  <rect x="624" y="416" width="230" height="100" rx="10" fill="#f1edf7" stroke="#75519a"/>
+  <text x="642" y="447" class="mono">R: answer = 99</text><text x="642" y="482" class="small">新表通过 E 的字段可达</text>
+  <text x="40" y="548" class="small">裸 answer 仍为 42；_G.answer 为 99。变化的是 E["_G"]，VM 环境身份未变。</text>
+  <text x="24" y="605" class="small">Rust 复制 TableRef 不自动保活。VM 的根枚举保活 E，collector 再沿字段追踪子图。</text>
+  <text x="24" y="636" class="small">独立 Heap 实验撤去所有外部根后，即使 E["_G"] = E，自环也应被回收。</text>
+  <text x="24" y="663" class="small">此图只解释 global environment；不证明任意回调、活动 varargs 或增量阶段切换安全。</text>
+</svg>

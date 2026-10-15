@@ -3,6 +3,76 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.16 统一参数规则、集中注册与唯一全局环境
+
+用户要求继续按问题链完善这三部分，补齐可运行反例、前后差异、状态图和验收练习，
+完成验证并更新交接。本次完成该教学包，**没有恢复暂停的原审计整改目标**。用户随后
+明确要求将本批章节、状态图、练习包和交接记录一并提交并推送。
+
+- 起点为 `main@77f75763b8d552a0cf592fe706c021402b6a8815`，开始时工作区干净，
+  本地跟踪的 origin/main 同 SHA；这是上一批已推送的 v0.15 教学包。本次生产
+  `crates/`、v0.16 快照核心与既有 tests 均无 diff。Cargo 仅增加本地 lua_stdlib
+  dev-dependency 和六个练习 test targets，lock 相应增加一个已有 workspace 依赖。
+  提交前 fetch 再次确认 HEAD 与 origin/main 无分叉。本批提交号以
+  `git log -1 -- book/src/versions/v16-core-stdlib.md` 为准，新提交 CI 须按其 SHA 查询。
+- [主章](book/src/versions/v16-core-stdlib.md) 按三问展开：分散取参导致 coercion/
+  错误编号不一致 → Args/HostError；已有函数体但漏安装/错 ID → catalog 驱动；
+  假设给 Rust globals 复制 `_G` 后读写分叉 → 唯一 Heap global_env。每问有预测、
+  固定反例、可编译 include、最小 diff、图、精确验收和下一问题。v0.15 实际尚无
+  `_G` 安装，双存储明确是人为失败迁移，未当成真实历史。
+- [参数包](book/code/v16-core-stdlib/exercises/args/README.md)：两个独立 number/
+  bytes TODO、9 项默认参考；真实 Args 验证借用别名、owned Vec 脱离输入仍有效、
+  缺参/nil/optional 默认、UTF-8→trim→Rust f64 词法边界；真实 VM 核对成功值与
+  Type/函数名/一基编号。非法 byte 255 的故障版变成 239/191/189，参考保持原字节。
+  不把 Args::table 的变体检查称为 Heap liveness 校验，也不宣称完整 Lua 数值词法。
+- [注册包](book/code/v16-core-stdlib/exercises/catalog/README.md)：一个 installer
+  TODO、8 项默认参考；独立 68 项名字/ID 清单检查目录和安装结果，额外以漏 math 库、
+  错 sqrt ID 的声明变体证明清单不会随待测输入缩小。固定漏装 sqrt/错配 Abs 分别
+  得到 nil/81，参考实际调用得到 9。同库重复拒绝、跨库同名可共存，后者也验实际调用。
+  preflight 只属于教学实验，真实 Vm::new 没有该动态检查；gc_* 诊断仍另行安装。
+  实验 Heap 读出稳定 ID，替换固定 proto 唯一 0 常量后交真实 VM 分派；真实 VM 自身
+  初始化另有代表调用对照，没有把实验 Heap 注入 VM，也未新增全部 68 函数体的行为证明。
+- [全局环境包](book/code/v16-core-stdlib/exercises/globals/README.md)：一个显式
+  initializer TODO、7 项默认参考。参考实际分配表、写 seed/_G 自指，constructor
+  只包装 handle；合同检查双向写、精确 nil 删除、_G 重绑、跨 GC 访问与撤字段回收。
+  独立 Heap 撤去外部根后，自环 env/child 的 `is_live==Ok(false)` 且访问失败。
+  真实 VM 分多次 execute/host GC，只返回 bool，weak owner/child 两槽精确 nil；
+  另在 `_G` 与观察别名都置 nil 后检查裸 global 与 math 调用。VM 的根枚举保活环境，
+  Copy handle 与自环都不自动成为根；替换 `_G` 字段不替换 Vm.global_env 身份。
+- 三幅 SVG（参数流、安装/依赖流、global owner/根路径）已浏览器核对文字、框线、
+  箭头与页脚，正文 include 正确展开。`builtin_contracts.lua` 返回 true；原 demo
+  仍返回 1616。受保护 callback/排序资源协议留下一包；原章 xpcall 表述校准为失败
+  返回 handler 首结果（可为非字符串或 nil），handler 自身失败才转为错误文本。
+- 本地 Rust/cargo **1.96.1**：fmt、workspace all-targets Clippy `-D warnings` 通过；
+  Debug/Release 各 **133 通过、0 失败、4 ignored**（109 原测试 + 24 新参考）。
+  learner 三组显式初始 2/1/1 项失败；四题均完成“失败 → 临时套解通过 → 原字节恢复
+  后再失败”，starter 哈希一致，恢复后刷新 mtime 避免 Cargo 缓存掩盖。默认 ignored
+  与 CLI 成功退出均不表示学习者完成。
+- 三个 CLI 的 **37 条关键输出**匹配；README 的 **13 条 exact 命令各执行 1 项**，
+  9 正向通过、4 learner 按预期失败。正文额外的三条正向 exact 命令也各执行 1 项。
+  PATH 的 `D:\lua51\lua.EXE` 确认为 **Lua 5.1.5**，实际启动 `stdlib_diff.lua`
+  退出 0、输出 1550；本次不是缺 oracle 跳过。全 20 版本教学检查、mdBook 构建、
+  38 页链接检查通过：**1,227 个站内链接，0 broken**。
+- 本机证据独立保存在 `target/teaching-v16-2026-10-15/`：
+  `full-validation/20261015T054915848303Z/{summary,metadata}.json` 记录整套命令/
+  计数/源码哈希/oracle；同目录 `exact-command-sources.json` 记录逐题命令来源。
+  `args/20261015T054354598325Z/`、`catalog/20261015T054534393Z/` 与
+  `globals/{starter-round-trip,scoped-verification}.json` 记录局部与套解恢复；
+  `final-verification.json` 记录最终站点/正文命令/交付文件哈希与基线 CI。
+  这些是本机忽略产物，不随 clone 交付；永久入口是主章、三个 README、contracts 与
+  examples。没有覆盖以前版本的教学证据。
+- 已推送基线 `77f7576` 的 [mdBook 38687260302](https://github.com/YanqingXu/lua_rust/actions/runs/38687260302)
+  成功；[Rust CI 38687260297](https://github.com/YanqingXu/lua_rust/actions/runs/38687260297)
+  失败，仅 Windows Quality Gate 的 M1 foundation and quality gate 失败，三个
+  Miri/ASan job 成功。此次 `gh run view --log-failed` 下载返回 HTTP 403 / API rate
+  limit exceeded，未核实具体失败原因；输出见 `baseline-77f7576-failed.log`，不把
+  以前提交的 Clippy 原因套用到本次。这是基线结果，不代表本批新提交的 CI。
+
+下一教学包可继续 v0.16 的 pcall/xpcall、sort comparator 与禁止 yield 边界，围绕
+回调返回/报错后如何恢复状态与保活临时对象建立反例。若选择工程整改，v0.15 已记录的
+`active_varargs_gap.lua` 尾调用活动 varargs 漏根仍未修复，本轮成功不能覆盖该缺口。
+后续按用户指令启动；原审计队列仍暂停在本地时间/UTC/DST。
+
 ## 2026-10-15：v0.15 独立栈、yield/resume 与 GC roots 所有权
 
 用户要求按问题链补齐 v0.15 的反例、前后差异、状态图和验收练习，验证后更新交接。
