@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="660" viewBox="0 0 900 660" role="img" aria-labelledby="title desc">
+  <title id="title">弱表先分类追踪边，再依据最终标记清理弱项</title>
+  <desc id="desc">普通表追踪所有键和值会让缓存中的对象一直存活。弱值模式 v 仍强追踪对象键和元表，但不沿值标记。弱键模式 k 不沿对象键标记，map中的值要等键已存活后由 ephemeron 传播；数组的数值键不是GC对象，值仍强追踪。kv同时弱化键和值，不做ephemeron传播。最后依据mark snapshot清除死亡弱项；标记阶段跳过边并不等于已经删除entry。</desc>
+  <defs>
+    <marker id="green" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <marker id="orange" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#a45a24"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; }
+      .label { font-size: 18px; }
+      .small { font-size: 16px; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .strong { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#green); }
+      .weak { fill: none; stroke: #a45a24; stroke-width: 2; stroke-dasharray: 6 4; marker-end: url(#orange); }
+    </style>
+  </defs>
+  <rect width="900" height="660" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">缓存只“看见”值，不一定负责让它存活</text>
+  <text x="24" y="65" class="small">共同输入：root → W，W.item → V；V 没有其他 root；所有边都在周期前建好。</text>
+
+  <rect x="20" y="86" width="420" height="179" rx="12" fill="#fff8ee" stroke="#a45a24"/>
+  <text x="38" y="117" class="label">错误：沿用普通表的全强边扫描</text>
+  <rect x="40" y="151" width="95" height="50" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="87" y="183" text-anchor="middle" class="label">root W</text>
+  <rect x="296" y="151" width="100" height="50" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="346" y="183" text-anchor="middle" class="label">V 存活</text>
+  <path d="M135 176H295" class="strong"/>
+  <text x="38" y="238" class="small">V 被扫描成 marked，后续 cleanup 也不会删它。</text>
+
+  <rect x="460" y="86" width="420" height="179" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="478" y="117" class="label">修复 v：不沿弱值边追踪 V</text>
+  <rect x="480" y="151" width="95" height="50" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="527" y="183" text-anchor="middle" class="label">root W</text>
+  <rect x="736" y="151" width="100" height="50" rx="6" fill="#fff" stroke="#a45a24"/>
+  <text x="786" y="183" text-anchor="middle" class="label">V 未标记</text>
+  <path d="M575 176H735" class="weak"/>
+  <text x="478" y="238" class="small">cleanup 删除 item；Sweep 才回收 V。</text>
+
+  <rect x="20" y="290" width="860" height="229" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="38" y="323" class="label">普通 Mark 扫描时，哪些工作项可以直接入队？</text>
+  <text x="40" y="360" class="mono">mode</text><text x="160" y="360" class="mono">map key</text><text x="330" y="360" class="mono">map value</text><text x="690" y="360" class="mono">array value</text>
+  <path d="M40 370H854" stroke="#c9bfd9"/>
+  <text x="40" y="393" class="mono">none</text><text x="160" y="393" class="label">强</text><text x="330" y="393" class="label">强</text><text x="690" y="393" class="label">强</text>
+  <text x="40" y="426" class="mono">v</text><text x="160" y="426" class="label">强</text><text x="330" y="426" class="label">弱</text><text x="690" y="426" class="label">弱</text>
+  <text x="40" y="459" class="mono">k</text><text x="160" y="459" class="label">弱</text><text x="330" y="459" class="label">等 key 存活后传播</text><text x="690" y="459" class="label">强</text>
+  <text x="40" y="492" class="mono">kv</text><text x="160" y="492" class="label">弱</text><text x="330" y="492" class="label">弱（不传播）</text><text x="690" y="492" class="label">弱</text>
+
+  <text x="24" y="555" class="small">W 自身必须可达；metatable 始终是强边。弱键 value 不能先按强边标记，再回头判断 key。</text>
+  <text x="24" y="586" class="small">数字、布尔、字节字符串等非 GC 对象视为存活；不能因为 W 是弱表就把所有 entry 都删除。</text>
+  <text x="24" y="617" class="small">跳过弱边只决定“不标记谁”；cleanup 决定“删除哪些弱项”，两个阶段都必须保留。</text>
+  <text x="24" y="648" class="small">这是本快照的对象追踪合同；周期中的弱写入、模式切换另有保守行为，不由此图外推。</text>
+</svg>

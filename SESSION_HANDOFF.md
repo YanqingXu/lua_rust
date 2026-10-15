@@ -3,6 +3,66 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v0.14 弱表、ephemeron 固定点与 resurrection 清理顺序
+
+用户要求继续按问题链补齐这组反例、前后差异、状态图和练习，完成验证并交接。
+本次完成该教学包，**没有恢复暂停的原审计整改目标**。用户随后明确要求将本批
+章节、状态图、练习包和交接一并提交并推送。
+
+- 起点为 `main@bdf023ec743abbf775015f9eda66d11030fc87c4`，工作区干净；提交前 fetch
+  再次确认与 origin/main 无分叉。该提交是上一批已推送的短借用/回调教学包，下面保留
+  其历史证据。本批提交号以 `git log -1 -- book/src/versions/v14-incremental-gc.md`
+  为准，新提交的 CI 须按其 SHA 查询。
+  本次生产 `crates/`、v0.14 快照核心与既有测试均无最终 diff。
+- [主章](book/src/versions/v14-incremental-gc.md) 新增问题八至十：普通强扫描为何令
+  弱缓存泄漏 → 按 `v/k/kv` 分类 array/map/metatable 边；单轮条件传播漏掉跨第二张
+  弱键表的 value → 收集候选、drain 强边、重复到固定点；弱项过早删除无法恢复 →
+  pending 图补标记先于 cleanup，Heap 返回后才执行 callback 发布 rescue root。
+  每问包含预测、可运行入口、starter/solution include、最小 diff、状态图与完成条件。
+- [弱表包](book/code/v14-incremental-gc/exercises/weak/README.md) 提供两个独立 TODO、
+  固定 faults、共享合同、10 项默认参考验收和 `weak_problem_chain` CLI。除两表精确
+  trace，还验收 1/4/16 个 productive rounds、空候选终止、撤根释放、无根 key/value
+  环不能自举；真实 Heap 对照实际对象访问、弱槽精确 nil 与共享 metatable 的模式刷新。
+- [复活顺序包](book/code/v14-incremental-gc/exercises/resurrection/README.md) 提供
+  一个 ordering TODO、6 项默认验收和 `resurrection_problem_chain` CLI。错误版当轮
+  对象仍活但四弱项已丢失；正确版按 rescue 三周期/no-rescue 两周期观察累计一次
+  finalizer 与 second death。真实 Heap 通过显式 roots 模拟发布/撤销，验证 userdata、
+  closure、closed upvalue 与 child/grandchild 访问，弱槽须精确 `Ok(Nil)`；真实 VM
+  另分三次 execute 验证 callback 看见弱项、rescue 可用、撤根后清理，只返回 bool。
+  `probe[value]=42` 验证 userdata key 真实可用，未通过重设 finalizer 改变 finalized。
+- 新增三幅 SVG：模式边矩阵、ephemeron 候选轮次、Atomic 到 callback 再到 second
+  death。浏览器已核对正文 include、文字/箭头和表格列对齐，临时预览进程已结束。
+- 源码边界单独写明：组图/模式切换固定在 Pause/完整周期之间；周期中的弱写入可能
+  保守多活一轮，模式刷新不重新扫描已标记表。Atomic 候选为空会直接退出固定点循环，
+  不在入口无条件 drain gray；finalizer 补标记之后不再次运行 ephemeron。本包只验收
+  弱值观察与独立弱键链，不把晚标 key/finalizer 混合图说成已正确，也不宣称官方
+  Lua 5.1 全部弱表/finalizer 组合兼容。这些工程边界未在本教学包中整改。
+- 本地 `rustc/cargo 1.96.1`：fmt、workspace all-targets Clippy `-D warnings` 通过；
+  Debug/Release 各 **119 通过、10 ignored**（84 原测试 + 19 旧参考 + 16 新参考）。
+  五组 learner 显式初始分别 3/1/3/2/1 项失败；本次三题分别完成“失败 → 临时套解
+  通过 → 字节恢复后再失败”，starter 原始哈希一致。默认 ignored 不表示练习已完成。
+- 四个 CLI 默认 all 的 36 条关键输出匹配；九条新增精确命令均执行到 1 项测试：
+  六正向通过、三 learner 按预期失败。教学结构覆盖 20 版本，mdBook 构建与 38 页
+  链接检查通过：**1,197 个站内链接、0 broken**。
+- 本机证据独立保存在 `target/teaching-v14-weak-2026-10-15/`：
+  `full-validation/20261015T033457998249Z/summary.json` 与 `metadata.json` 为整套
+  命令/计数/工具链/源码哈希；`local/20261015T033312732289Z/` 为弱表局部与套解；
+  `resurrection/starter-round-trip.json` 与 `resurrection/scoped-verification.json`
+  为复活局部与套解；`chapter-commands/` 为逐条命令；`final-verification.json` 为
+  最终站点/输入哈希/基线 CI 观察。此目录是忽略产物，不随 clone 交付；永久入口为
+  章节和两个 README，没有覆盖旧 `teaching-v14-*` 证据。
+- 基线 `bdf023e` 的 [mdBook 38675383210](https://github.com/YanqingXu/lua_rust/actions/runs/38675383210)
+  已成功；[Rust CI 38675383184](https://github.com/YanqingXu/lua_rust/actions/runs/38675383184)
+  已失败，仅 Windows Quality Gate 失败，其余三个 job 成功。`gh run view --log-failed`
+  下载该次日志返回 HTTP 403（要求 repository admin 权限），因此未核实该次具体原因，
+  不借用 `14ca9c0` 的旧 Clippy 日志当作本次证据。远端结果属于已推送基线，不覆盖
+  本批教学修改的本地验证，也不作为本批新提交的 CI 结果。
+
+下一教学包可从 v0.15 的“为什么 coroutine 不能共用一个活动栈”问题开始，继而验证
+yield/resume 与 GC roots 的 owner turn；按后续用户指令启动。若用户选择工程整改，
+应先对上述晚标 key/周期中模式切换另建真实故障复现，不把本轮模型当成修复证明。
+原审计队列仍暂停在本地时间/UTC/DST；提交推送仍需当次指令。
+
 ## 2026-10-15：v0.14 短借用、finalizer 事件与回调重入
 
 用户要求沿问题链继续完善短借用、事件所有权与回调重入，补齐反例、代码差异、状态图

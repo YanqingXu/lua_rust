@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="838" viewBox="0 0 900 838" role="img" aria-labelledby="title desc">
+  <title id="title">Resurrection：先保护待执行图，再清理弱项，回调之后才发布新根</title>
+  <desc id="desc">真实快照在Atomic先达ephemeron固定点，再把不可达且未finalized的userdata设为finalized并排队，补标记userdata与callback并排空强边，最后cleanup弱项和建立Sweep快照。Heap返回后VM才运行callback，callback可把userdata发布到rescue根。过早cleanup会永久删除本应保留的弱项，即使对象随后仍存活。第二周期有rescue根时继续存活，第三周期撤销rescue根后不再排finalizer，弱项被清除并second death。</desc>
+  <defs>
+    <marker id="green" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; }
+      .label { font-size: 18px; }
+      .small { font-size: 16px; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .flow { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#green); }
+    </style>
+  </defs>
+  <rect width="900" height="838" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">弱项清理前保护待执行对象；实际复活发生在回调中</text>
+  <text x="24" y="65" class="small">W 是有 root 的弱值表；U → callback → child → grandchild 为强图；本例没有弱键链。</text>
+
+  <rect x="20" y="86" width="860" height="270" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="38" y="118" class="label">第 1 周期 · Heap / Atomic 内部</text>
+  <rect x="40" y="139" width="816" height="48" rx="6" fill="#fff" stroke="#75519a"/>
+  <text x="58" y="170" class="small">① ephemeron 固定点结束；发现 U 未标记、未 finalized、且拥有 callback。</text>
+  <rect x="40" y="209" width="816" height="48" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="58" y="240" class="small">② 设 finalized，排事件；mark U / callback，并 drain 其全部强引用图。</text>
+  <rect x="40" y="279" width="816" height="48" rx="6" fill="#fff" stroke="#286047"/>
+  <text x="58" y="310" class="small">③ cleanup weak：W 中指向这批已标记对象的项保留；再建立 Sweep 快照。</text>
+  <path d="M448 187V208" class="flow"/>
+  <path d="M448 257V278" class="flow"/>
+
+  <rect x="20" y="377" width="860" height="92" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="38" y="410" class="label">Heap 返回后 · VM 执行 callback</text>
+  <text x="38" y="441" class="small">全批 temporary roots 保活 → callback 看见 W 中弱项 → 发布 rescue = U，才发生复活。</text>
+  <path d="M448 356V376" class="flow"/>
+
+  <rect x="20" y="491" width="420" height="119" rx="12" fill="#e5f1e7" stroke="#286047"/>
+  <text x="38" y="524" class="label">第 2 周期：rescue 仍是 root</text>
+  <text x="38" y="555" class="small">U 与强图可达，W 弱项仍在。</text>
+  <text x="38" y="586" class="small">没有新 finalizer 事件，累计 callback = 1。</text>
+  <rect x="460" y="491" width="420" height="119" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="478" y="524" class="label">第 3 周期：移除 rescue root</text>
+  <text x="478" y="555" class="small">U 已 finalized，不再排队；弱项被清除。</text>
+  <text x="478" y="586" class="small">Sweep 回收 U 与强图，累计 callback = 1。</text>
+  <path d="M440 550H459" class="flow"/>
+
+  <rect x="20" y="632" width="860" height="99" rx="12" fill="#fff8ee" stroke="#a45a24"/>
+  <text x="38" y="665" class="label">反例：若把 ③ cleanup 提到 ② 补标记之前</text>
+  <text x="38" y="696" class="small">W 中的项已被删除，后续 mark / callback 即使保活 U，也无法自动恢复这些 entry。</text>
+  <text x="38" y="723" class="small">所以必须同时验收对象可访问、弱项可见、rescue 发布与撤销后的 second death。</text>
+  <text x="24" y="769" class="small">无 rescue 的分支在下一完整周期即可死亡。这里没有重新注册 finalizer，也没有嵌套 GC。</text>
+  <text x="24" y="800" class="small">finalizer 标记后不重跑 ephemeron；本图只验收弱值观察，不能外推所有 weak-key/finalizer 组合。</text>
+  <text x="24" y="829" class="small">此顺序来自 v0.14 教学快照，不宣称是 Lua 5.1 官方 finalizer / weak table 的完整兼容合同。</text>
+</svg>

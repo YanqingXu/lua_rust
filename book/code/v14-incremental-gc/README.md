@@ -45,7 +45,32 @@ cargo test --manifest-path book/code/v14-incremental-gc/Cargo.toml --test gc_bor
 cargo test --manifest-path book/code/v14-incremental-gc/Cargo.toml --test gc_callbacks_exercises -- --ignored
 ```
 
-短借用参考 2 项、回调参考 9 项。默认 workspace 合计 **103 项通过、7 项 TODO ignored**
-（84 项原测试、8 项强引用验收、11 项借用/回调验收）。ignored 不是读者已完成练习；
-显式启用时七题初始均失败。短借用反例只在 rustc 子进程中编译，保留失败输入不会
+短借用参考 2 项、回调参考 9 项。ignored 不是读者已完成练习；
+显式启用时对应四题初始均失败。短借用反例只在 rustc 子进程中编译，保留失败输入不会
 破坏默认构建。两个 CLI 固定重放错误/修复，不读取 starter，进程退出 0 只表示重放完成。
+
+## 最后追问：弱边、ephemeron 固定点与 resurrection 顺序
+
+[弱表包](exercises/weak/README.md) 先修普通表扫描造成的弱目标泄漏，再用跨两张弱键
+表的链，展示单轮传播遗漏第二个 value。两项 TODO 分别修改边分类与固定点循环；
+合同还检查无根环、primitive/metatable、1/4/16 轮链。真实 Heap 对照检查对象实际访问、
+弱项清除，以及完整周期之间共享 metatable 的模式刷新。
+
+[复活顺序包](exercises/resurrection/README.md) 用第三项 TODO 交换“pending 强图
+补标记”和“weak cleanup”次序。模型、真实 Heap 可控 roots、同一真实 VM 的三次
+execute 分别证明弱项可见、rescue 保留和撤根后的 second death；没有重新注册 finalizer。
+真实 Atomic 在 finalizer 标记后不重跑 ephemeron，这组弱值测试不覆盖所有混合图。
+
+```powershell
+cargo run --quiet --manifest-path book/code/v14-incremental-gc/Cargo.toml --example weak_problem_chain
+cargo run --quiet --manifest-path book/code/v14-incremental-gc/Cargo.toml --example resurrection_problem_chain
+cargo test --manifest-path book/code/v14-incremental-gc/Cargo.toml --test gc_weak_reference --test gc_resurrection_reference
+
+# 初始分别 2 项、1 项失败；只修对应 starter 后应全部通过。
+cargo test --manifest-path book/code/v14-incremental-gc/Cargo.toml --test gc_weak_exercises -- --ignored
+cargo test --manifest-path book/code/v14-incremental-gc/Cargo.toml --test gc_resurrection_exercises -- --ignored
+```
+
+默认 workspace 合计 **119 项通过、10 项 TODO ignored**：84 项原测试、8 项强引用参考、
+11 项借用/回调参考、16 项弱表/复活参考。四个 CLI 都固定重放；学习者完成状态以各
+exercise target 的显式 `--ignored` 验收为准。

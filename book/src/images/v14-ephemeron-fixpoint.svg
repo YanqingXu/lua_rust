@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="736" viewBox="0 0 900 736" role="img" aria-labelledby="title desc">
+  <title id="title">Ephemeron：新标记的键需要下一轮传播</title>
+  <desc id="desc">W1 W2是已标记的弱键表，只有K1是直接根。W1[K1]=V1，V1强引用K2，W2[K2]=V2。每轮先基于当前标记收集候选，再入队并排空强边。第一轮得到V1并由其强边标记K2；第二轮才能得到V2；第三轮无新候选而结束。只传播一轮会留下已存活K2指向被回收V2的entry。没有外部根的K与V互相支撑时没有起始标记，不应自举存活。</desc>
+  <defs>
+    <marker id="green" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <marker id="purple" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#75519a"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 22px; font-weight: 700; }
+      .label { font-size: 18px; }
+      .small { font-size: 16px; }
+      .mono { font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 17px; }
+      .strong { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#green); }
+      .conditional { fill: none; stroke: #75519a; stroke-width: 2; stroke-dasharray: 6 4; marker-end: url(#purple); }
+    </style>
+  </defs>
+  <rect width="900" height="736" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="36" class="heading">一次传播产生新 key：因此还要再检查一次弱键表</text>
+  <text x="24" y="65" class="small">roots = W1、W2、K1；W1/W2 为 k 模式。虚线是“key 已存活，才允许保活 value”。</text>
+
+  <rect x="20" y="86" width="860" height="180" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="40" y="116" class="mono">W1[K1] = V1</text>
+  <text x="650" y="116" class="mono">W2[K2] = V2</text>
+  <rect x="40" y="146" width="130" height="64" rx="6" fill="#e5f1e7" stroke="#286047"/>
+  <text x="105" y="184" text-anchor="middle" class="label">K1 已标记</text>
+  <rect x="265" y="146" width="125" height="64" rx="6" fill="#fff" stroke="#75519a"/>
+  <text x="327" y="184" text-anchor="middle" class="label">V1</text>
+  <rect x="495" y="146" width="125" height="64" rx="6" fill="#fff" stroke="#286047"/>
+  <text x="557" y="184" text-anchor="middle" class="label">K2</text>
+  <rect x="725" y="146" width="125" height="64" rx="6" fill="#fff" stroke="#75519a"/>
+  <text x="787" y="184" text-anchor="middle" class="label">V2</text>
+  <path d="M170 178H264" class="conditional"/>
+  <path d="M390 178H494" class="strong"/>
+  <path d="M620 178H724" class="conditional"/>
+  <text x="404" y="241" class="small">V1 → K2 是普通强边</text>
+
+  <rect x="20" y="288" width="860" height="230" rx="12" fill="#f1edf7" stroke="#75519a"/>
+  <text x="40" y="321" class="label">每轮先收集全部候选，再 enqueue / drain；不依赖表的遍历顺序</text>
+  <text x="40" y="361" class="label">轮次</text><text x="140" y="361" class="label">轮初已标记</text><text x="520" y="361" class="label">候选</text><text x="680" y="361" class="label">drain 后新增</text>
+  <path d="M40 374H854" stroke="#c9bfd9"/>
+  <text x="40" y="397" class="mono">1</text><text x="140" y="397" class="mono">K1</text><text x="520" y="397" class="mono">[V1]</text><text x="680" y="397" class="mono">V1、K2</text>
+  <text x="40" y="433" class="mono">2</text><text x="140" y="433" class="mono">K1、V1、K2</text><text x="520" y="433" class="mono">[V2]</text><text x="680" y="433" class="mono">V2</text>
+  <text x="40" y="469" class="mono">3</text><text x="140" y="469" class="mono">K1、V1、K2、V2</text><text x="520" y="469" class="mono">[]</text><text x="680" y="469" class="label">停止</text>
+  <text x="40" y="502" class="small">表中的标记集合省略已标记 W1/W2 与 metatable；候选必须是尚未标记的 GC 值。</text>
+
+  <rect x="20" y="540" width="420" height="105" rx="12" fill="#fff8ee" stroke="#a45a24"/>
+  <text x="38" y="573" class="label">只跑一轮：V2 未标记</text>
+  <text x="38" y="604" class="small">K2 已存活，entry 仍可保留，但 V2 被误收。</text>
+  <text x="38" y="632" class="small">只检查 key 存活或队列曾为空都不够。</text>
+  <rect x="460" y="540" width="420" height="105" rx="12" fill="#fff" stroke="#286047"/>
+  <text x="478" y="573" class="label">达到固定点：V2 实际可访问</text>
+  <text x="478" y="604" class="small">每个 productive round 至少新增一个标记。</text>
+  <text x="478" y="632" class="small">有限对象 + 标记单调增长 → 最终无新候选。</text>
+  <text x="24" y="682" class="small">负向边界：没有 root 的 K ← V，即使 W[K]=V，二者也不能靠弱键关系自举保活。</text>
+  <text x="24" y="713" class="small">此图没有 finalizer。真实 Atomic 在 finalizer 补标记后不会再执行第二轮 ephemeron 固定点。</text>
+</svg>

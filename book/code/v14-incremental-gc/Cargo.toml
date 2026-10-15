@@ -44,3 +44,19 @@ path = "exercises/callbacks/acceptance.rs"
 [[test]]
 name = "gc_callbacks_reference"
 path = "exercises/callbacks/reference.rs"
+
+[[test]]
+name = "gc_weak_exercises"
+path = "exercises/weak/acceptance.rs"
+
+[[test]]
+name = "gc_weak_reference"
+path = "exercises/weak/reference.rs"
+
+[[test]]
+name = "gc_resurrection_exercises"
+path = "exercises/resurrection/acceptance.rs"
+
+[[test]]
+name = "gc_resurrection_reference"
+path = "exercises/resurrection/reference.rs"

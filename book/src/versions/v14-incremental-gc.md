@@ -1,6 +1,6 @@
 # v0.14 · 增量 GC、弱表与 Finalizer
 
-<div class="lesson-meta"><span>分步 → 进度 → barrier → 短借用 → 事件 → 重入</span><span>workspace</span><span>checkpoint v0.14</span></div>
+<div class="lesson-meta"><span>增量状态 → 借用与回调 → 弱边与固定点 → 复活顺序</span><span>workspace</span><span>checkpoint v0.14</span></div>
 
 <a id="learning-task-card"></a>
 ## 学习任务卡
@@ -9,15 +9,17 @@
   <strong>把一次完整遍历拆成可暂停、可回调的状态机</strong>
   <p>前置：v0.13 的 roots/edges、mark/sweep 与 Heap owner。先解决分步、保存进度和
   写入修复，再追问：扫描时怎样结束短借用、谁拥有待执行事件、回调重入和报错时谁负责
-  保活与收尾。产出是三个强引用 TODO、一个编译器借用实验、三个回调 TODO；每次改动
-  都用同一反例前后对照。weak/ephemeron 固定点留作扩展阅读。</p>
+  保活与收尾；最后处理弱表怎样分类边、ephemeron 为什么需要固定点、复活前怎样清理。
+  产出是十个 TODO：强引用三题、短借用一题、回调三题、弱表/固定点两题、清理顺序一题。
+  每次改动都用同一反例前后对照；自动调度保留为扩展阅读。</p>
 </div>
 
 v0.13 的一次 `collect` 要做完本轮 mark/sweep 才返回。现在让 VM 在回收步骤之间继续
 执行 Lua，就会依次遇到三个问题：**怎样交还控制权，怎样记住进度，怎样修复扫描之后
-新增的边**。前三问讲强引用状态机，后四问沿着“扫描 → 交还事件 → 调用 Lua”继续
-追踪 Rust 借用、事件所有权、GC roots 与错误路径。自动 checkpoint、weak table 和
-resurrection 的完整语义保留在扩展阅读，不作为前半练习的前置知识。
+新增的边**。前三问讲强引用状态机，问题四至七沿着“扫描 → 交还事件 → 调用 Lua”
+追踪 Rust 借用、事件所有权、GC roots 与错误路径。问题八至十继续追问：弱边为什么
+不能照常扫描，一轮条件传播为什么不够，待执行 finalizer 的补标记为何必须早于弱项清理。
+各组可以独立运行，先完成前一组再读下一组。
 
 配套代码分层验证：`exercises/model.rs` 是只含强引用的可运行小模型，用来替换
 错误设计、观察确定性轨迹；真实快照仍在 `crates/` 中，另用真实 `Heap` 对照验收。
@@ -25,6 +27,11 @@ resurrection 的完整语义保留在扩展阅读，不作为前半练习的前�
 `GcPhase`、`GcStep` 和 `GcStats`。`exercises/borrow/` 用 rustc 检验真实借用冲突；
 `exercises/callbacks/` 从已排好的事件批次开始模拟重入，另以真实 Heap/VM 验证保活、
 调用次数和错误后续执行。后者不模拟 Atomic、weak 或完整 Lua VM。
+
+`exercises/weak/` 与 `exercises/resurrection/` 再把弱边/固定点、待执行对象的补标记/
+清理顺序拆成两个独立模型。它们另有真实 Heap/VM 对照，不能把两包拼起来当成完整
+collector。下面讲的是 **v0.14 教学快照的可观察合同**，没有宣称全部 Lua 5.1
+弱表/finalizer 组合已经兼容；尤其要保留问题十列出的晚标记 key 边界。
 
 <a id="learning-predict"></a>
 ## 先预测再运行
@@ -58,7 +65,9 @@ CLI 在同一次运行中并列展示错误和修复后的行为；预期错误�
 6. 运行 `budget=1`/完整回收对照与 late child 保活验收；
 7. `mark_one` 的 record 借用 → 拥有型子边 → `enqueue_value`，对照短借用实验；
 8. `Heap::take_finalizers → Vm::gc_step_internal → invoke_callable`：先移走事件、
-   再保护全批 roots、最后调用 Lua 并收尾。
+   再保护全批 roots、最后调用 Lua 并收尾；
+9. `mark_one` 的弱边分类 → `atomic_phase` 的条件传播 → `cleanup_weak_tables`；
+10. Atomic 的 finalizer 补标记 → 弱项清理 → Heap 返回 → callback 发布 rescue root。
 
 ## 问题一：怎样在回收尚未完成时交还控制权？
 
@@ -522,49 +531,268 @@ temporary roots；但重新 `execute` 本身会清空临时 roots，所以该探
 即时 phase。
 
 **完成条件：** 调用次数、首错、外层 roots 保留、后续对象可回收四项一起成立。
-这些实验验证事件消费协议；weak/ephemeron 与 resurrection 仍需各自的具体反例。
+这些实验验证事件消费协议；下面再用独立反例验证 weak/ephemeron 与 resurrection。
 
-## 扩展阅读：自动调度、弱表与 resurrection
+## 问题八：缓存里只剩一个弱引用，为什么对象仍然回收不了？
 
-以下内容帮助定位最终 v0.14 已有能力。第一遍可以先完成章末练习，再回来阅读；
-完整 weak/ephemeron 教学尚未拆成问题链。
+### 给表加了模式，扫描算法却仍把所有边当成强边
 
-## Allocation accounting 与自动 checkpoint
+先预测下面的 Lua 返回什么。这里的 `cache` 与 metatable 有长期 root，临时表没有
+其他 root；所有对象和边都在 GC 开始之前建好：
+
+```lua
+local cache = setmetatable({}, { __mode = "v" })
+do cache.item = {} end
+gc_collect()
+return cache.item == nil
+```
+
+如果仅保存 `weak_values=true`，仍按普通表扫描全部值，临时表就被标记成可达，
+cleanup 也找不到该删除的弱项。实验固定同一张图，分别使用“全部强追踪”和模式分类：
+
+```powershell
+cargo run --quiet --manifest-path $gcManifest --example weak_problem_chain -- weak
+```
+
+分类前的入口可编译运行：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/weak/starter.rs:weak_edges_starter}}
+```
+
+修复只改变“哪些值作为普通强边入队”，先不改对象存储或 cleanup：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/weak/solution.rs:weak_edges_solution}}
+```
+
+```diff
+- let mut edges = table.array.clone();
++ let mut edges = Vec::new();
++ if !table.mode.weak_values() { edges.extend(table.array.iter().copied()); }
+  for &(key, value) in &table.map {
+-     edges.extend([key, value]);
++     if !table.mode.weak_keys() { edges.push(key); }
++     if !table.mode.weak_keys() && !table.mode.weak_values() { edges.push(value); }
+  }
+```
+
+前后差异可以逐类核对：
+
+| mode | 普通 Mark 的 map key | 普通 Mark 的 map value | array value |
+|---|---|---|---|
+| 无弱模式 | 强追踪 | 强追踪 | 强追踪 |
+| `v` | 强追踪 | 不追踪 | 不追踪 |
+| `k` | 不追踪 | 延迟到 key 已存活时传播 | 强追踪 |
+| `kv` | 不追踪 | 不追踪，不做 ephemeron 传播 | 不追踪 |
+
+metatable 在所有模式下都是强边。数组索引是数字，不是 GC 对象，所以 `k` 不会让
+array value 变弱。表中数字、布尔、字节字符串等没有 arena object ID 的 key/value
+视为存活，弱表不会让它们凭空消失。weak table **自身也必须可达**才谈得上向外追踪。
+
+![普通表强扫描会保留缓存值；弱表按 k/v 分类边，再根据标记结果清理弱项。](../images/v14-weak-edges.svg)
+
+### 跳过弱边之后，还要删掉死亡弱项
+
+“不沿弱边标记”并不等于“已经删除 entry”。真实 `cleanup_weak_tables` 先从 Heap 的
+标记位提取拥有型 `HashSet<object_id>`，结束这次读取，再借用各表修改其内容。map 的
+`retain` 要同时满足所有启用的弱条件；array 中死亡弱值改成 nil，再收缩尾部。
+
+```text
+保留 map entry = (!weak_keys || key 存活) && (!weak_values || value 存活)
+```
+
+小模型的 cleanup 是已给出的公共步骤，TODO 只修边分类。验收同时检查弱槽被清除、
+目标对象实际不可访问，以及仍有外部 root 的对象和 primitive entry 继续存活。
+只检查总对象数不足以区分“清理了错误的值”和“清理了正确的弱项”。
+
+真实 `table_set_metatable` 读取 `__mode`，`table_set` 更新 `__mode` 时刷新所有依赖
+表的缓存 flags。本包额外验证**完整周期之间**切换模式，并同时检查共享 metatable
+的两张表。周期中 weak→strong 只改 flags，不重新扫描已标记表；弱写入 barrier 也
+可能保守地让新增弱值多活一轮。因此本节的组图与模式切换都固定在 Pause，不能外推
+为“任意时刻修改模式都立即补扫”。
+
+**完成条件：** `v/k/kv`、array、metatable、primitive 的分类分别成立；错误强扫描
+确实保留了本应回收的弱目标。接着追问 `k` 模式延迟的 value：只等一次 key 就够了吗？
+
+```powershell
+cargo test --manifest-path $gcManifest --test gc_weak_reference weak_edges_follow_table_mode -- --exact
+```
+
+## 问题九：key 已经存活，为什么它对应的 value 还会被误收？
+
+### 第一轮传播才产生第二张表需要的 key
+
+准备两张有 root 的 `k` 表 W1/W2，只有 K1 是直接 root：
+
+```text
+W1[K1] = V1       V1 --强边--> K2       W2[K2] = V2
+roots = [W1, W2, K1]
+```
+
+普通 Mark 不沿弱 key，也不直接沿这些 map value。第一次条件传播发现 K1 已标记，
+才能排入 V1；排空 V1 的强边后 K2 才被标记。此时 W2 的条件刚刚成立，必须重新检查。
+先预测“只传播一轮”的版本是否会保留 V2，再运行：
+
+```powershell
+cargo run --quiet --manifest-path $gcManifest --example weak_problem_chain -- ephemeron
+```
+
+错误入口与修复入口如下；唯一新增的设计是重复“收集候选 → 入队 → 排空强边”，
+直到没有新候选，而不是人为把轮数写死为二：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/weak/starter.rs:ephemeron_starter}}
+```
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/weak/solution.rs:ephemeron_solution}}
+```
+
+```diff
++ loop {
+      let candidates = heap.candidates();
+      heap.record_round(&candidates);
++     if candidates.is_empty() { break; }
+      for value in candidates { heap.enqueue(value); }
+      heap.drain(classify);
++ }
+```
+
+真实 Atomic 每轮先只读收集 `Vec<Value>`，结束对 Heap 对象的遍历后再 enqueue 并
+排空 gray；候选为空则直接结束这段固定点循环，不会在循环入口无条件 drain 已有 gray。
+这也使用了问题四的短借用边界。因为本轮候选先统一收集，第一轮不会因
+HashMap 恰好按 W1/W2 顺序遍历而提前得到 V2，反例不依赖随机迭代顺序。
+
+![第一轮标记 V1 并沿强边标记 K2，第二轮才能标记 V2，第三次检查无新候选而结束。](../images/v14-ephemeron-fixpoint.svg)
+
+### 停止条件为什么是“没有新候选”？
+
+候选只来自**已标记的 k 且非 v 表**，要求 key 已存活、value 是尚未标记的 GC
+对象。每个有工作的轮次至少新增一个标记；对象集合有限且本例无分配，标记只增不减，
+所以最终必然停止。primitive value 已视为存活，不能反复把它作为“新工作”加入。
+真正的固定点还要求把候选的强边排空，不能只把候选 push 进队列就认为传播结束。
+
+只跑一轮时，K2 已标记，weak-key cleanup 可能保留 `W2[K2]`，但 V2 未标记，随后
+被 Sweep 回收。得到一个 handle 仍不能证明成功；参考验收要求 V2 的实际访问成功。
+反过来，没有外部 root 的 `W[K]=V、V→K` 不能靠二者相互支撑而自举存活；如果一开始
+就把 V 当强边扫描，恰好会错误地制造这条“活 key”。
+
+本节不含 finalizer。真实 `atomic_phase` 在 finalizer 补标记之后不会再执行第二遍
+ephemeron 固定点，因此不能从这个两表链外推到任意晚标 key 和 finalizer 混合图。
+
+**完成条件：** V2 可访问，移除 K1 root 后链上对象可回收，无根环也可回收；改变表
+遍历顺序不改变结果。修复不能靠把 K2/V2 加成直接 roots，或只增大固定循环上限。
+
+```powershell
+cargo test --manifest-path $gcManifest --test gc_weak_reference ephemerons_reach_a_fixed_point_without_bootstrapping_cycles -- --exact
+cargo test --manifest-path $gcManifest --test gc_weak_reference real_heap_cross_table_ephemerons_reach_a_fixed_point_then_release -- --exact
+```
+
+## 问题十：对象还要交给 finalizer，为什么弱项已经消失了？
+
+### 先清理，再补标记，无法恢复已经删除的 entry
+
+沿用问题五至七的事件协议，再增加一张有 root 的弱值表 W，观察以下强图：
+
+```text
+U → callback → child → grandchild
+W 的四个弱值槽分别指向上述四个对象；它们没有其他 root。
+```
+
+U 已注册 finalizer、尚未 finalized。先预测：若 Atomic 在保护待执行对象之前就清理
+W，随后 U 与整张强图仍能保活，W 中的弱项会自动恢复吗？
+
+```powershell
+cargo run --quiet --manifest-path $gcManifest --example resurrection_problem_chain -- order
+```
+
+错误和修复只交换两个步骤，均从同一输入开始：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/resurrection/starter.rs:resurrection_order_starter}}
+```
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/resurrection/solution.rs:resurrection_order_solution}}
+```
+
+```diff
+- heap.cleanup_weak();
+  heap.mark_pending_graph();
++ heap.cleanup_weak();
+```
+
+错误版会出现“对象当轮仍存活，但弱项已丢失”。所以统计 live 数量或只验证 callback
+被执行都不能发现问题。正确版要把 pending userdata/callback 的**整个强引用图**
+drain 完成，再根据最终标记清弱项，最后才准备 Sweep snapshot。
+
+![Atomic 先为待执行 userdata 和 callback 强图补标记，再清弱项；Heap 返回后回调才发布 rescue 根，后续撤根才 second death。](../images/v14-resurrection-order.svg)
+
+### 把“本轮保护”和“回调复活”分成两个时间点
+
+真实快照按以下次序推进，不能把第 4 步搬进 Heap 的 Atomic 借用中：
+
+1. Atomic 先执行问题九的 ephemeron 固定点；
+2. 找到未标记、未 finalized、拥有 callback 的 userdata，设置 finalized 并排事件；
+3. 标记 userdata/callback，排空其强图；清弱项，建立 Sweep snapshot，Heap 返回；
+4. VM 移走整批事件并注册 temporary roots，然后执行 callback；此时才可能发布
+   `rescued = value` 之类的长期 root。
+
+本轮 pending 保护只是让对象有机会被调用，不代表它已被 Lua 发布复活；在 callback
+里写入长期 root 才是本例的 resurrection。没有 rescue 的分支在下一完整周期即可
+second death；有 rescue 的分支则要等撤销该 root 后才死亡。
+
+| 完整周期 | 长期 roots 中的 U | 事件数 / 累计调用数 | 弱项与对象 |
+|---|---|---|---|
+| 1 | 开始时没有；callback 发布 rescue | 1 / 1 | 补标记保护强图，四弱项可见，callback 能使用对象 |
+| 2 | rescue 仍存在 | 0 / 1 | 沿 root 标记 U 与强图，弱项继续保留 |
+| 3 | 已撤销 rescue | 0 / 1 | finalized 阻止再次发现，弱项清除，强图实际不可访问 |
+
+这里没有重新注册 finalizer。真实 `userdata_set_finalizer` 会重置 finalized，不能
+在验证“只调用一次”时顺手用它探测存活。真实 Heap 对照用 `userdata_is_finalized`、
+`function_proto`、upvalue 和 table 访问；最后要求对象不可访问与四个弱槽精确返回
+`Ok(Nil)` 同时出现，不能把弱表容器失活的 Err 当成清槽成功。真实 Heap 不运行
+Lua callback，而是用显式 root 模拟宿主发布/撤销 rescue；真实 VM 另在**同一实例的
+三次 execute** 中验收 callback 看见弱项、发布的 rescue 可用、撤根后清理，每段只
+返回布尔值。
+
+```powershell
+cargo run --quiet --manifest-path $gcManifest --example resurrection_problem_chain -- real
+cargo test --manifest-path $gcManifest --test gc_resurrection_reference
+```
+
+可以先阅读真实 VM 第一段的输入，观察 callback 内何时读取弱项、何时发布 rescue：
+
+```rust
+{{#include ../../code/v14-incremental-gc/exercises/resurrection/real.rs:resurrection_real_vm}}
+```
+
+跨周期观察应结束临时值的作用域或执行帧。若把 `observed = weak[...]` 一直留在活动
+寄存器中，它自己也会成为 root。本实验分三次 execute，使前一次观察帧结束，再进入
+下一周期；真实 Heap 的精确 roots 对照则直接移除 rescue，用它判定 second death。
+
+### 这组实验还没有证明什么？
+
+本例只用弱值槽，不混入晚标记的 weak key。真实 Atomic 在第 3 步补标记后**不重新
+执行 ephemeron 固定点**；若 `U→callback→K` 此时才使 K 存活，`W[K]=V` 的 V 不一定
+得到条件传播。本章保留该快照边界，不把弱值三周期验收写成所有混合图已正确。
+Object ID 升序只让本快照的事件次序可重复，也不是对官方 finalizer 顺序的兼容承诺。
+
+**完成条件：** 同时观察弱项、U/callback/强子图访问、rescue 的发布与撤销、累计一次
+finalizer 和后续回收；不要把本轮 pending 保护、Rust 事件 Vec 或临时观察值当成永久 root。
+
+```powershell
+cargo test --manifest-path $gcManifest --test gc_resurrection_reference pending_graph_is_marked_before_weak_cleanup -- --exact
+cargo test --manifest-path $gcManifest --test gc_resurrection_reference real_heap_keeps_the_pending_graph_then_rescues_and_releases_it -- --exact
+cargo test --manifest-path $gcManifest --test gc_resurrection_reference real_vm_callback_sees_weak_entries_and_rescue_lasts_until_released -- --exact
+```
+
+## 扩展阅读：Allocation accounting 与自动 checkpoint
 
 Heap 为每次 Table、Closure、Upvalue、Userdata 分配累计 debt。达到阈值，或一个周期已经处于活动 phase，VM 会在每条指令完成并写回寄存器后推进少量工作。checkpoint 选在写回之后，避免刚创建但尚未进入 root 的对象被误回收。
 
 `with_gc_allocation_threshold(1)` 的压力测试在 100 次循环分配中让每个安全点推进 GC，同时验证寄存器、循环清理和 barrier 不产生 stale handle。周期完成后 debt 归零；v1.0 保留教学用对象计数合同，并在 `LUA51-D010` 中显式登记与官方字节计账/调参接口的差异。
-
-## Weak value、weak key 与 ephemeron
-
-Table 在设置 metatable 时读取 `__mode`：包含 `v` 时不从 table 标记 value，包含 `k` 时不直接标记对象 key。之后修改 metatable 的 `__mode` 会刷新所有依赖 table 的模式。
-
-Weak value 可以在 Atomic 直接依据 mark bit 删除。Weak key 更微妙：若 key 从其他 root 可达，那么它对应的 value 必须保留；value 又可能使其他 weak key 可达，所以需要重复到固定点：
-
-```text
-key 已标记 → 标记 value → 传播新 edges → 再检查 ephemeron
-```
-
-Atomic 先反复执行“已标记 key → 标记 value → 传播 edges”到固定点，再发现并排队
-finalizer、重新标记相关 userdata/callback 并排空 gray，最后清理弱边并建立 Sweep 快照。
-[查看完整 Atomic/weak/finalizer 实现](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/crates/lua_core/src/lib.rs)
-
-固定点完成后，weak key/value 中指向未标记 heap object 的 entry 被删除。Primitive key/value 不由 GC 管理，因此视为存活。数组部分在 weak-value 模式下把死亡元素改为 nil，再执行尾部收缩。
-
-## Finalizer、resurrection 与 second death
-
-本版加入最小 `UserdataRef`。`setfinalizer(userdata, callback)` 只是教学入口；Atomic 按 object ID 升序发现“white、尚未 finalized、拥有 callback”的 userdata：
-
-1. 设置 `finalized = true`，本周期重新标记 userdata 和 callback；
-2. 把事件交还 VM，在 Heap 可变借用结束后调用 Lua callback；
-3. callback 可把 userdata 写入 global/registry，形成 resurrection；
-4. 以后失去所有 roots 时，因 `finalized = true` 不再排队，直接在下一周期死亡。
-
-Object ID 顺序让教学测试可重复，但不是 v1.0 要宣称的 Lua 5.1 finalizer 顺序合同。正式兼容收口时必须与官方 oracle 对照并登记差异。
-
-问题五至七已单独验收事件转移、整批保活和错误后继续执行；这里的 resurrection 则是
-callback 主动把对象发布到新的长期 root。当前 VM 中 callback 报错后允许调用者再次
-执行并继续推进 GC，不能因此认为报错时周期已经全部完成。
 
 ## Rust 知识映射与设计选择
 
@@ -573,6 +801,8 @@ callback 主动把对象发布到新的长期 root。当前 VM 中 callback 报�
 - `allocation_threshold` 与 saturating debt 表达自动调度策略；
 - write barrier 集中在唯一 owner 的 mutation API，减少漏点；
 - `HashSet<object_id>` 是 Atomic 弱引用清理时的稳定 mark snapshot；
+- 先收集拥有型候选 Vec、再可变传播，沿用短借用；`retain` 负责依据快照删除弱项；
+- 有限对象和单调标记为固定点循环提供终止理由；测试还验证更长的传播链；
 - finalizer event 先脱离 Heap 借用再回调 VM，允许安全重入；
 - “记录第一个错误、继续 drain”让失败恢复成为显式协议。
 
@@ -604,9 +834,10 @@ type=number value=714
 ```
 
 基础快照的 84 项测试仍保留：59 个端到端测试、7 个编译器测试、15 个 core 测试和
-3 个 VM 测试。三个强引用问题另有 8 项参考验收；本次短借用新增 2 项、事件与重入新增
-9 项参考验收，默认 workspace 合计 **103 项通过、7 项学习者 TODO 显式 ignored**。
-默认通过说明反例检测、参考合同与原有回归通过，不表示七个 TODO 已完成。
+3 个 VM 测试。强引用参考 8 项、短借用参考 2 项、回调参考 9 项；本次弱表/固定点
+新增 10 项、resurrection 顺序新增 6 项参考验收，默认 workspace 合计 **119 项通过、
+10 项学习者 TODO 显式 ignored**。默认通过说明反例检测、参考合同与原有回归通过，
+不表示十个 TODO 已完成。
 
 ## 本版本暂不支持
 
@@ -712,6 +943,41 @@ cargo test --manifest-path $gcManifest --test gc_borrow_reference --test gc_call
 只表示重放完毕；学习者完成状态由上述 `--ignored` 验收决定。短借用题在 rustc 子进程
 内编译，因此保留初始 E0499 不会让 workspace 构建失败。
 
+### 弱边、固定点与清理顺序的三项验收
+
+理解题：预测普通/`v`/`k`/`kv` 的 array、map 与 metatable 追踪差异，再只修
+`exercises/weak/starter.rs::classify_edges`。保留 primitive entry，不能用“所有弱表
+一律删空”通过。合同同时覆盖对象 key 无 root、有 root，以及 value→key 无根环。
+
+实现题：只修同一 starter 的 `propagate`，直到没有尚未标记的条件 value。共享合同
+除两表精确 trace 外，还验证 1、4、16 个 productive rounds 的链及最后空候选停止，
+不能硬编码两轮。保留原 roots，撤销 key root 后整条链应能释放。
+
+调试题：只修 `exercises/resurrection/starter.rs::finish_atomic`。先完整标记 pending
+图，再清理弱项；callback 仍在模型的 VM 阶段执行。既要通过 rescue 三周期，也要通过
+无 rescue 的两周期；不修改 finalized 来强行保活，更不能永远保留 pending 图。
+
+```powershell
+# 初始分别 2 项失败、1 项失败；只修改上述三个 TODO 后必须全部通过。
+cargo test --manifest-path $gcManifest --test gc_weak_exercises -- --ignored
+cargo test --manifest-path $gcManifest --test gc_resurrection_exercises -- --ignored
+
+# 固定错误版、参考解与真实 Heap/VM 对照：10 + 6 项默认通过。
+cargo test --manifest-path $gcManifest --test gc_weak_reference --test gc_resurrection_reference
+```
+
+| 学习者验收 | 修改入口 | 成功条件 |
+|---|---|---|
+| `weak_edges_follow_table_mode` | `classify_edges` | 模式矩阵、metatable/primitive、槽清理和对象存活分别正确 |
+| `ephemerons_reach_a_fixed_point_without_bootstrapping_cycles` | `propagate` | 多轮链可访问、空候选停止、撤根后可收、无根环不能自举 |
+| `pending_graph_is_marked_before_weak_cleanup` | `finish_atomic` | callback 前四弱项可见，rescue 留存/撤销后实际死亡，累计只执行一次 |
+
+[弱表实验说明](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/exercises/weak/README.md)
+和 [复活顺序实验说明](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v14-incremental-gc/exercises/resurrection/README.md)
+提供精确单题命令、可选参考解和模型边界。它们的 CLI 使用独立固定 faults/solution，
+不读取 starter；完成练习仍以显式 `--ignored` 为准。不要改合同断言、真实 Heap/VM，
+或扩大 root 集合来适配错误设计。
+
 <a id="learning-checkpoint"></a>
 ## 完成检查点
 
@@ -723,7 +989,11 @@ cargo test --manifest-path $gcManifest --test gc_borrow_reference --test gc_call
 - 能让 record 借用先结束，并说明拥有型子边不等于 GC root；
 - 能分开解释 `finalized`、`mem::take`、全批 temporary roots 的作用；
 - 能手推 A 重入时源队列、B 的可达性、首错和 root_base 的变化；
-- 七项学习者验收显式运行通过，并能解释小模型、编译器和真实 Heap/VM 各自验证的范围。
+- 能按模式分类 array/map/metatable 的边，并区分跳过标记和删除弱项；
+- 能手推两轮候选传播、解释终止理由，以及无根环为何不能自举；
+- 能按 Atomic 补标记、cleanup、Heap 返回、callback rescue 的实际次序画出三周期；
+- 能说明周期中弱写入/模式切换、晚标 key 与 finalizer 混合图的未覆盖边界；
+- 十项学习者验收显式运行通过，并能解释小模型、编译器和真实 Heap/VM 各自验证的范围。
 
 ## 与成熟实现和专题章节的对应
 
