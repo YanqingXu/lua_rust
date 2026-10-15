@@ -1,0 +1,60 @@
+# string-format-contract/v1: result is ok/error; value_hex is the manually fixed result bytes.
+# The transport emits ASCII ok|<value_hex>|after or error|after, exit0 and empty stderr.
+id	result	value_hex
+literal	ok	706c61696e
+percent-no-consume	ok	253a37
+default-f	ok	312e353030303030
+negative-zero-f	ok	2d302e303030303030
+plus-f	ok	2b312e353030303030
+space-f	ok	20312e353030303030
+zero-width-f	ok	2d3030303030312e3530
+left-width-f	ok	312e3530202020202020
+empty-precision-f	ok	31
+alternate-f	ok	312e
+signed-integers	ok	373a2d37
+zero-width-d	ok	30303037
+plus-zero-d	ok	2b30303037
+space-width-d	ok	2020202037
+left-width-d	ok	3720202020
+precision-suppresses-zero	ok	2020303037
+zero-empty-precision-d	ok	
+negative-integer-precision	ok	20202d303037
+truncate-integers	ok	373a2d37
+numeric-string-coercion	ok	31363a312e353030303030
+multi-flag-precedence	ok	2b37202020
+repeat-flag-allowed	ok	2b37
+short-string-nul	ok	41
+string-precision	ok	616263
+string-width-precision	ok	2020206162
+string-left-width	ok	41ff202020
+number-string-fourteen-digits	ok	312e32333435363738393031323335
+number-string-exponents	ok	31652b32303a2231652d303522
+number-string-negative-zero	ok	2d30
+string-length-ninety-nine	ok	6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161
+string-length-one-hundred	ok	6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161005a
+long-string-width-fastpath	ok	6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161005a
+long-string-precision-no-fastpath	ok	6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161
+quote-binary	ok	225c303030ff5c0a5c725c225c5c22
+quote-roundtrip	ok	726f756e6474726970
+quote-flags-ignored	ok	22616222
+string-table-rejected	error	
+string-boolean-rejected	error	
+quote-boolean-rejected	error	
+integer-table-rejected	error	
+float-nil-rejected	error	
+missing-value	error	
+missing-invalid-value-priority	error	
+invalid-option	error	
+width-too-long	error	
+precision-too-long	error	
+six-flags-rejected	error	
+trailing-percent	error	
+percent-unused-argument	ok	25
+format-nul-literal	ok	410042
+format-number-small	ok	31652d3035
+format-number-large	ok	31652b3134
+format-table-rejected	error	
+format-boolean-rejected	error	
+format-nil-rejected	error	
+format-missing	error	
+format-nul-then-integer	ok	410037

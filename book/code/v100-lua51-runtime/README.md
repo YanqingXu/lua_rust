@@ -35,8 +35,8 @@ py -3 tools/check_repl_byte_contracts.py --check
 ```
 
 固定示例12条 `[ok]`、6项参考、6项真实 controller/I/O 测试；learner 一个 EOF
-TODO 初始 ignored，显式命令应失败，补完后通过。默认 workspace 为 **158通过、
-1 ignored**，ignored 不表示已完成练习。Release 对同一 run/test 加 `--release`。
+TODO 初始 ignored，显式命令应失败，补完后通过。ignored 不表示已完成练习。
+Release 对同一 run/test 加 `--release`。
 
 本地 byte 合同26个 case，与 v0.18 各自对固定 oracle 验完整 stdout/stderr bytes
 与退出码；两份 fixture、wrapper、runner 逐 byte 相同，只有显式版本 banner 参数。
@@ -44,6 +44,45 @@ TODO 初始 ignored，显式命令应失败，补完后通过。默认 workspace
 [共享合同说明](../../../tools/repl_byte_contracts/README.md)。不 trim/normalize 输出，
 不把相互一致当作正确。read_line 仍使用 UTF-8；Lua print 走进程 stdout，泛型
 writer 只接收 REPL 输出。TTY 编辑、signal、完整官方 REPL 等价不在26条合同内。
+
+## `string.format` 的有界兼容问题链
+
+从旧 `%f -> to_string()` 的错误绿色测试开始，先确定默认6位精度，再让 `%04d`、
+`%.2f` 推导真实 FormatSpec/字节游标，最后用 table 被 `%s` 接受的反例推动参数
+类型与错误边界。真实实现位于 `crates/lua_vm/src/string_format.rs`，通过本地 VM
+adapter 调用；没有引入 C varargs 或外部依赖。
+
+- 已有 `s/d/i/f/q/%%` 支持 flags、最多两位 width/precision、缺参及类型检查；
+  precision未提供与显式0区分，符号与padding按优先级组合。
+- `%%`不取参数；其它项先检查参数存在，再解析规格。失败不返回成功部分字符串，
+  不回滚此前VM副作用。格式串自身也检查类型并使用统一number/string转换。
+- `%s`短串C-NUL路径与至少100bytes/无precision的fast path分别验收；`%q`包含
+  `5c0a`物理换行转义并可由Lua回读，不用UTF-8有损解码处理payload。
+- d/i共同signed i32范围、有限数值；其它转换、宿主printf/locale/浮点边缘、非有限值
+  和超范围整数仍保留 **LUA51-D005 partial**，不宣称完整format/string library。
+
+从仓库根运行[格式化练习包](exercises/string_format/README.md)：
+
+```powershell
+cargo run --quiet --manifest-path book/code/v100-lua51-runtime/Cargo.toml --example string_format_problem_chain -- all
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_format_reference
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_format_exercises argument_cursor_commits_only_after_validation -- --ignored --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_format_contract real_binary_matches_fifty_seven_fixed_format_byte_cases -- --exact
+py -3 book/code/v100-lua51-runtime/tools/check_string_format_contract.py --check
+```
+
+固定all有12条unique marker；9参考、1个consume TODO，复用真实parser与Args，仅
+演示类型验证后提交参数游标。这个hook不替代真实数值范围与渲染，初始learner应
+失败。为练习显式引用已有workspace的lua_stdlib，本目录所有path依赖仍独立闭合。
+
+57个手写固定byte case由本地binary与官方Lua5.1.5各自对固定expected验收。Lua
+driver将内部bytes编码为hex后io.write，避免Windows C stdout对LF的转换；runner
+不trim、不normalize双流。另有3组本地测试核错误kind/参数号/分类。`--check`只
+验schema/driver，打印两端NOT_RUN；实际对照须提供两binary和固定源码归档，见
+[官方对照说明](tools/string_format_contract/README.md)。旧2026-08-21双oracle基线保留。
+
+当前默认workspace在Debug/Release各 **180通过、2ignored**：原158项再加formatter
+unit8、参考9、合同5；两个learner分别属于REPL与本格式化包，交付保留TODO。
 
 ## 发布合同
 
@@ -54,6 +93,8 @@ writer 只接收 REPL 输出。TTY 编辑、signal、完整官方 REPL 等价不
 - `lua_bytecode --format opcode-audit` 输出 38 行机器可读映射，并明确 `binary_chunk_compatible=false`。
 - bytecode JSON 与 VM trace 分别冻结为 `lua-rust-bytecode/v1` 和 `lua-rust-vm-trace/v1`。
 - 本地 REPL 续行与明确 EOF 策略由 `tests/repl_byte_contract.rs` 指向固定字节证据。
+- format 子集的能力行由 `tests/string_format_contract.rs` 提供证据，继续引用D005；
+  byte-string原能力也保持partial，不因57条通过而移除剩余偏差。
 
 真实双 oracle gate：
 

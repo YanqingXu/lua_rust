@@ -9,6 +9,7 @@ dependencies = [
  "lua_bytecode",
  "lua_compiler",
  "lua_core",
+ "lua_stdlib",
  "lua_vm",
 ]
 

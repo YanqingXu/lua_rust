@@ -3,6 +3,98 @@
 更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-15：v1.0 string.format 有界兼容问题链
+
+用户要求先收口已有转换项的默认精度、flags/宽度/精度、参数类型与错误边界，补齐
+反例、diff、状态图、练习与官方Lua5.1.5字节对照，更新能力证据并保持D005 partial。
+本批实现、教学与验证已完成，**没有恢复暂停的原审计目标**。用户随后明确要求将
+本批实现、官方字节合同、章节、状态图、练习包、能力证据和交接记录一并提交推送。
+
+- 起点为已推送 `main@74fe6ca0efa597db4053039e8a13842b2a39d940`，开始时工作区
+  干净、origin/main跟踪同SHA。仅修改v100 VM adapter、新string_format模块、旧
+  stdlib测试的错误%f预期、Cargo/lock本地依赖与教学/证据文件；生产根crates、
+  v18、v100 compiler/core/bytecode/stdlib本体、REPL实现及既有字节合同均无diff。
+  lua_app为练习直接引用已有lua_stdlib path包，没有引入第三方、FFI或C varargs。
+  提交前fetch确认HEAD与origin/main无分叉。本批提交号以
+  `git log -1 -- book/src/versions/v100-lua51-runtime.md` 为准，新提交CI按其SHA查询。
+  提交前暂存检查识别到TSV空末列必需的尾部tab；.gitattributes仅为该fixture指定
+  LF及whitespace=-blank-at-eol，保留原数据SHA和其它路径的默认空白检查。
+- [主章](book/src/versions/v100-lua51-runtime.md) 新增问题四至六：错误绿色测试
+  → 默认precision6；单byte读取 → FormatSpec与局部cursor；宽泛stringify → 类型/
+  缺参/错误优先级。每问含预测、可运行faults、最小diff、≤60行源码include与exact
+  验收；两幅新SVG解释规格解析/补齐优先级与格式/参数双游标。章末/README补齐三类
+  练习与检查点，保留REPL上一批及2026-08-21历史双oracle证据归属。
+- 真实模块公开Flags、FormatSpec、parse_spec，start紧接%、next紧接conversion。
+  flags为-+ #0，按字符数≤5（++允许，第6个才错）；width/precision各最多两位，
+  None和Some(0)分开，空precision为0。已有s/d/i/f/q/%%保留；f默认6位，处理负零、
+  符号后补零、左对齐/+优先级、整数precision抑制zero宽度、#保留小数点。
+- format_arguments统一首参数缺参/类型与数字转字符串路径，s/q数字按局部%.14g
+  近似与列明代表值验收，不改变全局Args。d/i共同signed i32范围，非有限与超范围
+  返回错误；宿主CRT/locale/浮点舍入边缘与其它转换仍明确partial。该范围收口不
+  宣称所有旧i64数值和官方不同整数配置等价；范围guard有unit验收与偏差登记。
+- dispatcher普通byte/%%不取参数，其余先检查缺参再parse规格、类型/范围与render，
+  成功后提交局部结果和双游标。Type错误保留真实Lua参数号；局部Vec不返回成功
+  半成品，不回滚VM此前globals/I/O。短%s按C-NUL截断，无precision且len>=100时
+  原bytes直通并绕width；显式precision禁fast path。q按5.1.5生成5c0a物理换行、
+  NUL/引号/反斜杠转义，另经实际compiler/VM及loadstring回读原bytes。
+- [练习包](book/code/v100-lua51-runtime/exercises/string_format/README.md)：1个
+  consume TODO、9参考，fixed faults四条、真实format八条、all十二条unique marker。
+  spec借真实parser，values借完整参数slice且cursor从1开始，复用Args验证后才前移；
+  Value clone不深拷贝heap。它是类型/缺参与游标提交投影，数值范围、字符串转数字
+  边缘与render另验，不伪造第二parser或VM回滚。D/R TODO初始101→临时solution0→
+  原bytes恢复并刷新mtime→再次101，交付保留TODO；旧REPL题仍归上一批。
+- [官方合同](book/code/v100-lua51-runtime/tools/string_format_contract/README.md)：
+  57个手写固定expected先由真实官方核对；独立driver按id执行，不读取expected，
+  编码器用byte/sub/整数运算，不调用format。为区分Windows C stdout文本换行与
+  内部q bytes，Lua层先编码ASCIIhex，捕获后不trim/normalize双流。完整stdout为
+  ok|hex|after或error|after、stderr空、exit0；Rust另3组检查全部16类错误的kind/
+  参数号/分类/缺参优先级，不能仅凭pcall false误绿。未知id/assert在pcall外。
+- 永久Python gate --check只检查schema/driver并明确两端NOT_RUN；实际运行强制
+  candidate+official+固定源码归档，独占run/case保存实际/预期原始双流、空stdin、
+  metadata与SHA。communicate并发drain，超时kill后仍wait；有界无后代，不外推
+  任意进程树/fsync。官方源码tar SHA2640fc56…b0738695333，实际官方x64 PE8664、
+  binary SHA47fd81e4…693978d，实际-v为5.1.5。分别记录源码与binary身份，不把
+  版本字符串说成可复现构建证明，也不冒充本轮执行了固定C++双oracle。
+- capabilities新增format子集partial行→tests/string_format_contract.rs→D005，
+  原byte-string行仍partial。D005描述保留pattern、其它format转换、dump、宿主
+  printf/locale/float边缘、非有限值与超signed i32范围；没有把57条升级为complete。
+- 本地Windows Rust/cargo **1.96.1**：release_gate一次执行，fmt、all-targets
+  Clippy -Dwarnings、D/R workspace各 **180通过/0失败/2ignored**（原158+VM8+
+  参考9+合同5）。两profile bins、faults4/format8/all12逐行验收，demo100、stdlib1550
+  通过。既有REPL26场景由workspace两profile回归，源码/fixture均未改；legacy语言
+  双oracle明确skipped，新format官方合同单独验证，不借历史baseline冒充通过。
+- Rust进程合同两profile各57case；独立Python双方D/R共 **228个raw case**逐byte
+  通过且全回收。先冻结上一批实际旧binary9efe6dc…，SHA与上批记录相符并捕获
+  8组旧/官方raw baseline；旧binary跑同57场景被拒33项、官方仍57/57，CLI exit1，
+  负控114次与新228次分开。缺official参数exit2、错tar SHAexit1亦按预期失败。
+- 全新独立snapshot copy有68代码输入、6本地packages、path依赖全部闭合、第三方0；
+  不共享target，offline/locked构建workspacebins、本地5合同/57cases与demo100通过。
+  继承祖先Rust linker配置，无v18/根tools源码依赖。全量70输入SHA前后无漂移，
+  包括Cargo.lock、能力/偏差、driver/fixture/Python gate，练习/合同各层冻结另留。
+  主章与3README去重16条exact，D/R共32命令：30正向通过、2learner预期失败，
+  全部恰1test；文档冻结68输入SHA稳定，doc-exact/20261015T104229783610Z/summary.json。
+- 本机ignored证据在 `target/teaching-v100-format-2026-10-15/`：旧binary基线
+  `baseline-20261015T103007995206Z/summary.json`；真实unit/旧测试
+  `runtime/20261015T103511605210Z/summary.json`；练习套解
+  `exercises/20261015T103500250973Z/summary.json`（36commands）；合同
+  `contracts/20261015T103838922136Z/summary.json`（12commands/228rawcase）；
+  全量 `full-validation/20261015T104005353752Z/summary.json`（18commands/冻结
+  脚本SHA）。full初始化103937579774Z只因路径假设错误停止、0命令，provenance-note
+  保留，未重复跑gate。最终范围、HTML、图和文档exact见final-verification.json。
+- 20版本教学检查、mdBook、38页 **1,383站内链接/0broken**通过。两SVG由bundled
+  sharp/libvips渲染PNG并直接检查文字/箭头/页脚；Fontconfig缓存不可写告警不影响
+  渲染。HTML另验include与图片引用，不把PNG审阅冒称浏览器页面视觉验证。
+- 基线74fe的 [mdBook 38718514453](https://github.com/YanqingXu/lua_rust/actions/runs/38718514453)
+  成功；[Rust 38718514632](https://github.com/YanqingXu/lua_rust/actions/runs/38718514632)
+  completed/failure，两个Miri/Linux ASan成功；Windows仅M1质量门因生产fetch_update
+  弃用的严格Clippy失败，其余测试/文档/audit门通过，official source三方10/10。
+  baseline-book/rust.json与真实baseline-rust-job.log保留；本批不处理生产CI。
+
+下一工作包从D005剩余转换或pattern选具体失败fixture继续推进，先定义边界再改实现
+和证据，保留本轮signed i32/有限值/CRT差异的归属。发布证据治理、getfenv/setfenv、
+TTY/signal/增量parser另立问题链。原审计仍暂停在os.date/os.time本地时间、UTC、DST，
+本交接不表示恢复；本批按用户明确指令提交推送，新提交CI须按其SHA另查。
+
 ## 2026-10-15：结构化 REPL 协议迁入 v1.0 独立快照
 
 用户要求将 v0.18 的结构化续行与 EOF 协议显式迁入 v1.0，复用字节验收合同，补齐

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="920" viewBox="0 0 900 920" role="img" aria-labelledby="title desc">
+<title id="title">从单字符分支到结构化 FormatSpec</title><desc id="desc">百分号后按flags、width、可选precision、conversion依次解析。以百分号加号零八点二f为例，返回正号零补齐、宽度8、精度2、转换f和下一字节位置。flags最多5个字符，宽度和精度最多2位；空精度为0。未写精度的f用6，零精度与未写不同。渲染处理符号和补齐优先级。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:18px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="920" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">先解析规格，再按转换项渲染；不在看见第一个字符时下结论</text>
+<rect x="24" y="64" width="852" height="72" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="98" class="mono">输入 format bytes = "%+08.2f"，value = 1.5</text><text x="44" y="124" class="small">parse_spec 的 start=1，指向 % 后；输入仅共享借用，游标是局部值。</text>
+<path d="M450 136V156H120V174" class="flow"/>
+<rect x="24" y="178" width="190" height="120" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="212" class="label">Flags</text><text x="44" y="246" class="mono">+ 0</text><text x="44" y="280" class="small">plus / zero = true</text>
+<rect x="238" y="178" width="190" height="120" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="258" y="212" class="label">Width</text><text x="258" y="246" class="mono">8</text><text x="258" y="280" class="small">Some(8)</text>
+<rect x="452" y="178" width="210" height="120" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="472" y="212" class="label">Precision</text><text x="472" y="246" class="mono">.2</text><text x="472" y="280" class="small">Some(2)</text>
+<rect x="686" y="178" width="190" height="120" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="706" y="212" class="label">Conversion</text><text x="706" y="246" class="mono">f</text><text x="706" y="280" class="small">next = 7</text>
+<path d="M214 238H234" class="flow"/><path d="M428 238H448" class="flow"/><path d="M662 238H682" class="flow"/>
+<rect x="24" y="328" width="852" height="112" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="44" y="362" class="label">每个边界都能产生 Result::Err</text><text x="44" y="394" class="small">flag 字符最多5个：++ 可接受，第6个才报 repeated flags；宽度 / 精度最多2位。</text><text x="44" y="424" class="small">%100d、%.100f、%*d、无转换项都失败；不会读出 slice 或继续猜测规格。</text>
+<path d="M450 440V460H158V478" class="flow"/><path d="M450 460V478" class="flow"/><path d="M450 460H742V478" class="flow"/>
+<rect x="24" y="482" width="268" height="118" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="516" class="mono">%f → None</text><text x="44" y="550" class="small">默认精度6</text><text x="44" y="582" class="mono">1.500000</text>
+<rect x="316" y="482" width="268" height="118" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="336" y="516" class="mono">%.f → Some(0)</text><text x="336" y="550" class="small">显式零位，不能当 None</text><text x="336" y="582" class="mono">%.f, 1.4 → 1</text>
+<rect x="608" y="482" width="268" height="118" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="628" y="516" class="mono">%.2f → Some(2)</text><text x="628" y="550" class="small">显式两位</text><text x="628" y="582" class="mono">1.50</text>
+<path d="M742 600V620H450V638" class="flow"/>
+<rect x="24" y="642" width="852" height="96" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="676" class="label">本例：符号 + → 零补齐 000 → 数字 1.50</text><text x="44" y="712" class="mono">%+08.2f → "+0001.50"，共8 bytes</text>
+<rect x="24" y="768" width="852" height="96" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="802" class="label">有规则的组合，不能只按 flags 出现顺序追加</text><text x="44" y="836" class="small">左对齐压过零补齐；+ 压过空格；整数显式精度压过零宽度补齐；# 可保留 f 的小数点。</text>
+<text x="24" y="900" class="small">已有 s/d/i/f/q/%% 的有界实现；其它转换、数值范围与宿主 printf 边缘继续登记 partial。</text>
+</svg>

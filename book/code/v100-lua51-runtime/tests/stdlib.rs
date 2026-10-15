@@ -108,7 +108,7 @@ fn string_library_preserves_bytes_and_tests_each_exposed_function() {
              local first, last = string.find('a.b.c', '.b', 1, true)\n\
              assert(first == 2 and last == 3)\n\
              assert(string.find('abc', 'z') == nil)\n\
-             assert(string.format('%s:%d:%f:%%', 'x', 7, 1.5) == 'x:7:1.5:%')\n\
+             assert(string.format('%s:%d:%f:%%', 'x', 7, 1.5) == 'x:7:1.500000:%')\n\
              assert(('hello'):sub(2, 4) == 'ell')\n\
              local bad_char = pcall(string.char, 256)\n\
              local bad_len = pcall(string.len, {})\n\

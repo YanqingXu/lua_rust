@@ -9,6 +9,7 @@ lua_compiler = { path = "crates/lua_compiler" }
 lua_core = { path = "crates/lua_core" }
 lua_vm = { path = "crates/lua_vm" }
 lua_bytecode = { path = "crates/lua_bytecode" }
+lua_stdlib = { path = "crates/lua_stdlib" }
 
 [workspace]
 resolver = "2"
@@ -31,3 +32,11 @@ path = "exercises/repl_migration/acceptance.rs"
 [[test]]
 name = "repl_migration_reference"
 path = "exercises/repl_migration/reference.rs"
+
+[[test]]
+name = "string_format_exercises"
+path = "exercises/string_format/acceptance.rs"
+
+[[test]]
+name = "string_format_reference"
+path = "exercises/string_format/reference.rs"

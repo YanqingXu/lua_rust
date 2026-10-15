@@ -17,6 +17,8 @@ use std::process::Command;
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub mod string_format;
+
 const METAMETHOD_CHAIN_LIMIT: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2434,83 +2436,13 @@ impl Vm {
                     None => vec![Value::Nil],
                 })
             }
+            // ANCHOR: string_format_vm_adapter
             StringFunction::Format => {
-                let format = bytes(0)?;
-                let mut output = Vec::new();
-                let mut argument = 1;
-                let mut cursor = 0;
-                while cursor < format.len() {
-                    if format[cursor] != b'%' {
-                        output.push(format[cursor]);
-                        cursor += 1;
-                        continue;
-                    }
-                    cursor += 1;
-                    let Some(specifier) = format.get(cursor).copied() else {
-                        return Err(self.error_kind(
-                            proto,
-                            pc,
-                            VmErrorKind::Type,
-                            "invalid format (ends with '%')",
-                        ));
-                    };
-                    cursor += 1;
-                    if specifier == b'%' {
-                        output.push(b'%');
-                        continue;
-                    }
-                    let value = args
-                        .required(argument)
-                        .map_err(|error| self.host_error(function.name(), error, proto, pc))?;
-                    match specifier {
-                        b's' => output.extend(Self::stringify(value)),
-                        b'd' | b'i' => output.extend(
-                            args.integer(argument)
-                                .map_err(|error| {
-                                    self.host_error(function.name(), error, proto, pc)
-                                })?
-                                .to_string()
-                                .as_bytes(),
-                        ),
-                        b'f' => output.extend(
-                            args.number(argument)
-                                .map_err(|error| {
-                                    self.host_error(function.name(), error, proto, pc)
-                                })?
-                                .to_string()
-                                .as_bytes(),
-                        ),
-                        b'q' => {
-                            output.push(b'"');
-                            for byte in Args::new(std::slice::from_ref(value)).bytes(0).map_err(
-                                |error| self.host_error(function.name(), error, proto, pc),
-                            )? {
-                                match byte {
-                                    b'"' | b'\\' => {
-                                        output.push(b'\\');
-                                        output.push(byte);
-                                    }
-                                    b'\n' => output.extend_from_slice(b"\\n"),
-                                    b'\r' => output.extend_from_slice(b"\\r"),
-                                    0 => output.extend_from_slice(b"\\000"),
-                                    _ => output.push(byte),
-                                }
-                            }
-                            output.push(b'"');
-                        }
-                        _ => {
-                            return Err(self.error_kind(
-                                proto,
-                                pc,
-                                VmErrorKind::Type,
-                                format!("unsupported format option '%{}'", specifier as char),
-                            ));
-                        }
-                    }
-                    argument += 1;
-                }
+                let output = string_format::format_arguments(arguments).map_err(|error| {
+                    self.error_kind(proto, pc, VmErrorKind::Type, error.to_string())
+                })?;
                 Ok(vec![Value::String(ByteString::new(output))])
-            }
+            } // ANCHOR_END: string_format_vm_adapter
         }
     }
 

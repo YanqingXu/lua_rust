@@ -10,7 +10,8 @@
   <p>前置：v0.18 的语言、CLI 和观察协议。新知识：闭世界矩阵、双向引用校验、schema
   version、oracle provenance、差分子进程与 release gate。完成后你应能区分代表性通过、
   partial deviation 和被明确排除的版本边界。先把结构化 REPL 协议迁入本地快照，
-  再用同一份原始字节合同验证两个独立 binary。</p>
+  再用同一份原始字节合同验证两个独立 binary；随后从 string.format 的真实差异
+  推导格式规格、参数检查与有界兼容证据。</p>
 </div>
 
 v0.18 已经能运行脚本、模块和协程，也能观察 bytecode、CFG 与 trace。但功能数量不是兼容性证据：如果测试没有说明参照物、平台归一化规则和允许差异，“测试通过”仍可能只是与自己一致。本版完成三件事：**补齐核心源码语法缺口、冻结可观察协议、让每项兼容结论都能追溯到测试或偏差 ID**。
@@ -25,6 +26,10 @@ v0.18 已经能运行脚本、模块和协程，也能观察 bytecode、CFG 与 
 再预测：v0.18 已能将两行 `return 40 +`、`2` 合成42，v1.0 是否自然拥有这个行为？
 输入未闭合 block 后直接 EOF，退出码应该是多少？最后一个短字符串片段有没有 LF，
 会不会改变分类？先保留这些预测，运行下方迁移反例再核对。
+
+再写下 `string.format('%f', 1.5)`、`string.format('%04d', 7)` 和
+`pcall(string.format, '%s', {})` 的预期。若本地测试把错误结果写成 expected，
+测试全绿还能说明兼容吗？下面的问题四至六将把这个差异变成可执行规格。
 
 <a id="learning-code-map"></a>
 ## 代码阅读地图
@@ -42,6 +47,10 @@ v0.18 已经能运行脚本、模块和协程，也能观察 bytecode、CFG 与 
 → `Repl` → `Session::execute_multi` → 本地 `lua_compiler::compile` → VM。先看
 compiler 返回的 kind，再看 controller 保留的 source/诊断，最后看 adapter 的 EOF；
 `tests/repl_byte_contract.rs` 负责从进程外核对这条链。
+
+格式化另沿 `Vm::invoke_string` → `string_format::format_arguments` → `format`
+→ `parse_spec` → 各 renderer 阅读；`tests/string_format_contract.rs` 从实际 binary
+验固定字节，再单独检查本地错误 kind、参数号与分类。
 
 本版阅读顺序从证据到实现：先问“这个结论由什么证明”，再进入 parser/opcode/tool 代码。
 测试存在并不自动成为证据；只有覆盖对象、参照物和允许归一化都明确时，才能支撑对应行。
@@ -287,6 +296,220 @@ normalize；下文语言 differential runner 的 CRLF 规则属于另一组明�
 也能观察，不能只看两边 exit0 或示例打印 `[ok]`。这26条证明本地 REPL 策略与列明
 边界，不代表官方 Lua 全部 TTY 行为；signal、编辑器、增量解析仍要另立规格。
 
+## 问题四：`%f` 有输出，为什么仍然不兼容？
+
+### 从一个错误的绿色测试开始
+
+迁移前的真实 v1.0 用 `f64::to_string()` 实现 `%f`。旧 `tests/stdlib.rs` 还将
+`'%s:%d:%f:%%'` 的预期写成 `x:7:1.5:%`，因此测试通过恰好固定了偏差。
+对提交 `74fe6ca` 的 binary 和官方 Lua 5.1.5 实际运行，可观察到：
+
+| 输入 | 修改前 v1.0 | 官方 Lua 5.1.5 |
+| --- | --- | --- |
+| `string.format('%f', 1.5)` | `1.5` | `1.500000` |
+| `string.format('%04d', 7)` | 报 unsupported `%0` | `0007` |
+| `string.format('%.2f', 1.5)` | 报 unsupported `%.` | `1.50` |
+| `pcall(string.format, '%s', {})` | `true` | `false` |
+
+先用固定反例对照当前真实 VM：
+
+```powershell
+cargo run --quiet --manifest-path book/code/v100-lua51-runtime/Cargo.toml --example string_format_problem_chain -- all
+```
+
+缺省 `all` 共12条不同 `[ok]`：`faults` 四条重放通用显示、单字节规格、宽泛
+stringify 和过早推进游标，`format` 八条调用本地 parser/VM。固定参考与反例的
+通过不代表 learner 完成，也不代替后面的官方进程字节对照。
+
+### 最小变化：精度成为独立输入
+
+```diff
+-output.extend(number.to_string().as_bytes());
++let precision = usize::from(spec.precision.unwrap_or(6));
++let digits = format!("{:.*}", precision, number.abs()).into_bytes();
++// 符号和宽度补齐由独立步骤处理。
+```
+
+通用显示与格式协议有不同目标。`%f` 没有 precision 时默认6；`%.2f` 指定2，
+`%.f` 指定0。后两者不能被“去掉多余零”实现。`Option<u8>` 把未提供与显式0
+区分开，renderer 才能选对默认规则。旧测试的预期也必须随已确认的官方合同修正。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_format.rs:format_render_numbers}}
+```
+
+数值先校验，再分离符号与绝对值数字；零宽度补齐应位于符号之后。`+` 压过空格，
+左对齐压过零补齐；整数显式 precision 压过零宽度补齐。`%#.0f` 在零小数位时仍
+保留小数点，`-0.0` 的符号也不能在取绝对值后丢掉。
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml -p lua_vm string_format::tests::fixed_floats_have_six_default_digits_and_sign_aware_zero_padding -- --exact
+```
+
+该测试同时观察默认6位、符号后补零、`#`、左对齐与负零，并明确拒绝非有限值。
+本次 `d/i` 有界支持共同的 signed i32 范围；超范围返回错误，C locale、宿主浮点
+舍入边缘与其它转换仍登记 partial，不把几组普通数值外推为完整 printf。
+
+## 问题五：为什么 `%` 后不能只读取一个字符？
+
+### 让输入迫使数据结构出现
+
+`%+08.2f` 的第一个字符 `+` 是 flag，第二个 `0` 也是 flag，`8` 才是 width；
+`.` 后的 `2` 是 precision，最后的 `f` 是 conversion。单字符 match 把这些层次
+混成一个“未知转换”，读者无法逐步补齐。先把五个 flag 的语义与可选数值存下来：
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_format.rs:format_spec}}
+```
+
+![格式规格解析与渲染优先级](../images/v100-format-spec.svg)
+
+parser 共享借用 `&[u8]`，局部 cursor 按 flags → width → precision → conversion
+前进；成功返回 `(FormatSpec, next)`，由 dispatcher 提交 next。失败走 Result，
+不按错误文字猜测已经消费多少，也不把某个数字默认成0继续运行。
+
+```diff
+-let specifier = format[cursor];
+-cursor += 1;
++let (spec, next) = parse_spec(format, cursor)?;
++// 用 spec 渲染成功后，再将 format cursor 设为 next。
+```
+
+这里的 start 紧接 `%`；`%%` 已在 dispatcher 提前处理，不进入规格 parser。
+Lua 5.1 的 scanformat 有两个值得亲自预测的限制：flag **字符数**最多5个，
+`%++d` 可以接受，第6个才报 repeated flags；width/precision 最多两位，第三位
+报错。两位十进制累积不会超出 u8，范围由语法本身约束。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_format.rs:format_parse_digits}}
+```
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_format.rs:format_parse_spec}}
+```
+
+`%100d`、`%.100f`、`%*d`、末尾 `%` 和未知转换分别触发相应失败路径；`%.f`
+则合法地返回 `Some(0)`。这里继续只支持已有 `s/d/i/f/q/%%`，不会因为 scanner
+能识别规格结构，就声称已实现 `%x/%e/%g/%c` 等转换。
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_format_reference actual_parser_checks_the_whole_bounded_specification -- --exact
+```
+
+测试直接借用真实 `parse_spec`，检查字段、next、重复 flag 与长度边界；练习没有
+再写一个简化 parser。规则依据可查[Lua 5.1.5 的 scanformat/str_format 源码](https://www.lua.org/source/5.1/lstrlib.c.html#scanformat)。
+
+## 问题六：参数能显示出来，为什么仍必须报错？
+
+### 两个游标，各有成功与失败边界
+
+`%s/%q` 接受 string 或 number，`%d/%i/%f` 接受 number 或可转换的数字字符串；
+table、boolean 和 nil 不因通用显示能生成文字而合法。第一参数格式串也要检查
+缺参与类型，数字格式串使用同一 number-to-string 路径，不绕回 Rust 通用显示。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_format.rs:format_arguments}}
+```
+
+![格式游标、参数游标与错误返回](../images/v100-format-arguments.svg)
+
+普通字节只推进格式游标，`%%` 输出一个 `%` 且不拿参数。其它转换先检查下一项
+是否存在，再 parse 规格、检查类型并渲染。因此 `string.format('%100d')` 先报
+缺参数 #2，提供参数后才报 width 太长；每个转换的诊断参数号还要包含格式串 #1。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_format.rs:format_dispatch}}
+```
+
+局部 `Vec<u8>` 累积的前缀不会在后续错误时成为成功返回值。Err 经 VM 的 Type
+错误传到 pcall 或 CLI；format 没有中途输出字符串。此前 chunk 的 globals/I/O
+副作用仍已发生，这不是整个 VM 的事务回滚。
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_format_contract format_type_errors_keep_kind_and_argument_number -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_format_contract missing_values_take_priority_before_format_parsing -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_format_contract invalid_format_errors_do_not_become_argument_errors -- --exact
+```
+
+三条命令分别检查 Type + 参数号、缺参优先级、格式错误分类。不能把任何异常都
+吞成“预期失败”就算通过，也不要求不同引擎的 traceback/源码路径完全相同。
+
+### bytes 的边界也要由反例决定
+
+Lua 5.1.5 的短 `%s` 路径按 C 字符串处理 NUL；没有 precision 且输入长度至少100
+时，源码走保留原 bytes 的 fast path，并绕过 width。显式 precision 则回到短路径。
+`%q` 转义 NUL、引号、反斜杠和换行，供 Lua 重新读入；实际 LF 被编码为反斜杠后
+跟 LF（`5c0a`），不能仅因为 `5c6e` 也可回读成 LF，就把两份输出称为逐字节一致。
+
+这些实现细节连同数字字符串转换，以[官方格式说明](https://www.lua.org/manual/5.1/manual.html#pdf-string.format)
+和固定 5.1.5 源码、实际 binary 对照。固定 byte fixture、真实输出和 `loadstring`
+回读都分别验证，不用宽泛“支持二进制字符串”替代每个路径的合同。
+
+### 验收练习：先验证，再提交参数游标
+
+只改[格式化练习包](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v100-lua51-runtime/exercises/string_format/README.md)
+的 `starter.rs::consume`。spec 来自真实 parser，values 共享借用完整参数切片，
+index0 是格式串，cursor 从1开始。成功返回一个 Value clone 并推进一项；缺参或
+类型错误返回 HostError，cursor 保持原值。Value clone 不深拷贝 Lua heap 对象。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/exercises/string_format/starter.rs:string_format_starter}}
+```
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/exercises/string_format/solution.rs:string_format_solution}}
+```
+
+这是参数检查与游标提交的教学投影，复用真实 Args；它不替代真实 formatter 的
+数字范围、数字字符串边缘、NUL 和渲染。`?` 在失败处立即返回，只有全部检查成功
+才改 cursor。fixed eager fault 提前推进，让缺参/类型错误也消耗了位置。
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_format_exercises argument_cursor_commits_only_after_validation -- --ignored --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_format_reference argument_cursor_commits_only_after_validation -- --exact
+```
+
+初始 learner 应失败；只补 hook 后通过。默认 ignored、9项固定参考和12条示例
+marker 不能替代 learner 完成；Release 加 `--release` 验同一边界。
+
+### 官方 Lua 5.1.5 字节合同
+
+固定 TSV 和独立 Lua driver 共57个 case：数字默认精度、flags/宽度/精度、参数
+消费、缺参/非法规格、类型、首参数 coercion、短串 NUL/长串 fast path、q bytes
+与回读。预期手写固定，driver 不读取预期，不用 string.format 编码输出。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/tests/string_format_contract.rs:format_binary_contract}}
+```
+
+Windows C stdout 会把 LF 转成 CRLF；要观察 q 的内部 `5c0a`，先在 **Lua 层**
+把结果 bytes 编成 ASCII hex，再 `io.write('ok|...|after')`。错误 case 输出
+`error|after`，本地三组诊断测试另核类别和参数号。Python/Rust 捕获完整双流与
+exit，不 trim、不替换 CRLF，也不用 formatter 自己生成 expected。未知 case、
+driver 编译失败或宿主故障不能作为合法 error case 通过。
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_format_contract real_binary_matches_fifty_seven_fixed_format_byte_cases -- --exact
+py -3 book/code/v100-lua51-runtime/tools/check_string_format_contract.py --check
+```
+
+`--check` 只检查 schema/driver 一致，明确打印 candidate/official NOT_RUN。实际
+对照必须同时给 candidate binary、official binary 与固定源码归档：
+
+```powershell
+py -3 book/code/v100-lua51-runtime/tools/check_string_format_contract.py --candidate-bin book/code/v100-lua51-runtime/target/x86_64-pc-windows-msvc/debug/lua_app.exe --official-bin target/oracles/lua-5.1.5/build/Release/lua51.exe --official-archive target/oracles/lua-5.1.5/lua-5.1.5.tar.gz --output target/string-format-review
+```
+
+先 `cargo build --manifest-path book/code/v100-lua51-runtime/Cargo.toml --bin lua_app`
+构建所选 profile；自定义 target/triple 时按实际产物改路径，Release 使用对应 binary。
+runner 保存唯一 run/case 的实际/预期原始双流、状态、版本与 corpus/source/binary
+SHA；超时后 kill/wait，缺 oracle 或归档失败显式失败。字段与复现边界见
+[官方合同说明](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v100-lua51-runtime/tools/string_format_contract/README.md)。
+
+本次能力矩阵新增 format 子集证据，byte-string 与 format 行仍为 **partial**，
+继续引用 `LUA51-D005`。旧2026-08-21双 oracle baseline保持原版本归属；本轮官方
+format证据单独归档，不把已有转换子集通过升级为完整 string library。
+
 ## 38 Opcode：语义覆盖不等于二进制兼容
 
 Lua 5.1 `lopcodes.h` 定义 38 个 Opcode。教学 VM 从 v0.5 起使用自己的 32 位寄存器格式，v0.18 已演进为 39 个更显式的 Opcode：
@@ -371,6 +594,9 @@ book/code/v100-lua51-runtime/tools/release_gate.ps1 -RunOracles `
 - source/archive hash 与 commit 一起固定，避免 oracle 随网络分支漂移。
 - `Repl<'a>` 借用唯一 Session，`Option::take` 将 EOF 诊断所有权转移一次；
 - 独立快照复制固定 byte fixture 与测试，仓库身份 gate 阻止副本分叉。
+- `FormatSpec` 与 `Option<u8>` 区分未指定和显式0；共享 byte slice 与局部 cursor
+  分离解析/提交，Result 将格式、缺参和类型错误带回 VM；
+- 符号、数值精度与宽度补齐分开，按规则处理优先级，不依赖通用 Display。
 
 替代方案是把教学 ISA 强行改成官方 38 条并立即读取官方 chunk。这会把语言收口与二进制格式、端序、数字宽度、安全 verifier 混成一次破坏性迁移，因此留给 v1.1。另一个方案是只保存 golden output；真实双进程差分能在平台和错误合同改变时暴露差异，证据更强。
 
@@ -385,6 +611,7 @@ book/code/v100-lua51-runtime/tools/release_gate.ps1 -RunOracles `
 - 保留：v0.18 的语言、VM、GC、Coroutine、标准库、模块、CLI 与工具测试；
 - 显式移植：结构化 CompileErrorKind、同一 Session 的 Repl 与真实 LF/EOF adapter；
 - 共用合同：26个 raw byte 场景，本地自含副本与仓库身份/进程 gate；
+- 收口子集：既有 string.format 的规格/参数边界与57场景官方字节合同，D005仍partial；
 - 未伪装：标准库剩余差异和 v1.1+ 能力继续显式登记。
 
 ## 运行与验收
@@ -458,6 +685,26 @@ Release gate 还要求相同测试在 `--release` 下通过、Clippy 零 warning
   给出证据，并区分副本身份检查、实际行为检查和官方语言 oracle 的覆盖范围。</p>
 </div>
 
+<div class="exercise understanding">
+  <strong>理解题：两个零为什么不是同一个含义？</strong>
+  <p>分别手推 %f、%.f、%05.3d 的 spec、默认精度与输出。成功条件是说明 None、
+  Some(0)、零宽度 flag 的区别，并解释整数显式 precision 为什么改变补零规则。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题：补齐格式化包的参数提交 hook</strong>
+  <p>只补 consume，要求成功后前移一次、缺参或类型错误保持 cursor；运行 --ignored
+  exact，再验真实 parser、VM 和固定57场景。Args 投影通过不等于真实 formatter
+  的数字范围、NUL 和字节渲染均已正确。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题：expected 自己写对了吗？</strong>
+  <p>复现旧 %f 预期、单byte规格与 table stringify 三个故障，定位每次必要改动；
+  再解释为什么直接捕获 Windows stdout 中的 q 换行会混入文本模式转换。成功条件
+  是从固定oracle、Lua层hex、本地错误分类各给证据，且D005仍准确标partial。</p>
+</div>
+
 <a id="learning-checkpoint"></a>
 ## 完成检查点
 
@@ -467,6 +714,10 @@ Release gate 还要求相同测试在 `--release` 下通过、Clippy 零 warning
 增量；手推 NeedMoreInput、普通错误、idle/pending EOF 与 I/O Err 的状态；完成 EOF
 TODO；独立构建 v1.0 并让两版逐字节满足同一固定合同，而非只互相相等。
 
+格式化还应能从一个失败输入推导 FormatSpec、默认精度与符号/补齐的顺序，区分
+格式游标与参数游标；完成 consume TODO；解释短串 NUL、长串 fast path 与 q 回读
+的不同合同，并用官方字节证据支撑子集进展，保留D005的剩余边界。
+
 ## 与成熟实现和专题章节的对应
 
 - 成熟实现的 differential runner、M0/M1 gate、official source manifest 和 living deviation log 是本版最小发布治理的扩展目标；
@@ -474,5 +725,5 @@ TODO；独立构建 v1.0 并让两版逐字节满足同一固定合同，而非�
 - [寄存器虚拟机](../ch04-vm/register-vm.md) 对照 composite opcode；
 - [用测试守住兼容性](../ch05-engineering/testing.md) 深入 fixture、oracle 与进程级证据；
 - 根目录 `book_plan.md` 继续定义 v1.1–v1.4 路线。
-- 下一步按 capability/deviation 中的具体失败 fixture 推动兼容收口；REPL 的 TTY、
-  signal、增量 parser 分别立项，不把本次26条扩写为未验证的官方全覆盖结论。
+- 下一步按 capability/deviation 中的具体失败 fixture 继续推进其它转换或 pattern；
+  REPL 的 TTY、signal、增量 parser 分别立项，REPL固定26条与format官方57条各保留覆盖归属。
