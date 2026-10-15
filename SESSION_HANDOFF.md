@@ -1,9 +1,43 @@
 # 未完成目标交接
 
-更新：2026-09-12，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
+更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
-## 目标和暂停位置
+## 2026-10-15：v0.13 GC 教学工作包
+
+本次用户要求参考《用 Rust 实现 Lua 解释器》，优先完善 v0.13 的小步迁移、对象状态图
+和可执行练习。此次只推进该教学工作包，**没有恢复下面暂停的主线审计整改目标**。
+
+- 开始时 `main@14718c8ce3364f965b9551248b87971e2c4ed852`，工作区干净，与原交接一致。
+  生产 `crates/` 和教学快照的 GC 核心行为均未修改。用户随后明确要求将章节、状态图、
+  练习包和本交接一并提交并推送；本批提交号以 `git log -1 -- book/src/versions/v13-runtime-gc.md`
+  为准，远端状态以对应提交的 GitHub Actions 运行记录为准。
+- [v0.13 章节](book/src/versions/v13-runtime-gc.md) 新增六个对照微课、每步定向验收、
+  双表环与 CLOSE 两幅 SVG；明确实际 owner 是 `Vm.heap`、Proto 不属于 arena，以及
+  roots/edges、mark 失败撤销和最终 Drop 的边界。微课对照 v0.12/最终 v0.13，
+  不宣称仓库新增了六份可运行中间快照。
+- [可执行练习包](book/code/v13-runtime-gc/exercises/README.md) 含四项 TODO starter、
+  共享行为合同及可选参考解：双表环、宿主 registry 租约、CLOSE 修复、primitive roots。
+  另验收部分 mark 失败后重试，以及真实 VM 的 primitive metatable 保活。
+- 本次验证限定到 v0.13 与教学站点：fmt、all-targets Clippy 通过；Debug/Release
+  workspace 各 **78 通过、4 ignored**。ignored 为学习者 TODO，显式启用时初始四项失败；
+  临时套用参考解后四项通过，随后恢复 starter。不能将默认通过视为读者已完成练习。
+- 真实 primitive root 故障注入得到 `Metamethod / stale GC handle`；恢复原行后同一定向
+  测试通过，核心源码没有最终 diff。两幅 SVG 已在浏览器检查文字与箭头。
+- 章节 13 条精确测试命令分别执行到 1 项通过。全 20 版本教学结构检查、mdBook 构建、
+  38 页链接检查通过（1,141 站内链接，0 broken）。本机命令日志与源文件 SHA-256 在
+  `target/teaching-v13-2026-10-15/chapter-command-results.json` 及同目录日志；该目录
+  是忽略产物，不随 clone 提供。永久复现入口是上面的章节命令与练习包说明。
+- 重新查询远程 CI：代码检查点 `834eee3` 的 [Rust CI 34686860957](https://github.com/YanqingXu/lua_rust/actions/runs/34686860957)
+  最终失败，日志中 Rust `constructs.lua` 超时；其 mdBook 成功。
+  后续交接提交 `14718c8` 的 [Rust CI 34687179499](https://github.com/YanqingXu/lua_rust/actions/runs/34687179499)
+  四项成功。保留两次运行各自的结果，不能抹掉历史超时；旧运行不覆盖本次教学工作包，
+  本批新提交须按自己的 SHA 查询 CI。
+
+下一教学任务可沿同一模板完善 v0.14，按新的用户指令启动；原主线队列仍从本地时间/
+UTC/DST 修复接续。提交、推送与线上发布均需按当次用户指令处理。
+
+## 原审计目标和暂停位置（2026-09-12）
 
 - 用户最初要求：拉取最新代码，深度审计项目，给出方向；随后要求“按照建议依次推进！”。
 - 本线程目标工具显示 objective 为“按照建议依次推进！”，状态为 **paused**；目标未完成。

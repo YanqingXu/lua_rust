@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="500" viewBox="0 0 900 500" role="img" aria-labelledby="title desc">
+  <title id="title">双表环：有根、移除根、完成回收</title>
+  <desc id="desc">Heap 的所有权用外框表示。有 global root 时 A 与 B 均可达；移除 global 且无其他根后，A 与 B 虽互相引用也不再可达，下一轮 sweep 删除二者。宿主持有的非拥有 handle 不参与标记，回收后访问返回 StaleHandle。统计只计算 A 与 B。</desc>
+  <defs>
+    <marker id="edge" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <marker id="handle" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#75519a"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 20px; font-weight: 700; }
+      .label { font-size: 16px; }
+      .small { font-size: 14px; }
+      .node { fill: #e5f1e7; stroke: #286047; stroke-width: 2; }
+      .white { fill: #fff; stroke: #68766c; stroke-width: 2; }
+      .trace { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#edge); }
+      .identity { fill: none; stroke: #75519a; stroke-width: 2; stroke-dasharray: 5 5; marker-end: url(#handle); }
+    </style>
+  </defs>
+  <rect width="900" height="500" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="32" class="heading">同一张对象图，改变的是 root 路径</text>
+  <text x="24" y="58" class="small">Heap 外框 = Rust 所有权；实线 = GC trace；紫色虚线 = 非拥有身份，不算 root</text>
+  <g transform="translate(20 82)">
+    <rect width="280" height="348" rx="12" fill="#f2efe5" stroke="#d9d5c7"/>
+    <text x="16" y="30" class="heading">① global 保留 A</text>
+    <rect x="72" y="46" width="136" height="36" rx="6" class="node"/>
+    <text x="140" y="70" text-anchor="middle" class="label">global root</text>
+    <rect x="20" y="108" width="240" height="148" rx="8" fill="#fff" stroke="#68766c"/>
+    <text x="120" y="132" class="small">Heap owns A / B</text>
+    <rect x="40" y="163" width="72" height="44" rx="6" class="node"/>
+    <rect x="168" y="163" width="72" height="44" rx="6" class="node"/>
+    <text x="76" y="191" text-anchor="middle" class="label">A</text>
+    <text x="204" y="191" text-anchor="middle" class="label">B</text>
+    <path d="M140 82L140 94L76 94L76 162" class="trace"/>
+    <path d="M112 177L167 177" class="trace"/>
+    <path d="M168 195L113 195" class="trace"/>
+    <text x="140" y="245" text-anchor="middle" class="small">两者可达：mark = true</text>
+    <text x="16" y="286" class="small">宿主 handle A</text>
+    <path d="M122 281L142 281L142 217L85 217L85 209" class="identity"/>
+    <text x="16" y="316" class="label">本轮 collected = 0</text>
+    <text x="16" y="337" class="small">成功后，保留对象 mark 复位</text>
+  </g>
+  <g transform="translate(310 82)">
+    <rect width="280" height="348" rx="12" fill="#f2efe5" stroke="#d9d5c7"/>
+    <text x="16" y="30" class="heading">② global 改成 nil</text>
+    <rect x="72" y="46" width="136" height="36" rx="6" class="white"/>
+    <text x="140" y="70" text-anchor="middle" class="label">global = nil</text>
+    <rect x="20" y="108" width="240" height="148" rx="8" fill="#fff" stroke="#68766c"/>
+    <text x="32" y="132" class="small">Heap 仍拥有 A / B</text>
+    <rect x="40" y="163" width="72" height="44" rx="6" class="white"/>
+    <rect x="168" y="163" width="72" height="44" rx="6" class="white"/>
+    <text x="76" y="191" text-anchor="middle" class="label">A</text>
+    <text x="204" y="191" text-anchor="middle" class="label">B</text>
+    <path d="M112 177L167 177" class="trace"/>
+    <path d="M168 195L113 195" class="trace"/>
+    <text x="140" y="245" text-anchor="middle" class="small">下一轮均未标记：false</text>
+    <text x="16" y="286" class="small">宿主 handle A</text>
+    <path d="M122 281L142 281L142 217L85 217L85 209" class="identity"/>
+    <text x="16" y="316" class="label">有环，但没有 root 路径</text>
+    <text x="16" y="337" class="small">前提：没有其他 root 保留 A/B</text>
+  </g>
+  <g transform="translate(600 82)">
+    <rect width="280" height="348" rx="12" fill="#f2efe5" stroke="#d9d5c7"/>
+    <text x="16" y="30" class="heading">③ mark 成功后 sweep</text>
+    <rect x="72" y="46" width="136" height="36" rx="6" class="white"/>
+    <text x="140" y="70" text-anchor="middle" class="label">global = nil</text>
+    <rect x="20" y="108" width="240" height="148" rx="8" fill="#fff" stroke="#68766c"/>
+    <text x="32" y="132" class="small">Heap：A / B 已被删除</text>
+    <rect x="40" y="163" width="72" height="44" rx="6" fill="#fff" stroke="#a43f22" stroke-dasharray="5 4"/>
+    <rect x="168" y="163" width="72" height="44" rx="6" fill="#fff" stroke="#a43f22" stroke-dasharray="5 4"/>
+    <text x="76" y="191" text-anchor="middle" class="label">∅</text>
+    <text x="204" y="191" text-anchor="middle" class="label">∅</text>
+    <text x="140" y="231" text-anchor="middle" class="small">旧 ID 不复用</text>
+    <text x="16" y="286" class="small">宿主 handle A 仍可复制</text>
+    <text x="16" y="316" class="label">访问 → StaleHandle</text>
+    <text x="16" y="337" class="small">本轮 collected = 2，remaining = 0</text>
+  </g>
+  <text x="24" y="466" class="small">统计只针对图中 A/B。VM 的 registry、活跃 closure 等对象另计，不据此推断 gc_live() 总数。</text>
+</svg>

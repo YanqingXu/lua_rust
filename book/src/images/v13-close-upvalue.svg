@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="470" viewBox="0 0 900 470" role="img" aria-labelledby="title desc">
+  <title id="title">CLOSE 先保存捕获值，再清空死亡寄存器</title>
+  <desc id="desc">关闭前，closure F 引用 Upvalue U，Open U 引用栈槽，栈槽中有指向 table T 的 handle。关闭时把该 Value 复制到 U 的 Closed 状态；随后栈槽置 nil。F 仍引用同一个 U，T 仍经 F 和 U 可达；普通死亡 local 则不再是 root。</desc>
+  <defs>
+    <marker id="edge" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei', 'Noto Sans SC', sans-serif; fill: #20352b; }
+      .heading { font-size: 21px; font-weight: 700; }
+      .label { font-size: 17px; }
+      .small { font-size: 15px; }
+      .node { fill: #e5f1e7; stroke: #286047; stroke-width: 2; }
+      .trace { fill: none; stroke: #286047; stroke-width: 2; marker-end: url(#edge); }
+    </style>
+  </defs>
+  <rect width="900" height="470" rx="16" fill="#fbfaf4"/>
+  <text x="24" y="34" class="heading">Closure 保存的 UpvalueRef 身份保持不变</text>
+  <text x="24" y="62" class="small">图中 F 仍从 root 可达；Heap 拥有 F、U、T，StackSlot 由 Rc 提供稳定位置。</text>
+  <g transform="translate(20 90)">
+    <rect width="415" height="300" rx="12" fill="#f2efe5" stroke="#d9d5c7"/>
+    <text x="18" y="30" class="heading">① CLOSE 之前：Open</text>
+    <rect x="24" y="60" width="110" height="52" rx="6" class="node"/>
+    <text x="79" y="92" text-anchor="middle" class="label">Closure F</text>
+    <rect x="222" y="60" width="170" height="52" rx="6" class="node"/>
+    <text x="307" y="82" text-anchor="middle" class="label">Upvalue U</text>
+    <text x="307" y="102" text-anchor="middle" class="small">Open(slot)</text>
+    <path d="M134 86L221 86" class="trace"/>
+    <rect x="222" y="159" width="170" height="52" rx="6" fill="#fff" stroke="#68766c" stroke-width="2"/>
+    <text x="307" y="181" text-anchor="middle" class="label">StackSlot</text>
+    <text x="307" y="201" text-anchor="middle" class="small">Value::Table(T)</text>
+    <path d="M307 112L307 158" class="trace"/>
+    <rect x="24" y="159" width="110" height="52" rx="6" class="node"/>
+    <text x="79" y="191" text-anchor="middle" class="label">Table T</text>
+    <path d="M222 185L135 185" class="trace"/>
+    <text x="18" y="251" class="small">读 U → 借用 slot → 读取当前 Value</text>
+    <text x="18" y="278" class="small">先复制这个 Value 到 U，随后才能清 slot。</text>
+  </g>
+  <g transform="translate(465 90)">
+    <rect width="415" height="300" rx="12" fill="#f2efe5" stroke="#d9d5c7"/>
+    <text x="18" y="30" class="heading">② CLOSE 之后：Closed</text>
+    <rect x="24" y="60" width="110" height="52" rx="6" class="node"/>
+    <text x="79" y="92" text-anchor="middle" class="label">Closure F</text>
+    <rect x="222" y="60" width="170" height="52" rx="6" class="node"/>
+    <text x="307" y="82" text-anchor="middle" class="label">同一 Upvalue U</text>
+    <text x="307" y="102" text-anchor="middle" class="small">Closed(Table(T))</text>
+    <path d="M134 86L221 86" class="trace"/>
+    <rect x="222" y="159" width="170" height="52" rx="6" fill="#fff" stroke="#68766c" stroke-width="2"/>
+    <text x="307" y="181" text-anchor="middle" class="label">StackSlot = nil</text>
+    <text x="307" y="201" text-anchor="middle" class="small">下一局部变量可复用</text>
+    <rect x="24" y="159" width="110" height="52" rx="6" class="node"/>
+    <text x="79" y="191" text-anchor="middle" class="label">Table T</text>
+    <path d="M307 112L307 135L79 135L79 158" class="trace"/>
+    <text x="18" y="251" class="small">T 仍经 F → U 可达，捕获值保留。</text>
+    <text x="18" y="278" class="small">未捕获的死亡 local 不再留在 slot 中保活。</text>
+  </g>
+  <text x="24" y="425" class="small">执行顺序：关闭受影响 upvalues 并解除 open map 登记 → 将 R[A..] 置 nil。</text>
+  <text x="24" y="451" class="small">如果先清 slot，捕获值会丢失；如果始终不清 slot，死亡对象可能形成假 root。</text>
+</svg>

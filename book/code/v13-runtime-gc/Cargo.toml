@@ -20,3 +20,11 @@ members = [
 
 [lints.clippy]
 all = "warn"
+
+[[test]]
+name = "gc_exercises"
+path = "exercises/acceptance.rs"
+
+[[test]]
+name = "gc_reference"
+path = "exercises/reference.rs"
