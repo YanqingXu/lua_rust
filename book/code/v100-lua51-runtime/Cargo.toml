@@ -40,3 +40,11 @@ path = "exercises/string_format/acceptance.rs"
 [[test]]
 name = "string_format_reference"
 path = "exercises/string_format/reference.rs"
+
+[[test]]
+name = "string_find_exercises"
+path = "exercises/string_find/acceptance.rs"
+
+[[test]]
+name = "string_find_reference"
+path = "exercises/string_find/reference.rs"

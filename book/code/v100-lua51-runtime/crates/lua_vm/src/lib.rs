@@ -17,6 +17,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub mod string_find;
 pub mod string_format;
 
 const METAMETHOD_CHAIN_LIMIT: usize = 64;
@@ -2412,29 +2413,25 @@ impl Vm {
                 let start_raw = args
                     .optional_integer(2, 1)
                     .map_err(|error| self.host_error(function.name(), error, proto, pc))?;
-                let start = Self::string_index(start_raw, haystack.len()).max(1) as usize;
-                if start > haystack.len().saturating_add(1) {
-                    return Ok(vec![Value::Nil]);
-                }
-                let offset = if needle.is_empty() {
-                    Some(0)
-                } else {
-                    haystack[start - 1..]
-                        .windows(needle.len())
-                        .position(|window| window == needle)
-                };
-                Ok(match offset {
-                    Some(offset) => {
-                        let first = start + offset;
-                        let last = if needle.is_empty() {
-                            first.saturating_sub(1)
+                // ANCHOR: string_find_vm_adapter
+                let plain = args.get(3).is_some_and(Value::is_truthy);
+                let found =
+                    string_find::find(&haystack, &needle, start_raw, plain).map_err(|error| {
+                        let kind = if matches!(error, string_find::FindError::Limit(_)) {
+                            VmErrorKind::Limit
                         } else {
-                            first + needle.len() - 1
+                            VmErrorKind::Type
                         };
-                        vec![Value::Number(first as f64), Value::Number(last as f64)]
-                    }
+                        self.error_kind(proto, pc, kind, error.to_string())
+                    })?;
+                Ok(match found {
+                    Some(range) => vec![
+                        Value::Number((range.start + 1) as f64),
+                        Value::Number(range.end as f64),
+                    ],
                     None => vec![Value::Nil],
                 })
+                // ANCHOR_END: string_find_vm_adapter
             }
             // ANCHOR: string_format_vm_adapter
             StringFunction::Format => {

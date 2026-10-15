@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="920" viewBox="0 0 900 920" role="img" aria-labelledby="title desc">
+<title id="title">到达才解析的字节 atom 与错误时机</title><desc id="desc">parse_atom只借用当前到达的pattern字节，返回Literal Any Class或借用Set以及下一个位置。匹配失败时不会提前检查尚未到达的后缀。因此z左方括号在abc上未命中，a左方括号到达缺闭合后报错。集合初始右括号是内容，空方括号实际缺闭合。资源、非法与未支持错误分开。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="920" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">一个到达的 atom，一次字节解释；没有预先验证整个模式</text>
+<rect x="24" y="64" width="852" height="72" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="98" class="mono">parse_atom(&amp;pattern, at) → Result&lt;(Atom,next),FindError&gt;</text><text x="44" y="124" class="small">Set借用原pattern切片；next位于atom后，量词由matcher读取。</text>
+<path d="M450 136V166H120V186" class="flow"/><path d="M450 166H338V186" class="flow"/><path d="M450 166H556V186" class="flow"/><path d="M556 166H774V186" class="flow"/>
+<rect x="24" y="190" width="194" height="110" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="224" class="label">Literal(byte)</text><text x="44" y="256" class="mono">a, 0xff</text><text x="44" y="286" class="small">只匹配指定byte。</text>
+<rect x="242" y="190" width="194" height="110" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="262" y="224" class="label">Any</text><text x="262" y="256" class="mono">.</text><text x="262" y="286" class="small">包括NUL与0xff。</text>
+<rect x="460" y="190" width="194" height="110" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="480" y="224" class="label">Class(byte)</text><text x="480" y="256" class="mono">%d, %D, %.</text><text x="480" y="286" class="small">类、补集或转义字面。</text>
+<rect x="678" y="190" width="198" height="110" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="698" y="224" class="label">Set(&amp;[u8])</text><text x="698" y="256" class="mono">[^A-C]</text><text x="698" y="286" class="small">集合、范围与取反。</text>
+<rect x="24" y="332" width="852" height="90" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="366" class="label">5.1.5 的解释细节，也属于规格</text><text x="44" y="398" class="small">%w不含下划线；未知%g按字面g；[]未闭合，[]]才可匹配字面]；[%f]不是frontier。</text>
+<path d="M235 422V460" class="flow"/><path d="M665 422V460" class="flow"/>
+<rect x="24" y="464" width="408" height="142" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="498" class="mono">subject=abc, pattern=z[</text><text x="44" y="532" class="small">z在所有候选起点都失败。</text><text x="44" y="564" class="small">[从未到达，不触发set parser。</text><text x="44" y="594" class="label">Ok(None) → Lua nil</text>
+<rect x="456" y="464" width="420" height="142" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="476" y="498" class="mono">subject=abc, pattern=a[</text><text x="476" y="532" class="small">第一个a成功，到达[。</text><text x="476" y="564" class="small">查不到闭合]，立即返回错误。</text><text x="476" y="594" class="label">Err(Invalid) → VM Type</text>
+<rect x="24" y="640" width="852" height="124" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="44" y="674" class="label">错误与支持范围分开记录</text><text x="44" y="706" class="small">Invalid：到达未闭集合 / 末尾%；Unsupported：到达未支持的capture、%b/%f等。</text><text x="44" y="736" class="small">Limit：步骤或重试栈上限；适配器保留Limit类别，不能返回“未命中”。</text><text x="44" y="760" class="small">? / -作为postfix量词暂不支持；转义或集合中的字面字符仍按其上下文解释。</text>
+<rect x="24" y="796" width="852" height="76" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="830" class="label">验收记录返回元数、坐标、错误类别与after哨兵</text><text x="44" y="860" class="small">未知case/driver失败不能冒充pattern错误；共享官方case与候选专用限制测试分开。</text>
+<text x="24" y="902" class="small">这里是ASCII/C-locale的有界字节实现；不外推Unicode字符、完整locale或全部Lua pattern。</text>
+</svg>

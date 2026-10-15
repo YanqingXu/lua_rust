@@ -81,8 +81,48 @@ driver将内部bytes编码为hex后io.write，避免Windows C stdout对LF的转�
 验schema/driver，打印两端NOT_RUN；实际对照须提供两binary和固定源码归档，见
 [官方对照说明](tools/string_format_contract/README.md)。旧2026-08-21双oracle基线保留。
 
-当前默认workspace在Debug/Release各 **180通过、2ignored**：原158项再加formatter
-unit8、参考9、合同5；两个learner分别属于REPL与本格式化包，交付保留TODO。
+格式化工作包增加unit8、参考9、合同5；该consume与REPL的finish题均保留TODO。
+
+## `string.find` 的有界 pattern 问题链
+
+从“空匹配不是nil”开始，先收口plain truthiness/init夹取，再用`.`、`%d`、`%.`
+与集合推导字节Atom；最后由`a*ab`在`aaab`上的后缀失败推导显式Retry栈。
+真实实现位于 `crates/lua_vm/src/string_find.rs`，VM只做参数/错误/坐标适配。
+
+- plain按Lua truthiness，0也为真；init正负与超界归为`0..=len`，空Range成功映射
+  Lua `(start+1,end)`。未命中只返回一个nil，不能用Range为空代替None。
+- 自动plain扫描pattern的C-prefix；字面路径保留完整pattern，pattern路径只解释
+  C-prefix，subject仍保留NUL/0xff。具体分流分别验，不笼统声称NUL规则一致。
+- byte atom/class/set/escape按到达解析，ASCII/C-locale类、range、补集与首`^`/末`$`
+  有固定case；`z[`未到达坏后缀可nil，`a[`才报malformed；`[]`缺闭合而`[]]`可匹配`]`。
+- `*`/`+`先贪尽再试较短候选，plus最少一次；Vec保存回退状态，无宿主递归。
+  默认matcher steps100000、栈深128，耗尽返回Limit，不伪装为nil；plain fast path
+  不计matcher预算。不宣称任意复杂度、locale或完整Lua pattern均兼容。
+
+从仓库根运行[find练习包](exercises/string_find/README.md)：
+
+```powershell
+cargo run --quiet --manifest-path book/code/v100-lua51-runtime/Cargo.toml --example string_find_problem_chain -- all
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_reference
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_exercises retry_positions_keep_greedy_order_and_the_repetition_minimum -- --ignored --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_contract real_binary_matches_seventy_five_fixed_find_byte_cases -- --exact
+py -3 book/code/v100-lua51-runtime/tools/check_string_find_contract.py --check
+```
+
+fixed faults5/find8/all13条unique marker、9参考与1个next_position TODO，hook只提出
+候选位置，真实parser/VM另验完整匹配。Some(0)合法，候选下降、不重复、守minimum；
+参考通过不表示learner完成，初始--ignored命令应失败。
+
+75个手写固定case保留返回元数与坐标；Lua driver用select与算术/char编码，输出
+ASCII无换行，捕获后不normalize。真实官方5.1.5与candidate各对固定expected验收，
+错误类别、Unsupported与Limit另用本地测试精核。--check明确两端NOT_RUN；实际
+对照须两binary与固定source tar，命令/身份/范围见[find官方合同](tools/string_find_contract/README.md)。
+
+D005下byte-string、format、find三行都保持partial；captures/backrefs/%b/%f、optional/
+non-greedy量词、gmatch/gsub及其它已登记缺口继续保留。旧format57条与REPL26条各自回归。
+
+当前workspace在Debug/Release各 **204通过、3ignored**：原180再加find unit9、参考9、
+合同6；三个learner分别属于REPL、format与find，交付保留TODO。
 
 ## 发布合同
 
@@ -95,6 +135,7 @@ unit8、参考9、合同5；两个learner分别属于REPL与本格式化包，�
 - 本地 REPL 续行与明确 EOF 策略由 `tests/repl_byte_contract.rs` 指向固定字节证据。
 - format 子集的能力行由 `tests/string_format_contract.rs` 提供证据，继续引用D005；
   byte-string原能力也保持partial，不因57条通过而移除剩余偏差。
+- find子集由 `tests/string_find_contract.rs` 提供75场景与本地错误边界证据，仍为D005 partial。
 
 真实双 oracle gate：
 

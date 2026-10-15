@@ -11,7 +11,8 @@
   version、oracle provenance、差分子进程与 release gate。完成后你应能区分代表性通过、
   partial deviation 和被明确排除的版本边界。先把结构化 REPL 协议迁入本地快照，
   再用同一份原始字节合同验证两个独立 binary；随后从 string.format 的真实差异
-  推导格式规格、参数检查与有界兼容证据。</p>
+  推导格式规格、参数检查与有界兼容证据；再从 string.find 的空匹配和失败后缀
+  推导字节 atom、按路径解析与显式回退栈。</p>
 </div>
 
 v0.18 已经能运行脚本、模块和协程，也能观察 bytecode、CFG 与 trace。但功能数量不是兼容性证据：如果测试没有说明参照物、平台归一化规则和允许差异，“测试通过”仍可能只是与自己一致。本版完成三件事：**补齐核心源码语法缺口、冻结可观察协议、让每项兼容结论都能追溯到测试或偏差 ID**。
@@ -30,6 +31,10 @@ v0.18 已经能运行脚本、模块和协程，也能观察 bytecode、CFG 与 
 再写下 `string.format('%f', 1.5)`、`string.format('%04d', 7)` 和
 `pcall(string.format, '%s', {})` 的预期。若本地测试把错误结果写成 expected，
 测试全绿还能说明兼容吗？下面的问题四至六将把这个差异变成可执行规格。
+
+再预测 `string.find('abc','',99,true)`、`string.find('axb','a.b')` 与
+`string.find('aaab','a*ab')`。最后比较 `'z['` 和 `'a['` 在 `'abc'` 上的结果：
+未闭集合总要立即报错吗？问题七至九从这些输入建立新的搜索状态。
 
 <a id="learning-code-map"></a>
 ## 代码阅读地图
@@ -51,6 +56,10 @@ compiler 返回的 kind，再看 controller 保留的 source/诊断，最后看 
 格式化另沿 `Vm::invoke_string` → `string_format::format_arguments` → `format`
 → `parse_spec` → 各 renderer 阅读；`tests/string_format_contract.rs` 从实际 binary
 验固定字节，再单独检查本地错误 kind、参数号与分类。
+
+find 则读 `StringFunction::Find` adapter → `string_find::find` 的 init/plain 分流
+→ `match_at` → 到达的 `parse_atom/Atom::matches` → `greedy_end/retry`。adapter
+拥有本次参数字节副本，matcher借用它们，Set借用pattern切片；没有延长heap对象生命周期。
 
 本版阅读顺序从证据到实现：先问“这个结论由什么证明”，再进入 parser/opcode/tool 代码。
 测试存在并不自动成为证据；只有覆盖对象、参照物和允许归一化都明确时，才能支撑对应行。
@@ -510,6 +519,230 @@ SHA；超时后 kill/wait，缺 oracle 或归档失败显式失败。字段与�
 继续引用 `LUA51-D005`。旧2026-08-21双 oracle baseline保持原版本归属；本轮官方
 format证据单独归档，不把已有转换子集通过升级为完整 string library。
 
+## 问题七：没有找到，和找到了零个字节，是一回事吗？
+
+### 先对照当前接口实际承诺了什么
+
+旧 v1.0 的 find 总是字面查找，未读取第四参数 plain；init超过末端就直接返回nil。
+原 stdlib测试主要覆盖 `plain=true` 的字面成功，无法暴露默认pattern尚未实现。
+从提交 `5347c60` 的冻结binary与官方5.1.5真实运行，可以观察到：
+
+| 输入 | 修改前 v1.0 | 官方 Lua 5.1.5 |
+| --- | --- | --- |
+| `string.find('a.b','.')` | `2,2` | `1,1` |
+| `string.find('abc12','%d+')` | `nil` | `4,5` |
+| `string.find('aaab','a*ab')` | `nil` | `1,4` |
+| `string.find('abc','',99)` | `nil` | `4,3` |
+
+从仓库根运行反例与真实parser/VM对照：
+
+```powershell
+cargo run --quiet --manifest-path book/code/v100-lua51-runtime/Cargo.toml --example string_find_problem_chain -- all
+```
+
+`faults|find|all` 缺省all，共13条不同 `[ok]`。其中 literal fault 与大init直接nil
+复现旧策略；另有强制忽略plain、贪尽不退、eager检查后缀等固定设计反例。忽略plain
+的fault强制走新pattern路径，不能把它说成旧binary的逐行实现。固定参考和真实进程
+合同各自证明不同层次，marker不代表TODO或官方验收已完成。
+
+### 先分流、再解释结果
+
+plain按Lua truthiness解释，数字0也为真；false/nil才为假。plain为真时完整pattern
+按字节查找；默认模式还会扫描pattern首NUL前的C-prefix，若无SPECIALS，也进入
+完整长度的字面路径。只有需要pattern解释时，才把该C-prefix交给matcher。
+
+```diff
+-if start > subject.len() { return Ok(None); }
+-// Every request does a literal windows search.
++let start = normalize_init(init, subject.len());
++// plain truthiness / no magic → full-byte literal search
++// otherwise → match the pattern C-prefix, with subject bytes kept intact
+```
+
+这段是流程差异；实际init代码要处理负数与极端i64，不能把超界算术变成panic。
+归一化的offset总在 `0..=len`，包括末端。空pattern在末端仍匹配成功。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_init_and_branch}}
+```
+
+![init、plain与NUL分流](../images/v100-find-routing.svg)
+
+Rust 用 `Result<Option<Range<usize>>, FindError>`：Err是错误；Ok(None)是未命中；
+Ok(Some(start..end))是成功，start等于end也合法。半开range映射到Lua闭区间为
+`(start+1,end)`：`Some(3..3)` 是 `(4,3)`，空subject上的 `a*` 是 `(1,0)`。
+因此不能用 `range.is_empty()` 或整数0代表“没找到”，还要核对返回元数。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/lib.rs:string_find_vm_adapter}}
+```
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_contract plain_truthiness_init_empty_ranges_and_c_prefixes_remain_distinct -- --exact
+```
+
+### NUL 在主体和模式中，不走同一条规则
+
+主体始终按完整bytes保留；`.` 能吃一个NUL或0xff，`%z`明确匹配NUL。pattern本身
+则继承5.1.5的分流边界：`a\0x` 中找 `\0.`，自动plain按完整pattern查找而未命中；
+`ab` 中找 `.\0x`，matcher只看`.`而返回 `(1,1)`。显式plain=true始终看完整pattern。
+图中的 `\0` 表示一个NUL byte，复现脚本用string.char(0)构造，不传反斜杠字符。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_entry}}
+```
+
+分流与init依据[官方5.1.5 str_find_aux](https://www.lua.org/source/5.1/lstrlib.c.html#str_find_aux)，
+固定fixture分别验主体、模式与显式plain，不以“用了byte slice”外推所有NUL行为。
+
+## 问题八：为什么不能先把整个 pattern 验证一遍？
+
+### 让错误时机约束 parser 的形状
+
+`string.find('abc','z[')` 返回nil，因为各候选起点的z都失败，尚未到达未闭集合；
+`string.find('abc','a[')` 才在a成功后报缺少`]`。全pattern eager parser会把两者
+都立即拒绝，虽然诊断“看起来更早”，却改变了可观察行为。
+
+```diff
+-let ast = parse_entire_pattern(pattern)?;
+-match_ast(ast, subject)
++// Only parse the atom reached by the current match path.
++let (atom, after_atom) = parse_atom(pattern, pattern_offset)?;
++// A failed atom does not inspect its unreached suffix.
+```
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_atom_and_error}}
+```
+
+Atom分为Literal、Any、Class、Set；Set共享借用原pattern，不能比原bytes活得更久。
+转义 `%.` 通过Class的fallback匹配字面点号；`%d/%D/%z`分别表示数字、补集与NUL。
+parser只返回当前atom及其后位置，`*`/`+`由matcher读取，语法检查沿实际到达路径发生。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_parse_atom}}
+```
+
+![字节atom与错误到达时机](../images/v100-find-atoms.svg)
+
+这不是Unicode正则。当前类按ASCII/C-locale解释，`%w`不包含下划线；5.1.5未定义
+为字符类的 `%g/%G` 走字面fallback。集合支持范围、取反和escape，集合内的`%f`
+不是frontier。`[]`也不是空集合：第一个`]`是集合内容，还需要闭合`]`，因此
+`[]`报错而`[]]`能匹配字面`]`。locale差异和标准未定义的range/class混合不外推。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_ascii_class}}
+```
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_reference actual_atom_parser_borrows_sets_and_matches_raw_bytes -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_contract find_errors_keep_argument_categories_and_only_validate_reached_atoms -- --exact
+```
+
+第一项借真实parser核atom、游标与NUL/ff匹配；第二项检查Type、参数号、具体malformed
+类别及未到达后缀不报错。Invalid、Unsupported和Limit分别记录：未实现capture、
+backreference、`%b/%f`、optional/non-greedy量词不能静默按字面或统一返回nil。
+转义、集合和普通字面上下文仍按各自规则；首`^`/末`$`的小范围支持也有单独回归。
+
+## 问题九：贪婪匹配为什么必须保存“退一步”的状态？
+
+### 后缀失败，也是推动设计的输入
+
+`aaab` 匹配 `a*ab`：a*先吃三个a，从位置3试后缀ab，只剩b，失败；退到位置2
+后剩ab，才成功。只调用 `try_suffix(greedy_end)` 会把合法匹配拒绝。`+`还要求
+至少一次：`ab` 能匹配 `a*ab`，不能退到零次让 `a+ab` 也成功。
+
+```diff
+-return try_suffix(greedy_end);
++// Try the greedy end first; retain progressively shorter alternatives.
++save_retry(minimum, greedy_end - 1, suffix_pattern_position);
++// On suffix failure, resume from the next saved (subject, pattern) pair.
+```
+
+实际push只有在end大于minimum时才创建frame，不在无候选时计算end-1。每个frame
+存下界、下一subject位置与后缀pattern位置；嵌套重复用显式Vec栈，没有宿主递归。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_retry_state}}
+```
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_greedy_candidates}}
+```
+
+![贪尽、失败与较短候选](../images/v100-find-backtrack.svg)
+
+步骤与frame深度有独立guard，默认100000步骤、128层。预算在同次搜索的候选间
+共用，耗尽返回Limit，经adapter保留VmErrorKind::Limit；不是匹配失败，也不保证
+精确wall-clock时限。字面fast path另走库的slice查找，不受matcher预算计量。
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_contract candidate_work_limits_are_errors_and_leave_the_session_usable -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_contract unsupported_constructs_are_explicit_partial_errors_in_the_candidate -- --exact
+```
+
+用小limits确定性验步骤/栈深guard，再从真实VM触发默认Limit、读取同Session已保存
+的全局变量，确认错误后仍能继续。Unsupported测试属于候选有界策略，不能把它
+加入官方成功case中后宣称两边结果相等。
+
+### 验收练习：下一次应提出哪个位置？
+
+只改[find练习包](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v100-lua51-runtime/exercises/string_find/README.md)
+的 `starter.rs::next_position`。Retry投影保存 consumed range、minimum与next Option，
+hook每次只提出一个后缀起点，不判断后缀。`take()`消费当前候选，checked算术计算
+下一项；Some(0)合法，只有None表示耗尽，`+`不能低于至少一次的下界。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/exercises/string_find/starter.rs:string_find_starter}}
+```
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/exercises/string_find/solution.rs:string_find_solution}}
+```
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_exercises retry_positions_keep_greedy_order_and_the_repetition_minimum -- --ignored --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_reference retry_positions_keep_greedy_order_and_the_repetition_minimum -- --exact
+```
+
+初始learner应失败，补hook后通过；9参考和all13条marker不表示学生已完成。真实
+atom和VM probes另验完整匹配、late error、坐标及恢复，练习没有第二套matcher。
+Release对同样run/test加`--release`复核。
+
+### 官方 Lua 5.1.5 的75场景字节合同
+
+手写固定TSV保存返回元数与每项坐标/单nil；独立driver按id调用find，用select计数
+而不丢掉nil。输出如 `ok|2|n:4|n:3|after`、`ok|1|nil|after` 或 `error|after`；
+编码不依赖find或format生成预期，不输出换行。捕获完整stdout/stderr/exit，原始
+bytes不trim、不normalize，区分返回一个nil与空匹配的两个坐标。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/tests/string_find_contract.rs:find_binary_contract}}
+```
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_contract real_binary_matches_seventy_five_fixed_find_byte_cases -- --exact
+py -3 book/code/v100-lua51-runtime/tools/check_string_find_contract.py --check
+```
+
+本地测试无需外部Lua；`--check`只检查schema/driver，明确NOT_RUN。真实官方对照
+要求同时提供两端binary与固定source tar，示例Windows路径按实际target产物调整：
+
+```powershell
+cargo build --manifest-path book/code/v100-lua51-runtime/Cargo.toml --bin lua_app
+py -3 book/code/v100-lua51-runtime/tools/check_string_find_contract.py --candidate-bin book/code/v100-lua51-runtime/target/x86_64-pc-windows-msvc/debug/lua_app.exe --official-bin target/oracles/lua-5.1.5/build/Release/lua51.exe --official-archive target/oracles/lua-5.1.5/lua-5.1.5.tar.gz --output target/string-find-review
+```
+
+runner独占run/case目录，保存实际/预期双流、元数、状态、版本、输入与binary/source
+SHA；缺文件、超时或归档失败显式失败。错误case用pcall稳定输出，Rust另核错误
+类别、参数号与到达时机；未知id/driver编译错误在Lua `pcall` 之外，不能冒充合法pattern错误。
+详细边界见[find官方合同](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v100-lua51-runtime/tools/string_find_contract/README.md)。
+
+能力矩阵新增find子集证据，byte-string、format、find三行仍为 **partial**，共同
+引用 `LUA51-D005`。captures、backreference、balanced/frontier、optional/non-greedy、
+gmatch/gsub、locale与资源边界继续登记，既有format57条、REPL26条和旧语言双oracle
+基线各保留原覆盖归属，不把find子集称为完整Lua pattern。
+
 ## 38 Opcode：语义覆盖不等于二进制兼容
 
 Lua 5.1 `lopcodes.h` 定义 38 个 Opcode。教学 VM 从 v0.5 起使用自己的 32 位寄存器格式，v0.18 已演进为 39 个更显式的 Opcode：
@@ -597,6 +830,8 @@ book/code/v100-lua51-runtime/tools/release_gate.ps1 -RunOracles `
 - `FormatSpec` 与 `Option<u8>` 区分未指定和显式0；共享 byte slice 与局部 cursor
   分离解析/提交，Result 将格式、缺参和类型错误带回 VM；
 - 符号、数值精度与宽度补齐分开，按规则处理优先级，不依赖通用 Display。
+- find用 `Result<Option<Range<usize>>, FindError>` 分离错误、未命中与空成功；
+  Atom借用pattern、Vec保存回退状态，让错误时机与候选顺序可以直接测试。
 
 替代方案是把教学 ISA 强行改成官方 38 条并立即读取官方 chunk。这会把语言收口与二进制格式、端序、数字宽度、安全 verifier 混成一次破坏性迁移，因此留给 v1.1。另一个方案是只保存 golden output；真实双进程差分能在平台和错误合同改变时暴露差异，证据更强。
 
@@ -612,6 +847,7 @@ book/code/v100-lua51-runtime/tools/release_gate.ps1 -RunOracles `
 - 显式移植：结构化 CompileErrorKind、同一 Session 的 Repl 与真实 LF/EOF adapter；
 - 共用合同：26个 raw byte 场景，本地自含副本与仓库身份/进程 gate；
 - 收口子集：既有 string.format 的规格/参数边界与57场景官方字节合同，D005仍partial；
+- 收口子集：find的plain/init、字节atom和`*`/`+`回退与75场景官方合同，D005仍partial；
 - 未伪装：标准库剩余差异和 v1.1+ 能力继续显式登记。
 
 ## 运行与验收
@@ -705,6 +941,24 @@ Release gate 还要求相同测试在 `--release` 下通过、Clippy 零 warning
   是从固定oracle、Lua层hex、本地错误分类各给证据，且D005仍准确标partial。</p>
 </div>
 
+<div class="exercise understanding">
+  <strong>理解题：没有byte，为什么仍然成功？</strong>
+  <p>把None、Some(0..0)、Some(3..3)、Err分别映射到Lua结果或错误；手推plain=0、
+  init=99与NUL分流。成功条件是能区分返回一个nil与返回两个空区间坐标。</p>
+</div>
+
+<div class="exercise implementation">
+  <strong>实现题：只提出下一次重试的位置</strong>
+  <p>只补next_position，候选降序、每项一次、Some(0)有效，plus不低于一次；运行
+  --ignored exact，再验真实atom、matcher与官方75场景。hook不自己判断后缀。</p>
+</div>
+
+<div class="exercise debugging">
+  <strong>调试题：未闭集合为什么有时没有报错？</strong>
+  <p>对照z[与a[、贪尽不退与逐步退、Limit与None三组反例。成功条件是标出当前
+  subject/pattern位置和Retry，解释哪一步到达错误，并说明eager parser为何改变行为。</p>
+</div>
+
 <a id="learning-checkpoint"></a>
 ## 完成检查点
 
@@ -718,6 +972,10 @@ TODO；独立构建 v1.0 并让两版逐字节满足同一固定合同，而非�
 格式游标与参数游标；完成 consume TODO；解释短串 NUL、长串 fast path 与 q 回读
 的不同合同，并用官方字节证据支撑子集进展，保留D005的剩余边界。
 
+find还应能手推init/空区间和C-prefix分流，解释借用Set的生命周期与按到达才解析；
+完成Retry TODO，画出a*ab的失败/回退轨迹，说明*与+的下界；用官方元数/坐标合同
+和候选专用Unsupported/Limit检查各自举证，不外推完整pattern或无限资源。
+
 ## 与成熟实现和专题章节的对应
 
 - 成熟实现的 differential runner、M0/M1 gate、official source manifest 和 living deviation log 是本版最小发布治理的扩展目标；
@@ -725,5 +983,5 @@ TODO；独立构建 v1.0 并让两版逐字节满足同一固定合同，而非�
 - [寄存器虚拟机](../ch04-vm/register-vm.md) 对照 composite opcode；
 - [用测试守住兼容性](../ch05-engineering/testing.md) 深入 fixture、oracle 与进程级证据；
 - 根目录 `book_plan.md` 继续定义 v1.1–v1.4 路线。
-- 下一步按 capability/deviation 中的具体失败 fixture 继续推进其它转换或 pattern；
-  REPL 的 TTY、signal、增量 parser 分别立项，REPL固定26条与format官方57条各保留覆盖归属。
+- 下一步可从捕获的保存/失败回滚，或其它登记构造的最小fixture继续推进；REPL的
+  TTY/signal/增量parser分别立项，REPL26、format57、find75各保留自己的覆盖归属。

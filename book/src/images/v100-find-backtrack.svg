@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="940" viewBox="0 0 900 940" role="img" aria-labelledby="title desc">
+<title id="title">贪婪重复的后缀失败与候选回退</title><desc id="desc">aaab匹配a*ab，a星先消费3个a，从位置3尝试后缀ab失败，再退到2成功。显式Retry栈保存下一位置、最小位置和后缀pattern位置；星的最低重复0，加号最低1。练习状态每次提出一个候选，Some0合法，消费后不重复。步骤与栈深上限独立报Limit。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:18px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="940" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">贪婪决定尝试顺序：先长后短，不是只试最长</text>
+<rect x="24" y="64" width="852" height="96" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="98" class="mono">subject:  a a a b     （0-based位置：0 1 2 3，末端4）</text><text x="44" y="130" class="mono">pattern:  a*ab → [a*] [a] [b] → 先贪尽到位置3</text><text x="44" y="154" class="small">重复atom的最大消耗为0..3，后缀ab从pattern位置2继续。</text>
+<path d="M450 160V198" class="flow"/>
+<rect x="24" y="202" width="852" height="84" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="44" y="236" class="label">保存 Retry：后缀起点pattern=2，minimum=0，next=2</text><text x="44" y="268" class="small">位置3先直接尝试；之后才从栈取2、1、0。真实matcher用Vec，不借宿主递归栈。</text>
+<path d="M450 286V324" class="flow"/>
+<rect x="24" y="328" width="852" height="92" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="44" y="362" class="mono">试位置3：subject剩 b，pattern后缀 ab</text><text x="44" y="394" class="label">a ≠ b → 后缀失败 → 取下一候选2</text>
+<path d="M450 420V458" class="flow"/>
+<rect x="24" y="462" width="852" height="92" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="496" class="mono">试位置2：subject剩 ab，pattern后缀 ab</text><text x="44" y="528" class="label">成功 → Some(0..4) → Lua返回(1,4)</text>
+<rect x="24" y="588" width="408" height="116" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="622" class="label">*：minimum=0</text><text x="44" y="654" class="small">候选可退到重复0次。</text><text x="44" y="686" class="mono">ab 匹配 a*ab → (1,2)</text>
+<rect x="456" y="588" width="420" height="116" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="476" y="622" class="label">+：minimum=1</text><text x="476" y="654" class="small">候选不能越过至少1次的下界。</text><text x="476" y="686" class="mono">ab 匹配 a+ab → nil</text>
+<rect x="24" y="738" width="852" height="112" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="772" class="label">练习投影 next_position(&amp;mut Retry)</text><text x="44" y="804" class="small">每次只提出一个位置，不负责判断后缀；Some(0)是有效位置，None才表示耗尽。</text><text x="44" y="834" class="small">候选降序、不重复、守minimum；真实parse/完整matcher与最终坐标另验。</text>
+<text x="24" y="892" class="small">步骤预算与重试栈深度独立计量，耗尽返回Limit；显式栈不等于无限时间或无限内存。</text>
+<text x="24" y="922" class="small">本包只收口 * / +；非贪婪、optional、captures、gmatch/gsub等继续登记D005 partial。</text>
+</svg>

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="950" viewBox="0 0 900 950" role="img" aria-labelledby="title desc">
+<title id="title">string.find 的 init、plain 与 NUL 分流</title><desc id="desc">init被归为零基字节偏移并夹在0到长度之间。plain按Lua truthiness选择，或者pattern的C前缀没有特殊字符时，走完整长度的字面查找；否则仅C前缀进入pattern matcher。结果使用Result Option半开Range，空Range也是成功，映射到Lua的start加1与end。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:22px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:17px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="950" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">先决定在哪里、用什么规则找，再解释“成功”的长度</text>
+<rect x="24" y="64" width="852" height="90" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="98" class="label">init → 0-based offset，始终在 0..=subject.len()</text><text x="44" y="132" class="small">正数减1；0归0；负数相对末尾；过大归末端，不能提前返回 nil。</text>
+<path d="M450 154V188" class="flow"/>
+<rect x="24" y="192" width="852" height="90" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="44" y="226" class="label">plain 为真？或 pattern 的 C-prefix 没有 SPECIALS？</text><text x="44" y="260" class="small">plain 按Lua truthiness：0也是true；只有false/nil为false。C-prefix在首NUL前结束。</text>
+<path d="M240 282V320" class="flow"/><path d="M660 282V320" class="flow"/>
+<rect x="24" y="324" width="408" height="142" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="358" class="label">是：字面路径</text><text x="44" y="392" class="small">subject 与 pattern 都按完整长度。</text><text x="44" y="424" class="small">NUL、0xff 都是普通数据 byte。</text><text x="44" y="452" class="small">空 pattern 在末端仍成功。</text>
+<rect x="456" y="324" width="420" height="142" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="476" y="358" class="label">否：pattern 路径</text><text x="476" y="392" class="small">只解释 pattern 的 C-prefix。</text><text x="476" y="424" class="small">subject 继续保留完整 bytes。</text><text x="476" y="452" class="small">到达 atom 时才解析与检查错误。</text>
+<rect x="24" y="498" width="852" height="128" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="532" class="label">NUL 在 pattern 的位置，会改变所选路径</text><text x="44" y="566" class="mono">subject=a\0x, pattern=\0. → 自动plain → nil</text><text x="44" y="598" class="mono">subject=ab,   pattern=.\0x → matcher只见 . → Lua(1,1)</text><text x="44" y="622" class="small">显式 plain=true 时，两者始终用完整pattern bytes；这是5.1.5的列明边界。</text>
+<path d="M450 626V662" class="flow"/>
+<rect x="24" y="666" width="268" height="126" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="700" class="label">Ok(Some(start..end))</text><text x="44" y="734" class="small">成功，start=end也合法。</text><text x="44" y="766" class="mono">Lua: (start+1,end)</text>
+<rect x="316" y="666" width="268" height="126" rx="12" fill="#f1edf7" stroke="#75519a"/>
+<text x="336" y="700" class="label">Ok(None)</text><text x="336" y="734" class="small">尝试后没有匹配。</text><text x="336" y="766" class="small">Lua只返回一个nil。</text>
+<rect x="608" y="666" width="268" height="126" rx="12" fill="#fff1ee" stroke="#b55b48"/>
+<text x="628" y="700" class="label">Err(FindError)</text><text x="628" y="734" class="small">非法 / 未支持 / 限制。</text><text x="628" y="766" class="small">不伪装成nil或空匹配。</text>
+<rect x="24" y="824" width="852" height="76" rx="12" fill="#edf6ed" stroke="#286047"/>
+<text x="44" y="858" class="mono">find('abc','',99,true) → Some(3..3) → Lua(4,3)</text><text x="44" y="888" class="small">find('','a*') → Some(0..0) → Lua(1,0)；不要用 range.is_empty() 判失败。</text>
+<text x="24" y="932" class="small">共同字节子集与固定官方证据；locale、完整pattern API与资源上限继续属于D005 partial。</text>
+</svg>
