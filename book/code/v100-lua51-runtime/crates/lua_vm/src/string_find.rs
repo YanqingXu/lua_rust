@@ -1,4 +1,4 @@
-//! A byte-oriented Lua 5.1 `find` subset; captures and other pattern APIs stay partial.
+//! A byte-oriented Lua 5.1 `find` subset; backreferences and other pattern APIs stay partial.
 use std::fmt;
 use std::ops::Range;
 
@@ -32,6 +32,51 @@ impl fmt::Display for FindError {
 
 impl std::error::Error for FindError {}
 
+// ANCHOR: find_capture_values
+pub const MAX_CAPTURES: usize = 32;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Capture {
+    Bytes(Range<usize>),
+    Position(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FindMatch {
+    pub span: Range<usize>,
+    pub captures: Vec<Capture>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CaptureState {
+    Open(usize),
+    Closed(Range<usize>),
+    Position(usize),
+}
+// ANCHOR_END: find_capture_values
+
+// ANCHOR: find_capture_checkpoint
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureCheckpoint(Vec<CaptureState>);
+
+impl CaptureCheckpoint {
+    pub fn states(&self) -> &[CaptureState] {
+        &self.0
+    }
+}
+
+pub fn capture_checkpoint(states: &[CaptureState]) -> Result<CaptureCheckpoint, FindError> {
+    if states.len() > MAX_CAPTURES {
+        return Err(FindError::Limit("too many captures (maximum 32)"));
+    }
+    Ok(CaptureCheckpoint(states.to_vec()))
+}
+
+pub fn restore_captures(states: &mut Vec<CaptureState>, checkpoint: &CaptureCheckpoint) {
+    states.clone_from(&checkpoint.0);
+}
+// ANCHOR_END: find_capture_checkpoint
+
 // ANCHOR: find_limits
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
@@ -64,6 +109,7 @@ impl Budget {
 
 // ANCHOR: find_parse_atom
 /// Parse only the atom reached by matching; do not eagerly validate a whole pattern.
+/// Capture delimiters are control instructions handled before this atom parser.
 pub fn parse_atom(pattern: &[u8], at: usize) -> Result<(Atom<'_>, usize), FindError> {
     let byte = *pattern
         .get(at)
@@ -183,36 +229,110 @@ struct Retry {
     minimum: usize,
     next: usize,
     pattern: usize,
+    captures: CaptureCheckpoint,
 }
 
-fn retry(stack: &mut Vec<Retry>) -> Option<(usize, usize)> {
-    let frame = stack.last_mut()?;
+fn retry(
+    stack: &mut Vec<Retry>,
+    captures: &mut Vec<CaptureState>,
+    budget: &mut Budget,
+) -> Result<Option<(usize, usize)>, FindError> {
+    let Some(frame) = stack.last_mut() else {
+        return Ok(None);
+    };
+    budget.charge(captures.len() + frame.captures.states().len())?;
+    restore_captures(captures, &frame.captures);
     let candidate = (frame.next, frame.pattern);
     if frame.next == frame.minimum {
         stack.pop();
     } else {
         frame.next -= 1;
     }
-    Some(candidate)
+    Ok(Some(candidate))
 }
 // ANCHOR_END: find_retry_state
+
+// ANCHOR: find_capture_control
+fn capture_control(
+    pattern: &[u8],
+    cursor: usize,
+    source: usize,
+    captures: &mut Vec<CaptureState>,
+    budget: &mut Budget,
+) -> Result<Option<usize>, FindError> {
+    match pattern[cursor] {
+        b'(' => {
+            if captures.len() >= MAX_CAPTURES {
+                return Err(FindError::Limit("too many captures (maximum 32)"));
+            }
+            budget.charge(1)?;
+            let position = pattern.get(cursor + 1) == Some(&b')');
+            captures.push(if position {
+                CaptureState::Position(source)
+            } else {
+                CaptureState::Open(source)
+            });
+            Ok(Some(cursor + if position { 2 } else { 1 }))
+        }
+        b')' => {
+            budget.charge(captures.len())?;
+            let (index, start) = captures
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, state)| match state {
+                    CaptureState::Open(start) => Some((index, *start)),
+                    _ => None,
+                })
+                .ok_or(FindError::Invalid("invalid pattern capture"))?;
+            captures[index] = CaptureState::Closed(start..source);
+            Ok(Some(cursor + 1))
+        }
+        _ => Ok(None),
+    }
+}
+// ANCHOR_END: find_capture_control
+
+// ANCHOR: find_capture_finish
+fn finish_match(
+    span: Range<usize>,
+    states: Vec<CaptureState>,
+    budget: &mut Budget,
+) -> Result<FindMatch, FindError> {
+    budget.charge(states.len())?;
+    let captures = states
+        .into_iter()
+        .map(|state| match state {
+            CaptureState::Open(_) => Err(FindError::Invalid("unfinished capture")),
+            CaptureState::Closed(bytes) => Ok(Capture::Bytes(bytes)),
+            CaptureState::Position(offset) => Ok(Capture::Position(offset)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(FindMatch { span, captures })
+}
+// ANCHOR_END: find_capture_finish
 
 fn match_at(
     subject: &[u8],
     pattern: &[u8],
     start: usize,
     budget: &mut Budget,
-) -> Result<Option<usize>, FindError> {
+) -> Result<Option<FindMatch>, FindError> {
     let (mut source, mut cursor) = (start, 0);
     let mut stack = Vec::new();
+    let mut captures = Vec::new();
     loop {
         budget.charge(1)?;
         if cursor == pattern.len() {
-            return Ok(Some(source));
+            return finish_match(start..source, captures, budget).map(Some);
+        }
+        if let Some(next) = capture_control(pattern, cursor, source, &mut captures, budget)? {
+            cursor = next;
+            continue;
         }
         if pattern[cursor] == b'$' && cursor + 1 == pattern.len() {
             if source == subject.len() {
-                return Ok(Some(source));
+                return finish_match(start..source, captures, budget).map(Some);
             }
         } else {
             let (atom, next) = parse_atom(pattern, cursor)?;
@@ -224,7 +344,7 @@ fn match_at(
                 let end = greedy_end(subject, source, atom, budget)?;
                 let minimum = source + usize::from(modifier == Some(b'+'));
                 if end >= minimum {
-                    push_retry(&mut stack, minimum, end, next + 1, budget)?;
+                    push_retry(&mut stack, minimum, end, next + 1, &captures, budget)?;
                     source = end;
                     cursor = next + 1;
                     continue;
@@ -237,7 +357,7 @@ fn match_at(
                 }
             }
         }
-        let Some((next_source, next_pattern)) = retry(&mut stack) else {
+        let Some((next_source, next_pattern)) = retry(&mut stack, &mut captures, budget)? else {
             return Ok(None);
         };
         source = next_source;
@@ -267,16 +387,19 @@ fn push_retry(
     minimum: usize,
     end: usize,
     pattern: usize,
-    budget: &Budget,
+    captures: &[CaptureState],
+    budget: &mut Budget,
 ) -> Result<(), FindError> {
     if end > minimum {
         if stack.len() >= budget.0.backtrack_depth {
             return Err(FindError::Limit("backtrack depth exhausted"));
         }
+        budget.charge(captures.len())?;
         stack.push(Retry {
             minimum,
             next: end - 1,
             pattern,
+            captures: capture_checkpoint(captures)?,
         });
     }
     Ok(())
@@ -329,17 +452,41 @@ pub fn find_with_limits(
     plain: bool,
     limits: Limits,
 ) -> Result<Option<Range<usize>>, FindError> {
+    Ok(find_captures_with_limits(subject, pattern, init, plain, limits)?.map(|found| found.span))
+}
+// ANCHOR_END: find_entry
+
+// ANCHOR: find_capture_entry
+pub fn find_captures(
+    subject: &[u8],
+    pattern: &[u8],
+    init: i64,
+    plain: bool,
+) -> Result<Option<FindMatch>, FindError> {
+    find_captures_with_limits(subject, pattern, init, plain, Limits::default())
+}
+
+pub fn find_captures_with_limits(
+    subject: &[u8],
+    pattern: &[u8],
+    init: i64,
+    plain: bool,
+    limits: Limits,
+) -> Result<Option<FindMatch>, FindError> {
     let start = initial_offset(subject.len(), init);
     let prefix = c_prefix(pattern);
     if plain || !prefix.iter().any(|byte| b"^$*+?.([%-".contains(byte)) {
-        return Ok(plain_find(subject, pattern, start));
+        return Ok(plain_find(subject, pattern, start).map(|span| FindMatch {
+            span,
+            captures: Vec::new(),
+        }));
     }
     let anchored = prefix.first() == Some(&b'^');
     let pattern = if anchored { &prefix[1..] } else { prefix };
     let mut budget = Budget(limits);
     for candidate in start..=subject.len() {
-        if let Some(end) = match_at(subject, pattern, candidate, &mut budget)? {
-            return Ok(Some(candidate..end));
+        if let Some(found) = match_at(subject, pattern, candidate, &mut budget)? {
+            return Ok(Some(found));
         }
         if anchored {
             break;
@@ -347,7 +494,7 @@ pub fn find_with_limits(
     }
     Ok(None)
 }
-// ANCHOR_END: find_entry
+// ANCHOR_END: find_capture_entry
 
 #[cfg(test)]
 mod tests {
@@ -424,7 +571,7 @@ mod tests {
 
     #[test]
     fn unsupported_constructs_are_separate_from_syntax_misses_and_limits() {
-        for pattern in [b"a?".as_slice(), b"a-", b"(a)", b"%b()", b"%f[%a]", b"%1"] {
+        for pattern in [b"a?".as_slice(), b"a-", b"%b()", b"%f[%a]", b"%1"] {
             assert!(
                 matches!(
                     find(b"abc", pattern, 1, false),
@@ -488,5 +635,261 @@ mod tests {
         assert_eq!(next, 6);
         assert!(atom.matches(b'A') && !atom.matches(b'3'));
         assert!(parse_atom(pattern, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn captures_preserve_opening_order_and_bytes_without_allocating_substrings() {
+        use super::{find_captures, Capture, FindMatch};
+        assert_eq!(
+            find_captures(b"id=42", b"(%a+)=(%d+)", 1, false),
+            Ok(Some(FindMatch {
+                span: 0..5,
+                captures: vec![Capture::Bytes(0..2), Capture::Bytes(3..5)],
+            }))
+        );
+        assert_eq!(
+            find_captures(b"A\0\xffB", b"(%z.)", 1, false)
+                .unwrap()
+                .unwrap()
+                .captures,
+            vec![Capture::Bytes(1..3)]
+        );
+    }
+
+    #[test]
+    fn retry_restores_closed_slots_and_discards_failed_suffix_captures() {
+        use super::{find_captures, Capture};
+        for (pattern, expected) in [
+            (b"(a*)ab".as_slice(), vec![Capture::Bytes(0..2)]),
+            (b"a*(a)b".as_slice(), vec![Capture::Bytes(2..3)]),
+            (
+                b"(a*)(a)b".as_slice(),
+                vec![Capture::Bytes(0..2), Capture::Bytes(2..3)],
+            ),
+        ] {
+            let found = find_captures(b"aaab", pattern, 1, false).unwrap().unwrap();
+            assert_eq!(found.span, 0..4);
+            assert_eq!(found.captures, expected, "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn nested_captures_close_the_latest_open_slot_after_retry() {
+        use super::{find_captures, Capture};
+        let found = find_captures(b"aaab", b"((a*)a)b", 1, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found.captures,
+            vec![Capture::Bytes(0..3), Capture::Bytes(0..2)]
+        );
+        let found = find_captures(b"aaab", b"(a*)(a*)ab", 1, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found.captures,
+            vec![Capture::Bytes(0..2), Capture::Bytes(2..2)]
+        );
+    }
+
+    #[test]
+    fn empty_bytes_and_position_captures_have_different_types() {
+        use super::{find_captures, Capture};
+        let found = find_captures(b"", b"(a*)()", 1, false).unwrap().unwrap();
+        assert_eq!(found.span, 0..0);
+        assert_eq!(
+            found.captures,
+            vec![Capture::Bytes(0..0), Capture::Position(0)]
+        );
+        let found = find_captures(b"ab", b"()a()", 1, false).unwrap().unwrap();
+        assert_eq!(found.span, 0..1);
+        assert_eq!(
+            found.captures,
+            vec![Capture::Position(0), Capture::Position(1)]
+        );
+    }
+
+    #[test]
+    fn failed_candidate_and_later_calls_start_with_fresh_capture_state() {
+        use super::{find_captures, Capture};
+        let found = find_captures(b"axab", b"(a)b", 1, false).unwrap().unwrap();
+        assert_eq!(found.span, 2..4);
+        assert_eq!(found.captures, vec![Capture::Bytes(2..3)]);
+        assert_eq!(find_captures(b"x", b"a", 1, false), Ok(None));
+        assert!(find_captures(b"a", b"a", 1, false)
+            .unwrap()
+            .unwrap()
+            .captures
+            .is_empty());
+        assert!(find_captures(b"(a)", b"(a)", 1, true)
+            .unwrap()
+            .unwrap()
+            .captures
+            .is_empty());
+    }
+
+    #[test]
+    fn capture_checkpoint_restores_contents_and_count_idempotently() {
+        use super::{capture_checkpoint, restore_captures, CaptureState};
+        let original = vec![
+            CaptureState::Open(0),
+            CaptureState::Closed(1..3),
+            CaptureState::Position(4),
+        ];
+        let checkpoint = capture_checkpoint(&original).unwrap();
+        let mut changed = original.clone();
+        changed[0] = CaptureState::Closed(0..9);
+        changed[1] = CaptureState::Open(8);
+        changed.push(CaptureState::Position(10));
+        restore_captures(&mut changed, &checkpoint);
+        assert_eq!(changed, original);
+        restore_captures(&mut changed, &checkpoint);
+        assert_eq!(changed, original);
+        assert_eq!(checkpoint.states(), original);
+    }
+
+    #[test]
+    fn unfinished_capture_is_checked_only_after_a_candidate_succeeds() {
+        use super::find_captures;
+        assert_eq!(
+            find_captures(b"abc", b"^a)", 1, false),
+            Err(FindError::Invalid("invalid pattern capture"))
+        );
+        for pattern in [b"z(".as_slice(), b"(z"] {
+            assert_eq!(find_captures(b"abc", pattern, 1, false), Ok(None));
+        }
+        for pattern in [b"a(".as_slice(), b"(a", b"a+)"] {
+            assert!(
+                matches!(
+                    find_captures(b"abc", pattern, 1, false),
+                    Err(FindError::Invalid(_))
+                ),
+                "{pattern:?}"
+            );
+            assert!(matches!(
+                find(b"abc", pattern, 1, false),
+                Err(FindError::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            parse_atom(b"(a)", 0),
+            Err(FindError::Unsupported(_))
+        ));
+        assert_eq!(find(b")", b")", 1, false), Ok(Some(0..1)));
+    }
+
+    #[test]
+    fn thirty_two_captures_fit_but_a_reached_thirty_third_is_a_limit() {
+        use super::{capture_checkpoint, find_captures, CaptureState, MAX_CAPTURES};
+        let pattern = b"()".repeat(MAX_CAPTURES);
+        assert_eq!(
+            find_captures(b"", &pattern, 1, false)
+                .unwrap()
+                .unwrap()
+                .captures
+                .len(),
+            32
+        );
+        let too_many = b"()".repeat(MAX_CAPTURES + 1);
+        assert!(matches!(
+            find_captures(b"", &too_many, 1, false),
+            Err(FindError::Limit("too many captures (maximum 32)"))
+        ));
+        assert!(matches!(
+            capture_checkpoint(&vec![CaptureState::Open(0); 33]),
+            Err(FindError::Limit(_))
+        ));
+        assert_eq!(
+            find_captures(b"abc", &[b"z".as_slice(), &too_many].concat(), 1, false),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn checkpoint_and_restore_charge_work_without_rewinding_the_budget() {
+        use super::{find_captures_with_limits, push_retry, retry, Budget, CaptureState};
+        let original = vec![CaptureState::Open(0), CaptureState::Position(1)];
+        let mut budget = Budget(Limits {
+            steps: 20,
+            backtrack_depth: 128,
+        });
+        let mut stack = Vec::new();
+        push_retry(&mut stack, 0, 2, 7, &original, &mut budget).unwrap();
+        assert_eq!(budget.0.steps, 18); // Two snapshot slots were cloned.
+        let mut changed = vec![
+            CaptureState::Closed(0..3),
+            CaptureState::Position(1),
+            CaptureState::Open(3),
+        ];
+        assert_eq!(
+            retry(&mut stack, &mut changed, &mut budget).unwrap(),
+            Some((1, 7))
+        );
+        assert_eq!(changed, original);
+        assert_eq!(budget.0.steps, 13); // Three current plus two saved slots.
+        assert_eq!(
+            retry(&mut stack, &mut changed, &mut budget).unwrap(),
+            Some((0, 7))
+        );
+        assert_eq!(budget.0.steps, 9);
+        assert!(find_captures_with_limits(
+            b"aaaaab",
+            b"(a*)aab",
+            1,
+            false,
+            Limits {
+                steps: 100,
+                backtrack_depth: 128
+            }
+        )
+        .unwrap()
+        .is_some());
+        assert!(matches!(
+            find_captures_with_limits(
+                b"aaaaab",
+                b"(a*)aab",
+                1,
+                false,
+                Limits {
+                    steps: 30,
+                    backtrack_depth: 128
+                }
+            ),
+            Err(FindError::Limit("step budget exhausted"))
+        ));
+    }
+
+    #[test]
+    fn vm_returns_owned_binary_captures_and_recovers_after_capture_errors() {
+        use crate::{Vm, VmErrorKind};
+        use lua_core::{ByteString, Value};
+        let mut vm = Vm::new();
+        let first = vm
+            .execute_multi(
+                &lua_compiler::compile(b"return string.find('A'..string.char(0,255)..'B','(%z.)')")
+                    .unwrap(),
+            )
+            .unwrap();
+        vm.execute_multi(&lua_compiler::compile(b"return string.find('zzz','(z+)')").unwrap())
+            .unwrap();
+        let error = vm
+            .execute_multi(
+                &lua_compiler::compile(b"saved=40;return string.find('a','a(')").unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, VmErrorKind::Type);
+        assert_eq!(
+            vm.execute_multi(&lua_compiler::compile(b"return saved+2").unwrap())
+                .unwrap(),
+            vec![Value::Number(42.0)]
+        );
+        assert_eq!(
+            first,
+            vec![
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::String(ByteString::new(vec![0, 255]))
+            ]
+        );
     }
 }

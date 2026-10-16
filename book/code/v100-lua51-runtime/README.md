@@ -87,7 +87,7 @@ driver将内部bytes编码为hex后io.write，避免Windows C stdout对LF的转�
 
 从“空匹配不是nil”开始，先收口plain truthiness/init夹取，再用`.`、`%d`、`%.`
 与集合推导字节Atom；最后由`a*ab`在`aaab`上的后缀失败推导显式Retry栈。
-真实实现位于 `crates/lua_vm/src/string_find.rs`，VM只做参数/错误/坐标适配。
+真实实现位于 `crates/lua_vm/src/string_find.rs`，VM做参数/错误/坐标适配及成功捕获物化。
 
 - plain按Lua truthiness，0也为真；init正负与超界归为`0..=len`，空Range成功映射
   Lua `(start+1,end)`。未命中只返回一个nil，不能用Range为空代替None。
@@ -118,11 +118,54 @@ ASCII无换行，捕获后不normalize。真实官方5.1.5与candidate各对固�
 错误类别、Unsupported与Limit另用本地测试精核。--check明确两端NOT_RUN；实际
 对照须两binary与固定source tar，命令/身份/范围见[find官方合同](tools/string_find_contract/README.md)。
 
-D005下byte-string、format、find三行都保持partial；captures/backrefs/%b/%f、optional/
+D005下原byte-string、format、find三行都保持partial；backrefs/%b/%f、optional/
 non-greedy量词、gmatch/gsub及其它已登记缺口继续保留。旧format57条与REPL26条各自回归。
 
-当前workspace在Debug/Release各 **204通过、3ignored**：原180再加find unit9、参考9、
-合同6；三个learner分别属于REPL、format与find，交付保留TODO。
+基础find工作包增加unit9、参考9与合同6；原三个learner属于REPL、format与find。
+
+## `string.find` 捕获、检查点与返回值所有权
+
+继续从旧binary明确拒绝捕获开始：`find('id=42','(%a+)=(%d+)')`需要在两个坐标后
+追加id/42；`()`返回位置数字，`(a*)`可以返回空字符串。真实工作状态用
+`CaptureState::{Open,Closed,Position}`，成功结果用`FindMatch{span,captures}`。
+旧`find/find_with_limits`继续返回整体Range投影，但先做完整捕获验证。
+
+- `(a*)(a)b`在aaab上的失败后缀同时关闭旧槽并新建槽；Retry完整复制/恢复检查点，
+  只truncate长度或全部clear都不够。每个候选起点有独立槽，按左括号顺序返回。
+- Budget不在checkpoint中；快照/恢复按槽数计费，同次find跨回退和候选起点共用预算，
+  不退还已做的工作。plain仍绕开matcher计费；当前steps100000、retry深度128。
+- matcher只返回范围元数据；VM成功后把捕获bytes复制为拥有Box<[u8]>的ByteString。
+  保存NUL/0xff返回值，再执行GC/下一次find并释放Session，原bytes仍保持。
+- 上限32槽包括普通/嵌套/位置和已关闭槽，第33槽按到达路径Limit；unfinished只在
+  成功结果边界检查。错误类别/时机与后续Session可用由本地测试另验。
+
+从仓库根运行[捕获练习包](exercises/string_find_captures/README.md)：
+
+```powershell
+cargo run --quiet --manifest-path book/code/v100-lua51-runtime/Cargo.toml --example string_find_captures_problem_chain -- all
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_captures_reference
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_captures_exercises checkpoint_restore_replaces_old_slots_and_removes_new_slots -- --ignored --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract real_binary_matches_fifty_four_fixed_capture_byte_cases -- --exact
+py -3 book/code/v100-lua51-runtime/tools/check_string_find_contract.py --suite all --check
+```
+
+fixed faults3/captures9/all12条unique marker、9参考、1个restore_slots TODO。hook借
+真实CaptureState与checkpoint.states()，恢复全部旧值、删新增槽、保留saved可再用；
+没有第二matcher。预算整数fault是教学投影，真实API的30steps Limit/100steps成功
+及VM错误后继续另验；learner初始ignored，显式命令应失败，参考通过不表示题已完成。
+
+新增54个手写固定捕获case，字符串编码`s:长度:hex`、位置用`n:`，保留返回元数，
+空字符串与nil分别表达。原75个case与driver逐byte保留，输出不变。CLI的`--suite`
+可选base/captures/all，缺省base；--check仅schema并明确两端NOT_RUN。实际官方
+对照和独占原始证据归档见[find合同说明](tools/string_find_contract/README.md)。
+候选预算与Unsupported不是官方相等场景；原语言双oracle baseline保持历史归属。
+
+capture新增能力行也保持 **LUA51-D005 partial**；backrefs、%b/%f、?/-、gmatch/gsub、
+其它format/dump、locale与资源边界继续登记。本包增加unit10、参考9与合同6，新增
+restore_slots题保留TODO；旧三项learner与其原验证版本归属不变。
+
+当前workspace在Debug/Release各 **229通过、4ignored**：原204加capture unit10、
+参考9与合同6；四个learner分别为REPL、format、find回退位置和capture检查点恢复。
 
 ## 发布合同
 
@@ -136,6 +179,7 @@ non-greedy量词、gmatch/gsub及其它已登记缺口继续保留。旧format57
 - format 子集的能力行由 `tests/string_format_contract.rs` 提供证据，继续引用D005；
   byte-string原能力也保持partial，不因57条通过而移除剩余偏差。
 - find子集由 `tests/string_find_contract.rs` 提供75场景与本地错误边界证据，仍为D005 partial。
+- find捕获由 `tests/string_find_capture_contract.rs` 提供54场景、回退/错误/所有权证据，仍为D005 partial。
 
 真实双 oracle gate：
 

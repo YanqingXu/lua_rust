@@ -1,4 +1,4 @@
-# string.find 的有界官方字节合同
+# string.find 的字节与捕获官方合同
 
 从仓库根运行；Release 在 `--` 前加 `--release`：
 
@@ -63,12 +63,65 @@ Lua 5.1 将超大 init 截到末端，`find('abc','',99)` 为4,3；不能套用�
 
 pcall false 只冻结跨引擎的稳定错误标志，不伪造 traceback/路径/诊断文字一致。
 本地错误测试另外逐类核 VM Type、参数号、malformed 分类和可达性时机。候选独有的
-Unsupported/Limit 由另外两个测试验证：`?`/`-`、captures/backrefs、`%b/%f` 到达时
+Unsupported/Limit 由另外两个测试验证：`?`/`-`量词、backrefs、`%b/%f` 到达时
 显式拒绝；step/retry-depth 耗尽返回 Limit，不冒充 nil，Session 后续仍可用。
 这些不是与官方正常支持行为相等的75条之一；plain 路径不使用 pattern budget，
-也不宣称整个VM/进程有统一资源限制。gmatch/gsub、captures、locale等继续 D005 partial。
+也不宣称整个VM/进程有统一资源限制。gmatch/gsub、backrefs、locale等继续 D005 partial。
 
 每次运行创建唯一目录，保存双方各75项实际/预期双流、stdin、metadata，汇总另存
 fixture/driver/checker/source成员/binary SHA与版本原流。错误/超时也归档，拒绝覆盖；
 写入失败不报通过，不宣称 fsync/断电原子性。新证据不覆盖旧 format/REPL 合同，
 也不冒充旧五项语言双 oracle 基线的新结果。
+
+## 捕获增量：54条独立固定合同
+
+旧75条fixture与driver保持原bytes，SHA-256分别为
+`a14bf24da1b30e064f8e6bcc66d755decae537d3f28730d901ac55f22be2780d`与
+`b82485d108683dd9e13ada899d5e82670289b4a6e7185a5b243ffde67e899153`。
+新增 `tests/fixtures/string-find-captures/{cases.tsv,driver.lua}` 独立保存54项预期，
+均先手写再核官方5.1.5，不改旧case去迁就新实现。两套合计129个不同场景。
+
+捕获driver保留元数和类型：`n:3`是位置数字，`s:0:`是空字符串，
+`s:2:00ff`是两个原bytes，`nil`是一次未命中；string的length必须与hex一致。
+匹配成功仍先输出两个闭区间坐标，随后按左括号打开顺序输出捕获。位置捕获`()`
+不是普通空字符串捕获；例如 `(a*)` 可产生`s:0:`，`()`则产生数字位置。
+hex在Lua内部由byte/sub/算术编码，不使用find/format，也不依赖stdout文本模式。
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract real_binary_matches_fifty_four_fixed_capture_byte_cases -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract capture_corpus_keeps_fifty_four_arities_lengths_and_binary_values -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract capture_errors_keep_success_path_timing_and_distinct_categories -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract rollback_restores_closed_values_positions_and_new_slot_count -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract owned_indices_vm_strings_and_legacy_range_projection_keep_their_boundaries -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract captures_do_not_enable_backreferences_or_erase_pattern_work_limits -- --exact
+```
+
+54条覆盖普通/嵌套/空字符串/position、NUL/ff/LF、已有closed槽恢复、新增槽截断、
+position替换、候选起点reset、多次调用不泄漏、plain/C-prefix、成功路径才报告unfinished、
+孤立右括号与坏集合的可达性。32个普通/嵌套/position/mixed捕获能成功，第33个到达
+时失败；未到达的第33个不预先拒绝。`')'`自身没有magic而走autoPlain，非法多余close
+用`^a)`强制pattern路径，避免把字面搜索误当capture语法验证。
+
+`find_captures`返回拥有的`FindMatch`与`Capture::{Bytes(Range),Position(offset)}`
+索引，位置为0-based；这些数字不借用subject，也不使原subject存活。VM成功后才按编号
+把range复制为owned ByteString，position加1；本地合同在清payload、GC及另一轮find后
+核返回bytes仍在。旧`find`保留Range投影，也必须验证unfinished，不能通过丢掉captures
+把错误变成功。回退同时恢复既有槽内容和槽数；已消耗steps不回滚，retry深度限制同时保留的栈帧数。
+
+checker缺省仍为base75；显式选择captures54或all129，`--check`不启动binary：
+
+```powershell
+py -3 book/code/v100-lua51-runtime/tools/check_string_find_contract.py --check --suite captures
+py -3 book/code/v100-lua51-runtime/tools/check_string_find_contract.py --check --suite all
+cargo build --manifest-path book/code/v100-lua51-runtime/Cargo.toml --bin lua_app
+py -3 book/code/v100-lua51-runtime/tools/check_string_find_contract.py --suite all --candidate-bin book/code/v100-lua51-runtime/target/x86_64-pc-windows-msvc/debug/lua_app.exe --official-bin target/oracles/lua-5.1.5/build/Release/lua51.exe --official-archive target/oracles/lua-5.1.5/lua-5.1.5.tar.gz --output target/teaching-v100-captures-2026-10-15/official-contract
+```
+
+all归档按suite/role/case分开，汇总有每套fixture/driver hash；base缺省仍沿原目录协议。
+同一固定官方source tar/binary身份沿用上文，每次实际重新记录，captures的源依据是
+lstrlib.c的start_capture/end_capture/push_onecapture/str_find_aux，不冒充新增C++差分。
+pcall false仍只固定稳定标志；本地Type/Limit与原因另验。第33个capture在候选内分类
+为Limit，区别于unfinished/孤立close的Type，不要求Lua C运行时具有同一Rust错误枚举。
+普通/position捕获已实现，backrefs、`%b/%f`、optional/non-greedy、gmatch/gsub与locale
+仍保持D005 partial，不能因capture返回成功宣称完整Lua pattern。

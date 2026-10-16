@@ -48,3 +48,11 @@ path = "exercises/string_find/acceptance.rs"
 [[test]]
 name = "string_find_reference"
 path = "exercises/string_find/reference.rs"
+
+[[test]]
+name = "string_find_captures_exercises"
+path = "exercises/string_find_captures/acceptance.rs"
+
+[[test]]
+name = "string_find_captures_reference"
+path = "exercises/string_find_captures/reference.rs"

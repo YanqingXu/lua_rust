@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="960" viewBox="0 0 900 960" role="img" aria-labelledby="title desc">
+<title id="title">捕获槽的状态、编号与成功返回</title><desc id="desc">左括号按出现顺序分配槽；普通捕获从Open变成Closed，空括号直接成为Position。闭合最近的Open而不是最后一槽。成功结束仍有Open才报unfinished；32槽与工作预算分别检查。空字符串范围和位置捕获返回不同Lua类型。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:23px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:18px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="960" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">先保存捕获的状态，成功后才构造 Lua 返回值</text>
+<rect x="24" y="62" width="852" height="100" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="96" class="mono">subject = id=42    pattern = (%a+)=(%d+)</text>
+<text x="44" y="129" class="small">编号由左括号顺序决定；整体 span=0..5，捕获依次为 0..2、3..5。</text>
+<path d="M450 162V178H221V196" class="flow"/><path d="M450 178H671V196" class="flow"/>
+<rect x="24" y="196" width="394" height="122" rx="12" fill="#fff0d9" stroke="#a37128"/>
+<text x="44" y="230" class="label">遇到普通左括号 (</text><text x="44" y="266" class="mono">push Open(source)</text><text x="44" y="296" class="small">记录起点，不提前查找匹配的右括号。</text>
+<rect x="466" y="196" width="410" height="122" rx="12" fill="#e5f3eb" stroke="#43865f"/>
+<text x="486" y="230" class="label">遇到空括号 ()</text><text x="486" y="266" class="mono">push Position(source)</text><text x="486" y="296" class="small">不消费subject；它不是空字符串。</text>
+<path d="M221 318V360" class="flow"/>
+<path d="M671 318V340H888V592H876" class="flow"/>
+<rect x="24" y="360" width="852" height="128" rx="12" fill="#e5f3eb" stroke="#43865f"/>
+<text x="44" y="394" class="label">到达右括号 )：关闭最近一个 Open</text>
+<text x="44" y="430" class="mono">Open(start) → Closed(start..source)</text>
+<text x="44" y="464" class="small">嵌套捕获查找最近的未闭合槽；已闭合槽与Position不会抢占关闭顺序。</text>
+<path d="M450 488V530" class="flow"/>
+<rect x="24" y="530" width="852" height="126" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="564" class="label">整体匹配成功：finish 检查所有槽</text>
+<text x="44" y="600" class="mono">Closed → Capture::Bytes    Position → Capture::Position</text>
+<text x="44" y="632" class="small">仍有Open才报unfinished capture；未命中的尝试丢弃状态，不提前验证全pattern。</text>
+<rect x="24" y="694" width="852" height="124" rx="12" fill="#fff0d9" stroke="#a37128"/>
+<text x="44" y="728" class="label">同一个零偏移，返回类型可以不同</text>
+<text x="44" y="764" class="mono">find('ab','(a*)ab') → 1,2,''</text>
+<text x="44" y="798" class="mono">find('ab','()a()')  → 1,1,1,2</text>
+<text x="24" y="862" class="small">内部范围和Position均为0-based；VM将位置+1，并保留整体两个坐标和捕获元数。</text>
+<text x="24" y="898" class="small">最多32槽；第33槽按到达路径报Limit。工作steps与retry深度另验，不能把错误当nil。</text>
+<text x="24" y="934" class="small">plain仍按完整bytes字面查找；括号只有进入matcher后才成为捕获控制字节。</text>
+</svg>

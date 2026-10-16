@@ -2415,8 +2415,8 @@ impl Vm {
                     .map_err(|error| self.host_error(function.name(), error, proto, pc))?;
                 // ANCHOR: string_find_vm_adapter
                 let plain = args.get(3).is_some_and(Value::is_truthy);
-                let found =
-                    string_find::find(&haystack, &needle, start_raw, plain).map_err(|error| {
+                let found = string_find::find_captures(&haystack, &needle, start_raw, plain)
+                    .map_err(|error| {
                         let kind = if matches!(error, string_find::FindError::Limit(_)) {
                             VmErrorKind::Limit
                         } else {
@@ -2425,10 +2425,23 @@ impl Vm {
                         self.error_kind(proto, pc, kind, error.to_string())
                     })?;
                 Ok(match found {
-                    Some(range) => vec![
-                        Value::Number((range.start + 1) as f64),
-                        Value::Number(range.end as f64),
-                    ],
+                    // ANCHOR: string_find_owned_captures
+                    Some(found) => {
+                        let mut values = vec![
+                            Value::Number((found.span.start + 1) as f64),
+                            Value::Number(found.span.end as f64),
+                        ];
+                        values.extend(found.captures.into_iter().map(|capture| match capture {
+                            string_find::Capture::Bytes(range) => {
+                                Value::String(ByteString::new(haystack[range].to_vec()))
+                            }
+                            string_find::Capture::Position(offset) => {
+                                Value::Number((offset + 1) as f64)
+                            }
+                        }));
+                        values
+                    }
+                    // ANCHOR_END: string_find_owned_captures
                     None => vec![Value::Nil],
                 })
                 // ANCHOR_END: string_find_vm_adapter

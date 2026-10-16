@@ -3,7 +3,7 @@ LUA51-D001	binary-chunk	deferred	v1.1	No Lua 5.1 binary chunk serializer deseria
 LUA51-D002	c-api	deferred	v1.2	No stable Lua C API ABI headers lauxlib or external C consumer contract
 LUA51-D003	native-module	deferred	v1.3	No package.loadlib dynamic library loading symbol lookup or native module lifecycle
 LUA51-D004	base-environment	registered	v1.x	getfenv setfenv load reader functions and per-function environments are not implemented
-LUA51-D005	string-library	registered	v1.x	Existing format s d i f q percent and find plain init byte classes escapes greedy star plus have bounded contracts; captures backreferences balanced frontier optional and non-greedy quantifiers gmatch gsub other formats string.dump locale printf floating edges nonfinite values integers outside signed i32 and matcher resource limits remain unavailable or partial
+LUA51-D005	string-library	registered	v1.x	Existing format s d i f q percent and find plain init byte classes escapes greedy star plus ordinary nested empty-string and position captures have bounded contracts; backreferences balanced frontier optional and non-greedy quantifiers gmatch gsub other formats string.dump locale printf floating edges nonfinite values integers outside signed i32 and matcher resource limits remain unavailable or partial
 LUA51-D006	io-library	registered	v1.x	io input output lines tmpfile popen setvbuf and complete text-mode number parsing are not all implemented
 LUA51-D007	os-library	registered	v1.x	locale local timezone DST CPU clock os.exit and platform-specific status tuples are approximated or unavailable
 LUA51-D008	package-library	registered	v1.x	package.loaders cpath module and seeall are unavailable; Lua path preload loaded and require are implemented

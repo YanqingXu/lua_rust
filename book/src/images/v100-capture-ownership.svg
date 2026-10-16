@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="960" viewBox="0 0 900 960" role="img" aria-labelledby="title desc">
+<title id="title">从借用匹配输入到拥有捕获返回值</title><desc id="desc">VM adapter拥有本次subject和pattern字节副本，matcher仅借用并返回拥有范围元数据的FindMatch。成功后adapter一次拷贝捕获字节到ByteString Box，位置捕获变成数字。前一个候选、下一次调用和GC都不能让返回的捕获借用局部输入。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:23px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:18px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="960" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">matcher返回范围；VM成功后生成拥有数据的值</text>
+<rect x="24" y="62" width="852" height="112" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="96" class="label">VM adapter拥有本次调用的字节副本</text><text x="44" y="132" class="mono">haystack: Vec&lt;u8&gt;    needle: Vec&lt;u8&gt;</text><text x="44" y="160" class="small">NUL/0xff保留原值；不把payload变成UTF-8 String。</text>
+<path d="M450 174V210" class="flow"/>
+<rect x="24" y="210" width="852" height="122" rx="12" fill="#fff0d9" stroke="#a37128"/>
+<text x="44" y="244" class="label">find_captures临时借用输入，每个候选拥有自己的槽</text><text x="44" y="280" class="mono">&amp;[u8] → match_at → Vec&lt;CaptureState&gt;</text><text x="44" y="312" class="small">未命中丢弃当前候选槽；下一候选起点不继承Open/Closed/Position。</text>
+<path d="M450 332V368" class="flow"/>
+<rect x="24" y="368" width="852" height="122" rx="12" fill="#e5f3eb" stroke="#43865f"/>
+<text x="44" y="402" class="label">成功的FindMatch拥有元数据，没有借出的payload引用</text><text x="44" y="438" class="mono">span: Range&lt;usize&gt;    captures: Vec&lt;Capture&gt;</text><text x="44" y="470" class="small">Capture::Bytes(range) 或 Position(offset)；读取bytes时仍需原subject。</text>
+<path d="M450 490V526" class="flow"/>
+<rect x="24" y="526" width="852" height="146" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="560" class="label">adapter按编号一次物化返回值</text><text x="44" y="596" class="mono">Bytes(range) → ByteString::new(haystack[range].to_vec())</text><text x="44" y="630" class="mono">Position(offset) → Number(offset + 1)</text><text x="44" y="658" class="small">整体先返回start+1/end，再追加全部捕获；只在成功路径分配捕获字符串。</text>
+<path d="M450 672V708" class="flow"/>
+<rect x="24" y="708" width="852" height="114" rx="12" fill="#e5f3eb" stroke="#43865f"/>
+<text x="44" y="742" class="label">结果拥有Box&lt;[u8]&gt;，输入局部副本随后可释放</text><text x="44" y="778" class="small">保留返回值，再执行下一次find或collectgarbage，原捕获00ff仍应逐byte不变。</text><text x="44" y="808" class="small">失败不交付半成品捕获，也不回滚此前的Lua globals/I/O等VM副作用。</text>
+<text x="24" y="874" class="small">这是现有ByteString的Rust所有权课；字符串是拥有的Box，不引入新的GC根或借用延长。</text>
+<text x="24" y="910" class="small">旧find/find_with_limits仍投影整体Range，但先执行完整捕获验证；不能绕过unfinished错误。</text>
+<text x="24" y="944" class="small">字节合同独立编码s:长度:hex与n:数值，保留arity，旧75个坐标场景的输出原样保留。</text>
+</svg>

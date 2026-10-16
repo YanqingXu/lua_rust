@@ -1,7 +1,115 @@
 # 未完成目标交接
 
-更新：2026-10-15，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
+更新：2026-10-16，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
+
+## 2026-10-15：v1.0 string.find 捕获、检查点与返回值所有权
+
+用户要求按问题链完善普通/嵌套/空字符串/位置捕获、NUL/0xff、错误时机与捕获上限，
+讲清检查点恢复和预算不回滚，补齐反例、diff、状态图、练习及官方字节对照，保留原75
+场景输出与D005 partial。本批实现、教学和验证已完成，**没有恢复暂停的原审计目标**。
+2026-10-16用户明确要求将本批实现、官方字节合同、章节、状态图、练习包、能力证据
+和交接记录一并提交推送。同期VS Code工作包已另提交，本批不修改其配置/说明。
+
+- 起点HEAD与本地origin/main均为`ef753fbd31c0888956456601840681067d7887ab`，开始时
+  工作区干净；上一个find实现为已推送`db3e55f2aefa50661236421a7984a9290563ad5a`。
+  本批修改v100 VM adapter/既有find模块、两个Cargo test target、find旧typed合同、
+  新capture合同/练习/示例、checker suite、能力证据和教学。生产根crates、v18、
+  v100 compiler/core/bytecode/stdlib本体、REPL/format及其旧合同、Cargo.lock、oracle
+  manifest与2026-08-21 baseline均无diff；无第三方依赖或新GC根。
+  提交前fetch确认HEAD与origin/main无分叉；本批提交号以
+  `git log -1 -- book/src/versions/v100-lua51-runtime.md`为准，新提交CI按其SHA查询。
+- [主章](book/src/versions/v100-lua51-runtime.md)新增问题十至十二：整体Range不足
+  →工作态与结果态；两槽失败后truncate不足→完整checkpoint；输入只是借用→VM
+  成功后生成owned ByteString。每问含预测、实际旧binary/官方观察、设计fault、小步
+  diff、≤60行include和exact验收；新增11个include、三幅SVG、三类练习及检查点。
+  前三问的历史图保留原工作包边界，正文明确当前capture扩展归属。
+- 新find_captures/find_captures_with_limits返回FindMatch{span,captures}；成功态为
+  Capture::Bytes(Range)/Position(offset)，位置内部0-based。工作槽用Open/Closed/
+  Position，按左括号顺序编号，右括号关闭最近的Open；空bytes与位置数字分开。
+  旧find/find_with_limits保留Range投影，但仍先验证captures，不绕过unfinished。
+  parse_atom仍只解释atom，完整matcher在它之前处理捕获控制字节。
+- 每个Retry拥有完整CaptureCheckpoint，恢复旧槽内容并删新增槽。强反例aaab与
+  (a*)(a)b先得到Closed(0..3)/Open(3)，恢复Open(0)后重试，成功返回1,4,aa,a；
+  a*(a)b、嵌套与不同候选起点另验。只truncate长度会留错Closed，只clear会丢起点。
+  每个match_at另建捕获Vec，避免候选起点/后续调用泄漏。
+- Budget不入checkpoint；保存按saved槽数、恢复按live+saved槽数计费，逆向查Open/
+  完成结果等也计工作。已消耗steps不回滚，同次find所有候选共用预算；retry深度
+  是同时保留的frame数，pop可减少当前深度。真实aaaaab/(a*)aab的30steps Limit与
+  100steps捕获aaa另验，固定8→5→8整数fault只演示退款错误。plain仍绕开matcher
+  计费，不宣称统一wall-clock时限或官方资源配额。
+- 按路径处理括号：z(未到达可nil，a(成功结果边界才unfinished，(z整体未命中不报
+  Open错误；仅右括号且无magic时autoPlain，^a)才到达非法关闭。Invalid→VM Type，
+  与官方capture_to_close对应的reason为invalid pattern capture。当前官方配置32槽，
+  普通/嵌套/位置/已关闭槽均计数；第33次实际打开为Limit→VM Limit，未到达不提前
+  报错。该固定上限和steps/depth分别测试，不只凭pcall false认定错误边界正确。
+- matcher只借用输入，FindMatch拥有范围元数据但没有subject bytes；adapter成功后
+  一次按编号把Bytes复制进现有Box<[u8]> ByteString，Position转offset+1 Number。
+  真实probe保留含NUL/0xff的Value，GC/下一次find后释放Session仍逐byte不变；不
+  经UTF-8有损解码，也不把索引说成已拥有字符串。错误不回滚此前globals/I/O。
+- [练习包](book/code/v100-lua51-runtime/exercises/string_find_captures/README.md)含
+  9参考、1 restore_slots TODO，faults3/captures9/all12条unique marker/profile。
+  hook借真实CaptureState与checkpoint.states()，完整恢复且saved可重用；参考与
+  实际restore API对照，没有第二matcher。D/R各完成初始101→临时解0→原bytes恢复
+  并刷新mtime→再101；交付仍TODO，36命令/10文件SHA稳定。125926初轮归加强前，
+  最终130009补(a*)(a)b真实两槽断言，旧证据与provenance-note保留。
+- [官方合同](book/code/v100-lua51-runtime/tools/string_find_contract/README.md)：原75
+  fixture与driver逐byte保留（SHA a14bf24d…be2780d / b82485d1…e899153）；新54手写
+  expected先由官方54/54核对，无预期修正。capture fixture/driver独立，字符串用
+  s:长度:hex、数字n:、nil独立，保元数，stdout ASCII无LF，双流不trim/normalize。
+  新真实binary case A..char(0,255)..B /(%z.)输出n:2/n:3/s:2:00ff；不混同此前
+  推荐探针char(0,255)/(..)的n:1/n:2。driver不读取TSV或反生成expected。
+- checker增加--suite base|captures|all，默认base兼容旧入口；--check只schema并
+  明确两端NOT_RUN。实际两profile双方各129场景，共516 raw（基础300+捕获216）
+  逐byte通过，全部回收；Rust集成两profile另258次case，workspace/isolated/exact
+  的自然复跑不计新增覆盖。冻结旧305f7577…ea69828 binary的新54负控拒40/54、
+  官方54/54、CLI exit1，108raw与516正向分开；缺oracle参数/错tar亦按预期拒绝。
+  communicate并发drain，超时kill后仍wait；有界无后代，不外推任意进程树。
+- 官方固定tar SHA2640fc56…b0738695333、实际x64 PE8664 binary SHA47fd81e4…693978d，
+  版本5.1.5；归档成员lstrlib.c、luaconf.h、lua.h单独记录SHA。源码和binary身份
+  分开，不把-v字符串冒充可复现构建证明，也未重跑历史C++双oracle。
+- capabilities新增capture子集partial行→tests/string_find_capture_contract.rs→D005，
+  byte-string/format/find基础/capture四行均partial。D005移除已实现capture的笼统
+  缺口，继续保留backrefs、%b/%f、?/-、gmatch/gsub、其它format/dump、locale/浮点/
+  整数及资源边界。原75/format57/REPL26与历史语言baseline保持各自覆盖归属。
+- Windows Rust/cargo1.96.1：唯一一次本地release_gate通过fmt、all-targets Clippy
+  -Dwarnings、D/R workspace各229通过/0失败/4ignored（原204+VM10+参考9+合同6）。
+  新example faults3/captures9/all12、旧find all13、demo100/stdlib1550两profile
+  全过。旧REPL26/format57、基础find75、新capture54由workspace回归；旧语言
+  dual-oracle明确skipped，新官方字节合同另列。
+- 独立copy94代码/运行输入，6本地path packages闭合、第三方0；新target不共享产物，
+  offline/locked构建workspace bins、两个find合同各6项/共129场景与demo100通过。
+  继承祖先Rust linker配置，无v18/根tools源码依赖。20全量命令成功，96输入运行
+  前后SHA稳定，冻结验证器SHA42b2c5626f153ddc73cbb64e8bf49ebe84b57ff09026827848967c816dcb425c。
+- 全量之后只收紧工具README一句：区分已消耗steps与同时frame数，不改代码/fixture/
+  driver/命令。documentation-refinement.json记录原/新SHA并保留原README；full96/
+  contract85历史快照保留原SHA，不能冒称该文案在旧运行前就存在。最终4docs去重
+  16exact，D/R32次：30positive通过、2learner预期101，每次恰选1test；97个最终
+  代码/metadata/文档/SVG输入前后稳定，并验证唯一文档差异。
+- 本机ignored证据根`target/teaching-v100-captures-2026-10-15/`：真实24次基线
+  `baseline-20261015T125641433214Z/summary.json`；官方初核
+  `contracts/official-fixed-20261015T125649070878Z/summary.json`；runtime最终
+  `runtime/20261015T130123961282Z/summary.json`（125907初轮后仅纠正关闭错误reason，
+  新typed断言/6局部命令重验）；练习`exercises/20261015T130009339480Z/summary.json`；
+  合同`contracts/20261015T130309342350Z/summary.json`（16commands/516raw）；全量
+  `full-validation/20261015T130648629381Z/summary.json`（20commands）；文档
+  `doc-exact/20261015T131029641331Z/summary.json`。范围/HTML/图与最终哈希见
+  本根final-verification.json、visual-review.json。
+- 20版本教学检查、mdBook与38页1425站内链接/0broken通过。38个include均≤60，
+  本包新11个最长38行。三SVG经bundled sharp/libvips生成PNG并直接检查文字/箭头/
+  页脚，无裁切；Fontconfig缓存告警不影响本次渲染。另验HTML/include/image引用，
+  不把PNG审阅冒称浏览器页面视觉验证。
+- 基线ef753fb的[mdBook 38735596968](https://github.com/YanqingXu/lua_rust/actions/runs/38735596968)
+  success；[Rust 38735596977](https://github.com/YanqingXu/lua_rust/actions/runs/38735596977)
+  failure，三个Miri/ASan job success。Windows除M1严格Clippy生产fetch_update弃用
+  失败，还在official source enforcement中为rust9/10，官方/C++各10/10；不能沿用
+  前一基线“官方三方10/10”的结论。baseline-book/rust.json及实际job日志保留，
+  本批未整改生产CI或宣称远端绿色。
+
+下一工作包可从%1读取已闭合捕获、未闭合/位置引用的错误时机推进backreference，
+先冻结官方具体fixture，再决定借用范围与引用比较的预算；%b/%f、?/-、gmatch/gsub
+仍各自立项。原审计暂停目标仍为os.date/os.time本地时间、UTC、DST，本交接不表示
+恢复。本批按用户明确指令提交推送；最终提交SHA的CI状态另行查询，不沿用基线结论。
 
 ## 2026-10-15：v1.0 string.find 有界兼容问题链
 

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1040" viewBox="0 0 900 1040" role="img" aria-labelledby="title desc">
+<title id="title">失败后恢复完整捕获检查点，预算持续消耗</title><desc id="desc">aaab匹配(a*)(a)b。a星贪尽时保存Open0，后缀把第一槽关闭并创建第二槽后失败。重试恢复第一槽Open并删除第二槽，再从位置2成功得到aa和a。快照与恢复按槽数计费，预算不在快照中，不因回退得到退款。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#286047"/></marker><style>text{font-family:'Microsoft YaHei','Noto Sans SC',sans-serif;fill:#20352b}.head{font-size:23px;font-weight:700}.label{font-size:19px}.small{font-size:16px}.mono{font-family:Consolas,'Microsoft YaHei',monospace;font-size:18px}.flow{fill:none;stroke:#286047;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="900" height="1040" rx="16" fill="#fbfaf4"/>
+<text x="24" y="38" class="head">回退要恢复“当时是什么”，不是只恢复“有几个”</text>
+<rect x="24" y="62" width="852" height="112" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="96" class="mono">subject = aaab    pattern = (a*)(a)b</text><text x="44" y="132" class="small">捕获#1已Open(0)；a*贪尽到source=3，在后缀 )(a)b 之前保存检查点。</text>
+<path d="M450 174V210" class="flow"/>
+<rect x="24" y="210" width="852" height="114" rx="12" fill="#e5f3eb" stroke="#43865f"/>
+<text x="44" y="244" class="label">Retry拥有索引状态快照</text><text x="44" y="280" class="mono">next=2    suffix=')(a)b'    saved=[Open(0)]</text><text x="44" y="308" class="small">快照只复制≤32个CaptureState；不复制subject bytes，不包含Budget。</text>
+<path d="M450 324V360" class="flow"/>
+<rect x="24" y="360" width="852" height="116" rx="12" fill="#fff0d9" stroke="#a37128"/>
+<text x="44" y="394" class="label">后缀先改变两个槽，再因 a 遇到 b 失败</text><text x="44" y="430" class="mono">live=[Closed(0..3), Open(3)]</text><text x="44" y="460" class="small">#1从Open变Closed；#2在快照之后新建。两个变化都需要撤销。</text>
+<path d="M450 476V512" class="flow"/>
+<rect x="24" y="512" width="852" height="112" rx="12" fill="#e5f3eb" stroke="#43865f"/>
+<text x="44" y="546" class="label">先付恢复费用，再完整替换槽内容并提出source=2</text><text x="44" y="582" class="mono">live=[Open(0)]    next suffix=')(a)b'</text><text x="44" y="610" class="small">只truncate(1)仍留下Closed(0..3)；clear()又丢失#1的起点。</text>
+<path d="M450 624V660" class="flow"/>
+<rect x="24" y="660" width="852" height="110" rx="12" fill="#eef5ff" stroke="#52769f"/>
+<text x="44" y="694" class="label">重试成功：按左括号顺序返回两个捕获</text><text x="44" y="730" class="mono">live=[Closed(0..2), Closed(2..3)] → 1,4,'aa','a'</text>
+<rect x="24" y="808" width="852" height="126" rx="12" fill="#f7e9ea" stroke="#a05360"/>
+<text x="44" y="842" class="label">Budget由整个find调用独立拥有，剩余值只减不增</text><text x="44" y="878" class="small">保存按saved槽数计费；恢复按live+saved槽数计费；回退不会退还已做的工作。</text><text x="44" y="910" class="small">换下一个候选起点时新建捕获槽，仍共用这次find的Budget，不能借重试重置预算。</text>
+<text x="24" y="978" class="small">检查点可反复借用；Vec完整恢复复制的是枚举/范围，不是深拷贝Lua字符串或VM。</text>
+<text x="24" y="1014" class="small">状态恢复与资源计量是两项合同：工作预算耗尽仍报Limit，不伪装为nil或官方无限配额。</text>
+</svg>

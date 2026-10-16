@@ -12,7 +12,8 @@
   partial deviation 和被明确排除的版本边界。先把结构化 REPL 协议迁入本地快照，
   再用同一份原始字节合同验证两个独立 binary；随后从 string.format 的真实差异
   推导格式规格、参数检查与有界兼容证据；再从 string.find 的空匹配和失败后缀
-  推导字节 atom、按路径解析与显式回退栈。</p>
+  推导字节 atom、按路径解析与显式回退栈；最后用捕获槽的变化推导检查点恢复、
+  持续计费和返回字节的所有权。</p>
 </div>
 
 v0.18 已经能运行脚本、模块和协程，也能观察 bytecode、CFG 与 trace。但功能数量不是兼容性证据：如果测试没有说明参照物、平台归一化规则和允许差异，“测试通过”仍可能只是与自己一致。本版完成三件事：**补齐核心源码语法缺口、冻结可观察协议、让每项兼容结论都能追溯到测试或偏差 ID**。
@@ -36,6 +37,10 @@ v0.18 已经能运行脚本、模块和协程，也能观察 bytecode、CFG 与 
 `string.find('aaab','a*ab')`。最后比较 `'z['` 和 `'a['` 在 `'abc'` 上的结果：
 未闭集合总要立即报错吗？问题七至九从这些输入建立新的搜索状态。
 
+再预测 `string.find('aaab','(a*)(a)b')` 的两个捕获：贪尽时第一槽已经关闭，第二槽
+已经新建，失败后只截短Vec够不够？`()`与匹配到空字符串有什么区别？返回的NUL/
+0xff捕获在下一次find或Session释放后由谁保存？问题十至十二继续沿失败轨迹演进。
+
 <a id="learning-code-map"></a>
 ## 代码阅读地图
 
@@ -57,9 +62,11 @@ compiler 返回的 kind，再看 controller 保留的 source/诊断，最后看 
 → `parse_spec` → 各 renderer 阅读；`tests/string_format_contract.rs` 从实际 binary
 验固定字节，再单独检查本地错误 kind、参数号与分类。
 
-find 则读 `StringFunction::Find` adapter → `string_find::find` 的 init/plain 分流
-→ `match_at` → 到达的 `parse_atom/Atom::matches` → `greedy_end/retry`。adapter
-拥有本次参数字节副本，matcher借用它们，Set借用pattern切片；没有延长heap对象生命周期。
+find 则读 `StringFunction::Find` adapter → `string_find::find_captures` 的 init/plain
+分流 → `match_at/capture_control` → 到达的 `parse_atom/Atom::matches` →
+`greedy_end/retry` → `finish_match` → adapter物化捕获。旧`find`仍提供整体Range投影。
+adapter拥有本次参数字节副本，matcher借用它们，Set借用pattern切片；FindMatch拥有
+范围元数据，返回的ByteString另外拥有捕获bytes，没有延长输入借用或heap对象生命周期。
 
 本版阅读顺序从证据到实现：先问“这个结论由什么证明”，再进入 parser/opcode/tool 代码。
 测试存在并不自动成为证据；只有覆盖对象、参照物和允许归一化都明确时，才能支撑对应行。
@@ -640,8 +647,8 @@ cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string
 ```
 
 第一项借真实parser核atom、游标与NUL/ff匹配；第二项检查Type、参数号、具体malformed
-类别及未到达后缀不报错。Invalid、Unsupported和Limit分别记录：未实现capture、
-backreference、`%b/%f`、optional/non-greedy量词不能静默按字面或统一返回nil。
+类别及未到达后缀不报错。Invalid、Unsupported和Limit分别记录：未实现backreference、
+`%b/%f`、optional/non-greedy量词不能静默按字面或统一返回nil。
 转义、集合和普通字面上下文仍按各自规则；首`^`/末`$`的小范围支持也有单独回归。
 
 ## 问题九：贪婪匹配为什么必须保存“退一步”的状态？
@@ -661,6 +668,7 @@ backreference、`%b/%f`、optional/non-greedy量词不能静默按字面或统�
 
 实际push只有在end大于minimum时才创建frame，不在无候选时计算end-1。每个frame
 存下界、下一subject位置与后缀pattern位置；嵌套重复用显式Vec栈，没有宿主递归。
+下方当前源码还带capture检查点和计费；本问先只跟踪位置，问题十一再推导这些字段。
 
 ```rust,ignore
 {{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_retry_state}}
@@ -671,6 +679,9 @@ backreference、`%b/%f`、optional/non-greedy量词不能静默按字面或统�
 ```
 
 ![贪尽、失败与较短候选](../images/v100-find-backtrack.svg)
+
+此图记录上一工作包的分流与回退边界；图末尚未纳入的capture在问题十至十二扩展，
+不表示当前matcher会拒绝本轮已经覆盖的捕获。
 
 步骤与frame深度有独立guard，默认100000步骤、128层。预算在同次搜索的候选间
 共用，耗尽返回Limit，经adapter保留VmErrorKind::Limit；不是匹配失败，也不保证
@@ -738,10 +749,251 @@ SHA；缺文件、超时或归档失败显式失败。错误case用pcall稳定�
 类别、参数号与到达时机；未知id/driver编译错误在Lua `pcall` 之外，不能冒充合法pattern错误。
 详细边界见[find官方合同](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v100-lua51-runtime/tools/string_find_contract/README.md)。
 
-能力矩阵新增find子集证据，byte-string、format、find三行仍为 **partial**，共同
-引用 `LUA51-D005`。captures、backreference、balanced/frontier、optional/non-greedy、
+上一工作包的byte-string、format、find三行继续保持 **partial**，共同
+引用 `LUA51-D005`。backreference、balanced/frontier、optional/non-greedy、
 gmatch/gsub、locale与资源边界继续登记，既有format57条、REPL26条和旧语言双oracle
 基线各保留原覆盖归属，不把find子集称为完整Lua pattern。
+
+## 问题十：为什么整体匹配成功，还没有完整表达 find 的结果？
+
+### 从当前 binary 真正拒绝的输入开始
+
+上一包只收口整体匹配范围，捕获会明确返回Unsupported。冻结`db3e55f`实现的实际
+Debug binary，对照官方5.1.5再运行，下列输入从错误变成了本轮要实现的规格：
+
+| Lua调用 | 修改前 | 官方5.1.5的返回值 |
+| --- | --- | --- |
+| `string.find('id=42','(%a+)=(%d+)')` | error | `1,5,'id','42'` |
+| `string.find('ab','(a*)ab')` | error | `1,2,''` |
+| `string.find('ab','()a()')` | error | `1,1,1,2` |
+| `string.find('aaab','(a*)(a)b')` | error | `1,4,'aa','a'` |
+
+从仓库根运行固定设计反例与真实matcher/VM观察：
+
+```powershell
+cargo run --quiet --manifest-path book/code/v100-lua51-runtime/Cargo.toml --example string_find_captures_problem_chain -- all
+```
+
+`faults|captures|all`缺省all，分别3/9/12条不同`[ok]`。truncate、clear与退还工作
+计数是固定设计fault；修改前binary是明确不支持capture，不能说成它曾使用这些错误
+算法。先写预期，再区分“旧实现缺能力”和“一个拟议实现为什么还不正确”。
+
+### 第一步：把工作状态和成功结果分开
+
+一个`Range<usize>`只能表示整体范围。它装不下多个捕获，也无法区分空字符串和
+位置。捕获编号按左括号出现顺序，而不是关闭顺序；`((a)b)`返回外层ab，再返回内层a。
+
+```diff
+-Result<Option<Range<usize>>, FindError>
++Result<Option<FindMatch>, FindError>
++// FindMatch { span, captures: Vec<Capture> }
++// working: Open(start) / Closed(range) / Position(offset)
++// success: Bytes(range) / Position(offset)
+```
+
+这是新增`find_captures/find_captures_with_limits`的返回协议。旧`find/find_with_limits`
+仍投影整体Range，供上一练习使用，但先完成捕获验证；不能借投影绕过unfinished错误。
+读真实类型，确认哪个Vec拥有状态，哪些字段只是索引：
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_capture_values}}
+```
+
+`Open(0)`表示尚未关闭，不能假造一个终点0；`Closed(0..0)`是成功的空字符串；
+`Position(0)`则对应Lua数字1。它们不能用一个长度为0的range互相替代。
+
+### 第二步：控制字节按实际执行路径改变槽位
+
+先处理`(`/`)`控制，再把其它字节交给atom parser。普通`(`添加Open，紧接`)`的
+`()`直接添加Position；右括号逆向寻找最近的Open，跨过已关闭槽和位置槽。
+公开`parse_atom`只解析atom，本身仍不解释捕获；完整matcher在它之前分派控制字节。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_capture_control}}
+```
+
+![捕获工作状态与结果状态](../images/v100-capture-states.svg)
+
+不要在入口扫描全pattern来配括号。对`abc`，`z(`未到达后缀而nil；`a(`走到模式末端，
+准备成功返回时才因Open报unfinished。`(z`每个起点都匹配失败，不会仅因Open就报错。
+只含`)`且无其它magic时走自动plain；要观察无Open却到达右括号的错误，用`^a)`。
+这延续了上一包的“到达才验证”，而不是另设一套eager capture parser。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_capture_finish}}
+```
+
+当前配置最多32个捕获槽，普通、嵌套、位置和已经关闭的捕获都计入编号；不是只数
+当前Open深度。第33次实际打开时返回明确Limit，未到达的第33个括号不提前报错。
+unfinished/无Open关闭是Invalid→VM Type；32槽上限是Limit→VM Limit。官方合同只
+冻结稳定的pcall错误标志，本地测试另外核分类、原因、参数号与发生时机。
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract capture_errors_keep_success_path_timing_and_distinct_categories -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_captures_reference actual_nested_empty_and_position_captures_keep_distinct_kinds -- --exact
+```
+
+## 问题十一：只退回两个游标，为什么仍可能返回错误的捕获？
+
+### 失败分支会修改旧槽，也会创建新槽
+
+用`aaab`匹配`(a*)(a)b`，按0-based索引手推：
+
+1. 打开#1得到Open(0)，a*贪尽到3；在尝试后缀`)(a)b`前保存检查点。
+2. `)`关闭#1为Closed(0..3)，`(`新建#2为Open(3)，下一个a却遇到b，失败。
+3. 重试a*只取两个a之前，必须把#1恢复Open(0)，并删掉#2。
+4. 重跑后缀得到Closed(0..2)、Closed(2..3)，整体成功，返回`1,4,'aa','a'`。
+
+只truncate到1槽，#1仍错误地关闭；全部clear又丢掉了回退点之前已有的起点。
+`(a*)ab`仍保留作小例，但它不能单独证明旧槽与新增槽都正确恢复。
+
+```diff
+-Retry { minimum, next, pattern }
++Retry { minimum, next, pattern, captures: CaptureCheckpoint }
+-captures.truncate(saved_length);
++restore_captures(&mut captures, &frame.captures);
+```
+
+这个diff把错误设计与当前机制并列，不冒称旧提交存在truncate代码。真实checkpoint
+拥有完整的状态Vec；`states()`借出只读slice。复制的是枚举和offset/range，不是subject
+数据；最多32槽的有界快照先让语义清楚，后续优化必须继续满足同一恢复合同。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_capture_checkpoint}}
+```
+
+![检查点恢复与持续计费](../images/v100-capture-checkpoints.svg)
+
+### 捕获状态回退，已经付出的工作不退还
+
+检查点不包含Budget。真正matcher保存快照前按saved槽数计费，重试恢复前按live与
+saved槽数之和计费；逆向找Open、完成结果等也计工作。公共checkpoint/restore辅助
+API不接受Budget，计费由matcher调用点负责，不能拿裸helper宣称有统一配额。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/string_find.rs:find_retry_state}}
+```
+
+Budget由同一次find独立拥有，在所有retry和候选起点之间共用。恢复捕获后，剩余
+steps继续减少；若把工作计数一起恢复，失败分支便可以反复获得免费重试。新的
+`match_at`拥有新的capture Vec，但借用的仍是同一个Budget；下一次find才另起预算。
+retry深度限制的是同时保留的frame数，pop会减少当前深度；它不是累计消耗的steps。
+
+对`aaaaab`和`(a*)aab`，真实API在30steps报Limit，在100steps成功捕获aaa；低预算
+不是nil，也不是半成品捕获。该计数是候选实现的资源合同，不与官方正常pcall结果
+冒充等价；固定work-counter fault的8→5→8只演示退款问题，不是实际算法的步骤数。
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract rollback_restores_closed_values_positions_and_new_slot_count -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_captures_reference actual_capture_and_work_limits_return_errors_without_destroying_the_session -- --exact
+```
+
+### 验收练习：完整恢复借来的检查点
+
+只改`exercises/string_find_captures/starter.rs::restore_slots`。输入是工作Vec的
+`&mut`短借用和真实checkpoint借出的`&[CaptureState]`。恢复旧槽的每个状态、删除
+多出的槽，保持saved不变且可再次借用；不要改合同、solution、faults、probes或ignore。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/exercises/string_find_captures/starter.rs:capture_restore_starter}}
+```
+
+参考实现把checkpoint内容复制回工作Vec，不持有指向checkpoint内部的长期引用：
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/exercises/string_find_captures/solution.rs:capture_restore_solution}}
+```
+
+合同故意既改Open/Closed/Position的旧值，也追加新槽，并连续恢复两次；只断言长度
+会漏掉损坏。hook是恢复投影，没有Budget借用；真实matcher的计费与错误后继续另验。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/exercises/string_find_captures/contracts.rs:capture_restore_contract}}
+```
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_captures_reference checkpoint_restore_replaces_old_slots_and_removes_new_slots -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_captures_exercises checkpoint_restore_replaces_old_slots_and_removes_new_slots -- --ignored --exact
+```
+
+第一条验参考，第二条选learner，初始必须失败，补完后才通过；每条恰选一项测试。
+Release在`--`前加`--release`。本包还有8项参考覆盖真实回退、空/位置、不同起点、
+owned bytes、上限与helper一致性；详见[捕获练习包](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v100-lua51-runtime/exercises/string_find_captures/README.md)。
+
+## 问题十二：matcher借用输入，返回的捕获字节最后由谁拥有？
+
+### 从一次调用的索引，走到调用之后仍有效的值
+
+`FindMatch`拥有span和捕获范围元数据，没有拥有subject bytes；调用者解读范围仍要
+保留原subject。matcher借用VM adapter本次的参数副本，不在内部先分配每个尝试的
+捕获字符串。成功后，adapter按编号一次把Bytes(range)复制为现有ByteString，把
+Position(offset)转为offset+1的Number，追加在整体两个坐标之后。
+
+```diff
+-return values_that_borrow_local_subject;
++// Keep offsets while matching; materialize only the successful captures.
++Value::String(ByteString::new(haystack[range].to_vec()))
++Value::Number((offset + 1) as f64)
+```
+
+前一行是会受局部输入生命周期限制的拟议接口，不是历史实现。当前ByteString拥有
+Box<[u8]>；这是Rust所有权问题，没有引入新的GC根，也不把范围元数据说成字符串。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/crates/lua_vm/src/lib.rs:string_find_owned_captures}}
+```
+
+![捕获返回值所有权](../images/v100-capture-ownership.svg)
+
+每个候选起点的新Vec防止失败尝试泄漏：`find('axab','(a)b')`应为`3,4,'a'`，不能
+夹带前一次已关闭或未闭合的槽。失败不交付成功半成品，不回滚此前Lua的globals/I/O。
+保存含NUL/0xff的返回Value，再做GC与下一次find，最后释放Session，才检查原bytes：
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/exercises/string_find_captures/probes.rs:capture_real_owned_bytes}}
+```
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_captures_reference actual_vm_returns_owned_binary_capture_values -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract owned_indices_vm_strings_and_legacy_range_projection_keep_their_boundaries -- --exact
+```
+
+### 数字坐标合同不能自动验字符串捕获
+
+原75个case与driver逐byte不改，继续验原样坐标/元数输出。新增54个手写固定场景
+使用独立capture fixture/driver：数值仍为`n:`，字符串为`s:长度:小写hex`，空字符串
+为`s:0:`，nil仍是单独一个值；保留完整arity。固定binary case用`'A'..char(0,255)..'B'`
+匹配`(%z.)`，stdout为`ok|3|n:2|n:3|s:2:00ff|after`，不让Windows stdout文本换行或UTF-8解码
+掩盖payload。driver不读取TSV，也不用find/format生成expected。
+
+```rust,ignore
+{{#include ../../code/v100-lua51-runtime/tests/string_find_capture_contract.rs:capture_binary_contract}}
+```
+
+```powershell
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract real_binary_matches_fifty_four_fixed_capture_byte_cases -- --exact
+cargo test --manifest-path book/code/v100-lua51-runtime/Cargo.toml --test string_find_capture_contract capture_corpus_keeps_fifty_four_arities_lengths_and_binary_values -- --exact
+py -3 book/code/v100-lua51-runtime/tools/check_string_find_contract.py --suite all --check
+```
+
+--check只做schema/driver检查，两端明确NOT_RUN。实际对照从仓库根构建binary后运行：
+
+```powershell
+cargo build --manifest-path book/code/v100-lua51-runtime/Cargo.toml --bin lua_app
+py -3 book/code/v100-lua51-runtime/tools/check_string_find_contract.py --suite all --candidate-bin book/code/v100-lua51-runtime/target/x86_64-pc-windows-msvc/debug/lua_app.exe --official-bin target/oracles/lua-5.1.5/build/Release/lua51.exe --official-archive target/oracles/lua-5.1.5/lua-5.1.5.tar.gz --output target/string-find-captures-review
+```
+
+旧75与新54各自对固定expected验双方完整双流和退出码；Python实际执行和Rust
+集成执行单列计数，复跑不计新增覆盖。独占case/run目录归档stdin、原始双流、metadata
+和输入/binary/source SHA，超时后kill仍wait；源tar与真实官方binary身份分开记录。
+错误case的pcall false不替代本地分类检查；traceback文字和候选资源预算不冒称官方
+逐字相同。参照[Lua5.1捕获规则](https://www.lua.org/manual/5.1/manual.html#5.4.1)及
+[5.1.5源码](https://www.lua.org/source/5.1/lstrlib.c.html)的start/end_capture、push_captures；
+永久CLI和身份说明见[find官方合同](https://github.com/YanqingXu/lua_rust/blob/main/book/code/v100-lua51-runtime/tools/string_find_contract/README.md)。
+
+新增capture能力行指向本地合同，但byte-string、format、find基础和capture四行都
+保持 **LUA51-D005 partial**。backreference、balanced/frontier、optional/non-greedy、
+gmatch/gsub、其它format/dump和locale/资源边界继续登记；不把129个场景说成完整pattern。
 
 ## 38 Opcode：语义覆盖不等于二进制兼容
 
@@ -832,6 +1084,8 @@ book/code/v100-lua51-runtime/tools/release_gate.ps1 -RunOracles `
 - 符号、数值精度与宽度补齐分开，按规则处理优先级，不依赖通用 Display。
 - find用 `Result<Option<Range<usize>>, FindError>` 分离错误、未命中与空成功；
   Atom借用pattern、Vec保存回退状态，让错误时机与候选顺序可以直接测试。
+- capture用enum区分工作态与成功态；拥有的检查点Vec与只读slice分开，完整恢复
+  旧值/槽数。Budget独立借用且持续计费，ByteString在成功边界拥有拷贝出的原bytes。
 
 替代方案是把教学 ISA 强行改成官方 38 条并立即读取官方 chunk。这会把语言收口与二进制格式、端序、数字宽度、安全 verifier 混成一次破坏性迁移，因此留给 v1.1。另一个方案是只保存 golden output；真实双进程差分能在平台和错误合同改变时暴露差异，证据更强。
 
@@ -848,6 +1102,7 @@ book/code/v100-lua51-runtime/tools/release_gate.ps1 -RunOracles `
 - 共用合同：26个 raw byte 场景，本地自含副本与仓库身份/进程 gate；
 - 收口子集：既有 string.format 的规格/参数边界与57场景官方字节合同，D005仍partial；
 - 收口子集：find的plain/init、字节atom和`*`/`+`回退与75场景官方合同，D005仍partial；
+- 收口子集：find普通/嵌套/空字符串/位置捕获、检查点恢复与owned返回，另54场景，D005仍partial；
 - 未伪装：标准库剩余差异和 v1.1+ 能力继续显式登记。
 
 ## 运行与验收
@@ -959,6 +1214,24 @@ Release gate 还要求相同测试在 `--release` 下通过、Clippy 零 warning
   subject/pattern位置和Retry，解释哪一步到达错误，并说明eager parser为何改变行为。</p>
 </div>
 
+<div class="exercise">
+  <strong>理解题：整体范围相同，第三个值为什么不同？</strong>
+  <p>预测find('b','(a*)')与find('b','()')，列出整体Range、capture工作态、成功态和
+  Lua返回元数/类型。再手推((a)b)的编号与关闭顺序，解释为什么未闭合不能用0终点表示。</p>
+</div>
+<div class="exercise">
+  <strong>实现题：恢复完整的capture检查点</strong>
+  <p>只补string_find_captures/starter.rs::restore_slots。恢复Open/Closed/Position旧值，
+  删除新增槽，让同一saved可再次使用；逐项写下哪一个owner负责live、snapshot和Budget。
+  显式运行learner exact，初始失败，修改后通过，不能改ignore或参考答案。</p>
+</div>
+<div class="exercise">
+  <strong>调试题：位置退回了，capture和预算分别该怎么办？</strong>
+  <p>对aaab与(a*)(a)b，标出checkpoint、live旧槽/新增槽和下一候选。分别用truncate、
+  clear、恢复工作计数三个fault解释错在哪里。再保留二进制capture返回Value，GC并释放
+  Session后检查00ff，说明索引元数据与owned ByteString各自能保证什么。</p>
+</div>
+
 <a id="learning-checkpoint"></a>
 ## 完成检查点
 
@@ -976,6 +1249,10 @@ find还应能手推init/空区间和C-prefix分流，解释借用Set的生命周
 完成Retry TODO，画出a*ab的失败/回退轨迹，说明*与+的下界；用官方元数/坐标合同
 和候选专用Unsupported/Limit检查各自举证，不外推完整pattern或无限资源。
 
+捕获还应能解释Open/Closed/Position与成功态的区别，手推同时改旧槽/添新槽的回退；
+完成restore_slots TODO，证明只改Vec长度不足。说明预算为何不在checkpoint内、快照/
+恢复如何计费；解释VM在哪一步拥有捕获bytes，并让原75与新增54场景各自逐byte通过。
+
 ## 与成熟实现和专题章节的对应
 
 - 成熟实现的 differential runner、M0/M1 gate、official source manifest 和 living deviation log 是本版最小发布治理的扩展目标；
@@ -983,5 +1260,6 @@ find还应能手推init/空区间和C-prefix分流，解释借用Set的生命周
 - [寄存器虚拟机](../ch04-vm/register-vm.md) 对照 composite opcode；
 - [用测试守住兼容性](../ch05-engineering/testing.md) 深入 fixture、oracle 与进程级证据；
 - 根目录 `book_plan.md` 继续定义 v1.1–v1.4 路线。
-- 下一步可从捕获的保存/失败回滚，或其它登记构造的最小fixture继续推进；REPL的
-  TTY/signal/增量parser分别立项，REPL26、format57、find75各保留自己的覆盖归属。
+- 下一步可由backreference的最小fixture继续推进捕获读取/未闭合引用的错误边界，
+  或选择另一个登记构造；%b/%f、?/-、gmatch/gsub与REPL的TTY/signal/增量parser分别
+  立项。REPL26、format57、find基础75和capture54各保留自己的覆盖与历史证据归属。

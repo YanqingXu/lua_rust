@@ -273,7 +273,7 @@ fn plain_truthiness_init_empty_ranges_and_c_prefixes_remain_distinct() {
 // ANCHOR: find_partial_rejection_contract
 #[test]
 fn unsupported_constructs_are_explicit_partial_errors_in_the_candidate() {
-    for pattern in ["a?", "a-", "(a)", "%b()", "%f[%a]", "%1"] {
+    for pattern in ["a?", "a-", "%b()", "%f[%a]", "%1"] {
         assert!(
             matches!(
                 find(b"abc", pattern.as_bytes(), 1, false),
@@ -292,6 +292,11 @@ fn unsupported_constructs_are_explicit_partial_errors_in_the_candidate() {
     }
     assert_eq!(find(b"abc", b"z%f[", 1, false), Ok(None));
     assert_eq!(find(b"a?", b"a?", 1, true), Ok(Some(0..2)));
+    assert_eq!(find(b"abc", b"(b)", 1, false), Ok(Some(1..2)));
+    assert!(matches!(
+        find(b"a", b"(a", 1, false),
+        Err(FindError::Invalid(_))
+    ));
 }
 // ANCHOR_END: find_partial_rejection_contract
 

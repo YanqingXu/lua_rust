@@ -13,6 +13,7 @@ stdlib	math library	partial	tests/stdlib.rs	LUA51-D010
 stdlib	byte-string library	partial	tests/stdlib.rs	LUA51-D005
 stdlib	string.format existing conversions flags width precision and argument contracts	partial	tests/string_format_contract.rs	LUA51-D005
 stdlib	string.find plain init empty byte classes escapes and greedy star plus	partial	tests/string_find_contract.rs	LUA51-D005
+stdlib	string.find capture checkpoints rollback owned results and capture limits	partial	tests/string_find_capture_contract.rs	LUA51-D005
 stdlib	table library	complete	tests/stdlib.rs	-
 stdlib	io and file library	partial	tests/host_stdlib.rs	LUA51-D006
 stdlib	os library	partial	tests/host_stdlib.rs	LUA51-D007

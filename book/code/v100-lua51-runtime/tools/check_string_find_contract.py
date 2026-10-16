@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the fixed bounded Lua-5.1 string.find oracle without output normalization."""
+"""Verify fixed Lua-5.1 find base/capture byte suites without output normalization."""
 from __future__ import annotations
 
 import argparse
@@ -22,20 +22,27 @@ SNAPSHOT = Path(__file__).resolve().parents[1]
 FIXTURE = SNAPSHOT / "tests/fixtures/string-find/cases.tsv"
 DRIVER = SNAPSHOT / "tests/fixtures/string-find/driver.lua"
 SOURCE_SHA256 = "2640fc56a795f29d28ef15e13c34a47e223960b0240e8cb0a82d9b0738695333"
+SUITES = {"base": ("string-find", 75), "captures": ("string-find-captures", 54)}
 
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def corpus():
-    raw = FIXTURE.read_bytes()
+def suite_paths(suite):
+    directory = SNAPSHOT / "tests/fixtures" / SUITES[suite][0]
+    return directory / "cases.tsv", directory / "driver.lua"
+
+
+def corpus(suite="base"):
+    fixture, driver = suite_paths(suite)
+    raw = fixture.read_bytes()
     if not raw.endswith(b"\n"):
         raise ValueError("fixture must end in a newline")
     lines = [line for line in raw.decode("ascii").splitlines() if not line.startswith("#")]
     rows = list(csv.DictReader(lines, delimiter="\t"))
-    if not lines or lines[0] != "id\tresult\tarity\tvalues" or len(rows) != 75:
-        raise ValueError("expected declared 75-row fixture schema")
+    if not lines or lines[0] != "id\tresult\tarity\tvalues" or len(rows) != SUITES[suite][1]:
+        raise ValueError("unexpected fixed case count/schema for " + suite)
     ids = set()
     for row in rows:
         if set(row) != {"id", "result", "arity", "values"}:
@@ -50,11 +57,23 @@ def corpus():
             values = row["values"].split(",")
             if row["arity"] != str(len(values)):
                 raise ValueError("declared arity differs from fixed values")
-            if not (values == ["nil"] or (len(values) == 2 and all(re.fullmatch(r"n:(?:0|[1-9][0-9]*)", value) for value in values))):
-                raise ValueError("expected exactly one nil or two byte coordinates")
+            number = lambda value: re.fullmatch(r"n:(?:0|[1-9][0-9]*)", value) is not None
+            if values != ["nil"]:
+                if len(values) < 2 or not all(number(value) for value in values[:2]):
+                    raise ValueError("matched result starts with two byte coordinates")
+                if suite == "base" and len(values) != 2:
+                    raise ValueError("base fixture must retain its no-capture arity")
+                if len(values) > 34:
+                    raise ValueError("more than 32 captured values")
+                for value in values[2:]:
+                    if number(value):
+                        continue
+                    string = re.fullmatch(r"s:(0|[1-9][0-9]*):((?:[0-9a-f]{2})*)", value)
+                    if string is None or int(string[1]) != len(bytes.fromhex(string[2])):
+                        raise ValueError("invalid captured string length/hex")
         else:
             raise ValueError("unknown fixed result class")
-    selected = re.findall(r'\["([a-z-]+)"\]\s*=\s*function', DRIVER.read_text(encoding="utf-8"))
+    selected = re.findall(r'\["([a-z-]+)"\]\s*=\s*function', driver.read_text(encoding="utf-8"))
     if selected != [row["id"] for row in rows]:
         raise ValueError("driver case IDs/order differ from fixed oracle")
     return rows
@@ -120,10 +139,11 @@ def official_source(archive):
     return {"archive": str(archive), "archive_sha256": sha(raw), "member_sha256": files}
 
 
-def execute_case(binary, role, case, output, timeout):
+def execute_case(binary, role, case, output, timeout, suite="base"):
+    _, driver = suite_paths(suite)
     directory = output / role / case["id"]
     directory.mkdir(parents=True, exist_ok=False)
-    actual = capture(binary, [str(DRIVER), case["id"]], timeout)
+    actual = capture(binary, [str(driver), case["id"]], timeout)
     expected = expected_stdout(case)
     passed = (not actual["timed_out"] and actual["reaped"] and actual["exit"] == 0
               and actual["stdout"] == expected and actual["stderr"] == b"")
@@ -136,8 +156,8 @@ def execute_case(binary, role, case, output, timeout):
         key: value for key, value in actual.items() if key not in ("stdout", "stderr")
     }
     row.update({
-        "role": role, "id": case["id"], "passed": passed, "expected_exit": 0,
-        "argv": [str(DRIVER), case["id"]], "stdin_bytes": 0,
+        "role": role, "suite": suite, "id": case["id"], "passed": passed, "expected_exit": 0,
+        "argv": [str(driver), case["id"]], "stdin_bytes": 0,
         "stdout_bytes": len(actual["stdout"]), "stderr_bytes": len(actual["stderr"]),
         "stdout_sha256": sha(actual["stdout"]), "stderr_sha256": sha(actual["stderr"]),
         "stdout_exact": actual["stdout"] == expected, "stderr_exact": actual["stderr"] == b"",
@@ -150,6 +170,7 @@ def execute_case(binary, role, case, output, timeout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="schema/driver check only; no runtime compatibility claim")
+    parser.add_argument("--suite", choices=("base", "captures", "all"), default="base")
     parser.add_argument("--candidate-bin", type=Path)
     parser.add_argument("--official-bin", type=Path)
     parser.add_argument("--official-archive", type=Path)
@@ -161,8 +182,10 @@ def main():
         parser.error("actual comparison requires --candidate-bin, --official-bin and --official-archive together")
     if arguments.timeout <= 0:
         parser.error("--timeout must be positive")
-    cases = corpus()
-    print("schema PASS: 75 fixed cases; raw byte capture; arity/coordinates are encoded inside Lua", flush=True)
+    suites = tuple(SUITES) if arguments.suite == "all" else (arguments.suite,)
+    selected = {suite: corpus(suite) for suite in suites}
+    count = sum(len(cases) for cases in selected.values())
+    print("schema PASS:", count, "fixed cases; suites=" + ",".join(suites), "; raw arity/values encoded inside Lua", flush=True)
     if not any(provided):
         print("candidate NOT_RUN; official NOT_RUN (schema check only)", flush=True)
         return 0
@@ -179,29 +202,38 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     write_new(output / "official-version.stdout.bin", version["stdout"])
     write_new(output / "official-version.stderr.bin", version["stderr"])
-    write_new(output / "cases.tsv", FIXTURE.read_bytes())
-    write_new(output / "driver.lua", DRIVER.read_bytes())
+    suite_hashes = {}
+    for suite in suites:
+        fixture, driver = suite_paths(suite)
+        source_copy = output if len(suites) == 1 else output / suite
+        source_copy.mkdir(exist_ok=True)
+        write_new(source_copy / "cases.tsv", fixture.read_bytes())
+        write_new(source_copy / "driver.lua", driver.read_bytes())
+        suite_hashes[suite] = {"cases.tsv": sha(fixture.read_bytes()), "driver.lua": sha(driver.read_bytes())}
     rows = []
-    for role, binary in (("candidate", candidate), ("official", official)):
-        for case in cases:
-            rows.append(execute_case(binary, role, case, output, arguments.timeout))
+    for suite, cases in selected.items():
+        destination = output if len(suites) == 1 else output / suite
+        for role, binary in (("candidate", candidate), ("official", official)):
+            for case in cases:
+                rows.append(execute_case(binary, role, case, destination, arguments.timeout, suite))
     summary = {
-        "schema": "string-find-contract/v1", "created_utc": stamp,
-        "all_passed": all(row["passed"] for row in rows), "cases_per_binary": 75,
+        "schema": "string-find-contract/v1" if arguments.suite == "base" else "string-find-" + arguments.suite + "-contract/v1", "created_utc": stamp,
+        "all_passed": all(row["passed"] for row in rows), "cases_per_binary": count, "selected_suite": arguments.suite,
         "candidate_status": "passed" if all(row["passed"] for row in rows if row["role"] == "candidate") else "failed",
         "official_status": "passed" if all(row["passed"] for row in rows if row["role"] == "official") else "failed",
         "binary_identity": identity, "official_source": source,
         "official_version": {key: value for key, value in version.items() if key not in ("stdout", "stderr")},
         "input_sha256": {
-            "cases.tsv": sha(FIXTURE.read_bytes()), "driver.lua": sha(DRIVER.read_bytes()),
+            **(suite_hashes[suites[0]] if len(suites) == 1 else {}),
             "checker.py": sha(Path(__file__).read_bytes()),
         },
+        "suite_sha256": suite_hashes,
         "platform": {"system": platform.platform(), "python": platform.python_version(), "libc": platform.libc_ver()},
         "stream_policy": "full raw stdout/stderr and exit; no trim, decode or CRLF normalization",
-        "lua_transport": "pcall result/error, exact return arity, nil or byte coordinates and after sentinel; ASCII arithmetic/char encoding inside Lua without a formatter",
-        "error_scope": "pcall false is stable across engines; local Rust tests separately require VM Type, argument number, malformed category and reached-vs-unreached validation timing",
-        "bounded_scope": "plain/init, byte atoms/classes/sets, anchors and greedy */+; no optional/lazy quantifiers, captures/backrefs, balance/frontier, gmatch/gsub, locale or universal complexity guarantee",
-        "candidate_policy_scope": "Unsupported and bounded step/backtrack Limit are separate candidate-only tests, never mislabeled as official equivalent results",
+        "lua_transport": "pcall result/error, exact arity, nil or coordinates or s:byte-length:hex captures and after sentinel; ASCII arithmetic/char encoding in Lua",
+        "error_scope": "pcall false is stable across engines; local Rust tests separately check Type/malformed, argument number and reached-vs-unreached timing; a reached 33rd capture is candidate Limit, not a claim about a C runtime Rust enum",
+        "bounded_scope": "base 75 remains unchanged; capture suite adds ordinary/nested/empty/position captures, rollback and 32-slot boundary; backrefs, optional/lazy quantifiers, balance/frontier, gmatch/gsub and locale remain partial",
+        "candidate_policy_scope": "Unsupported and work-step/backtrack Limit are separate candidate-only tests; the 32-capture boundary is shared only through stable pcall success/error bytes",
         "provenance_scope": "source archive and executable identities are recorded separately; version text alone is not a reproducible build proof",
         "cases": rows,
     }
