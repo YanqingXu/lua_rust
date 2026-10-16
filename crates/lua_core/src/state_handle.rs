@@ -131,7 +131,7 @@ impl StateHandle {
 
 fn allocate_runtime_id(counter: &AtomicU64) -> Result<RuntimeId, RuntimeIdExhausted> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             if current == 0 {
                 None
             } else {

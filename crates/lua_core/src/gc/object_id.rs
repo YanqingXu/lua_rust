@@ -35,7 +35,7 @@ impl ObjectId {
 
     pub(crate) fn allocate() -> Self {
         let value = NEXT_OBJECT_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .unwrap_or_else(|_| panic!("GC ObjectId space exhausted"));

@@ -84,7 +84,7 @@ unsafe fn enter_vm_context_with_access(
         "VM context requires services from one Heap"
     );
     let scope_id = NEXT_SCOPE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .expect("VM service-scope identity space exhausted");

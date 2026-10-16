@@ -23,7 +23,7 @@ pub struct HeapId(NonZeroU64);
 impl HeapId {
     pub(crate) fn allocate() -> Self {
         let id = NEXT_HEAP_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .expect("process-wide HeapId namespace is exhausted");

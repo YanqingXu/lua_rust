@@ -3,6 +3,37 @@
 更新：2026-10-16，Asia/Shanghai。此文件是跨会话接续入口；详细整改状态见
 [审计整改](docs/audits/2026-09-12-remediation.md)，长期计划见 [plan.md](plan.md)。
 
+## 2026-10-16：修复 Rust CI 38830631080 的弃用 API 错误
+
+用户报告[本次Rust CI失败](https://github.com/YanqingXu/lua_rust/actions/runs/38830631080)，
+本包只处理这次CI故障，**没有恢复原os.date/os.time暂停审计**。起点HEAD与本地
+origin/main均为已推送`af5361191eb7f63786b05df1be08c85417c750fb`，工作区干净。
+
+- 实际失败环境为Rust1.99.1，Windows M1中的rust-quality-gate仅Clippy FAIL；
+  Format、Debug/Release、doctest、doc、audit均PASS。原run三个Miri/ASan job通过，
+  official source真实三方各10/10。安装器日志的error文本是脚本回显，syntax_error.lua
+  是预期负控，不能据此另判失败。
+- 生产ObjectId、HeapId、RuntimeId、VM service scope的四处AtomicU64::fetch_update
+  在新工具链被标弃用，-Dwarnings使其失败。直接替换为try_update，四文件各改一个
+  方法名；闭包、Relaxed/Relaxed、返回旧值、RuntimeId拒绝0、checked_add及耗尽错误/
+  panic均原样保留。不降低lint、不改CI或rust-version，不改教学快照。
+- 用CI相同的1.99.1在修复前实际复现Clippy exit101。修复后1.99.1与原本地1.96.1
+  的workspace/all-targets严格Clippy均通过；fmt通过。两工具链分别运行现有ObjectId1、
+  RuntimeId5、Heap4、VM context5项unit，各15通过，含永久耗尽/不回绕和8×512并发
+  身份唯一检查。13条本地验证命令成功，四源码运行前后SHA稳定；未重复运行本地
+  整套M0/M1/oracle/Miri/ASan，推送后由新CI重新执行，不挪用原run作新结果。
+- 为复现安装了独立1.99.1/clippy/rustfmt，默认stable仍1.96.1。MSRV能力另以1.96.1
+  和已装1.98.0独立编译运行try_update探针确认，没有提高项目声明的最低版本。
+- 本机ignored证据：`target/ci-fix-38830631080/failed-windows-job.log`、
+  `before-clippy-1.99.1.log`与`before-clippy.exit`（101）、`validation.json`及13条命令
+  原始双流；`target/ci-38830631080-atomic-audit/summary.json`与`freeze.json`保存
+  API探针和四文件审阅哈希。原capture/base75/format/REPL证据保持原SHA与版本归属。
+
+本修复作为已授权推送后CI故障的后续提交推送；提交前fetch确认main无分叉。本批
+提交号以`git log -1 -- crates/lua_core/src/state_handle.rs`为准，新CI按该SHA查询。
+下一入口：确认新Windows严格Clippy和M1门完成，并核对另外三个Miri/ASan job；
+若有新的失败先查真实步骤与产物，不将基线负控输出或历史成功冒充当前结果。
+
 ## 2026-10-15：v1.0 string.find 捕获、检查点与返回值所有权
 
 用户要求按问题链完善普通/嵌套/空字符串/位置捕获、NUL/0xff、错误时机与捕获上限，
